@@ -1,0 +1,18 @@
+{
+  "name": "minigraf_transact",
+  "description": "Store a durable fact in structured memory. Only call this for decisions, architecture, dependencies, constraints, or preferences — NOT for transient observations or intermediate reasoning.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "facts": {
+        "type": "string",
+        "description": "A Datalog transact block, e.g. [[:component/auth :calls :component/jwt]] or [[:decision/cache-strategy :decision/description \"use Redis\"]]"
+      },
+      "reason": {
+        "type": "string",
+        "description": "Why this fact deserves long-term storage. This forces you to justify writes — only store facts worth remembering."
+      }
+    },
+    "required": ["facts", "reason"]
+  }
+}
