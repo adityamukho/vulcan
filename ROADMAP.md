@@ -6,14 +6,14 @@
 - Operational prompts (system.txt, fewshots.txt)
 - Test harness
 
-## Phase 2 (In Progress)
+## Phase 2 (Complete ✓)
 
 | Priority | Item | Description | Effort | Status |
 |----------|------|-------------|--------|--------|
-| 1 | HTTP server | Axum HTTP wrapper for better agent performance | Medium | In Progress |
-| 2 | Write policy enforcer | Validate reason required before transact | Low | - |
-| 3 | report_issue tool | Auto-file GitHub issues on failures | Low | - |
-| 4 | install.py | One-command setup script | Low | - |
+| 1 | HTTP server | Axum HTTP wrapper for better agent performance | Medium | Complete ✓ |
+| 2 | Write policy enforcer | Validate reason required before transact | Low | Complete ✓ |
+| 3 | report_issue tool | Auto-file GitHub issues on failures | Low | Complete ✓ |
+| 4 | install.py | One-command setup script | Low | Complete ✓ |
 
 ## Future Phase 3+
 - WASM bindings (browser + edge)
