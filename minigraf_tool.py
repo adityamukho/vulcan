@@ -1,25 +1,51 @@
 #!/usr/bin/env python3
 """
-Minigraf CLI wrapper for AI coding agents.
+Minigraf CLI/HTTP wrapper for AI coding agents.
 
 Provides query and transact functions for persistent bi-temporal graph memory.
-Requires minigraf CLI (>= 0.13.0) to be on PATH.
+Supports both CLI mode (subprocess) and HTTP mode (Axum server).
+
+Usage:
+    CLI mode (default):  MINIGRAF_MODE=cli python minigraf_tool.py ...
+    HTTP mode:           MINIGRAF_MODE=http python minigraf_tool.py ...
 """
 
 import subprocess
 import json
 import os
 import tempfile
+import urllib.request
+import urllib.error
 from typing import Optional, Dict, Any, List, Union
 
 MINIGRAF_BIN = "minigraf"
 
 DEFAULT_GRAPH_PATH = os.path.join(tempfile.gettempdir(), "minigraf_memory.graph")
 
+MINIGRAF_MODE = os.environ.get("MINIGRAF_MODE", "cli")
+MINIGRAF_HTTP_URL = os.environ.get("MINIGRAF_HTTP_URL", "http://localhost:8080")
+
 
 class MinigrafError(Exception):
     """Error from minigraf operations."""
     pass
+
+
+def _run_http(endpoint: str, data: Dict) -> Dict[str, Any]:
+    """Call HTTP server and return parsed result."""
+    try:
+        req = urllib.request.Request(
+            f"{MINIGRAF_HTTP_URL}/{endpoint}",
+            data=json.dumps(data).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            return {"ok": True, "data": result}
+    except urllib.error.URLError as e:
+        return {"ok": False, "error": f"HTTP error: {e}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def _run_minigraf(args: List[str], input_data: Optional[str] = None) -> Dict[str, Any]:
@@ -60,6 +86,18 @@ def query(datalog: str, as_of: Optional[Union[int, str]] = None, graph_path: Opt
     """
     path = graph_path or DEFAULT_GRAPH_PATH
     
+    if MINIGRAF_MODE == "http":
+        # HTTP mode
+        payload = {"datalog": datalog}
+        if as_of is not None:
+            payload["as_of"] = as_of
+        result = _run_http("query", payload)
+        if not result.get("ok"):
+            return result
+        data = result.get("data", {})
+        return {"ok": True, "results": data.get("results", [])}
+    
+    # CLI mode (original implementation)
     if not os.path.exists(path):
         return {"ok": False, "error": f"No graph file at {path}. Transact first."}
     
@@ -135,6 +173,16 @@ def transact(facts: str, reason: Optional[str] = None, graph_path: Optional[str]
     
     path = graph_path or DEFAULT_GRAPH_PATH
     
+    if MINIGRAF_MODE == "http":
+        # HTTP mode
+        payload = {"facts": facts, "reason": reason}
+        result = _run_http("transact", payload)
+        if not result.get("ok"):
+            return result
+        data = result.get("data", {})
+        return {"ok": True, "tx": data.get("tx", "unknown"), "reason": reason}
+    
+    # CLI mode
     full_tx = f"(transact {facts})"
     result = _run_minigraf(["--file", path], input_data=full_tx)
     
@@ -189,9 +237,12 @@ def get_graph_path() -> str:
 if __name__ == "__main__":
     import sys
     
+    mode = os.environ.get("MINIGRAF_MODE", "cli")
+    
     if len(sys.argv) < 2:
         print("Usage: minigraf_tool.py <command> [args]")
         print("Commands: query, transact, reset, path")
+        print(f"Mode: {mode} (set MINIGRAF_MODE=http for HTTP server)")
         sys.exit(1)
     
     cmd = sys.argv[1]
