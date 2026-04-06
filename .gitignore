@@ -2,3 +2,17 @@
 !prompts/*.txt
 !docs/**/*.txt
 
+# Python
+__pycache__/
+*.pyc
+
+# OpenCode
+.opencode/
+memory.graph
+
+# OS
+.DS_Store
+
+# Skill duplicates (use .opencode/skills/ version)
+SKILL.md
+
