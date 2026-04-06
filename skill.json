@@ -4,7 +4,8 @@
   "description": "Persistent bi-temporal graph memory for coding agents. Prevents context drift across long sessions by storing architecture decisions, dependencies, and constraints.",
   "tools": [
     "tools/query.json",
-    "tools/transact.json"
+    "tools/transact.json",
+    "tools/report_issue.json"
   ],
   "requires": {
     "minigraf": ">=0.13.0"

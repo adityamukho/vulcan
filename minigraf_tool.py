@@ -130,6 +130,9 @@ def transact(facts: str, reason: Optional[str] = None, graph_path: Optional[str]
     Returns:
         Dict with 'ok', 'tx' (transaction count), and optional 'error'
     """
+    if not reason or not reason.strip():
+        return {"ok": False, "error": "reason is required for all writes"}
+    
     path = graph_path or DEFAULT_GRAPH_PATH
     
     full_tx = f"(transact {facts})"

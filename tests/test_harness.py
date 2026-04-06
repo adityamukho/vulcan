@@ -86,6 +86,29 @@ class TestHarness:
         print("✓ Temporal query: PASS")
         return True
     
+    def test_reason_required(self):
+        """Test: transact requires reason parameter."""
+        result = transact(
+            "[[:test :person/name \"Alice\"]]",
+            reason=None,
+            graph_path=self.graph_path
+        )
+        
+        assert not result["ok"], "transact should fail without reason"
+        assert "reason is required for all writes" in result.get("error", "")
+        
+        result_empty = transact(
+            "[[:test :person/name \"Bob\"]]",
+            reason="",
+            graph_path=self.graph_path
+        )
+        
+        assert not result_empty["ok"], "transact should fail with empty reason"
+        assert "reason is required for all writes" in result_empty.get("error", "")
+        
+        print("✓ Reason required: PASS")
+        return True
+    
     def teardown(self):
         """Clean up test graph."""
         if os.path.exists(self.graph_path):
@@ -103,6 +126,7 @@ def run_tests():
         harness.test_recall_accuracy()
         harness.test_dependency_query()
         harness.test_temporal_query()
+        harness.test_reason_required()
         
         print("\n✓ All tests passed!")
         return 0

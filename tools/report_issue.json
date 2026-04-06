@@ -1,0 +1,27 @@
+{
+  "name": "minigraf_report_issue",
+  "description": "Report an issue with minigraf query or transact operations. Use this when minigraf returns errors to file a GitHub issue for tracking.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "issue_type": {
+        "type": "string",
+        "description": "Type of issue to report",
+        "enum": ["invalid_query", "transact_failure", "parse_error"]
+      },
+      "description": {
+        "type": "string",
+        "description": "Human-readable description of the issue"
+      },
+      "datalog": {
+        "type": "string",
+        "description": "Optional Datalog query or transact that failed"
+      },
+      "error": {
+        "type": "string",
+        "description": "Optional error message returned by minigraf"
+      }
+    },
+    "required": ["issue_type", "description"]
+  }
+}
