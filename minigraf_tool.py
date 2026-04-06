@@ -46,12 +46,13 @@ def _run_minigraf(args: List[str], input_data: Optional[str] = None) -> Dict[str
         return {"ok": False, "error": str(e)}
 
 
-def query(datalog: str, graph_path: Optional[str] = None) -> Dict[str, Any]:
+def query(datalog: str, as_of: Optional[Union[int, str]] = None, graph_path: Optional[str] = None) -> Dict[str, Any]:
     """
     Query the graph memory with a Datalog query.
     
     Args:
         datalog: A valid Datalog query string
+        as_of: Optional transaction count to query as of (temporal query)
         graph_path: Optional path to .graph file. Uses default temp location if not provided.
     
     Returns:
@@ -61,6 +62,26 @@ def query(datalog: str, graph_path: Optional[str] = None) -> Dict[str, Any]:
     
     if not os.path.exists(path):
         return {"ok": False, "error": f"No graph file at {path}. Transact first."}
+    
+    # Handle temporal query
+    if as_of is not None:
+        as_of_clause = f":as-of {as_of}"
+        if ":as-of" not in datalog:
+            if ":find" in datalog:
+                # Insert :as-of after :find clause
+                datalog = datalog.replace(":find", ":find", 1)  # Find first :find
+                # Find position after :find and insert
+                find_idx = datalog.find(":find")
+                after_find = datalog[find_idx + 5:]
+                # Find first space or [ after :find
+                next_space = len(after_find)
+                for char in [' ', '[']:
+                    idx = after_find.find(char)
+                    if idx != -1 and idx < next_space:
+                        next_space = idx
+                datalog = datalog[:find_idx + 5 + next_space] + f" {as_of_clause} " + datalog[find_idx + 5 + next_space:]
+            else:
+                datalog = f"[{as_of_clause} {datalog}]"
     
     full_query = f"(query {datalog})"
     result = _run_minigraf(["--file", path], input_data=full_query)
@@ -97,12 +118,13 @@ def query(datalog: str, graph_path: Optional[str] = None) -> Dict[str, Any]:
     return {"ok": True, "results": results}
 
 
-def transact(facts: str, graph_path: Optional[str] = None) -> Dict[str, Any]:
+def transact(facts: str, reason: Optional[str] = None, graph_path: Optional[str] = None) -> Dict[str, Any]:
     """
     Store facts in the graph memory.
     
     Args:
         facts: Datalog transact string with facts to store
+        reason: Why this fact deserves long-term storage (for future validation)
         graph_path: Optional path to .graph file. Uses default temp location if not provided.
     
     Returns:
@@ -120,7 +142,7 @@ def transact(facts: str, graph_path: Optional[str] = None) -> Dict[str, Any]:
     
     if "Transacted successfully" in output:
         tx_match = output.split("tx:")[1].strip().rstrip(")") if "tx:" in output else "unknown"
-        return {"ok": True, "tx": tx_match}
+        return {"ok": True, "tx": tx_match, "reason": reason}
     
     return {"ok": True, "output": output}
 
@@ -173,15 +195,27 @@ if __name__ == "__main__":
     
     if cmd == "query":
         if len(sys.argv) < 3:
-            print("Usage: minigraf_tool.py query '<datalog>'")
+            print("Usage: minigraf_tool.py query '<datalog>' [--as-of <tx>]")
             sys.exit(1)
-        result = query(sys.argv[2])
+        datalog = sys.argv[2]
+        as_of = None
+        if "--as-of" in sys.argv:
+            idx = sys.argv.index("--as-of")
+            if idx + 1 < len(sys.argv):
+                as_of = sys.argv[idx + 1]
+        result = query(datalog, as_of=as_of)
         print(json.dumps(result, indent=2))
     elif cmd == "transact":
         if len(sys.argv) < 3:
-            print("Usage: minigraf_tool.py transact '<facts>'")
+            print("Usage: minigraf_tool.py transact '<facts>' [--reason '<reason>']")
             sys.exit(1)
-        result = transact(sys.argv[2])
+        facts = sys.argv[2]
+        reason = None
+        if "--reason" in sys.argv:
+            idx = sys.argv.index("--reason")
+            if idx + 1 < len(sys.argv):
+                reason = sys.argv[idx + 1]
+        result = transact(facts, reason=reason)
         print(json.dumps(result, indent=2))
     elif cmd == "reset":
         result = reset()

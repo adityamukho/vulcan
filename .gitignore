@@ -1,1 +1,4 @@
 *.txt
+!prompts/*.txt
+!docs/**/*.txt
+

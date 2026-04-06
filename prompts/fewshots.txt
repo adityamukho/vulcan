@@ -1,0 +1,54 @@
+FEW-SHOT EXAMPLES FOR CODING AGENTS
+
+Example 1: User shares architecture decision
+---
+User: "We're using Apache Ignite 3 and prioritizing low-latency reads over write throughput."
+
+Action: Store it
+transact:
+[[:project/ignite3 :project/name "Apache Ignite 3"]
+ [:project/ignite3 :project/priority "low-latency reads"]
+ [:project/ignite3 :project/tradeoff "sacrifice write throughput"]
+ [:project/ignite3 :fact/created "2026-04-06"]]
+Reason: Architecture constraint worth remembering across sessions
+
+---
+Example 2: User mentions component relationship
+---
+User: "The auth service calls the JWT module for token validation."
+
+Action: Store it
+transact:
+[[:component/auth :component/name "AuthService"]
+ [:component/auth :calls :component/jwt]
+ [:component/jwt :component/name "JWTModule"]
+ [:component/auth :fact/role "authentication"]]
+Reason: Dependency relationship needed for impact analysis
+
+---
+Example 3: Before modifying existing code
+---
+User: "Add caching to the query layer"
+
+Action: FIRST query memory
+query:
+[:find ?decision ?constraint
+ :where
+ [?e :decision/description ?decision]
+ [?e :project/constraint ?constraint]]
+
+Then write code based on retrieved context
+
+---
+Example 4: User asks about past decisions
+---
+User: "What did we decide about the cache strategy?"
+
+Action: Query memory first
+query:
+[:find ?desc ?reason
+ :where
+ [?e :decision/description ?desc]
+ [?e :decision/reason ?reason]]
+
+Respond with retrieved facts
