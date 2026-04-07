@@ -1,6 +1,8 @@
 *.txt
 !prompts/*.txt
 !docs/**/*.txt
+!requirements.txt
+!pyproject.toml
 
 # Python
 __pycache__/

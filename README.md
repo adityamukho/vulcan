@@ -1,58 +1,95 @@
 # Temporal Reasoning
 
-Persistent bi-temporal graph memory skill for AI coding agents. Prevents context drift across long sessions by storing architecture decisions, dependencies, and constraints.
+Persistent bi-temporal graph memory for AI coding agents. Prevents context drift across long sessions by storing architecture decisions, dependencies, and constraints.
+
+## Problem Scope
+
+This skill solves a specific problem: **AI coding agents forget context between conversations**.
+
+What it does:
+- **Stores** architecture decisions, constraints, and preferences
+- **Queries** past state with temporal awareness
+- **Persists** memory across sessions
+
+What it is NOT:
+- A general-purpose database
+- A replacement for version control
+- A code search tool
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                   AI Coding Agent                        │
+│              (Claude Code, OpenCode, Codex)            │
+└─────────────────────┬───────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────┐
+│              Python Skill Layer                          │
+│         (minigraf_tool.py - this repo)                  │
+│   - query(), transact() functions                     │
+│   - CLI and HTTP modes                                 │
+│   - Backup/restore utilities                           │
+└─────────────────────┬───────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────┐
+│              Minigraph CLI (>= 0.18.0)                  │
+│         (https://github.com/adityamukho/minigraf)       │
+│   - Bi-temporal Datalog database                      │
+│   - Transaction time + Valid time                      │
+└─────────────────────┬───────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────┐
+│              Graph File                                  │
+│     ~/.local/share/temporal-reasoning/memory.graph      │
+│     (persistent, user-specific)                        │
+└─────────────────────────────────────────────────────────┘
+```
+
+## Install
+
+```bash
+# Install minigraf (requires Rust)
+cargo install --git https://github.com/adityamukho/minigraf
+
+# Or use pip (if available)
+pip install temporal-reasoning
+
+# Run setup
+python install.py
+```
 
 ## Quick Start
 
 ```python
 from minigraf_tool import query, transact
 
-transact("[[:decision/cache-strategy :decision/description \"use Redis\"]]", reason="Architecture decision")
-result = query("[:find ?desc :where [?e :decision/description ?desc]]")
+# Store a decision
+transact("[[:decision/cache-strategy :decision/description \"use Redis\"]]", 
+         reason="Architecture decision for low-latency caching")
+
+# Query decisions
+result = query("[:find ?d :where [?e :decision/description ?d]]")
 ```
 
-## Architecture
+## Storage Location
 
-```
-[ Agent (Claude Code / OpenCode / Codex) ]
-        ↓
-[ Python Skill Layer ]
-        ↓
-[ Minigraf CLI ] (>= 0.13.0)
-        ↓
-[ .graph file on disk ]
-```
+Default: `~/.local/share/temporal-reasoning/memory.graph`
 
-## Install
-
-```bash
-# Install minigraf
-cargo install --git https://github.com/adityamukho/minigraf
-
-# Run setup (checks dependencies, syncs skill from GitHub)
-python install.py
-```
-
-## Starting a Session
-
-```bash
-# Before starting work, run install.py to check for updates
-python install.py
-
-# Then start OpenCode
-opencode .
-```
-
-**Note:** `install.py` checks for updates weekly. Run it manually to force an immediate update.
+Override: `MINIGRAF_GRAPH_PATH=/custom/path python ...`
 
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `minigraf_tool.py` | Python CLI wrapper |
-| `minigraf_server.rs` | Axum HTTP server (Phase 2) |
-| `report_issue.py` | GitHub issue reporter (Phase 2) |
-| `install.py` | One-command setup (Phase 2) |
+| `minigraf_server.rs` | Axum HTTP server |
+| `report_issue.py` | GitHub issue reporter |
+| `install.py` | Setup script |
+| `pyproject.toml` | Python packaging |
 | `tools/*.json` | Tool schemas |
 | `prompts/*.txt` | Behavioral prompts |
 | `tests/test_harness.py` | Validation tests |
@@ -61,7 +98,20 @@ opencode .
 
 - **minigraf_query** — Query memory with Datalog
 - **minigraf_transact** — Store facts (reason required)
-- **minigraf_report_issue** — File GitHub issues on failures
+- **minigraf_report_issue** — File GitHub issues
+
+## Query Examples
+
+```python
+# Basic query
+query("[:find ?x :where [?e :attr ?x]]")
+
+# Temporal query (state at transaction N)
+query("[:find ?x :as-of 5 :where [?e :attr ?x]]")
+
+# Aggregation
+query("[:find (count ?e) :where [?e :decision/description ?d]]")
+```
 
 ## Phases
 

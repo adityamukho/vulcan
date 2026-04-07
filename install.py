@@ -2,17 +2,26 @@
 """
 Installation script for temporal-reasoning skill.
 Checks dependencies, syncs skill files, provides next steps.
+
+Usage:
+    python install.py          # Full install with dependencies
+    python install.py --check  # Just check dependencies
+    python install.py --force  # Force reinstall even if recent
 """
 
 import sys
 import subprocess
 import os
 import time
-import json
 
 UPDATE_INTERVAL = 7 * 24 * 60 * 60  # 7 days in seconds
 SKILL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".opencode", "skills", "temporal-reasoning")
 LAST_UPDATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_update")
+
+
+def is_ci_environment():
+    """Check if running in CI/CD environment."""
+    return os.environ.get("CI", "").lower() in ("1", "true", "yes")
 
 
 def check_python_version():
@@ -25,7 +34,7 @@ def check_python_version():
 
 
 def check_minigraf():
-    """Check if minigraf CLI is installed, auto-install if missing."""
+    """Check if minigraf CLI is installed, prompt to install if missing."""
     try:
         result = subprocess.run(
             ["minigraf", "--version"],
@@ -34,7 +43,7 @@ def check_minigraf():
             timeout=10
         )
         if result.returncode == 0:
-            version = result.stdout.strip()
+            version = result.stdout.strip() or "unknown"
             print(f"✓ minigraf CLI: {version}")
             return True
     except FileNotFoundError:
@@ -44,29 +53,11 @@ def check_minigraf():
 
     print("✗ minigraf CLI not found")
     print()
-    print("Installing minigraf...")
-    
-    try:
-        result = subprocess.run(
-            ["cargo", "install", "--git", "https://github.com/adityamukho/minigraf"],
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
-        if result.returncode == 0:
-            print("✓ minigraph installed successfully!")
-            return True
-        else:
-            print("✗ Failed to install minigraf")
-            print(result.stderr)
-            return False
-    except FileNotFoundError:
-        print("✗ cargo not found - please install Rust first:")
-        print("  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh")
-        return False
-    except subprocess.TimeoutExpired:
-        print("✗ Installation timed out")
-        return False
+    print("To install minigraf:")
+    print("  cargo install --git https://github.com/adityamukho/minigraf")
+    print()
+    print("Or see README.md for full installation instructions.")
+    return False
 
 
 def check_tool_import():

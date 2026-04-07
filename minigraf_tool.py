@@ -13,6 +13,7 @@ Usage:
 import subprocess
 import json
 import os
+import time
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -102,7 +103,7 @@ def query(datalog: str, as_of: Optional[Union[int, str]] = None, graph_path: Opt
         graph_path: Optional path to .graph file. Uses default temp location if not provided.
     
     Returns:
-        Dict with 'ok', 'results' (list of results), and optional 'error'
+        Dict with 'ok', 'results' (list of results), 'path' (graph path), and optional 'error'
     """
     path = graph_path or DEFAULT_GRAPH_PATH
     
@@ -115,7 +116,7 @@ def query(datalog: str, as_of: Optional[Union[int, str]] = None, graph_path: Opt
         if not result.get("ok"):
             return result
         data = result.get("data", {})
-        return {"ok": True, "results": data.get("results", [])}
+        return {"ok": True, "results": data.get("results", []), "path": path, "mode": "http"}
     
     # CLI mode (original implementation)
     if not os.path.exists(path):
@@ -197,7 +198,7 @@ def transact(facts: str, reason: Optional[str] = None, graph_path: Optional[str]
         if not result.get("ok"):
             return result
         data = result.get("data", {})
-        return {"ok": True, "tx": data.get("tx", "unknown"), "reason": reason}
+        return {"ok": True, "tx": data.get("tx", "unknown"), "reason": reason, "path": path, "mode": "http"}
     
     # CLI mode
     full_tx = f"(transact {facts})"
@@ -210,9 +211,9 @@ def transact(facts: str, reason: Optional[str] = None, graph_path: Optional[str]
     
     if "Transacted successfully" in output:
         tx_match = output.split("tx:")[1].strip().rstrip(")") if "tx:" in output else "unknown"
-        return {"ok": True, "tx": tx_match, "reason": reason}
+        return {"ok": True, "tx": tx_match, "reason": reason, "path": path, "mode": "cli"}
     
-    return {"ok": True, "output": output}
+    return {"ok": True, "output": output, "path": path, "mode": "cli"}
 
 
 def temporal_query(datalog: str, as_of: Union[int, str], graph_path: Optional[str] = None) -> Dict[str, Any]:
@@ -239,6 +240,44 @@ def reset(graph_path: Optional[str] = None) -> Dict[str, Any]:
         os.remove(path)
         return {"ok": True, "deleted": path}
     return {"ok": True, "deleted": None, "note": "No file to delete"}
+
+
+def export(graph_path: Optional[str] = None) -> Dict[str, Any]:
+    """Export all facts from the graph to a JSON file."""
+    path = graph_path or DEFAULT_GRAPH_PATH
+    
+    if not os.path.exists(path):
+        return {"ok": False, "error": f"No graph file at {path}"}
+    
+    result = query("[:find ?e ?a ?v :where [?e ?a ?v]]", graph_path=path)
+    if not result.get("ok"):
+        return result
+    
+    export_data = {
+        "version": "1.0",
+        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "graph_path": path,
+        "facts": result.get("results", [])
+    }
+    
+    return {"ok": True, "data": export_data}
+
+
+def import_data(data: Dict, graph_path: Optional[str] = None) -> Dict[str, Any]:
+    """Import facts from exported JSON data."""
+    path = graph_path or DEFAULT_GRAPH_PATH
+    
+    facts_list = data.get("facts", [])
+    if not facts_list:
+        return {"ok": False, "error": "No facts to import"}
+    
+    for fact in facts_list:
+        if len(fact) >= 3:
+            entity, attr, value = fact[0], fact[1], fact[2]
+            facts = f"[[{entity} {attr} {value}]]"
+            transact(facts, reason=f"Import from backup", graph_path=path)
+    
+    return {"ok": True, "imported": len(facts_list)}
 
 
 def get_graph_path() -> str:
