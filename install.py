@@ -175,7 +175,7 @@ def update_skill():
             print("✓ Skill already up-to-date")
             return False
     except Exception as e:
-        print(f"Note: Could not update skill: {e}")
+        print(f"ERROR: Could not update skill: {e}")
         return False
 
 

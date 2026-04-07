@@ -12,12 +12,27 @@ static GRAPH_PATH: OnceLock<String> = OnceLock::new();
 
 fn get_graph_path() -> String {
     GRAPH_PATH
-        .get_or_init(|| "/tmp/minigraf_memory.graph".to_string())
+        .get_or_init(|| {
+            std::env::var("MINIGRAF_GRAPH_PATH").unwrap_or_else(|_| {
+                if std::path::Path::new("/tmp").map(|p| p.exists()).unwrap_or(false) {
+                    "/tmp/minigraf_memory.graph".to_string()
+                } else {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                    std::path::Path::new(&home)
+                        .join(".local")
+                        .join("share")
+                        .join("temporal-reasoning")
+                        .join("memory.graph")
+                        .to_string_lossy()
+                        .to_string()
+                }
+            })
+        })
         .clone()
 }
 
 fn get_minigraf_path() -> String {
-    std::env::var("MINIGRAF_BIN").unwrap_or_else(|_| "/home/aditya/.cargo/bin/minigraf".to_string())
+    std::env::var("MINIGRAF_BIN").unwrap_or_else(|_| "minigraf".to_string())
 }
 
 #[derive(Debug, Serialize, Deserialize)]

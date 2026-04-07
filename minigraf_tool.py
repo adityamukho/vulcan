@@ -13,25 +13,43 @@ Usage:
 import subprocess
 import json
 import os
+import sys
 import time
 import urllib.request
 import urllib.error
+import logging
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stderr
+)
+logger = logging.getLogger("minigraf_tool")
 
 MINIGRAF_BIN = "minigraf"
 
 def _get_default_graph_path() -> str:
     """Get default graph path with proper platform support."""
+    import platform
+    
     env_path = os.environ.get("MINIGRAF_GRAPH_PATH")
     if env_path:
         return env_path
     
-    if os.name == "nt":  # Windows
+    system = platform.system()
+    
+    if system == "Windows":
         base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local"))
         graph_dir = Path(base) / "temporal-reasoning"
+    elif system == "Darwin":
+        xdg_data = os.environ.get("XDG_DATA_HOME")
+        if xdg_data:
+            graph_dir = Path(xdg_data) / "temporal-reasoning"
+        else:
+            graph_dir = Path.home() / ".local" / "share" / "temporal-reasoning"
     else:
-        # Linux/macOS - use XDG_DATA_HOME or ~/.local/share
         xdg_data = os.environ.get("XDG_DATA_HOME")
         if xdg_data:
             graph_dir = Path(xdg_data) / "temporal-reasoning"
@@ -70,7 +88,12 @@ def _run_http(endpoint: str, data: Dict) -> Dict[str, Any]:
 
 
 def _run_minigraf(args: List[str], input_data: Optional[str] = None) -> Dict[str, Any]:
-    """Run minigraf CLI and return parsed result."""
+    """Run minigraf CLI and return parsed result.
+    
+    Note: Uses list args (not shell=True) to prevent shell injection.
+    Timeout is set to 30 seconds to prevent indefinite hangs.
+    """
+    logger.debug(f"Running minigraf with args: {args}")
     try:
         result = subprocess.run(
             [MINIGRAF_BIN] + args,

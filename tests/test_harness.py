@@ -73,11 +73,8 @@ class TestHarness:
     
     def test_temporal_query(self):
         """Test: Can we query at a specific transaction time?"""
-        tx_before = 1
-        
         result = query(
-            "[:find ?desc :where [?e :decision/description ?desc]]",
-            as_of=tx_before,
+            "[:find ?desc :as-of 1 :where [?e :decision/description ?desc]]",
             graph_path=self.graph_path
         )
         

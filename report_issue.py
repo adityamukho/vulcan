@@ -129,7 +129,10 @@ def report_issue(
         is_minigraf_bug = True
     
     target_repo = _get_target_repo(is_minigraf_bug)
-    repo_name = f"{target_repo['owner']}/{target_repo['name']}" if target_repo else "unknown"
+    if target_repo:
+        repo_name = f"{target_repo['owner']}/{target_repo['name']}"
+    else:
+        repo_name = "unknown"
     
     body_parts = [f"**Description:** {description}"]
     
