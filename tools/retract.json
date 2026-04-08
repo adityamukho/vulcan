@@ -1,0 +1,18 @@
+{
+  "name": "minigraf_retract",
+  "description": "Retract a fact from the graph memory. Retraction records a new fact with asserted=false - original stays in history for bitemporal auditing.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "facts": {
+        "type": "string",
+        "description": "A Datalog retract block, e.g. [[:component/auth :calls :component/jwt]]"
+      },
+      "reason": {
+        "type": "string",
+        "description": "Why this fact is being retracted. This forces you to justify the removal."
+      }
+    },
+    "required": ["facts", "reason"]
+  }
+}

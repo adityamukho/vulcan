@@ -75,6 +75,15 @@ from minigraf_tool import transact
 transact("[[:decision/cache-strategy :decision/description \"use Redis\"]]", reason="Caching strategy decision made in architecture review")
 ```
 
+### minigraf_retract
+Retract a fact from the graph. Original stays in history for bitemporal auditing.
+
+```python
+from minigraf_tool import retract
+
+retract("[[:task/old-task :task/description \"obsolete description\"]]", reason="Replaced with cleaner attribute name")
+```
+
 ## Key Conventions
 
 1. **QUERY before answering**: Always query memory before answering questions about past decisions, architecture, dependencies
