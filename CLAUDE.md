@@ -24,9 +24,9 @@ result = query("[:find ?d :where [?e :decision/description ?d]]")
 
 ## Graph Storage
 
-Default location: `~/.local/share/temporal-reasoning/memory.graph`
+Default: `memory.graph` in the current working directory.
 
-Override with: `MINIGRAF_GRAPH_PATH=/custom/path python ...`
+Override: `MINIGRAF_GRAPH_PATH=/custom/path python ...`
 
 ## Query Examples
 

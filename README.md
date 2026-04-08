@@ -44,8 +44,7 @@ What it is NOT:
                       ▼
 ┌─────────────────────────────────────────────────────────┐
 │              Graph File                                  │
-│     ~/.local/share/temporal-reasoning/memory.graph      │
-│     (persistent, user-specific)                        │
+│     memory.graph (current working directory)                        │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -91,7 +90,7 @@ result = query("[:find ?d :where [?e :decision/description ?d]]")
 
 ## Storage Location
 
-Default: `~/.local/share/temporal-reasoning/memory.graph`
+Default: `memory.graph` in the current working directory.
 
 Override: `MINIGRAF_GRAPH_PATH=/custom/path python ...`
 
