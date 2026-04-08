@@ -55,9 +55,6 @@ What it is NOT:
 # Install minigraf (requires Rust)
 cargo install minigraf
 
-# Or use pip (if available)
-pip install temporal-reasoning
-
 # Run setup
 python install.py
 ```
