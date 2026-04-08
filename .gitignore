@@ -10,6 +10,8 @@ __pycache__/
 
 # OpenCode
 .opencode/
+.codex
+.codex/
 memory.graph
 
 # OS
@@ -20,4 +22,3 @@ memory.graph
 
 # Update tracking
 .last_update
-
