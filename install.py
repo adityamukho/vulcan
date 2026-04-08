@@ -154,6 +154,8 @@ def update_skill():
 
     print("Checking for skill updates...")
 
+    claude_skill_dir = os.path.join(repo_dir, "skills", "temporal-reasoning")
+
     try:
         result = subprocess.run(
             ["git", "pull", "origin", "master"],
@@ -169,15 +171,15 @@ def update_skill():
 
         if result.stdout.strip() and "Already up to date" not in result.stdout:
             print("Pulling latest from GitHub...")
-            os.makedirs(skill_dir, exist_ok=True)
-
             files_to_sync = ["SKILL.md"]
             for fname in files_to_sync:
                 src = os.path.join(repo_dir, fname)
-                dst = os.path.join(skill_dir, fname)
-                if os.path.exists(src):
-                    shutil.copy2(src, dst)
-                    print(f"✓ Synced {fname}")
+                for dest_dir in [skill_dir, claude_skill_dir]:
+                    os.makedirs(dest_dir, exist_ok=True)
+                    dst = os.path.join(dest_dir, fname)
+                    if os.path.exists(src):
+                        shutil.copy2(src, dst)
+                print(f"✓ Synced {fname}")
 
             print("✓ Skill updated!")
         else:

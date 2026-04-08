@@ -28,31 +28,15 @@ You are FORGETTING important context between conversations. Without this memory:
 
 **This is not optional. Query memory whenever you don't know the answer.**
 
-## ON BOOT (session start)
-
-Execute these actions IMMEDIATELY when the skill loads:
-
-1. **Load all rules**: Query memory for all facts with attribute pattern `:rules/*/description`
-   - Store these in working memory as active constraints
-   
-2. **Load all preferences**: Query memory for all facts with attribute pattern `:preference/*/description`
-   - Apply these to guide behavior and responses
-
-3. **Read project metadata**: Query memory for all facts with attribute pattern `:project/*/*`
-   - Check for project name, phase, goals, and other metadata
-   - Use this context for all subsequent work
-
-4. **Report status**: After loading, acknowledge what was loaded:
-   - "Loaded X rules, Y preferences, Z project metadata from memory"
-
 ## ENFORCEMENT RULES
 
 **You MUST query memory when:**
-1. User asks about past decisions, architecture, dependencies
-2. User asks "what did we...", "how did we...", "why did we..."
-3. User references something from "earlier", "before", "last time"
-4. You are about to modify code that might conflict with past decisions
-5. Any ambiguity about past context
+1. Before any substantive response — silently query `:rules/*/description` and `:preference/*/description` and apply what you find
+2. User asks about past decisions, architecture, dependencies
+3. User asks "what did we...", "how did we...", "why did we..."
+4. User references something from "earlier", "before", "last time"
+5. You are about to modify code that might conflict with past decisions
+6. Any ambiguity about past context
 
 **You MUST transact when:**
 1. User makes a decision ("we'll use X", "decided to...", "going with...")

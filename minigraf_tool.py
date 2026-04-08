@@ -119,6 +119,8 @@ def _run_minigraf(args: List[str], input_data: Optional[str] = None) -> Dict[str
             check=True
         )
 
+        if result.stderr.strip():
+            return {"ok": False, "error": result.stderr.strip()}
         return {"ok": True, "output": result.stdout.strip()}
     except FileNotFoundError:
         return {"ok": False, "error": f"minigraf not found. Is it installed and on PATH?"}
@@ -482,7 +484,7 @@ def main() -> None:
 
     if len(sys.argv) < 2:
         print("Usage: minigraf_tool.py <command> [args]")
-        print("Commands: query, transact, reset, path")
+        print("Commands: query, transact, retract, reset, path")
         print(f"Mode: {mode} (set MINIGRAF_MODE=http for HTTP server)")
         sys.exit(1)
 
@@ -511,6 +513,18 @@ def main() -> None:
             if idx + 1 < len(sys.argv):
                 reason = sys.argv[idx + 1]
         result = transact(facts, reason=reason)
+        print(json.dumps(result, indent=2))
+    elif cmd == "retract":
+        if len(sys.argv) < 3:
+            print("Usage: minigraf_tool.py retract '<facts>' [--reason '<reason>']")
+            sys.exit(1)
+        facts = sys.argv[2]
+        reason = None
+        if "--reason" in sys.argv:
+            idx = sys.argv.index("--reason")
+            if idx + 1 < len(sys.argv):
+                reason = sys.argv[idx + 1]
+        result = retract(facts, reason=reason)
         print(json.dumps(result, indent=2))
     elif cmd == "reset":
         result = reset()
