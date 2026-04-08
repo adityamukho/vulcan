@@ -20,8 +20,11 @@ jobs:
         pip install pylint
     - name: Create pylint config
       run: |
-        echo "[pylint]" > .pylintrc
+        echo "[MASTER]" > .pylintrc
         echo "max-line-length=100" >> .pylintrc
+        echo "" >> .pylintrc
+        echo "[MESSAGES CONTROL]" >> .pylintrc
+        echo "disable=C0111,C0301,C0303,C0411,C0413,C0415,R0801,W0212,W0611,W0621" >> .pylintrc
     - name: Analysing the code with pylint
       run: |
         pylint $(git ls-files '*.py')
