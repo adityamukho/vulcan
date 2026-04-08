@@ -28,6 +28,23 @@ You are FORGETTING important context between conversations. Without this memory:
 
 **This is not optional. Query memory whenever you don't know the answer.**
 
+## ON BOOT (session start)
+
+Execute these actions IMMEDIATELY when the skill loads:
+
+1. **Load all rules**: Query memory for all facts with attribute pattern `:rules/*/description`
+   - Store these in working memory as active constraints
+   
+2. **Load all preferences**: Query memory for all facts with attribute pattern `:preference/*/description`
+   - Apply these to guide behavior and responses
+
+3. **Read project metadata**: Query memory for all facts with attribute pattern `:project/*/*`
+   - Check for project name, phase, goals, and other metadata
+   - Use this context for all subsequent work
+
+4. **Report status**: After loading, acknowledge what was loaded:
+   - "Loaded X rules, Y preferences, Z project metadata from memory"
+
 ## ENFORCEMENT RULES
 
 **You MUST query memory when:**
@@ -89,13 +106,13 @@ retract("[[:task/old-task :task/description \"obsolete description\"]]", reason=
 1. **QUERY before answering**: Always query memory before answering questions about past decisions, architecture, dependencies
 2. **TRANSACT with reason**: Every write should include a reason explaining why it's worth keeping
 3. **Only store durable facts**: decisions, architecture, dependencies, constraints, user preferences — NOT transient observations
-4. **Use namespaces**: `:component/`, `:module/`, `:file/`, `:decision/`, `:arch/`, `:user/`, `:task/`, `:fact/`
+4. **Use namespaces**: Only use `:project/`, `:preference/`, `:rules/` for attributes
 5. **Attribute naming convention** (CRITICAL for cross-session entity discovery):
-   - ALL attribute names MUST follow the form: `:entity-unique-name/attribute-name`
-   - The prefix MUST match the entity being described
+   - ALL attribute names MUST follow the form: `:namespace/entity-unique-name/attribute-name`
+   - Use only the defined namespaces: :project/, :preference/, :rules/
    - Examples:
-     - GOOD: `:project/name`, `:task/monitor-ci/description`, `:fact/wal-behavior/description`
-     - BAD: `:description` (no entity prefix), `:project/description` (wrong entity)
+     - GOOD: :project/temporal-reasoning/name, :project/temporal-reasoning/phase, :preference/minigraph-search/description, :rules/ci-monitoring/description
+     - BAD: :rules/description (missing entity-unique-name), :project/name (missing entity-unique-name)
    - Query memory first to find existing entities before adding new facts about them
 
 ## QUICK REFERENCE

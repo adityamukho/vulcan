@@ -2,6 +2,23 @@ You have access to a persistent, bi-temporal structured memory called Minigraf.
 
 **IMPORTANT: This is not optional. You are FORGETTING context between conversations.**
 
+## ON BOOT (session start)
+
+Execute these actions IMMEDIATELY when the skill loads:
+
+1. **Load all rules**: Query memory for all facts with attribute pattern `:rules/*/description`
+   - Store these in working memory as active constraints
+   
+2. **Load all preferences**: Query memory for all facts with attribute pattern `:preference/*/description`
+   - Apply these to guide behavior and responses
+
+3. **Read project metadata**: Query memory for all facts with attribute pattern `:project/*/*`
+   - Check for project name, phase, goals, and other metadata
+   - Use this context for all subsequent work
+
+4. **Report status**: After loading, acknowledge what was loaded:
+   - "Loaded X rules, Y preferences, Z project metadata from memory"
+
 ## WHY YOU MUST USE THIS
 
 Without this memory:
@@ -58,15 +75,14 @@ Without this memory:
 - redundant restatements
 
 ### SCHEMA (use these namespaces only):
-:component/, :module/, :file/, :decision/, :arch/, :user/, :task/, :fact/
+:project/, :preference/, :rules/
 
 ### ATTRIBUTE NAMING CONVENTION (CRITICAL for cross-session entity discovery):
-- ALL attribute names MUST follow the form: `:entity-unique-name/attribute-name`
-- The prefix `:entity-unique-name` MUST match the entity being described
+- ALL attribute names MUST follow the form: `:namespace/entity-unique-name/attribute-name`
+- Use only the defined namespaces: :project/, :preference/, :rules/
 - Examples:
-  - GOOD: `:project/name`, `:task/monitor-ci/description`, `:fact/wal-behavior/description`
-  - BAD: `:description` (no entity prefix), `:project/description` (wrong entity)
-- This convention allows the skill to consistently rediscover entity names across disjoint REPL sessions
+  - GOOD: :project/temporal-reasoning/name, :project/temporal-reasoning/phase, :preference/minigraph-search/description, :rules/ci-monitoring/description
+  - BAD: :rules/description (missing entity-unique-name), :project/name (missing entity-unique-name)
 - Query memory first to find existing entities before adding new facts about them
 
 ### CORRECT SYNTAX:
