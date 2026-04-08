@@ -90,6 +90,13 @@ retract("[[:task/old-task :task/description \"obsolete description\"]]", reason=
 2. **TRANSACT with reason**: Every write should include a reason explaining why it's worth keeping
 3. **Only store durable facts**: decisions, architecture, dependencies, constraints, user preferences — NOT transient observations
 4. **Use namespaces**: `:component/`, `:module/`, `:file/`, `:decision/`, `:arch/`, `:user/`, `:task/`, `:fact/`
+5. **Attribute naming convention** (CRITICAL for cross-session entity discovery):
+   - ALL attribute names MUST follow the form: `:entity-unique-name/attribute-name`
+   - The prefix MUST match the entity being described
+   - Examples:
+     - GOOD: `:project/name`, `:task/monitor-ci/description`, `:fact/wal-behavior/description`
+     - BAD: `:description` (no entity prefix), `:project/description` (wrong entity)
+   - Query memory first to find existing entities before adding new facts about them
 
 ## QUICK REFERENCE
 

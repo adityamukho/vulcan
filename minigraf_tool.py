@@ -147,7 +147,14 @@ def query(
     Returns:
         Dict with 'ok', 'results' (list of results), 'path' (graph path), and optional 'error'
     """
-    path = graph_path or DEFAULT_GRAPH_PATH
+    # Check for local memory.graph in current directory first (for backward compatibility)
+    local_path = os.path.join(os.getcwd(), "memory.graph")
+    if os.path.exists(local_path):
+        path = local_path
+    elif graph_path:
+        path = graph_path
+    else:
+        path = DEFAULT_GRAPH_PATH
 
     if MINIGRAF_MODE == "http":
         # HTTP mode
@@ -237,7 +244,14 @@ def transact(
     if not reason or not reason.strip():
         return {"ok": False, "error": "reason is required for all writes"}
 
-    path = graph_path or DEFAULT_GRAPH_PATH
+    # Check for local memory.graph in current directory first (for backward compatibility)
+    local_path = os.path.join(os.getcwd(), "memory.graph")
+    if os.path.exists(local_path):
+        path = local_path
+    elif graph_path:
+        path = graph_path
+    else:
+        path = DEFAULT_GRAPH_PATH
 
     if MINIGRAF_MODE == "http":
         # HTTP mode
@@ -296,7 +310,15 @@ def retract(
     if not reason or not reason.strip():
         return {"ok": False, "error": "reason is required for retract"}
 
-    path = graph_path or get_graph_path()
+    # Check for local memory.graph in current directory first (for backward compatibility)
+    local_path = os.path.join(os.getcwd(), "memory.graph")
+    if os.path.exists(local_path):
+        path = local_path
+    elif graph_path:
+        path = graph_path
+    else:
+        path = get_graph_path()
+
     full_tx = f'(retract [{facts}])'
 
     result = _run_minigraf(["--file", path], input_data=full_tx)
@@ -342,7 +364,14 @@ def temporal_query(
 
 def reset(graph_path: Optional[str] = None) -> Dict[str, Any]:
     """Delete the graph file to start fresh."""
-    path = graph_path or DEFAULT_GRAPH_PATH
+    # Check for local memory.graph in current directory first (for backward compatibility)
+    local_path = os.path.join(os.getcwd(), "memory.graph")
+    if os.path.exists(local_path):
+        path = local_path
+    elif graph_path:
+        path = graph_path
+    else:
+        path = DEFAULT_GRAPH_PATH
     if os.path.exists(path):
         os.remove(path)
         return {"ok": True, "deleted": path}
@@ -351,7 +380,14 @@ def reset(graph_path: Optional[str] = None) -> Dict[str, Any]:
 
 def export(graph_path: Optional[str] = None) -> Dict[str, Any]:
     """Export all facts from the graph to a JSON file."""
-    path = graph_path or DEFAULT_GRAPH_PATH
+    # Check for local memory.graph in current directory first (for backward compatibility)
+    local_path = os.path.join(os.getcwd(), "memory.graph")
+    if os.path.exists(local_path):
+        path = local_path
+    elif graph_path:
+        path = graph_path
+    else:
+        path = DEFAULT_GRAPH_PATH
 
     if not os.path.exists(path):
         return {"ok": False, "error": f"No graph file at {path}"}
@@ -389,7 +425,14 @@ def _safe_datalog_token(token: str) -> bool:
 
 def import_data(data: Dict, graph_path: Optional[str] = None) -> Dict[str, Any]:
     """Import facts from exported JSON data."""
-    path = graph_path or DEFAULT_GRAPH_PATH
+    # Check for local memory.graph in current directory first (for backward compatibility)
+    local_path = os.path.join(os.getcwd(), "memory.graph")
+    if os.path.exists(local_path):
+        path = local_path
+    elif graph_path:
+        path = graph_path
+    else:
+        path = DEFAULT_GRAPH_PATH
 
     facts_list = data.get("facts", [])
     if not facts_list:

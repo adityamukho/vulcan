@@ -60,6 +60,15 @@ Without this memory:
 ### SCHEMA (use these namespaces only):
 :component/, :module/, :file/, :decision/, :arch/, :user/, :task/, :fact/
 
+### ATTRIBUTE NAMING CONVENTION (CRITICAL for cross-session entity discovery):
+- ALL attribute names MUST follow the form: `:entity-unique-name/attribute-name`
+- The prefix `:entity-unique-name` MUST match the entity being described
+- Examples:
+  - GOOD: `:project/name`, `:task/monitor-ci/description`, `:fact/wal-behavior/description`
+  - BAD: `:description` (no entity prefix), `:project/description` (wrong entity)
+- This convention allows the skill to consistently rediscover entity names across disjoint REPL sessions
+- Query memory first to find existing entities before adding new facts about them
+
 ### CORRECT SYNTAX:
 - transact: (transact [[:entity :attr "value"] [:entity2 :attr2 "value2"]])
 - retract: (retract [[:entity :attr "value"]])
