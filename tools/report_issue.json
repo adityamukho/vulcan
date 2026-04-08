@@ -7,7 +7,7 @@
       "issue_type": {
         "type": "string",
         "description": "Type of issue to report",
-        "enum": ["invalid_query", "transact_failure", "parse_error"]
+        "enum": ["invalid_query", "transact_failure", "parse_error", "minigraf_bug"]
       },
       "description": {
         "type": "string",

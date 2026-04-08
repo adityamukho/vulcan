@@ -347,19 +347,18 @@ def get_graph_path() -> str:
     return DEFAULT_GRAPH_PATH
 
 
-if __name__ == "__main__":
-    import sys
-    
+def main() -> None:
+    """Entry point for the `temporal-reasoning` console script."""
     mode = os.environ.get("MINIGRAF_MODE", "cli")
-    
+
     if len(sys.argv) < 2:
         print("Usage: minigraf_tool.py <command> [args]")
         print("Commands: query, transact, reset, path")
         print(f"Mode: {mode} (set MINIGRAF_MODE=http for HTTP server)")
         sys.exit(1)
-    
+
     cmd = sys.argv[1]
-    
+
     if cmd == "query":
         if len(sys.argv) < 3:
             print("Usage: minigraf_tool.py query '<datalog>' [--as-of <tx>]")
@@ -392,3 +391,7 @@ if __name__ == "__main__":
     else:
         print(f"Unknown command: {cmd}")
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
