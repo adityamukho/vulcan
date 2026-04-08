@@ -131,14 +131,18 @@ def _run_minigraf(args: List[str], input_data: Optional[str] = None) -> Dict[str
         return {"ok": False, "error": str(e)}
 
 
-def query(datalog: str, as_of: Optional[Union[int, str]] = None, graph_path: Optional[str] = None) -> Dict[str, Any]:
+def query(
+    datalog: str,
+    as_of: Optional[Union[int, str]] = None,
+    graph_path: Optional[str] = None
+) -> Dict[str, Any]:
     """
     Query the graph memory with a Datalog query.
 
     Args:
         datalog: A valid Datalog query string
         as_of: Optional transaction count to query as of (temporal query)
-        graph_path: Optional path to .graph file. Uses default temp location if not provided.
+        graph_path: Optional path to .graph file.
 
     Returns:
         Dict with 'ok', 'results' (list of results), 'path' (graph path), and optional 'error'
@@ -164,7 +168,8 @@ def query(datalog: str, as_of: Optional[Union[int, str]] = None, graph_path: Opt
     if as_of is not None and ":as-of" not in datalog:
         return {
             "ok": False,
-            "error": "as_of requires :as-of clause in datalog. Use: [:find ?x :as-of N :where [?e :attr ?x]]"
+            "error": "as_of requires :as-of clause in datalog. "
+                     "Use: [:find ?x :as-of N :where [?e :attr ?x]]"
         }
 
     full_query = f"(query {datalog})"
@@ -213,7 +218,11 @@ def query(datalog: str, as_of: Optional[Union[int, str]] = None, graph_path: Opt
     return {"ok": True, "results": results}
 
 
-def transact(facts: str, reason: Optional[str] = None, graph_path: Optional[str] = None) -> Dict[str, Any]:
+def transact(
+    facts: str,
+    reason: Optional[str] = None,
+    graph_path: Optional[str] = None
+) -> Dict[str, Any]:
     """
     Store facts in the graph memory.
 
@@ -237,7 +246,13 @@ def transact(facts: str, reason: Optional[str] = None, graph_path: Optional[str]
         if not result.get("ok"):
             return result
         data = result.get("data", {})
-        return {"ok": True, "tx": data.get("tx", "unknown"), "reason": reason, "path": path, "mode": "http"}
+        return {
+            "ok": True,
+            "tx": data.get("tx", "unknown"),
+            "reason": reason,
+            "path": path,
+            "mode": "http"
+        }
 
     # CLI mode
     full_tx = f"(transact {facts})"
@@ -251,12 +266,22 @@ def transact(facts: str, reason: Optional[str] = None, graph_path: Optional[str]
 
     if "Transacted successfully" in output:
         tx_match = output.split("tx:")[1].strip().rstrip(")") if "tx:" in output else "unknown"
-        return {"ok": True, "tx": tx_match, "reason": reason, "path": path, "mode": "cli"}
+        return {
+            "ok": True,
+            "tx": tx_match,
+            "reason": reason,
+            "path": path,
+            "mode": "cli"
+        }
 
     return {"ok": True, "output": output, "path": path, "mode": "cli"}
 
 
-def temporal_query(datalog: str, as_of: Union[int, str], graph_path: Optional[str] = None) -> Dict[str, Any]:
+def temporal_query(
+    datalog: str,
+    as_of: Union[int, str],
+    graph_path: Optional[str] = None
+) -> Dict[str, Any]:
     """
     DEPRECATED: Use query() with explicit :as-of in datalog instead.
 
@@ -344,7 +369,11 @@ def import_data(data: Dict, graph_path: Optional[str] = None) -> Dict[str, Any]:
             failed += 1
             continue
 
-        result = transact(f"[[{entity} {attr} {value}]]", reason="Import from backup", graph_path=path)
+        result = transact(
+            f"[[{entity} {attr} {value}]]",
+            reason="Import from backup",
+            graph_path=path
+        )
         if result.get("ok"):
             succeeded += 1
         else:

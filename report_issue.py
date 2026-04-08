@@ -211,8 +211,8 @@ def report_issue(
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Usage: report_issue.py <issue_type> <description> [--datalog <datalog>] [--error <error>]")
-        print(f"Valid issue types: {VALID_ISSUE_TYPES}")
+        print("Usage: report_issue.py <type> <desc> [--datalog X] [--error Y]")
+        print(f"Valid types: {VALID_ISSUE_TYPES}")
         sys.exit(1)
 
     issue_type = sys.argv[1]

@@ -15,14 +15,16 @@ import os
 from datetime import datetime, timezone
 
 UPDATE_INTERVAL = 7 * 24 * 60 * 60  # 7 days in seconds
-SKILL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".opencode", "skills", "temporal-reasoning")
-LAST_UPDATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".last_update")
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+SKILL_DIR = os.path.join(REPO_DIR, ".opencode", "skills", "temporal-reasoning")
+LAST_UPDATE_FILE = os.path.join(REPO_DIR, ".last_update")
 
 
 def check_python_version():
     """Check Python version is 3.8+."""
     if sys.version_info < (3, 8):
-        print(f"ERROR: Python 3.8+ required, found {sys.version_info.major}.{sys.version_info.minor}")
+        print(f"ERROR: Python 3.8+ required, "
+              f"found {sys.version_info.major}.{sys.version_info.minor}")
         return False
     print(f"✓ Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
     return True
@@ -94,7 +96,8 @@ def main():
         print()
         print("Usage:")
         print("  # As Python module:")
-        msg = "from minigraf_tool import query, transact; print(query('[:find ?e :where [?e :test/name]]'))"
+        msg = "from minigraf_tool import query, transact; "
+        msg += "print(query('[:find ?e :where [?e :test/name]]'))"
         print(f"  python -c \"{msg}\"")
         print()
         print("  # As CLI:")
@@ -103,7 +106,8 @@ def main():
         print()
         print("  # Import and use in code:")
         print("  from minigraf_tool import query, transact")
-        tx_msg = "transact('[[:decision :arch/cache-strategy \\\"Redis\\\"]]', reason='fast in-memory caching')"
+        tx_msg = "transact('[[:decision :arch/cache-strategy \"Redis\"]]', "
+        tx_msg += "reason='fast in-memory caching')"
         print(f"  {tx_msg}")
         q_msg = "result = query('[:find ?s :where [_ :arch/cache-strategy ?s]]')"
         print(f"  {q_msg}")
