@@ -39,8 +39,8 @@ jobs:
           pip install pytest
           python -c "import sys; print(sys.executable)"
 
+      - name: Add project to PYTHONPATH
+        run: echo "PYTHONPATH=${{ github.workspace }}" >> $GITHUB_ENV
+
       - name: Run tests with pytest
-        run: |
-          python -m pytest -v --tb=short tests/
-        env:
-          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest -v --tb=short tests/
