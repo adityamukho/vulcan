@@ -22,13 +22,7 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
 
 logger = logging.getLogger("minigraf_tool")
-
-if not logging.getLogger().handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-        stream=sys.stderr
-    )
+logger.addHandler(logging.NullHandler())
 
 MINIGRAF_BIN = "minigraf"
 
@@ -58,8 +52,7 @@ def _get_default_graph_path() -> str:
         base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local"))
         graph_dir = Path(base) / "temporal-reasoning"
     elif system == "Darwin":
-        base = os.environ.get("HOME") or str(Path.home()) if Path.home().exists() else os.path.expanduser("~")
-        graph_dir = Path(base) / "Library" / "Application Support" / "temporal-reasoning"
+        graph_dir = Path.home() / "Library" / "Application Support" / "temporal-reasoning"
     else:
         xdg_data = os.environ.get("XDG_DATA_HOME")
         if xdg_data:

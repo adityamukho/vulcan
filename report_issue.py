@@ -12,7 +12,11 @@ Automatically routes issues to the correct repo:
 
 import subprocess
 import sys
+import logging
 from typing import Dict, Optional
+
+logger = logging.getLogger("minigraf.report_issue")
+logger.addHandler(logging.NullHandler())
 
 VALID_ISSUE_TYPES = ["invalid_query", "transact_failure", "parse_error", "minigraf_bug"]
 
@@ -151,22 +155,20 @@ def report_issue(
     gh_available = _check_gh_available()
     
     if not gh_available:
-        print("=" * 50)
-        print(f"GitHub CLI (gh) not available. Issue not filed.")
-        print(f"Target repo: {repo_name}")
-        print("=" * 50)
-        print(f"Title: {title}")
-        print(f"Body:\n{body}")
-        print("=" * 50)
+        logger.warning(
+            "GitHub CLI (gh) not available. Issue not filed.\n"
+            "Target repo: %s\nTitle: %s\nBody:\n%s",
+            repo_name, title, body
+        )
         return {
             "ok": True,
             "method": "log",
             "repo": repo_name,
-            "result": "gh not available, logged to stdout"
+            "result": "gh not available, logged"
         }
-    
+
     if not target_repo:
-        print("Not in a GitHub repository. Issue not filed.")
+        logger.warning("Not in a GitHub repository. Issue not filed.")
         return {
             "ok": True,
             "method": "log",

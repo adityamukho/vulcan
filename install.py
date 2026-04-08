@@ -13,6 +13,7 @@ import sys
 import subprocess
 import os
 import time
+from datetime import datetime, timezone
 
 UPDATE_INTERVAL = 7 * 24 * 60 * 60  # 7 days in seconds
 SKILL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".opencode", "skills", "temporal-reasoning")
@@ -123,11 +124,11 @@ def should_update():
             content = f.read().strip()
             if not content:
                 return True
-            last_update = int(content)
+            last_update = datetime.fromisoformat(content)
     except (ValueError, IOError):
         return True
-    
-    return (time.time() - last_update) > UPDATE_INTERVAL
+
+    return (datetime.now(timezone.utc) - last_update).total_seconds() > UPDATE_INTERVAL
 
 
 def update_skill():
@@ -165,7 +166,7 @@ def update_skill():
             
             # Record update time
             with open(LAST_UPDATE_FILE, 'w') as f:
-                f.write(str(int(time.time())))
+                f.write(datetime.now(timezone.utc).isoformat())
             
             print("✓ Skill updated!")
             return True
