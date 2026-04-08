@@ -13,7 +13,7 @@ import json
 import os
 import sys
 import tempfile
-import subprocess
+from urllib.parse import urlparse
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -270,7 +270,8 @@ def test_report_issue_gh_success():
         result = report_issue("parse_error", "test issue")
     assert result["ok"]
     assert result["method"] == "gh"
-    assert "github.com" in result["result"]
+    parsed = urlparse(result["result"])
+    assert parsed.netloc in ("github.com", "github.local")
 
 
 def test_report_issue_minigraf_bug_routes_to_minigraf_repo():
