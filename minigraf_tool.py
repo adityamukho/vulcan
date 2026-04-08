@@ -39,16 +39,17 @@ def _get_timeout() -> int:
 
 MINIGRAF_TIMEOUT = _get_timeout()
 
-def _get_default_graph_path() -> str:
-    """Get default graph path with proper platform support."""
+
+def _resolve_default_graph_path() -> str:
+    """Resolve the default graph path without touching the filesystem."""
     import platform
-    
+
     env_path = os.environ.get("MINIGRAF_GRAPH_PATH")
     if env_path:
         return env_path
-    
+
     system = platform.system()
-    
+
     if system == "Windows":
         base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~/AppData/Local"))
         graph_dir = Path(base) / "temporal-reasoning"
@@ -60,11 +61,21 @@ def _get_default_graph_path() -> str:
             graph_dir = Path(xdg_data) / "temporal-reasoning"
         else:
             graph_dir = Path.home() / ".local" / "share" / "temporal-reasoning"
-    
-    graph_dir.mkdir(parents=True, exist_ok=True)
+
     return str(graph_dir / "memory.graph")
 
-DEFAULT_GRAPH_PATH = _get_default_graph_path()
+
+def _get_default_graph_path() -> str:
+    """Backwards-compatible wrapper for resolving the default graph path."""
+    return _resolve_default_graph_path()
+
+
+def _ensure_parent_dir(path: str) -> None:
+    """Create the parent directory for a graph path when a write is needed."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+
+DEFAULT_GRAPH_PATH = _resolve_default_graph_path()
 
 MINIGRAF_MODE = os.environ.get("MINIGRAF_MODE", "cli")
 MINIGRAF_HTTP_URL = os.environ.get("MINIGRAF_HTTP_URL", "http://localhost:8080")
@@ -231,6 +242,7 @@ def transact(facts: str, reason: Optional[str] = None, graph_path: Optional[str]
     
     # CLI mode
     full_tx = f"(transact {facts})"
+    _ensure_parent_dir(path)
     result = _run_minigraf(["--file", path], input_data=full_tx)
     
     if not result.get("ok"):

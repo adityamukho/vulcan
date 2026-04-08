@@ -4,9 +4,11 @@ Tests for functions not covered by test_minigraf_tool.py:
   - export()
   - import_data() — valid data, failed transact, malformed/unsafe facts
   - HTTP mode (_run_http via MINIGRAF_MODE=http)
+  - import-time path behavior
   - report_issue — gh available, gh unavailable, invalid issue type
 """
 
+import importlib
 import json
 import os
 import sys
@@ -37,6 +39,38 @@ def test_get_graph_path_env_override(tmp_path):
         # Re-evaluate the default path using the internal helper directly
         result = minigraf_tool._get_default_graph_path()
     assert result == custom
+
+
+def test_import_does_not_create_default_graph_dir(tmp_path):
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    module_name = "minigraf_tool"
+    original = sys.modules.pop(module_name, None)
+
+    try:
+        with patch.dict(os.environ, {"HOME": str(fake_home)}, clear=False), \
+             patch("pathlib.Path.mkdir", side_effect=AssertionError("mkdir should not run during import")):
+            imported = importlib.import_module(module_name)
+    finally:
+        sys.modules.pop(module_name, None)
+        if original is not None:
+            sys.modules[module_name] = original
+
+    expected = fake_home / ".local" / "share" / "temporal-reasoning" / "memory.graph"
+    assert imported.DEFAULT_GRAPH_PATH == str(expected)
+
+
+def test_transact_creates_default_graph_parent_dir_lazily(tmp_path, mock_minigraf):
+    fake_graph = tmp_path / "nested" / "memory.graph"
+
+    with patch.object(minigraf_tool, "DEFAULT_GRAPH_PATH", str(fake_graph)):
+        result = minigraf_tool.transact(
+            "[[:test :person/name \"Alice\"]]",
+            reason="create graph on first write"
+        )
+
+    assert result["ok"]
+    assert fake_graph.parent.exists()
 
 
 # ---------------------------------------------------------------------------
