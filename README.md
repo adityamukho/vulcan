@@ -195,6 +195,22 @@ local proxy for prompt size. It does not claim model-token exactness; it only
 shows that recalling stored context can reduce repeated prompt text in a later
 session.
 
+## Skill Benchmarks
+
+Four evals measure how the skill changes behavior versus a no-skill baseline. Each eval is seeded with a specific memory state and tests a distinct capability.
+
+| Eval | What it tests | With Skill | Without Skill |
+|------|--------------|-----------|---------------|
+| Decision storage | Persists architectural decisions with correct naming + reasons | 6/6 | 0/6 |
+| Populated retrieval | Queries memory and cites stored facts by name | 5/5 | 0/5 |
+| Cross-session preference | Discovers and applies a constraint never stated in the current conversation | 4/4 | 0/4 |
+| Conflict detection | Surfaces architectural conflicts before silently overriding decisions | 4/4 | 0/4 |
+| **Total** | | **19/19 (100%)** | **0/19 (0%)** |
+
+The cross-session preference eval is the most discriminating: the prompt says "make sure it fits with how we do things" with no hint that a relevant constraint exists. The skill queries memory, finds a stored no-mocks preference from a prior session, and writes a test using real database connections — without being told to.
+
+See [`evals/benchmark.md`](evals/benchmark.md) for full results and per-eval breakdowns.
+
 ## Phases
 
 - **Phase 1** — Python skill layer ✓

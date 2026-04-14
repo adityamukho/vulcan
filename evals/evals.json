@@ -1,0 +1,56 @@
+{
+  "skill_name": "temporal-reasoning",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Hey, we've finalized the stack for our new service. We're going with PostgreSQL 15 as the primary database — we need strong JSON support and ACID compliance, and we're OK trading some write throughput for that. The auth service will cache session tokens in Redis with a 24-hour TTL. One more thing: the API layer will be FastAPI, not Flask, because of the async support.",
+      "expected_output": "Claude stores all 3 decisions (PostgreSQL, Redis, FastAPI) using minigraf_transact with proper three-part attribute naming and meaningful reasons.",
+      "files": [],
+      "expectations": [
+        "Claude calls minigraf_transact at least once",
+        "PostgreSQL or database choice is stored as a fact",
+        "Redis caching or session token TTL is stored as a fact",
+        "FastAPI or API framework decision is stored as a fact",
+        "Each transact call includes a non-empty reason parameter",
+        "Stored attributes use the three-part :namespace/entity-name/attribute naming convention"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "I can't remember — what database are we using for the project? And what's the caching approach for auth tokens? We talked about it before but I don't have the chat open.",
+      "expected_output": "Memory is pre-populated with PostgreSQL 15, Redis (24h TTL), and FastAPI decisions. Claude must query memory first, then cite the specific stored facts in its answer.",
+      "files": [],
+      "expectations": [
+        "Claude calls minigraf_query before providing any answer",
+        "Claude explicitly signals it is checking memory (e.g. 'Let me check memory...')",
+        "Claude's answer names PostgreSQL 15 as the database, grounded in the query result",
+        "Claude's answer mentions Redis and the 24-hour TTL for auth token caching, grounded in the query result",
+        "Claude cites specific stored facts rather than guessing or hallucinating"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Can you add a test for the user registration endpoint? Make sure it fits with how we do things.",
+      "expected_output": "Memory is pre-seeded with the no-mocks preference (from a 'previous session'). The eval prompt does NOT mention mocks. Claude must query memory, discover the preference, and write a test that uses real DB connections — without being told to.",
+      "files": [],
+      "expectations": [
+        "Claude calls minigraf_query before writing any test code",
+        "Claude discovers and cites the no-db-mocks preference from memory",
+        "Claude acknowledges the memory-sourced constraint before coding",
+        "The proposed test uses real database connections, not mocks — consistent with the discovered preference"
+      ]
+    },
+    {
+      "id": 4,
+      "prompt": "Hey, we need to connect to a MySQL database for a new analytics sidecar. Can you write the SQLAlchemy connection setup for MySQL?",
+      "expected_output": "Memory is pre-seeded with PostgreSQL 15 as the 'finalized' primary database. Claude should query memory, detect a potential conflict (PostgreSQL established, but MySQL is now being requested), and surface the conflict before proceeding — asking for clarification rather than silently writing MySQL code.",
+      "files": [],
+      "expectations": [
+        "Claude calls minigraf_query before writing any connection code",
+        "Claude detects that PostgreSQL 15 is the established primary database from memory",
+        "Claude surfaces the potential conflict (MySQL request vs. PostgreSQL decision) before proceeding",
+        "Claude asks for clarification or confirmation rather than silently switching databases"
+      ]
+    }
+  ]
+}
