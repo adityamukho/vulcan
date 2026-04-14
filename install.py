@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Installation script for temporal-reasoning skill.
+Installation script for vulcan skill.
 Checks dependencies, syncs skill files, provides next steps.
 
 Usage:
@@ -18,11 +18,11 @@ UPDATE_INTERVAL = 7 * 24 * 60 * 60  # 7 days in seconds
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 LAST_UPDATE_FILE = os.path.join(REPO_DIR, ".last_update")
 
-FILES_TO_SYNC = ["SKILL.md", "minigraf_tool.py", "skill.json"]
+FILES_TO_SYNC = ["SKILL.md", "vulcan.py", "skill.json"]
 DIRS_TO_SYNC = ["tools"]
 SKILL_DIRS = [
-    os.path.join(".opencode", "skills", "temporal_reasoning"),
-    os.path.join("skills", "temporal-reasoning"),
+    os.path.join(".opencode", "skills", "vulcan"),
+    os.path.join("skills", "vulcan"),
 ]
 
 
@@ -71,24 +71,24 @@ def check_minigraf():
 
 
 def check_tool_import():
-    """Verify minigraf_tool can be imported."""
+    """Verify vulcan module can be imported."""
     try:
         import importlib.util
-        spec = importlib.util.find_spec("minigraf_tool")
+        spec = importlib.util.find_spec("vulcan")
         if spec is None:
             script_dir = os.path.dirname(os.path.abspath(__file__))
             sys.path.insert(0, script_dir)
-        import minigraf_tool
-        print("✓ minigraf_tool module can be imported")
+        import vulcan
+        print("✓ vulcan module can be imported")
         return True
     except ImportError as e:
-        print(f"✗ Cannot import minigraf_tool: {e}")
+        print(f"✗ Cannot import vulcan: {e}")
         return False
 
 
 def main():
     print("=" * 50)
-    print("Temporal-Reasoning Skill Setup")
+    print("Vulcan Skill Setup")
     print("=" * 50)
     print()
 
@@ -111,16 +111,16 @@ def main():
         print()
         print("Usage:")
         print("  # As Python module:")
-        msg = "from minigraf_tool import query, transact; "
+        msg = "from vulcan import query, transact; "
         msg += "print(query('[:find ?e :where [?e :test/name]]'))"
         print(f"  python -c \"{msg}\"")
         print()
         print("  # As CLI:")
-        print("  python minigraf_tool.py query '[:find ?e :where [?e :test/name]]'")
-        print("  python minigraf_tool.py transact '[[:test :person/name \\\"Alice\\\"]]'")
+        print("  python vulcan.py query '[:find ?e :where [?e :test/name]]'")
+        print("  python vulcan.py transact '[[:test :person/name \\\"Alice\\\"]]'")
         print()
         print("  # Import and use in code:")
-        print("  from minigraf_tool import query, transact")
+        print("  from vulcan import query, transact")
         tx_msg = "transact('[[:decision :arch/cache-strategy \"Redis\"]]', "
         tx_msg += "reason='fast in-memory caching')"
         print(f"  {tx_msg}")
