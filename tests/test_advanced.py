@@ -1,5 +1,5 @@
 """
-Tests for functions not covered by test_minigraf_tool.py:
+Tests for functions not covered by test_vulcan.py:
   - get_graph_path()
   - export()
   - import_data() — valid data, failed transact, malformed/unsafe facts
@@ -34,7 +34,7 @@ def temp_graph():
 @pytest.fixture
 def mock_minigraf():
     """Patch subprocess.run so tests run without a live minigraf binary."""
-    with patch("minigraf_tool.subprocess.run") as mock_run:
+    with patch("vulcan.subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(
             returncode=0,
             stdout="Transacted successfully (tx: 1)",
@@ -44,8 +44,8 @@ def mock_minigraf():
 
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import minigraf_tool
-from minigraf_tool import get_graph_path, export, import_data
+import vulcan
+from vulcan import get_graph_path, export, import_data
 from report_issue import report_issue
 
 
@@ -63,14 +63,14 @@ def test_get_graph_path_returns_string():
 def test_get_graph_path_always_returns_cwd(tmp_path, monkeypatch):
     """Test that get_graph_path returns CWD memory.graph."""
     monkeypatch.chdir(tmp_path)
-    result = minigraf_tool.get_graph_path()
+    result = vulcan.get_graph_path()
     assert result == str(tmp_path / "memory.graph")
 
 
 def test_project_root_detection(tmp_path, monkeypatch):
     """Test that project root is simply CWD."""
     monkeypatch.chdir(tmp_path)
-    result = minigraf_tool._get_project_root_path()
+    result = vulcan._get_project_root_path()
     assert result == str(tmp_path / "memory.graph")
 
 
@@ -231,7 +231,7 @@ def test_report_issue_minigraf_bug_routes_to_minigraf_repo():
 
 def test_retract_requires_reason(mock_minigraf, temp_graph):
     """Test retract requires reason parameter."""
-    from minigraf_tool import retract
+    from vulcan import retract
     result = retract("[[:test :attr \"value\"]]", reason=None, graph_path=temp_graph)
     assert not result["ok"]
     assert "reason is required" in result["error"]
@@ -239,14 +239,14 @@ def test_retract_requires_reason(mock_minigraf, temp_graph):
 
 def test_retract_reason_empty_fails(mock_minigraf, temp_graph):
     """Test retract fails with empty reason."""
-    from minigraf_tool import retract
+    from vulcan import retract
     result = retract("[[:test :attr \"value\"]]", reason="", graph_path=temp_graph)
     assert not result["ok"]
 
 
 def test_retract_success(mock_minigraf, temp_graph):
     """Test retract succeeds."""
-    from minigraf_tool import retract
+    from vulcan import retract
     mock_minigraf.return_value = MagicMock(returncode=0, stdout="Retracted successfully (tx: 1)", stderr="")
     result = retract("[[:test :person/name \"Alice\"]]", reason="No longer needed", graph_path=temp_graph)
     assert result["ok"]
@@ -255,7 +255,7 @@ def test_retract_success(mock_minigraf, temp_graph):
 
 def test_retract_returns_tx_count(mock_minigraf, temp_graph):
     """Test retract returns transaction count."""
-    from minigraf_tool import retract
+    from vulcan import retract
     mock_minigraf.return_value = MagicMock(returncode=0, stdout="Retracted successfully (tx: 42)", stderr="")
     result = retract("[[:old :attr \"value\"]]", reason="Obsolete", graph_path=temp_graph)
     assert result["ok"]

@@ -18,7 +18,7 @@ def temp_graph():
 @pytest.fixture
 def mock_minigraf():
     """Patch subprocess.run so tests run without a live minigraf binary."""
-    with patch("minigraf_tool.subprocess.run") as mock_run:
+    with patch("vulcan.subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(
             returncode=0,
             stdout="Transacted successfully (tx: 1)",

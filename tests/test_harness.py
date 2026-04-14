@@ -14,7 +14,7 @@ import tempfile
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from minigraf_tool import query, transact, reset
+from vulcan import query, transact, reset
 
 
 def _first_value(result):
