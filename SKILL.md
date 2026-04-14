@@ -65,21 +65,28 @@ After retraction, say: "I've removed that from memory (the original is preserved
 
 Skip transient observations, intermediate reasoning, raw code snippets, and restatements of what the user just said. Store durable, cross-session facts only: decisions, preferences, constraints, dependencies, architecture.
 
-## Naming Convention (Critical)
+## Entity Idents and Attribute Names
 
-All attribute names follow a strict three-part path: `:namespace/entity-name/attribute-name`
+Facts are stored as triples: `[entity attribute value]`. The entity ident is the organizing key — it carries all the identity and namespacing you need. Use flat, descriptive attribute names.
 
-**Valid namespaces:** `:project/`, `:preference/`, `:rules/`
+**Entity idents** should be meaningful and namespaced: `:project/postgres`, `:preference/no-db-mocks`, `:rules/python-version`
 
-Examples:
-- `:project/postgres/name` — good
-- `:project/postgres/role` — good
-- `:preference/no-db-mocks/description` — good
-- `:rules/python-version/description` — good
-- `:rules/description` — **BAD** (missing entity name)
-- `:project/name` — **BAD** (missing entity name)
+**Attribute names** should be flat and self-explanatory: `:name`, `:role`, `:reason`, `:rejected`, `:description`, `:tradeoff`, `:ttl`
 
-Query memory first to find existing entity names before adding new facts about them.
+```
+[:project/postgres :name "PostgreSQL 15"]
+[:project/postgres :role "primary database"]
+[:project/postgres :tradeoff "lower write throughput"]
+[:preference/no-db-mocks :description "always use real DB connections in tests"]
+[:preference/no-db-mocks :reason "mock/prod divergence caused silent migration failure"]
+```
+
+To retrieve all facts for an entity, query by ident directly — no need to know attribute names in advance:
+```python
+query("[:find ?a ?v :where [:project/postgres ?a ?v]]")
+```
+
+Before adding new facts about an entity, query it first to find existing attributes and avoid duplication.
 
 ## Tools
 
@@ -87,9 +94,10 @@ Query memory first to find existing entity names before adding new facts about t
 ```python
 from minigraf_tool import transact
 
-transact("""[[:project/postgres :project/postgres/name "PostgreSQL 15"]
-             [:project/postgres :project/postgres/priority "ACID compliance + JSON support"]
-             [:project/postgres :project/postgres/tradeoff "lower write throughput"]]""",
+transact("""[[:project/postgres :name "PostgreSQL 15"]
+             [:project/postgres :role "primary database"]
+             [:project/postgres :priority "ACID compliance + JSON support"]
+             [:project/postgres :tradeoff "lower write throughput"]]""",
          reason="Database choice finalized — JSON support required for analytics queries")
 ```
 
@@ -102,33 +110,43 @@ python minigraf_tool.py transact '[...]' --reason "why this is worth keeping"
 ```python
 from minigraf_tool import query
 
-# Broad scan
-result = query("[:find ?e ?a ?v :where [?e ?a ?v]]")
+# All facts for a known entity
+query("[:find ?a ?v :where [:project/postgres ?a ?v]]")
 
-# Targeted
-result = query("[:find ?name :where [?e :project/postgres/name ?name]]")
+# Broad scan of everything in memory
+query("[:find ?e ?a ?v :where [?e ?a ?v]]")
 
-# Temporal — what was stored before transaction 5
-result = query("[:find ?v :as-of 5 :where [?e :project/postgres/priority ?v]]")
+# Search stored values by content (useful when entity ident is unknown)
+query('[:find ?e ?a ?v :where [?e ?a ?v] (contains? ?v "Redis")]')
+query('[:find ?e ?v :where [?e :reason ?v] (starts-with? ?v "chosen")]')
+
+# Temporal — state at transaction N
+query("[:find ?a ?v :as-of 5 :where [:project/postgres ?a ?v]]")
 ```
 
 ### minigraf_retract
 ```python
 from minigraf_tool import retract
-retract("[[:project/old-entity :project/old-entity/name \"obsolete\"]]",
-        reason="Superseded by new decision")
+retract("[[:project/old-service :name \"obsolete\"]]",
+        reason="Service decommissioned")
 ```
 
 ## Quick Reference
 
 ### Aggregations
 - `(count ?e)` / `(count-distinct ?e)` / `(sum ?n)` / `(min ?x)` / `(max ?x)`
-- Group by: `[:find ?phase (count ?e) :where [?e :project/component/phase ?phase]]`
+- Group by: `[:find ?role (count ?e) :where [?e :role ?role]]`
 
 ### Bi-temporal
 - `:as-of N` — state at transaction N
 - `:valid-at "2024-01-01"` — facts valid at date
 - `:any-valid-time` — ignore valid-time filter
+
+### Filter predicates (on values)
+- `(starts-with? ?v "text")` — value begins with text
+- `(ends-with? ?v ".rs")` — value ends with text
+- `(contains? ?v "keyword")` — value contains keyword
+- `(matches? ?v "^regex$")` — value matches regex
 
 ### Negation
 - `(not [?e :attr val])` — exclude matches
@@ -148,24 +166,36 @@ Default: `memory.graph` in the current working directory. Run all commands from 
 ### Storing a tech stack decision
 User: "We're using FastAPI over Flask — async support is critical for our Redis calls."
 ```python
-transact("""[[:project/api-layer :project/api-layer/name "FastAPI"]
-             [:project/api-layer :project/api-layer/rejected "Flask"]
-             [:project/api-layer :project/api-layer/reason "async support required for Redis calls"]]""",
+transact("""[[:project/api-layer :name "FastAPI"]
+             [:project/api-layer :rejected "Flask"]
+             [:project/api-layer :reason "async support required for Redis calls"]]""",
          reason="API framework finalized")
+```
+
+### Retrieving facts for a known entity
+```python
+query("[:find ?a ?v :where [:project/api-layer ?a ?v]]")
+# Returns: :name "FastAPI", :rejected "Flask", :reason "async support..."
+```
+
+### Searching memory by content (entity ident unknown)
+User: "What did we decide about Redis?"
+```python
+query('[:find ?e ?a ?v :where [?e ?a ?v] (contains? ?v "Redis")]')
+# Finds any stored fact whose value mentions Redis
 ```
 
 ### Querying before modifying code
 User: "Add connection pooling to the DB layer."
 ```python
-# Before touching anything:
 result = query("[:find ?e ?a ?v :where [?e ?a ?v]]")
-# Scan for :project/ facts — check if DB choice or constraints exist
+# Scan results for any DB-related decisions before touching anything
 ```
 
 ### Handling empty memory
 User: "What database did we decide on?"
 ```python
-result = query("[:find ?name :where [?e :project/postgres/name ?name]]")
+result = query("[:find ?a ?v :where [:project/postgres ?a ?v]]")
 # result["results"] == []
 ```
 Response: "Let me check memory... Memory doesn't have anything recorded about a database choice. If you share the decision, I'll store it for future sessions."
@@ -174,15 +204,15 @@ Response: "Let me check memory... Memory doesn't have anything recorded about a 
 User: "Help me set up a MySQL connection."
 ```python
 result = query("[:find ?e ?a ?v :where [?e ?a ?v]]")
-# Finds :project/postgres/name "PostgreSQL 15"
+# Finds [:project/postgres :name "PostgreSQL 15"] and [:project/postgres :role "primary database"]
 ```
 Response: "Before we proceed — memory shows we're using PostgreSQL 15 as the primary database. Is this a new secondary database, or has the decision changed? If it's changed, I'll update memory to reflect that."
 
 ### Storing a preference with context
 User: "I hate mocks in DB tests — we got burned when mocked tests passed but the migration failed."
 ```python
-transact("""[[:preference/no-db-mocks :preference/no-db-mocks/description "always use real database connections in tests"]
-             [:preference/no-db-mocks :preference/no-db-mocks/reason "mock/prod divergence caused silent migration failure"]]""",
+transact("""[[:preference/no-db-mocks :description "always use real database connections in tests"]
+             [:preference/no-db-mocks :reason "mock/prod divergence caused silent migration failure"]]""",
          reason="Strong team preference — backed by production incident")
 ```
 
