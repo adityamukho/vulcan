@@ -1,6 +1,6 @@
-# Vulcan Repository
+# Temporal Reasoning Repository
 
-Persistent bi-temporal graph memory skill for AI coding agents. Prevents context drift across long sessions by storing architecture decisions, dependencies, and constraints.
+Persistent bi-temporal graph memory for AI coding agents. Prevents context drift across long sessions by storing architecture decisions, dependencies, and constraints.
 
 ## Architecture
 
@@ -9,14 +9,14 @@ Persistent bi-temporal graph memory skill for AI coding agents. Prevents context
         ↓
 [ Python Skill Layer ]              ← this repo
         ↓
-[ Minigraf CLI ]                   ← must be on PATH (>= 0.18.0)
+[ Minigraf CLI ]                   ← must be on PATH (>= 0.19.0)
         ↓
 [ .graph file on disk ]
 ```
 
 ## Dependencies
 
-- **Minigraf >= 0.18.0** — install via: `cargo install minigraf`
+- **Minigraf >= 0.19.0** — run `python install.py` (downloads pre-built binary automatically)
 - **Python 3** — for the CLI wrapper
 
 ## Files

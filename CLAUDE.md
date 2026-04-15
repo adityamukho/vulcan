@@ -1,6 +1,6 @@
-# Vulcan — AI Coding Agent Memory
+# Temporal Reasoning — AI Coding Agent Memory
 
-Vulcan provides persistent bi-temporal graph memory for AI coding agents.
+Temporal Reasoning provides persistent bi-temporal graph memory for AI coding agents.
 
 ## Quick Start
 

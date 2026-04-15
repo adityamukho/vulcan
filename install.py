@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Installation script for vulcan skill.
-Checks dependencies, syncs skill files, provides next steps.
+Installation script for temporal-reasoning skill.
+Checks dependencies (downloading minigraf pre-built binary if needed), syncs skill files, provides next steps.
 
 Usage:
     python install.py          # Full install with dependencies
@@ -13,6 +13,8 @@ import sys
 import subprocess
 import os
 from datetime import datetime, timezone
+import platform
+import hashlib
 
 UPDATE_INTERVAL = 7 * 24 * 60 * 60  # 7 days in seconds
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -21,9 +23,185 @@ LAST_UPDATE_FILE = os.path.join(REPO_DIR, ".last_update")
 FILES_TO_SYNC = ["SKILL.md", "vulcan.py", "skill.json"]
 DIRS_TO_SYNC = ["tools"]
 SKILL_DIRS = [
-    os.path.join(".opencode", "skills", "vulcan"),
-    os.path.join("skills", "vulcan"),
+    os.path.join(".opencode", "skills", "temporal-reasoning"),
+    os.path.join("skills", "temporal-reasoning"),
 ]
+
+MINIGRAF_RELEASES_URL = "https://github.com/adityamukho/minigraf/releases"
+
+
+def _get_platform_asset() -> str | None:
+    """Return the release asset filename for the current platform, or None if unsupported."""
+    machine = platform.machine().lower()
+    plat = sys.platform
+
+    if plat == "linux":
+        if machine in ("x86_64", "amd64"):
+            return "minigraf-x86_64-unknown-linux-gnu.tar.xz"
+        if machine in ("aarch64", "arm64"):
+            return "minigraf-aarch64-unknown-linux-gnu.tar.xz"
+    elif plat == "darwin":
+        if machine in ("arm64", "aarch64"):
+            return "minigraf-aarch64-apple-darwin.tar.xz"
+        if machine in ("x86_64", "amd64"):
+            return "minigraf-x86_64-apple-darwin.tar.xz"
+    elif plat == "win32":
+        return "minigraf-x86_64-pc-windows-msvc.zip"
+
+    return None
+
+
+def _verify_checksum(asset_path: str, sha256_path: str) -> None:
+    """Verify SHA256 of asset_path against sha256_path. Raises ValueError on mismatch."""
+    h = hashlib.sha256()
+    with open(asset_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    actual = h.hexdigest()
+
+    with open(sha256_path) as f:
+        expected = f.read().strip().split()[0]
+
+    if actual != expected:
+        raise ValueError(
+            f"SHA256 mismatch for {os.path.basename(asset_path)}: "
+            f"got {actual[:16]}…, expected {expected[:16]}…"
+        )
+
+
+def _install_binary(asset_path: str, asset: str) -> str:
+    """Extract minigraf binary from asset archive. Returns path to installed binary."""
+    if sys.platform == "win32":
+        install_dir = os.path.join(
+            os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+            "Programs", "minigraf"
+        )
+        binary_name = "minigraf.exe"
+    else:
+        install_dir = os.path.expanduser("~/.local/bin")
+        binary_name = "minigraf"
+
+    os.makedirs(install_dir, exist_ok=True)
+
+    if asset.endswith(".tar.xz"):
+        import tarfile as _tarfile
+        with _tarfile.open(asset_path) as tar:
+            members = [m for m in tar.getmembers()
+                       if m.name.endswith("minigraf") or m.name.endswith("minigraf.exe")]
+            if not members:
+                raise ValueError(f"No minigraf binary found in {asset}")
+            member = members[0]
+            member.name = os.path.basename(member.name)
+            tar.extract(member, path=install_dir)
+    elif asset.endswith(".zip"):
+        import zipfile as _zipfile
+        with _zipfile.ZipFile(asset_path) as zf:
+            names = [n for n in zf.namelist()
+                     if n.endswith("minigraf.exe") or n.endswith("minigraf")]
+            if not names:
+                raise ValueError(f"No minigraf binary found in {asset}")
+            data = zf.read(names[0])
+            out = os.path.join(install_dir, os.path.basename(names[0]))
+            with open(out, "wb") as f:
+                f.write(data)
+
+    binary_path = os.path.join(install_dir, binary_name)
+    if sys.platform != "win32":
+        os.chmod(binary_path, 0o755)
+
+    return binary_path
+
+
+def _get_latest_version() -> str:
+    """Follow GitHub releases/latest redirect to get the current version tag."""
+    import urllib.request
+    url = f"{MINIGRAF_RELEASES_URL}/latest"
+    req = urllib.request.Request(url, headers={"User-Agent": "temporal-reasoning-install"})
+    with urllib.request.urlopen(req) as resp:
+        final_url = resp.url
+    # final_url is like .../releases/tag/v0.19.0
+    tag = final_url.rstrip("/").split("/")[-1]
+    if not tag.startswith("v"):
+        raise ValueError(f"Could not determine latest version from redirect URL: {final_url}")
+    return tag
+
+
+def _download_binary(asset: str, version: str, dest_dir: str) -> str:
+    """Download asset and its .sha256 sidecar to dest_dir. Returns path to asset file."""
+    import urllib.request
+    base_url = f"{MINIGRAF_RELEASES_URL}/download/{version}"
+    asset_path = os.path.join(dest_dir, asset)
+    for filename in (asset, asset + ".sha256"):
+        url = f"{base_url}/{filename}"
+        out = os.path.join(dest_dir, filename)
+        print(f"  Downloading {filename}...")
+        urllib.request.urlretrieve(url, out)
+    return asset_path
+
+
+def _install_via_cargo() -> bool:
+    """Fall back to cargo install minigraf. Returns True on success."""
+    try:
+        result = subprocess.run(
+            ["cargo", "install", "minigraf"],
+            timeout=300,
+        )
+        if result.returncode == 0:
+            print("✓ minigraf installed via cargo")
+            return True
+        print("✗ cargo install minigraf failed")
+        return False
+    except FileNotFoundError:
+        print("✗ cargo not found")
+        print()
+        print("To install minigraf, either:")
+        print("  1. Install Rust (https://rustup.rs), then: cargo install minigraf")
+        print("  2. Download manually from: https://github.com/adityamukho/minigraf/releases")
+        return False
+
+
+def ensure_minigraf() -> bool:
+    """Ensure minigraf is available. Downloads pre-built binary if not on PATH."""
+    try:
+        subprocess.run(
+            ["minigraf"],
+            input="",
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        print("✓ minigraf CLI: found")
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        pass
+
+    print("✗ minigraf CLI not found — downloading pre-built binary...")
+
+    asset = _get_platform_asset()
+    if asset is None:
+        print("  No pre-built binary for this platform — falling back to cargo install...")
+        return _install_via_cargo()
+
+    try:
+        import tempfile
+        version = _get_latest_version()
+        with tempfile.TemporaryDirectory() as tmp:
+            asset_path = _download_binary(asset, version, tmp)
+            _verify_checksum(asset_path, asset_path + ".sha256")
+            binary_path = _install_binary(asset_path, asset)
+
+        install_dir = os.path.dirname(binary_path)
+        print(f"✓ minigraf {version} installed to {binary_path}")
+
+        path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+        if install_dir not in path_dirs:
+            print(f"  Note: add {install_dir} to your PATH to use minigraf from any directory.")
+
+        return True
+    except Exception as e:
+        print(f"  Binary download failed ({e}) — falling back to cargo install...")
+        return _install_via_cargo()
 
 
 def _get_target_dir() -> str:
@@ -43,31 +221,6 @@ def check_python_version():
         return False
     print(f"✓ Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
     return True
-
-
-def check_minigraf():
-    """Check if minigraf CLI is installed, prompt to install if missing."""
-    try:
-        subprocess.run(
-            ["minigraf"],
-            input="",
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True
-        )
-        print("✓ minigraf CLI: found")
-        return True
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        pass
-
-    print("✗ minigraf CLI not found")
-    print()
-    print("To install minigraf:")
-    print("  cargo install minigraf")
-    print()
-    print("Or see README.md for full installation instructions.")
-    return False
 
 
 def check_tool_import():
@@ -94,7 +247,7 @@ def main():
 
     checks = [
         ("Python version", check_python_version),
-        ("minigraf CLI", check_minigraf),
+        ("minigraf CLI", ensure_minigraf),
         ("Module import", check_tool_import),
     ]
 

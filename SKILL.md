@@ -1,5 +1,5 @@
 ---
-name: vulcan
+name: temporal-reasoning
 description: >
   Use this skill whenever the user mentions decisions ("we'll use X", "going with Y", "decided to Z"),
   preferences ("I prefer", "I don't like", "always use", "never use"), constraints ("must be", "can't use",
@@ -9,15 +9,15 @@ description: >
   query first. When in doubt, query.
 ---
 
-# Vulcan
+# Temporal Reasoning
 
 Perfect memory. Exact reasoning. Complete history.
 
-Vulcan gives AI coding agents bi-temporal graph memory: query any past state, traverse live dependency graphs, and correlate architectural decisions with structural change — all with deterministic Datalog, no fuzzy retrieval.
+Temporal Reasoning gives AI coding agents bi-temporal graph memory: query any past state, traverse live dependency graphs, and correlate architectural decisions with structural change — all with deterministic Datalog, no fuzzy retrieval.
 
 ## The Core Idea
 
-Without memory, every conversation starts from zero. You end up asking the user things they've already answered, writing code that contradicts decisions they've already made, and missing constraints they told you about weeks ago. This skill gives you a persistent store you can write to and query at any time.
+Every session starts from zero — you ask questions already answered, write code that contradicts decisions already made, and miss constraints established weeks ago. Temporal Reasoning fixes this: a persistent bi-temporal graph store you write to and query at any time, so context survives across sessions.
 
 **The two habits this skill builds:**
 - **Write immediately** when the user establishes something worth keeping (decision, preference, constraint)
@@ -236,7 +236,7 @@ Default: `memory.graph` in the current working directory. Run all commands from 
 
 ## Dependencies
 
-- **Minigraf >= 0.18.0** — `cargo install minigraf`
+- **Minigraf >= 0.19.0** — run `python install.py` to download the correct pre-built binary for your platform automatically. Falls back to `cargo install minigraf` only on unsupported platforms.
 - **Python 3** — for the wrapper
 
 ## Examples
