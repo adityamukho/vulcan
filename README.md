@@ -1,10 +1,10 @@
-# Vulcan
+# Temporal Reasoning
 
 **Perfect memory. Exact reasoning. Complete history.**
 
-Vulcan gives AI coding agents bi-temporal graph memory: query any past state, traverse live dependency graphs, and correlate architectural decisions with structural change — all with deterministic Datalog, no fuzzy retrieval.
+Temporal Reasoning gives AI coding agents bi-temporal graph memory: query any past state, traverse live dependency graphs, and correlate architectural decisions with structural change — all with deterministic Datalog, no fuzzy retrieval.
 
-## Questions Only Vulcan Can Answer
+## Questions Only Temporal Reasoning Can Answer
 
 These queries are impossible with git log, vector search, or key-value memory:
 
@@ -26,11 +26,11 @@ These queries are impossible with git log, vector search, or key-value memory:
  :where [?module :depends-on :service/payment]]
 ```
 
-Vulcan is the only tool where both the decision and the structural change live as datoms in the same graph and can be joined in a single query. See [Phase 4](ROADMAP.md) for code structure evolution from git history.
+This is the only tool where both the decision and the structural change live as datoms in the same graph and can be joined in a single query. See [Phase 4](ROADMAP.md) for code structure evolution from git history.
 
-## Why Vulcan?
+## Why Temporal Reasoning?
 
-Most memory tools for agents are key-value stores or vector databases. They answer "what do you know now?" Vulcan answers a harder question: **"what did you know then, and what changed?"**
+Most memory tools for agents are key-value stores or vector databases. They answer "what do you know now?" Temporal Reasoning answers a harder question: **"what did you know then, and what changed?"**
 
 **Time travel.** Every write is stamped with a transaction number. You can query the graph as it existed at any past transaction:
 
@@ -78,9 +78,9 @@ query("[:find ?name :where [:project/db :name ?name]]")
                       │
                       ▼
 ┌─────────────────────────────────────────────────────────┐
-│              Minigraf CLI (>= 0.18.0)                   │
+│              Minigraf CLI (>= 0.19.0)                   │
 │         (https://github.com/adityamukho/minigraf)       │
-│         (Vulcan's storage engine)                       │
+│         (the storage engine)                       │
 │   - Bi-temporal Datalog database                      │
 │   - Transaction time + Valid time                      │
 └─────────────────────┬───────────────────────────────────┘
@@ -94,30 +94,44 @@ query("[:find ?name :where [:project/db :name ?name]]")
 
 ## Install
 
-```bash
-# Install minigraf (requires Rust)
-cargo install minigraf
+### Claude Code (plugin — recommended)
 
-# Run setup
+Add to your Claude Code `settings.json`:
+
+```json
+"extraKnownMarketplaces": {
+  "temporal-reasoning": {
+    "source": {
+      "source": "git",
+      "url": "https://github.com/adityamukho/temporal_reasoning"
+    }
+  }
+}
+```
+
+Then enable the `temporal-reasoning` plugin in Claude Code. Once enabled, run once to download the minigraf binary:
+
+```bash
 python install.py
 ```
 
-### Install In Agent Environments
+`install.py` auto-detects your platform and downloads the correct pre-built binary (Linux x86_64/aarch64, macOS arm64/x86_64, Windows). Falls back to `cargo install minigraf` on unsupported platforms.
 
-Claude Code / Codex:
-- Install the local skill from this repository as `vulcan`.
-- Use [SKILL.md](/SKILL.md) and [skill.json](/skill.json) as the primary skill files.
+### Manual install
 
-OpenCode:
-- Run `python install.py` from the repository root.
-- This syncs the skill into `.opencode/skills/vulcan`.
+```bash
+git clone https://github.com/adityamukho/temporal_reasoning
+cd temporal_reasoning
+python install.py
+```
 
-If manual installation is required, include:
-- [SKILL.md](/SKILL.md)
-- [skill.json](/skill.json)
-- [tools/query.json](/tools/query.json)
-- [tools/transact.json](/tools/transact.json)
-- [tools/report_issue.json](/tools/report_issue.json)
+### OpenCode
+
+```bash
+python install.py
+```
+
+This syncs the skill into `.opencode/skills/temporal-reasoning`.
 
 ## Quick Start
 
