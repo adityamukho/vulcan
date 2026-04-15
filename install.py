@@ -223,31 +223,6 @@ def check_python_version():
     return True
 
 
-def check_minigraf():
-    """Check if minigraf CLI is installed, prompt to install if missing."""
-    try:
-        subprocess.run(
-            ["minigraf"],
-            input="",
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True
-        )
-        print("✓ minigraf CLI: found")
-        return True
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        pass
-
-    print("✗ minigraf CLI not found")
-    print()
-    print("To install minigraf:")
-    print("  cargo install minigraf")
-    print()
-    print("Or see README.md for full installation instructions.")
-    return False
-
-
 def check_tool_import():
     """Verify vulcan module can be imported."""
     try:
