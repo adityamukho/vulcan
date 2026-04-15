@@ -9,7 +9,7 @@ Persistent bi-temporal graph memory for AI coding agents. Prevents context drift
         ↓
 [ Python Skill Layer ]              ← this repo
         ↓
-[ Minigraf CLI ]                   ← must be on PATH (>= 0.18.0)
+[ Minigraf CLI ]                   ← must be on PATH (>= 0.19.0)
         ↓
 [ .graph file on disk ]
 ```
