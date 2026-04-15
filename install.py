@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Installation script for vulcan skill.
-Checks dependencies, syncs skill files, provides next steps.
+Installation script for temporal-reasoning skill.
+Checks dependencies (downloading minigraf pre-built binary if needed), syncs skill files, provides next steps.
 
 Usage:
     python install.py          # Full install with dependencies
@@ -23,8 +23,8 @@ LAST_UPDATE_FILE = os.path.join(REPO_DIR, ".last_update")
 FILES_TO_SYNC = ["SKILL.md", "vulcan.py", "skill.json"]
 DIRS_TO_SYNC = ["tools"]
 SKILL_DIRS = [
-    os.path.join(".opencode", "skills", "vulcan"),
-    os.path.join("skills", "vulcan"),
+    os.path.join(".opencode", "skills", "temporal-reasoning"),
+    os.path.join("skills", "temporal-reasoning"),
 ]
 
 MINIGRAF_RELEASES_URL = "https://github.com/adityamukho/minigraf/releases"
@@ -160,6 +160,50 @@ def _install_via_cargo() -> bool:
         return False
 
 
+def ensure_minigraf() -> bool:
+    """Ensure minigraf is available. Downloads pre-built binary if not on PATH."""
+    try:
+        subprocess.run(
+            ["minigraf"],
+            input="",
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        print("✓ minigraf CLI: found")
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        pass
+
+    print("✗ minigraf CLI not found — downloading pre-built binary...")
+
+    asset = _get_platform_asset()
+    if asset is None:
+        print("  No pre-built binary for this platform — falling back to cargo install...")
+        return _install_via_cargo()
+
+    try:
+        import tempfile
+        version = _get_latest_version()
+        with tempfile.TemporaryDirectory() as tmp:
+            asset_path = _download_binary(asset, version, tmp)
+            _verify_checksum(asset_path, asset_path + ".sha256")
+            binary_path = _install_binary(asset_path, asset)
+
+        install_dir = os.path.dirname(binary_path)
+        print(f"✓ minigraf {version} installed to {binary_path}")
+
+        path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+        if install_dir not in path_dirs:
+            print(f"  Note: add {install_dir} to your PATH to use minigraf from any directory.")
+
+        return True
+    except Exception as e:
+        print(f"  Binary download failed ({e}) — falling back to cargo install...")
+        return _install_via_cargo()
+
+
 def _get_target_dir() -> str:
     """Return install target: --target arg if provided, else cwd."""
     if "--target" in sys.argv:
@@ -228,7 +272,7 @@ def main():
 
     checks = [
         ("Python version", check_python_version),
-        ("minigraf CLI", check_minigraf),
+        ("minigraf CLI", ensure_minigraf),
         ("Module import", check_tool_import),
     ]
 

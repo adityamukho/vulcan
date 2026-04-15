@@ -180,3 +180,48 @@ class TestInstallViaCargo:
     def test_returns_false_when_cargo_not_found(self):
         with patch("subprocess.run", side_effect=FileNotFoundError):
             assert install._install_via_cargo() is False
+
+
+class TestEnsureMinigraf:
+    def test_returns_true_if_already_on_path(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0)
+            assert install.ensure_minigraf() is True
+        mock_run.assert_called_once_with(
+            ["minigraf"], input="", capture_output=True, text=True, timeout=10, check=True
+        )
+
+    def test_downloads_binary_when_not_found(self, tmp_path):
+        binary_path = str(tmp_path / "bin" / "minigraf")
+        with patch("subprocess.run", side_effect=FileNotFoundError), \
+             patch("install._get_platform_asset", return_value="minigraf-x86_64-unknown-linux-gnu.tar.xz"), \
+             patch("install._get_latest_version", return_value="v0.19.0"), \
+             patch("install._download_binary", return_value=str(tmp_path / "asset.tar.xz")), \
+             patch("install._verify_checksum"), \
+             patch("install._install_binary", return_value=binary_path):
+            assert install.ensure_minigraf() is True
+
+    def test_falls_back_to_cargo_on_unsupported_platform(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError), \
+             patch("install._get_platform_asset", return_value=None), \
+             patch("install._install_via_cargo", return_value=True) as mock_cargo:
+            assert install.ensure_minigraf() is True
+        mock_cargo.assert_called_once()
+
+    def test_falls_back_to_cargo_on_download_failure(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError), \
+             patch("install._get_platform_asset", return_value="minigraf-x86_64-unknown-linux-gnu.tar.xz"), \
+             patch("install._get_latest_version", side_effect=Exception("network error")), \
+             patch("install._install_via_cargo", return_value=False) as mock_cargo:
+            assert install.ensure_minigraf() is False
+        mock_cargo.assert_called_once()
+
+    def test_falls_back_to_cargo_on_checksum_failure(self, tmp_path):
+        with patch("subprocess.run", side_effect=FileNotFoundError), \
+             patch("install._get_platform_asset", return_value="minigraf-x86_64-unknown-linux-gnu.tar.xz"), \
+             patch("install._get_latest_version", return_value="v0.19.0"), \
+             patch("install._download_binary", return_value=str(tmp_path / "asset.tar.xz")), \
+             patch("install._verify_checksum", side_effect=ValueError("SHA256 mismatch")), \
+             patch("install._install_via_cargo", return_value=True) as mock_cargo:
+            assert install.ensure_minigraf() is True
+        mock_cargo.assert_called_once()
