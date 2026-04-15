@@ -61,6 +61,8 @@ Extend the bi-temporal graph to store code structure extracted from git history,
 - Cross-layer queries that join code structure edges with agent decision datoms in the same graph — e.g., "show dependency changes that occurred after the database migration decision"
 - Natural-language question templates mapped to Datalog patterns so agents can ask structural questions without writing raw Datalog
 
-## Marketplace Publishing
+## Marketplace Publishing ✓
 
-The skill is functionally complete and benchmarked. The blocking dependency for marketplace publication is **minigraf pre-built binaries**: `cargo install minigraf` requires a Rust toolchain, which is too high a barrier for general users. Will be published once minigraf ships binaries for common platforms (Linux x86_64, macOS arm64/x86_64, Windows). At that point, will also reframe the skill description to lead with the user benefit (no lost context between sessions) rather than the mechanism.
+Published as a GitHub-hosted Claude Code plugin. Users add the repo to `extraKnownMarketplaces` in `settings.json` — see README for instructions.
+
+Pre-built binary support landed in minigraf v0.19.0 (2026-04-14), removing the `cargo`/Rust installation barrier. `install.py` now downloads the correct binary automatically for Linux x86_64, Linux aarch64, macOS arm64, macOS x86_64, and Windows. Skill description reframed to lead with user benefit.
