@@ -1,6 +1,0 @@
-# No runtime dependencies - uses subprocess to call minigraf CLI
-
-# Development dependencies
-pytest>=8.4.2
-black>=25.11.0
-ruff>=0.15.12
