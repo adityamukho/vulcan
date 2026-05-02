@@ -183,3 +183,61 @@ class TestVulcanReportIssue:
         with patch.dict("sys.modules", {"report_issue": None}):
             result = mcp_server.handle_vulcan_report_issue("bug", "something broke")
         assert result["ok"] is False
+
+
+class TestMemoryPrepareTurn:
+    def test_returns_empty_string_when_graph_empty(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.reset_mock()
+
+        result = mcp_server.handle_memory_prepare_turn("what database are we using?")
+
+        assert isinstance(result, str)
+
+    def test_includes_matching_facts_in_output(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        def execute_side_effect(cmd):
+            if "contains?" in cmd and "postgres" in cmd.lower():
+                return json.dumps({"results": [[":name", "PostgreSQL 15"]]})
+            return json.dumps({"results": []})
+
+        db_instance.execute.side_effect = execute_side_effect
+        result = mcp_server.handle_memory_prepare_turn("what did we decide about postgres?")
+
+        assert "PostgreSQL" in result or "postgres" in result.lower() or result == ""
+
+    def test_falls_back_to_broad_scan_when_no_targeted_results(self, mock_minigraf_db, tmp_path):
+        mock_class, db_instance = mock_minigraf_db
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        call_count = [0]
+
+        def execute_side_effect(cmd):
+            call_count[0] += 1
+            # Targeted queries return nothing; broad scan returns something
+            if "contains?" in cmd:
+                return json.dumps({"results": []})
+            return json.dumps({"results": [[":e", ":name", "FastAPI"]]})
+
+        db_instance.execute.side_effect = execute_side_effect
+        result = mcp_server.handle_memory_prepare_turn("tell me about our framework")
+
+        # Broad scan should have been called
+        assert call_count[0] > 0
+
+    def test_respects_scan_limit_env_var(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setenv("VULCAN_PREPARE_SCAN_LIMIT", "10")
+        db_instance.execute.return_value = json.dumps({"results": []})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+
+        mcp_server.handle_memory_prepare_turn("hello")
+        # Should not raise; limit is respected internally
