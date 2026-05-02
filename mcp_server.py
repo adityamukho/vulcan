@@ -6,15 +6,13 @@ Persistent stdio MCP server providing bi-temporal graph memory for AI coding age
 Sole interface to the minigraf .graph file via the MiniGrafDb Python binding.
 """
 import asyncio
-import json
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import TextContent, Tool
-from minigraf import MiniGrafDb, MiniGrafError
+from minigraf import MiniGrafDb
 
 # ---------------------------------------------------------------------------
 # Session-scoped rules — registered once at startup, cached in RuleRegistry
