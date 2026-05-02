@@ -6,6 +6,7 @@ Persistent stdio MCP server providing bi-temporal graph memory for AI coding age
 Sole interface to the minigraf .graph file via the MiniGrafDb Python binding.
 """
 import asyncio
+import datetime
 import json
 import os
 import re
@@ -188,28 +189,39 @@ def _is_historical_query(user_message: str) -> bool:
     return bool(_HISTORICAL_SIGNALS.search(user_message))
 
 
+def _now_utc_ms() -> str:
+    """Return current UTC time as an ISO 8601 string with millisecond precision and Z suffix.
+
+    minigraf requires UTC (no timezone offsets) and millisecond precision to
+    reliably find facts transacted in the same second as the query.
+    e.g. "2026-05-02T15:44:52.184Z"
+    """
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
 def _build_query_clauses(user_message: str) -> str:
     """
     Return temporal clauses to append to a Datalog query.
 
-    minigraf `:valid-at "YYYY-MM-DD"` resolves the date to midnight UTC at the
-    START of that day. Facts transacted without an explicit valid-at receive a
-    valid_from equal to the transaction timestamp (after midnight). Querying
-    with :valid-at "today" therefore misses all facts written today, and
-    :valid-at "yesterday" misses all facts written since yesterday midnight.
+    For current-state queries use :valid-at with the current UTC timestamp
+    (millisecond precision). This correctly finds all facts whose valid window
+    includes right now — including facts transacted earlier the same second —
+    while excluding expired/retracted facts and future-dated facts.
 
-    Consequence: :any-valid-time is the correct clause for current-state
-    queries — it returns all facts regardless of valid period, which is what
-    "what do we know right now?" requires. :valid-at is reserved for
-    point-in-time historical queries with an explicit PAST date, where we
-    specifically want the graph state as it was at midnight on that date.
+    For historical queries where an explicit ISO date is detected in the user
+    message, use :valid-at with that date (resolves to midnight UTC on that
+    date — intentional for point-in-time historical semantics).
+
+    minigraf :valid-at accepts: ISO 8601 date ("YYYY-MM-DD" → midnight UTC)
+    or UTC datetime with Z suffix ("YYYY-MM-DDTHH:MM:SS.mmmZ").
+    Timezone offsets are not supported; :any-valid-time disables filtering.
     """
     if _is_historical_query(user_message):
         date_match = _DATE_PATTERN.search(user_message)
         if date_match:
             valid_at = date_match.group(1)
             return f':valid-at "{valid_at}"'
-    return ":any-valid-time"
+    return f':valid-at "{_now_utc_ms()}"'
 
 
 def handle_memory_prepare_turn(user_message: str) -> str:

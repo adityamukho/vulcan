@@ -254,14 +254,15 @@ class TestMemoryPrepareTurn:
         calls = [str(c) for c in db_instance.execute.call_args_list]
         assert any(':valid-at "2026-01-15"' in c for c in calls)
 
-    def test_uses_any_valid_time_for_current_state_queries(self, mock_minigraf_db, tmp_path):
+    def test_uses_current_utc_timestamp_for_current_state_queries(self, mock_minigraf_db, tmp_path):
         mock_class, db_instance = mock_minigraf_db
         db_instance.execute.return_value = json.dumps({"results": []})
-        import mcp_server
+        import mcp_server, re
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db_instance.execute.reset_mock()
 
         mcp_server.handle_memory_prepare_turn("what database are we using?")
 
         calls = [str(c) for c in db_instance.execute.call_args_list]
-        assert any(":any-valid-time" in c for c in calls)
+        # Should contain a UTC timestamp like 2026-05-02T15:44:52.184Z
+        assert any(re.search(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z', c) for c in calls)
