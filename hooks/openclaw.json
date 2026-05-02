@@ -1,0 +1,21 @@
+{
+  "_description": [
+    "OpenClaw MCP server configuration (degraded mode).",
+    "Merge the mcpServers block into your OpenClaw config.",
+    "Replace PATH_TO_REPO and PATH_TO_PROJECT with absolute paths.",
+    "",
+    "DEGRADED MODE: OpenClaw preRequest/postResponse hooks are not yet",
+    "implemented (upstream issue #28596), so auto-memory is not available.",
+    "The agent calls memory_prepare_turn / memory_finalize_turn explicitly",
+    "per SKILL.md. Watch the upstream issue for when full hook support lands."
+  ],
+  "mcpServers": {
+    "temporal-reasoning": {
+      "command": "python PATH_TO_REPO/mcp_server.py",
+      "env": {
+        "MINIGRAF_GRAPH_PATH": "PATH_TO_PROJECT/memory.graph",
+        "VULCAN_EXTRACTION_STRATEGY": "heuristic"
+      }
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "memory_finalize_turn",
+  "description": "Extract and store memorable facts from the completed conversation turn. Call this at the END of every turn, after composing your response. Pass the full user+agent exchange for this turn.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "conversation_delta": {
+        "type": "string",
+        "description": "The user message and agent response for this turn"
+      }
+    },
+    "required": ["conversation_delta"]
+  }
+}
