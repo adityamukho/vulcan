@@ -6,7 +6,8 @@ description: >
   "prioritize"), dependencies ("depends on", "requires"), or references past context ("what did we",
   "last time", "before", "earlier", "what was our"). Also use before any code modification that might
   conflict with past decisions — if you're about to touch an area where architectural choices might apply,
-  query first. When in doubt, query.
+  query first. When in doubt, query. If auto-memory hooks are not configured, call memory_prepare_turn
+  at the start of each turn and memory_finalize_turn at the end.
 ---
 
 # Temporal Reasoning
@@ -141,6 +142,38 @@ Use these standard attributes for edges between entities:
 | `:governs` | constraint applies to a component | entity ref |
 
 For traversal, use recursive rules (see Quick Reference).
+
+## Auto-Memory (MCP Server)
+
+When the MCP server is configured and hooks are enabled, memory is managed automatically without explicit tool calls:
+
+- **Before each turn** — `memory_prepare_turn` is called with the user's message and the result is injected as `additionalContext`.
+- **After each turn** — `memory_finalize_turn` is called with the user+agent exchange; facts are extracted and stored.
+
+Extraction strategy is controlled by `VULCAN_EXTRACTION_STRATEGY` (env var):
+- `heuristic` (default) — regex signal detection, zero API calls
+- `llm` — Claude Haiku extracts facts; falls back to agent on API failure
+- `agent` — MCP sampling asks the connected agent to identify facts
+
+**Without hooks** (OpenCode, OpenClaw, or unconfigured): call the tools explicitly at the start and end of each turn.
+
+### memory_prepare_turn
+
+Call at the **start** of each turn. Returns a context block string with facts relevant to the user's message.
+
+```
+memory_prepare_turn(user_message="what database did we decide on?")
+# → "Relevant memory context:\n  :name | PostgreSQL 15\n  :role | primary database"
+```
+
+### memory_finalize_turn
+
+Call at the **end** of each turn. Extracts durable facts from the completed exchange and stores them.
+
+```
+memory_finalize_turn(conversation_delta="User: We'll use Redis for caching.\nAgent: Stored.")
+# → {"ok": true, "stored_count": 1, "strategy": "heuristic"}
+```
 
 ## Tools
 
@@ -407,11 +440,21 @@ report_issue("parse_error", "query returns unexpected output",
 
 | File | Purpose |
 |------|---------|
-| `vulcan.py` | Python wrapper (import or CLI) |
+| `mcp_server.py` | Persistent MCP server — primary interface via MCP tools |
+| `vulcan.py` | Python wrapper (import or CLI — for direct use outside MCP) |
 | `report_issue.py` | GitHub issue reporter for errors |
+| `hooks/claude-code.json` | Claude Code settings fragment (MCP server + auto-memory hooks) |
+| `hooks/prepare_hook.py` | UserPromptSubmit hook script for Claude Code |
+| `hooks/finalize_hook.py` | Stop hook script for Claude Code |
+| `hooks/opencode.json` | OpenCode MCP config (degraded mode — no hook support yet) |
+| `hooks/openclaw.json` | OpenClaw MCP config (degraded mode — issue #28596) |
+| `hooks/codex.toml` | Codex CLI MCP config with commented hook stubs |
+| `hooks/hermes.yaml` | Hermes MCP config with commented hook stubs |
 | `tools/query.json` | Tool schema for vulcan_query |
 | `tools/transact.json` | Tool schema for vulcan_transact |
 | `tools/retract.json` | Tool schema for vulcan_retract |
 | `tools/report_issue.json` | Tool schema for vulcan_report_issue |
+| `tools/memory_prepare_turn.json` | Tool schema for memory_prepare_turn |
+| `tools/memory_finalize_turn.json` | Tool schema for memory_finalize_turn |
 | `install.py` | Setup script |
 | `ROADMAP.md` | Project roadmap |

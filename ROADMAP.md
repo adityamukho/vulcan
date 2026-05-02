@@ -14,11 +14,23 @@
 | 3 | report_issue tool | Auto-file GitHub issues on failures | Low | Complete ✓ |
 | 4 | install.py | One-command setup script | Low | Complete ✓ |
 
-## Future Phase 3+
+## Phase 3 (Complete ✓)
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Persistent MCP server | `mcp_server.py` — replaces CLI wrapper; single-process, stdio, minigraf Python binding | Complete ✓ |
+| 6 MCP tools | `vulcan_query`, `vulcan_transact`, `vulcan_retract`, `vulcan_report_issue`, `memory_prepare_turn`, `memory_finalize_turn` | Complete ✓ |
+| Auto-memory hooks (Claude Code) | `UserPromptSubmit` injects context; `Stop` hook extracts facts — `hooks/prepare_hook.py`, `hooks/finalize_hook.py` | Complete ✓ |
+| Hook config templates | `hooks/claude-code.json`, `hooks/codex.toml`, `hooks/hermes.yaml`, `hooks/opencode.json` (degraded), `hooks/openclaw.json` (degraded) | Complete ✓ |
+| Heuristic extraction | Regex-based signal detection; zero API calls; no configuration required | Complete ✓ |
+| LLM extraction | Claude Haiku extracts facts; falls back to agent strategy on API failure | Complete ✓ |
+| Agent extraction | MCP sampling requests a memory block from the connected agent | Complete ✓ |
+| Bi-temporal writes | `:valid-at` recorded on every write; point-in-time queries correct | Complete ✓ |
+
+## Future Phase 3+ (Remaining)
 - WASM bindings (browser + edge)
 - Mobile embedding
-- Claude Code MCP integration
-- Codex/OpenAI adapters
+- Codex/OpenAI full adapter (hook config template added in Phase 3)
 
 ## Why Not Just Read Git History?
 
