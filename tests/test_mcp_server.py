@@ -266,3 +266,63 @@ class TestMemoryPrepareTurn:
         calls = [str(c) for c in db_instance.execute.call_args_list]
         # Should contain a UTC timestamp like 2026-05-02T15:44:52.184Z
         assert any(re.search(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z', c) for c in calls)
+
+
+class TestHeuristicExtraction:
+    def test_extracts_decision_language(self):
+        import mcp_server
+        facts = mcp_server.heuristic_extract(
+            "User: We'll use FastAPI for the API layer.\nAgent: Got it."
+        )
+        assert len(facts) > 0
+        assert any("FastAPI" in f["value"] for f in facts)
+
+    def test_extracts_preference_language(self):
+        import mcp_server
+        facts = mcp_server.heuristic_extract(
+            "I prefer PostgreSQL over MySQL for this project."
+        )
+        assert any("PostgreSQL" in f["value"] for f in facts)
+
+    def test_returns_empty_list_for_no_signals(self):
+        import mcp_server
+        facts = mcp_server.heuristic_extract("The sky is blue today.")
+        assert facts == []
+
+    def test_each_fact_has_required_fields(self):
+        import mcp_server
+        facts = mcp_server.heuristic_extract("We decided to use Redis for caching.")
+        for fact in facts:
+            assert "entity" in fact
+            assert "attribute" in fact
+            assert "value" in fact
+            assert "reason" in fact
+
+
+class TestMemoryFinalizeTurnHeuristic:
+    def test_transacts_extracted_facts(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setenv("VULCAN_EXTRACTION_STRATEGY", "heuristic")
+        db_instance.execute.return_value = json.dumps({"tx": "5"})
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.reset_mock()
+
+        result = mcp_server.handle_memory_finalize_turn(
+            "User: We'll use Redis.\nAgent: Stored."
+        )
+
+        assert result["ok"] is True
+        assert isinstance(result["stored_count"], int)
+
+    def test_returns_zero_stored_when_no_signals(self, mock_minigraf_db, tmp_path, monkeypatch):
+        mock_class, db_instance = mock_minigraf_db
+        monkeypatch.setenv("VULCAN_EXTRACTION_STRATEGY", "heuristic")
+        import mcp_server
+        mcp_server.open_db(str(tmp_path / "t.graph"))
+        db_instance.execute.reset_mock()
+
+        result = mcp_server.handle_memory_finalize_turn("The weather is fine.")
+
+        assert result["ok"] is True
+        assert result["stored_count"] == 0

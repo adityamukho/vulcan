@@ -275,6 +275,118 @@ def handle_memory_prepare_turn(user_message: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Fact extraction — heuristic strategy
+# ---------------------------------------------------------------------------
+
+_SIGNAL_PATTERNS = [
+    (r"we'?ll?\s+use\s+([\w\-]+)", "decision", ":description", "chosen technology or approach"),
+    (r"going\s+with\s+([\w\-]+)", "decision", ":description", "chosen approach"),
+    (r"decided\s+(?:to\s+)?(?:use\s+)?([\w\-]+)", "decision", ":description", "decided approach"),
+    (r"we\s+chose\s+([\w\-]+)", "decision", ":description", "chosen option"),
+    (r"I\s+prefer\s+([\w\-]+)", "preference", ":description", "stated preference"),
+    (r"I\s+don'?t\s+like\s+([\w\-]+)", "preference", ":description", "stated dislike"),
+    (r"always\s+use\s+([\w\-]+)", "preference", ":description", "always-use preference"),
+    (r"never\s+use\s+([\w\-]+)", "preference", ":description", "never-use preference"),
+    (r"must\s+be\s+([\w\-]+)", "constraint", ":description", "hard constraint"),
+    (r"can'?t\s+use\s+([\w\-]+)", "constraint", ":description", "exclusion constraint"),
+    (r"prioritize\s+([\w\-]+)", "constraint", ":description", "priority constraint"),
+    (r"depends\s+on\s+([\w\-]+)", "dependency", ":description", "dependency relationship"),
+    (r"requires?\s+([\w\-]+)", "dependency", ":description", "required dependency"),
+]
+
+
+def heuristic_extract(text: str) -> List[Dict[str, str]]:
+    """
+    Scan text for decision-signal phrases and return a list of fact dicts.
+    Each dict has keys: entity, attribute, value, reason.
+    """
+    facts = []
+    seen_values: set = set()
+
+    for pattern, entity_type, attribute, reason_prefix in _SIGNAL_PATTERNS:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            value = match.group(1).strip()
+            if len(value) < 2 or value.lower() in _STOP_WORDS:
+                continue
+            key = (entity_type, value.lower())
+            if key in seen_values:
+                continue
+            seen_values.add(key)
+            entity_ident = f":{entity_type}/{value.lower().replace('-', '_')}"
+            facts.append({
+                "entity": entity_ident,
+                "attribute": attribute,
+                "value": value,
+                "reason": f"{reason_prefix} — extracted by heuristic strategy",
+            })
+
+    return facts
+
+
+def _transact_extracted_facts(facts: List[Dict[str, str]]) -> int:
+    """
+    Transact a list of extracted fact dicts. Returns count of successfully stored facts.
+
+    Sets :valid-at to the current UTC ms timestamp on every write so that
+    valid-time is recorded. Combined with :as-of in queries this enables true
+    bi-temporal point-in-time reads.
+    """
+    db = get_db()
+    stored = 0
+    for fact in facts:
+        entity = fact["entity"]
+        attribute = fact["attribute"]
+        value = fact["value"]
+        now_z = _now_utc_ms()
+        try:
+            # Map syntax verified working: (transact [[e attr "v"]] {:valid-at "ts"})
+            db.execute(f'(transact [[{entity} {attribute} "{value}"]] {{:valid-at "{now_z}"}})')
+            db.checkpoint()
+            stored += 1
+        except MiniGrafError:
+            continue
+    return stored
+
+
+def _llm_extract_and_transact(conversation_delta: str) -> Dict[str, Any]:
+    """LLM-based extraction strategy — implemented in Task 7."""
+    raise NotImplementedError("llm strategy implemented in Task 7")
+
+
+def _agent_extract_and_transact(conversation_delta: str) -> Dict[str, Any]:
+    """Agent-based extraction strategy — implemented in Task 7."""
+    raise NotImplementedError("agent strategy implemented in Task 7")
+
+
+# ---------------------------------------------------------------------------
+# memory_finalize_turn — dispatcher
+# ---------------------------------------------------------------------------
+
+def handle_memory_finalize_turn(conversation_delta: str) -> Dict[str, Any]:
+    """
+    Extract facts from conversation_delta and transact them.
+    Strategy selected via VULCAN_EXTRACTION_STRATEGY env var (default: heuristic).
+    """
+    strategy = os.environ.get("VULCAN_EXTRACTION_STRATEGY", "heuristic")
+
+    if strategy == "heuristic":
+        facts = heuristic_extract(conversation_delta)
+        stored = _transact_extracted_facts(facts)
+        return {"ok": True, "stored_count": stored, "strategy": "heuristic"}
+
+    if strategy == "llm":
+        result = _llm_extract_and_transact(conversation_delta)
+        if result["ok"]:
+            return result
+        return _agent_extract_and_transact(conversation_delta)
+
+    if strategy == "agent":
+        return _agent_extract_and_transact(conversation_delta)
+
+    return {"ok": False, "error": f"Unknown strategy: {strategy}"}
+
+
+# ---------------------------------------------------------------------------
 # MCP server (tools wired in subsequent tasks)
 # ---------------------------------------------------------------------------
 
