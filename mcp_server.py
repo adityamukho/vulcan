@@ -30,6 +30,13 @@ SESSION_RULES = [
 # Module-level DB instance — opened once, held for the session lifetime
 _db: Optional[MiniGrafDb] = None
 
+# Track graph path and last-known mtime so we can detect external modifications.
+# minigraf's Drop impl writes to the file even for read-only handles, which
+# invalidates any other open handle's in-memory page table.  Reopening on
+# mtime change is the workaround until the upstream bug is fixed.
+_graph_path: str = ""
+_db_mtime: float = 0.0
+
 # Module-level server reference — set after server creation for MCP sampling
 _server_ref: Optional[Server] = None
 
@@ -42,14 +49,54 @@ def _get_graph_path() -> str:
     return os.environ.get("MINIGRAF_GRAPH_PATH", str(Path.cwd() / "memory.graph"))
 
 
-def open_db(graph_path: Optional[str] = None) -> MiniGrafDb:
-    """Open MiniGrafDb and register session-scoped rules. Called once at startup."""
-    global _db
-    path = graph_path or _get_graph_path()
+def _open_db_at(path: str) -> MiniGrafDb:
+    """Open MiniGrafDb at path, register session rules, update mtime tracking."""
+    global _db, _graph_path, _db_mtime
     _db = MiniGrafDb.open(path)
     for rule in SESSION_RULES:
         _db.execute(rule)
+    _graph_path = path
+    try:
+        _db_mtime = os.path.getmtime(path)
+    except OSError:
+        _db_mtime = 0.0
     return _db
+
+
+def open_db(graph_path: Optional[str] = None) -> MiniGrafDb:
+    """Open MiniGrafDb and register session-scoped rules. Called once at startup."""
+    return _open_db_at(graph_path or _get_graph_path())
+
+
+def _update_mtime() -> None:
+    """Record the graph file mtime after our own checkpoint so we don't
+    treat our own write as an external modification on the next call."""
+    global _db_mtime
+    if not _graph_path:
+        return
+    try:
+        _db_mtime = os.path.getmtime(_graph_path)
+    except OSError:
+        pass
+
+
+def _refresh_if_stale() -> None:
+    """Reopen the DB if the graph file was modified externally since last open.
+
+    minigraf's Drop impl writes to the file even for read-only handles (upstream
+    bug).  Any subprocess that opens the same file — including the prepare/finalize
+    hooks — will change the mtime and invalidate this process's in-memory page
+    table.  Detect this via mtime and reopen transparently.
+    """
+    global _db_mtime
+    if not _graph_path:
+        return
+    try:
+        current_mtime = os.path.getmtime(_graph_path)
+    except OSError:
+        return
+    if current_mtime != _db_mtime:
+        _open_db_at(_graph_path)
 
 
 def get_db() -> MiniGrafDb:
@@ -103,10 +150,12 @@ def handle_vulcan_transact(facts: str, reason: str) -> Dict[str, Any]:
     """
     if not reason or not reason.strip():
         return {"ok": False, "error": "reason is required for all writes"}
+    _refresh_if_stale()
     db = get_db()
     try:
         raw = db.execute(f'(transact {facts} {{:valid-at "{_now_utc_ms()}"}})')
         db.checkpoint()
+        _update_mtime()
         result = _parse_tx_result(raw)
         if result["ok"]:
             result["reason"] = reason
@@ -119,10 +168,12 @@ def handle_vulcan_retract(facts: str, reason: str) -> Dict[str, Any]:
     """Retract facts from the graph. reason is required."""
     if not reason or not reason.strip():
         return {"ok": False, "error": "reason is required for retract"}
+    _refresh_if_stale()
     db = get_db()
     try:
         raw = db.execute(f"(retract {facts})")
         db.checkpoint()
+        _update_mtime()
         result = _parse_tx_result(raw)
         if result["ok"]:
             result["reason"] = reason
@@ -347,6 +398,7 @@ def _transact_extracted_facts(facts: List[Dict[str, str]]) -> int:
     valid-time is recorded. Combined with :as-of in queries this enables true
     bi-temporal point-in-time reads.
     """
+    _refresh_if_stale()
     db = get_db()
     stored = 0
     for fact in facts:
@@ -371,6 +423,7 @@ def _transact_extracted_facts(facts: List[Dict[str, str]]) -> int:
             continue
     if stored:
         db.checkpoint()
+        _update_mtime()
     return stored
 
 
@@ -451,9 +504,11 @@ def _llm_extract_and_transact(conversation_delta: str) -> Dict[str, Any]:
         valid_at, datalog = _parse_valid_at_hint(raw_facts)
         if not datalog or datalog == "[]":
             return {"ok": True, "stored_count": 0, "strategy": "llm"}
+        _refresh_if_stale()
         db = get_db()
         db.execute(f'(transact {datalog} {{:valid-at "{valid_at}"}})')
         db.checkpoint()
+        _update_mtime()
         # Approximate: count "[:" occurrences as a proxy for triple count.
         # Entity-reference values use ":foo" not "[:foo", so false positives are rare.
         stored_count = datalog.count("[:")
@@ -505,9 +560,11 @@ async def _agent_extract_and_transact(conversation_delta: str) -> Dict[str, Any]
         valid_at, datalog = _parse_valid_at_hint(raw_facts)
         if not datalog or datalog == "[]":
             return {"ok": True, "stored_count": 0, "strategy": "agent"}
+        _refresh_if_stale()
         db = get_db()
         db.execute(f'(transact {datalog} {{:valid-at "{valid_at}"}})')
         db.checkpoint()
+        _update_mtime()
         # Approximate: count "[:" occurrences as a proxy for triple count.
         stored_count = datalog.count("[:")
         return {"ok": True, "stored_count": stored_count, "strategy": "agent"}
