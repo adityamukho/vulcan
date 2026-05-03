@@ -168,11 +168,80 @@ def _get_target_dir() -> str:
     return os.getcwd()
 
 
-def main():
+_PLACEHOLDER_KEY = "your-api-key-here"
+
+
+def setup_mcp_json(target_dir: str) -> bool:
+    """Idempotently write the temporal-reasoning MCP server block into .mcp.json.
+
+    - Creates the file if absent.
+    - Merges into existing content if present (other servers are preserved).
+    - Always updates args and MINIGRAF_GRAPH_PATH to reflect current paths.
+    - Preserves VULCAN_EXTRACTION_STRATEGY if already set by the user.
+    - Preserves ANTHROPIC_API_KEY if already set to a real value; otherwise
+      writes a placeholder and prints a reminder.
+    """
+    import json
+
+    mcp_json_path = os.path.join(target_dir, ".mcp.json")
+    server_script = os.path.join(REPO_DIR, "mcp_server.py")
+    graph_path = os.path.join(target_dir, "memory.graph")
+
+    existing: dict = {}
+    file_existed = os.path.exists(mcp_json_path)
+    if file_existed:
+        try:
+            with open(mcp_json_path) as f:
+                existing = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            existing = {}
+
+    prev_env: dict = existing.get("mcpServers", {}).get("temporal-reasoning", {}).get("env", {})
+
+    strategy = prev_env.get("VULCAN_EXTRACTION_STRATEGY", "heuristic")
+    prev_key = prev_env.get("ANTHROPIC_API_KEY", "")
+    key_is_real = bool(prev_key) and prev_key != _PLACEHOLDER_KEY
+    api_key = prev_key if key_is_real else _PLACEHOLDER_KEY
+
+    new_env = {
+        "MINIGRAF_GRAPH_PATH": graph_path,
+        "VULCAN_EXTRACTION_STRATEGY": strategy,
+        "ANTHROPIC_API_KEY": api_key,
+    }
+    existing.setdefault("mcpServers", {})["temporal-reasoning"] = {
+        "type": "stdio",
+        "command": "python",
+        "args": [server_script],
+        "env": new_env,
+    }
+
+    try:
+        with open(mcp_json_path, "w") as f:
+            json.dump(existing, f, indent=2)
+            f.write("\n")
+    except IOError as e:
+        print(f"✗ Could not write .mcp.json: {e}")
+        return False
+
+    verb = "Updated" if file_existed else "Created"
+    print(f"✓ {verb} {mcp_json_path}")
+    print(f"    MINIGRAF_GRAPH_PATH = {graph_path}")
+    print(f"    VULCAN_EXTRACTION_STRATEGY = {strategy}")
+    if key_is_real:
+        print("    ANTHROPIC_API_KEY = (preserved)")
+    else:
+        print(f"    ANTHROPIC_API_KEY = {_PLACEHOLDER_KEY}  ← replace with your key")
+    return True
+
+
+def main(target_dir: str = "") -> None:
     print("=" * 50)
     print("Temporal Reasoning Skill Setup")
     print("=" * 50)
     print()
+
+    if not target_dir:
+        target_dir = _get_target_dir()
 
     checks = [
         ("Python version", check_python_version),
@@ -187,21 +256,24 @@ def main():
         results.append(check_func())
         print()
 
-    if all(results):
+    print("Configuring .mcp.json...")
+    mcp_ok = setup_mcp_json(target_dir)
+    print()
+
+    if all(results) and mcp_ok:
         print("=" * 50)
         print("✓ Setup complete!")
         print("=" * 50)
         print()
-        print("Next steps — add to your harness config:")
-        print("  See hooks/ directory for config templates:")
-        print("    hooks/claude-code.json  — Claude Code (MCP + auto-memory hooks)")
-        print("    hooks/codex.toml        — Codex CLI")
-        print("    hooks/hermes.yaml       — Hermes")
-        print("    hooks/opencode.json     — OpenCode (degraded mode)")
-        print("    hooks/openclaw.json     — OpenClaw (degraded mode)")
+        print("Claude Code hooks (auto-memory) — add to .claude/settings.local.json:")
+        print("  See hooks/claude-code.json for the hooks block template.")
+        print("  The hooks also need ANTHROPIC_API_KEY in the session env when")
+        print("  VULCAN_EXTRACTION_STRATEGY=llm (see README § Per-Turn Auto-Memory).")
         print()
-        print("  Set VULCAN_EXTRACTION_STRATEGY=llm for LLM-powered fact extraction")
-        print("  (requires ANTHROPIC_API_KEY and: pip install anthropic)")
+        print("Other agents:")
+        print("    hooks/codex.toml    — Codex CLI")
+        print("    hooks/hermes.yaml   — Hermes")
+        print("    hooks/opencode.json — OpenCode")
     else:
         print("=" * 50)
         print("✗ Setup incomplete — fix errors above")
@@ -220,4 +292,4 @@ if __name__ == "__main__":
     else:
         _sync_files(target_dir)
 
-    main()
+    main(target_dir)
