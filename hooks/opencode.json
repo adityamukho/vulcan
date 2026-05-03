@@ -1,0 +1,22 @@
+{
+  "_description": [
+    "OpenCode MCP server configuration (degraded mode).",
+    "Merge the mcp block into your OpenCode config file.",
+    "Replace PATH_TO_REPO and PATH_TO_PROJECT with absolute paths.",
+    "",
+    "DEGRADED MODE: OpenCode pre/post-request hooks do not fire around MCP",
+    "tool calls, so auto-memory is not available. The agent calls",
+    "memory_prepare_turn / memory_finalize_turn explicitly per SKILL.md."
+  ],
+  "mcp": {
+    "servers": {
+      "temporal-reasoning": {
+        "command": "python PATH_TO_REPO/mcp_server.py",
+        "env": {
+          "MINIGRAF_GRAPH_PATH": "PATH_TO_PROJECT/memory.graph",
+          "VULCAN_EXTRACTION_STRATEGY": "heuristic"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,21 @@
+# Temporal Reasoning — Hermes agent configuration
+# Merge into your Hermes agent config.
+# Replace PATH_TO_REPO and PATH_TO_PROJECT with absolute paths.
+
+mcp_servers:
+  temporal-reasoning:
+    command: python
+    args:
+      - PATH_TO_REPO/mcp_server.py
+    env:
+      MINIGRAF_GRAPH_PATH: PATH_TO_PROJECT/memory.graph
+      VULCAN_EXTRACTION_STRATEGY: heuristic
+
+# Auto-memory hooks — uncomment if your Hermes version supports pre/post-turn hooks:
+# hooks:
+#   pre_turn:
+#     command: python PATH_TO_REPO/hooks/prepare_hook.py
+#     timeout_ms: 5000
+#   post_turn:
+#     command: python PATH_TO_REPO/hooks/finalize_hook.py
+#     timeout_ms: 10000

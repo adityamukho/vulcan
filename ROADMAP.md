@@ -14,11 +14,23 @@
 | 3 | report_issue tool | Auto-file GitHub issues on failures | Low | Complete ✓ |
 | 4 | install.py | One-command setup script | Low | Complete ✓ |
 
-## Future Phase 3+
+## Phase 3 (Complete ✓)
+
+| Item | Description | Status |
+|------|-------------|--------|
+| Persistent MCP server | `mcp_server.py` — replaces CLI wrapper; single-process, stdio, minigraf Python binding | Complete ✓ |
+| 6 MCP tools | `vulcan_query`, `vulcan_transact`, `vulcan_retract`, `vulcan_report_issue`, `memory_prepare_turn`, `memory_finalize_turn` | Complete ✓ |
+| Auto-memory hooks (Claude Code) | `UserPromptSubmit` injects context; `Stop` hook extracts facts — `hooks/prepare_hook.py`, `hooks/finalize_hook.py` | Complete ✓ |
+| Hook config templates | `hooks/claude-code.json`, `hooks/codex.toml`, `hooks/hermes.yaml`, `hooks/opencode.json` (degraded), `hooks/openclaw.json` (degraded) | Complete ✓ |
+| Heuristic extraction | Regex-based signal detection; zero API calls; no configuration required | Complete ✓ |
+| LLM extraction | Claude Haiku extracts facts; falls back to agent strategy on API failure | Complete ✓ |
+| Agent extraction | MCP sampling requests a memory block from the connected agent | Complete ✓ |
+| Bi-temporal writes | `:valid-at` recorded on every write; point-in-time queries correct | Complete ✓ |
+
+## Future Phase 3+ (Remaining)
 - WASM bindings (browser + edge)
 - Mobile embedding
-- Claude Code MCP integration
-- Codex/OpenAI adapters
+- Codex/OpenAI full adapter (hook config template added in Phase 3)
 
 ## Why Not Just Read Git History?
 
@@ -60,6 +72,76 @@ Extend the bi-temporal graph to store code structure extracted from git history,
 - Agent-facing query patterns (fewshots / skill prompts) for common insights: circular dependency detection, high-churn modules, blast radius of a proposed change
 - Cross-layer queries that join code structure edges with agent decision datoms in the same graph — e.g., "show dependency changes that occurred after the database migration decision"
 - Natural-language question templates mapped to Datalog patterns so agents can ask structural questions without writing raw Datalog
+
+## Future Phase 5+ — Observability and Trust for Automatic Memory
+
+### Context
+
+Turn-by-turn automatic memory injection and extraction (Phase 3) is the right direction for solving agent memory loss, but the pattern has well-known failure modes when deployed without observability:
+
+1. **Opaque injection** — memory is silently retrieved and prepended to the prompt; the agent treats injected facts as context without knowing their provenance, making behavior non-reproducible and hard to debug.
+2. **Extraction corrupts memory** — the post-turn extractor is itself an LLM call and can hallucinate. A misread sarcastic remark becomes a permanent fact that compounds across future turns.
+3. **Latency and cost** — each turn triggers at minimum two additional LLM calls (prepare + finalize); without parallelism and model-tier selection this doubles per-turn cost.
+4. **Trust and consent** — users may not know which parts of their messages are stored, or be able to inspect or correct the stored form.
+
+The bi-temporal model partially addresses (2): wrong facts can be retracted without losing audit history, and point-in-time queries can recover the pre-corruption state. But structural observability tooling is still needed before this pattern is appropriate in any hosted or multi-user deployment.
+
+### Proposed work
+
+- **Injection trace logging** — for each `memory_prepare_turn` call, log which facts were retrieved, how they were ranked, and how they were formatted. Queryable via a `memory_audit_query` tool.
+- **Extraction confidence tagging** — tag every auto-extracted datom with `{:source "heuristic"|"llm"|"agent", :confidence 0.0–1.0, :model "...", :turn N}`. Low-confidence datoms can be auto-flagged for review rather than silently committed.
+- **Provisional extraction mode** — store extracted facts in a staging namespace (`:staged/...`) for a configurable number of turns before promoting to permanent; reversals during the staging window are low-cost.
+- **Periodic correction pass** — a background task (or agent-invocable tool) that scans recent extractions for internal contradictions and flags them. Leverages the bi-temporal graph's ability to show the full history of an entity's values.
+- **User-visible memory summary** — a `memory_summarize` tool that returns a human-readable summary of what is currently known about the session, queryable by topic, so users can spot and correct errors.
+- **Scoped injection** — allow `memory_prepare_turn` to be restricted to specific namespaces or entity types (e.g. `:decision/...` only, not `:user-preference/...`) to limit the blast radius of bad extractions.
+
+### When this matters
+
+For a local single-user developer tool (the current Phase 3 target), stored data stays on the user's machine, the user can inspect the `.graph` file directly, and wrong facts can be corrected manually. The risk profile is manageable without this work. For any hosted or multi-tenant deployment the observability layer is a prerequisite.
+
+---
+
+## Future Phase 6+ — Entity Normalization and Schema-Aware Extraction
+
+### The problem
+
+Without normalization the graph degrades into disconnected synonym clusters:
+- Same entity, different names: "the auth service", "the login system", "the SSO module" → three separate entities, queries miss two of three.
+- Same relationship, different predicates: `:depends-on` vs `:requires` vs `:uses`.
+- Same decision, different phrasings: "use Redis", "use Redis for caching", "Redis-based cache" → split across unconnected datoms.
+
+The bi-temporal model preserves *when* things were said but cannot help when the *what* is fragmented across synonyms.
+
+### Why a vector store is the wrong first move
+
+A vector store is a retrieval tool, not a normalization tool. It can find things *near* "auth service" in embedding space but cannot assert that "auth service" and "login system" are the *same* entity — "Redis" and "Memcached" are also near in embedding space. Fuzzy matching injected upstream of Datalog pattern queries also destroys reproducibility: the same query returns different results depending on embedding model version and similarity threshold.
+
+### Three approaches in increasing complexity
+
+**1. Canonicalization at write time (recommended first move).** The extractor is made schema-aware: before transacting, it receives a list of existing canonical entity names and attribute predicates (a cheap Datalog query: `[:find ?e ?n :where [?e :entity/canonical-name ?n]]`) and is instructed to reuse an existing entity ID where the reference is clear, or create a new canonical name if genuinely new. The bi-temporal model provides a safety net: a wrong merge can be retracted and re-asserted. This handles the large majority of normalization with no new infrastructure.
+
+**2. Alias facts at query time.** Store user phrasings as alias facts — `(:service/auth :alias "the auth service")`, `(:service/auth :alias "login system")`. Queries resolve non-canonical names through the alias index before pattern matching. More forgiving than (1) because the canonical decision is not irrevocable at write time. These aliases are just more datoms in Minigraf; no new infrastructure.
+
+**3. Embedding-based disambiguation as a fallback.** The vector store enters only when the extractor sees a reference it cannot confidently map to an existing entity or a confidently new one. It proposes candidates ("this looks 0.87 similar to `:service/auth`") and either the extractor or the user resolves the ambiguity. The vector store never directly answers Datalog queries; it is a disambiguation aid for the long tail.
+
+In practice (1) + (2) handle 90%+ of cases. (3) catches the long tail. Starting with (3) before trying (1) is a common mistake.
+
+### When a vector store becomes necessary
+
+Wait until at least two of these are true:
+- **Volume:** tens of thousands of entities, and schema-injection into the extractor prompt hits context limits.
+- **Cross-session resolution:** the user references something from months ago that isn't in the extractor's prompt window and canonical lookup fails.
+- **Free-text search:** users want to find facts by approximate description, not exact name ("show me anything related to performance"). This is a feature request, not a normalization problem, but a vector store solves it.
+
+### Shape of the vector store if added
+
+Embedded, co-located with the `.graph` file — `sqlite-vec`, `lancedb`, or a flat index. Not a separate service. Adding Pinecone or Qdrant to a personal-scale local tool would be architecturally inconsistent with the single-file embedded model. For mobile in particular, a separate vector store means more storage, memory, startup time, and battery.
+
+### Implementation note
+
+The normalization problem is fundamentally an *ontology problem*, not a tooling problem. "Are 'the auth service' and 'the login system' the same thing?" depends on project-specific context that only the extractor has (conversation context + existing graph schema). The correct architectural move is to make the extractor schema-aware and treat entity resolution as part of extraction, not a separate post-processing step.
+
+---
 
 ## Marketplace Publishing ✓
 

@@ -1,0 +1,14 @@
+{
+  "name": "memory_prepare_turn",
+  "description": "Retrieve relevant memory context for the current user message. Call this at the START of every turn, before reading the user's message. Returns a context block string to prepend to your working context.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "user_message": {
+        "type": "string",
+        "description": "The user's message for this turn"
+      }
+    },
+    "required": ["user_message"]
+  }
+}

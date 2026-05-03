@@ -1,0 +1,45 @@
+{
+  "_description": [
+    "Claude Code integration for Temporal Reasoning.",
+    "Merge mcpServers into ~/.claude/settings.json or .claude/settings.json.",
+    "The hooks block enables auto-memory: context is injected before each turn",
+    "and facts are extracted after. Replace PATH_TO_REPO / PATH_TO_PROJECT."
+  ],
+  "mcpServers": {
+    "temporal-reasoning": {
+      "type": "stdio",
+      "command": "python",
+      "args": ["PATH_TO_REPO/mcp_server.py"],
+      "env": {
+        "MINIGRAF_GRAPH_PATH": "PATH_TO_PROJECT/memory.graph",
+        "VULCAN_EXTRACTION_STRATEGY": "heuristic"
+      }
+    }
+  },
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python PATH_TO_REPO/hooks/prepare_hook.py",
+            "timeout": 5000
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python PATH_TO_REPO/hooks/finalize_hook.py",
+            "timeout": 10000
+          }
+        ]
+      }
+    ]
+  }
+}
