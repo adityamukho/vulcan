@@ -462,9 +462,9 @@ class TestReverseFillClaimAndProcess:
         assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == ":commit/preexisting"
         assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
         raw = mcp_server._db_execute(
-            real_db, f"(query [:find (count ?c) :where [{fn_ident} :modified-in {commit_ident}]])"
+            real_db, f"(query [:find ?c :where [{fn_ident} :modified-in ?c]])"
         )
-        assert json.loads(raw)["results"] == [[1]]
+        assert [commit_ident] in json.loads(raw)["results"]
 
     def test_frontier_high_interval_advances_by_one(self, real_db, tmp_path):
         import mcp_server
