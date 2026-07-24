@@ -14014,3 +14014,59 @@ class TestReverseFillClaimAndProcess:
         assert bounds is not None
         _lo_hash, hi_hash = bounds
         assert hi_hash == linearization[-1]
+
+
+class TestReverseBulkFillWalk:
+    def test_walks_until_gap_closes_and_returns_count(self, real_db, tmp_path):
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "a.py").write_text("def a(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h0"], cwd=repo, check=True, capture_output=True)
+        (repo / "b.py").write_text("def b(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h1"], cwd=repo, check=True, capture_output=True)
+        (repo / "c.py").write_text("def c(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h2"], cwd=repo, check=True, capture_output=True)
+
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        count = mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        assert count == 3
+        assert allocator.is_gap_empty() is True
+        fn_ident_a = mcp_server._code_ident("function", "a.py", "a")
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident_a) == f":commit/{linearization[0][:12]}"
+
+    def test_gap_already_empty_returns_zero(self, real_db, tmp_path):
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "a.py").write_text("def a(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h0"], cwd=repo, check=True, capture_output=True)
+
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-02T00:00:00Z")
+        while allocator.claim_low() is not None:
+            pass  # drain the gap forward first
+
+        count = mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        assert count == 0

@@ -7351,6 +7351,32 @@ def _reverse_fill_claim_and_process(
     return commit_hash
 
 
+def _reverse_bulk_fill_walk(
+    db: Any,
+    repo_path: str,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+    allocator: "frontier_registry.FrontierAllocator",
+    ignore_patterns: Sequence[str] = (),
+    index_con: Optional[Any] = None,
+) -> int:
+    """#222 phase 2b: repeatedly call _reverse_fill_claim_and_process until
+    the gap closes. Returns the count of commits processed. No caller in
+    this sub-phase -- 2d wires this into the real concurrent ingestion
+    loop alongside the forward stream.
+    """
+    count = 0
+    while True:
+        result = _reverse_fill_claim_and_process(
+            db, repo_path, linearization, commit_metadata, allocator,
+            ignore_patterns=ignore_patterns, index_con=index_con,
+        )
+        if result is None:
+            break
+        count += 1
+    return count
+
+
 async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure.
 
