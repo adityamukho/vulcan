@@ -8586,6 +8586,49 @@ class TestPrecomputeFileTriplesBodyDiff:
         field_ident = mcp_server._code_ident("field", "models.py", "Foo.bar")
         assert field_ident in result["unchanged_idents"]
 
+    def test_body_hashes_populated_for_every_new_side_function(self):
+        import mcp_server
+        parser = self._python_parser()
+        new_nodes = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        result = mcp_server._precompute_file_triples(
+            "auth.py", extracted, ":commit/c1", {}, new_entity_nodes=new_nodes,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert result["body_hashes"][fn_ident] == mcp_server._normalized_body_hash(new_nodes["function"]["login"])
+
+    def test_body_hashes_match_across_textually_identical_bodies(self):
+        import mcp_server
+        parser = self._python_parser()
+        nodes_a = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
+        nodes_b = self._all_nodes(parser, b"def login(user):\n\n    return   user.ok\n")
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        result_a = mcp_server._precompute_file_triples(
+            "auth.py", extracted, ":commit/c1", {}, new_entity_nodes=nodes_a,
+        )
+        result_b = mcp_server._precompute_file_triples(
+            "auth.py", extracted, ":commit/c2", {}, new_entity_nodes=nodes_b,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert result_a["body_hashes"][fn_ident] == result_b["body_hashes"][fn_ident]
+
+    def test_body_hashes_absent_without_new_entity_nodes(self):
+        import mcp_server
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        result = mcp_server._precompute_file_triples("auth.py", extracted, ":commit/c1", {})
+        assert result["body_hashes"] == {}
+
+    def test_module_ident_never_appears_in_body_hashes(self):
+        import mcp_server
+        parser = self._python_parser()
+        new_nodes = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        result = mcp_server._precompute_file_triples(
+            "auth.py", extracted, ":commit/c1", {}, new_entity_nodes=new_nodes,
+        )
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        assert module_ident not in result["body_hashes"]
+
 
 class TestFieldClassContainment:
     """Fields owned by a real (extracted) class get BOTH module- and

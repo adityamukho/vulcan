@@ -6420,6 +6420,23 @@ def _precompute_file_triples(
     except Exception:
         unchanged_idents = set()
 
+    # #222 phase 2b: per-entity body hash for every entity present on the
+    # NEW side, keyed the same way unchanged_idents is above -- lets the
+    # reverse-bulk-fill walk persist a candidate-diff record (body hash)
+    # for an entity without needing the raw tree-sitter node itself.
+    # Module-level entries are deliberately excluded: there is no
+    # tree-sitter node to hash for a whole file, and candidate-diff
+    # persistence is function/class/variable/field-only (matching
+    # unchanged_idents' own category scope).
+    body_hashes: Dict[str, str] = {}
+    try:
+        new_nodes_for_hash = new_entity_nodes or {}
+        for category in ("function", "class", "variable", "field"):
+            for name, node in new_nodes_for_hash.get(category, {}).items():
+                body_hashes[_code_ident(category, file_path, name)] = _normalized_body_hash(node)
+    except Exception:
+        body_hashes = {}
+
     return {
         "module_ident": module_ident,
         "module_candidate_triples": module_candidate_triples,
@@ -6431,6 +6448,7 @@ def _precompute_file_triples(
         "field_static_map": field_static_map,
         "resolved_imports": resolved_imports,
         "unchanged_idents": unchanged_idents,
+        "body_hashes": body_hashes,
     }
 
 
