@@ -7248,6 +7248,109 @@ def _extract_commit(
     return results, gitlink_changes, gitmodules_map, renamed_pairs
 
 
+def _reverse_fill_claim_and_process(
+    db: Any,
+    repo_path: str,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+    allocator: "frontier_registry.FrontierAllocator",
+    ignore_patterns: Sequence[str] = (),
+    index_con: Optional[Any] = None,
+) -> Optional[str]:
+    """#222 phase 2b: claim exactly one position from the gap's high end
+    (allocator.claim_high()) and process that one commit -- structural
+    facts, :modified-in edges, provisional :introduced-by, and candidate-diff
+    records for every entity the commit's "A"/"M" files touch. "D"/"R"
+    files are skipped entirely (deletions and renames are out of scope for
+    this sub-phase -- see the design spec).
+
+    Reuses _extract_commit/_build_code_triples unchanged: entity discovery
+    is direction-agnostic. The only new mechanism is substituting a DB
+    query (_entity_introduced_by_query) for forward walk's in-memory
+    entity_valid_from dict, since reverse walk has no accumulated-forward
+    state -- built fresh, per file, from currently-persisted graph state.
+
+    _build_code_triples's own candidate :introduced-by triples are filtered
+    out of what gets transacted here -- _entity_introduced_by_set_provisional
+    is the sole writer of :introduced-by in this walk, so a newly
+    discovered entity and one whose guess is being moved earlier go
+    through exactly the same code path.
+
+    Returns the claimed commit's hash, or None if the gap was already
+    empty (allocator.claim_high() returned None) -- caller's signal to
+    stop. Writes for one commit are followed by exactly one
+    _db_checkpoint(db) call, after _frontier_persist_claim records the
+    claim -- mirrors _run_ingestion's one-checkpoint-per-commit cadence
+    (see the design spec's "Resume-safety / atomicity boundary" section).
+    """
+    pos = allocator.claim_high()
+    if pos is None:
+        return None
+
+    commit_hash, commit_ts_iso, author, subject = commit_metadata[pos]
+    commit_ident = f":commit/{commit_hash[:12]}"
+
+    file_results, _gitlink_changes, _gitmodules_map, _renamed_pairs = _extract_commit(
+        repo_path, commit_hash, ignore_patterns
+    )
+
+    all_triples: List[str] = [
+        f"[{commit_ident} :entity-type :type/commit]",
+        f'[{commit_ident} :ident "{commit_ident}"]',
+        f'[{commit_ident} :description "{_edn_escape(subject[:120])}"]',
+        f'[{commit_ident} :hash "{commit_hash}"]',
+        f'[{commit_ident} :author "{_edn_escape(author)}"]',
+        f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
+        f'[{commit_ident} :date "{commit_ts_iso}"]',
+    ]
+    new_candidates: List[str] = []
+    provisional_moves: List[str] = []
+    body_hash_by_ident: Dict[str, str] = {}
+
+    for status, file_path, extracted, precomputed, _old_path in file_results:
+        if status not in ("A", "M"):
+            continue  # "D"/"R" deferred -- see design spec scope
+
+        candidate_idents = (
+            [precomputed["module_ident"]]
+            + [ident for ident, _name, _t in precomputed["function_entries"]]
+            + [ident for ident, _name, _t in precomputed["class_entries"]]
+            + [ident for ident, _name, _t in precomputed["global_entries"]]
+            + [ident for ident, _name, _t in precomputed["field_entries"]]
+        )
+        known_before: Dict[str, str] = {
+            ident: "known" for ident in candidate_idents
+            if _entity_introduced_by_query(db, ident) is not None
+        }
+        known_before_snapshot = set(known_before.keys())
+
+        triples = _build_code_triples(
+            file_path, extracted, commit_ts_iso, known_before, {}, {}, commit_ident,
+            precomputed, {}, {},
+        )
+        all_triples.extend(t for t in triples if ":introduced-by" not in t)
+
+        new_candidates.extend(set(known_before.keys()) - known_before_snapshot)
+        for ident in set(candidate_idents) & known_before_snapshot:
+            if _lineage_is_provisional(db, ident):
+                provisional_moves.append(ident)
+
+        body_hash_by_ident.update(precomputed.get("body_hashes", {}))
+
+    _transact(db, "[" + " ".join(all_triples) + "]", commit_ts_iso, index_con=index_con)
+
+    for ident in new_candidates + provisional_moves:
+        _entity_introduced_by_set_provisional(db, ident, commit_ident, commit_ts_iso, index_con=index_con)
+        if ident in body_hash_by_ident:
+            _candidate_diff_persist(
+                db, commit_hash, ident, body_hash_by_ident[ident], commit_ts_iso, index_con=index_con,
+            )
+
+    _frontier_persist_claim(db, linearization, pos, from_low=False, commit_ts_iso=commit_ts_iso, index_con=index_con)
+    _db_checkpoint(db)
+    return commit_hash
+
+
 async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure.
 
