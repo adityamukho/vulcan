@@ -433,7 +433,7 @@ class TestReverseFillClaimAndProcess:
             )
 
         fn_ident = mcp_server._code_ident("function", "auth.py", "login")
-        oldest_hash = linearization[0]  # h0
+        oldest_hash, mid_hash, newest_hash = linearization[0], linearization[1], linearization[2]
         assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{oldest_hash[:12]}"
         assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
         raw = mcp_server._db_execute(
@@ -441,6 +441,48 @@ class TestReverseFillClaimAndProcess:
         )
         assert json.loads(raw)["results"] == [[1]]
         assert mcp_server._candidate_diff_read(real_db, oldest_hash, fn_ident) is not None
+
+        # The converged :modified-in set must match what forward walk would
+        # have produced: every later touch except the true introduction
+        # commit itself (h0 gets none -- see the design spec's corrected
+        # "Per-commit algorithm" section and the final whole-branch
+        # review's Critical finding #1 that this test was added to catch).
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{fn_ident} :modified-in ?c]])"
+        )
+        modified_in_commits = {row[0] for row in json.loads(raw)["results"]}
+        assert modified_in_commits == {f":commit/{mid_hash[:12]}", f":commit/{newest_hash[:12]}"}
+
+    def test_two_entities_in_one_commit_get_different_classifications(self, real_db, tmp_path):
+        """A single claimed commit can simultaneously introduce a brand-new
+        entity and add a real touch to an already-authoritative one --
+        the two must not cross-contaminate each other's handling."""
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        linearization, commit_metadata, allocator = self._allocator_and_metadata(repo, real_db)
+
+        extra_ident = mcp_server._code_ident("function", "auth.py", "extra")
+        # Simulate Stream 1 having already confirmed extra() authoritatively,
+        # before Stream 2 ever runs -- extra() first appears at h1, and this
+        # commit (h2, claimed first) also touches it (its body is identical
+        # at h1/h2, but it still shares the file with a genuinely new touch).
+        mcp_server._transact(
+            real_db, f"[[{extra_ident} :introduced-by :commit/preexisting]]", "2025-01-01T00:00:00Z",
+        )
+
+        claimed_hash = mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        commit_ident = f":commit/{claimed_hash[:12]}"
+
+        more_ident = mcp_server._code_ident("function", "auth.py", "more")
+        # more() is genuinely new at h2 -- first sighting, provisional.
+        assert mcp_server._entity_introduced_by_query(real_db, more_ident) == commit_ident
+        assert mcp_server._lineage_is_provisional(real_db, more_ident) is True
+
+        # extra() stays authoritative and untouched on :introduced-by.
+        assert mcp_server._entity_introduced_by_query(real_db, extra_ident) == ":commit/preexisting"
+        assert mcp_server._lineage_is_provisional(real_db, extra_ident) is False
 
     def test_already_authoritative_entity_only_gets_modified_in(self, real_db, tmp_path):
         import mcp_server
@@ -508,17 +550,41 @@ def _reverse_fill_claim_and_process(
     files are skipped entirely (deletions and renames are out of scope for
     this sub-phase -- see the design spec).
 
-    Reuses _extract_commit/_build_code_triples unchanged: entity discovery
-    is direction-agnostic. The only new mechanism is substituting a DB
-    query (_entity_introduced_by_query) for forward walk's in-memory
-    entity_valid_from dict, since reverse walk has no accumulated-forward
-    state -- built fresh, per file, from currently-persisted graph state.
+    Reuses _extract_commit/_build_code_triples unchanged for entity
+    discovery/parsing (direction-agnostic). BOTH :introduced-by and
+    :modified-in are filtered out of _build_code_triples's own output and
+    written by this function instead -- _build_code_triples's gate for
+    both attributes is entity_valid_from membership, which for forward
+    walk coincides with "is this the introduction commit" but for reverse
+    walk does not: the first commit reverse walk sees an entity at is the
+    newest touch (not the introduction), and the commit where reverse walk
+    finally stops finding an even-earlier occurrence (the true
+    introduction) is by then already "known" from later, already-visited
+    commits. Reusing _build_code_triples's :modified-in emission verbatim
+    would misclassify both ends. See the design spec's "Per-commit
+    algorithm" section (revised after the final whole-branch review found
+    this defect) for the full derivation.
 
-    _build_code_triples's own candidate :introduced-by triples are filtered
-    out of what gets transacted here -- _entity_introduced_by_set_provisional
-    is the sole writer of :introduced-by in this walk, so a newly
-    discovered entity and one whose guess is being moved earlier go
-    through exactly the same code path.
+    :introduced-by: a newly-discovered entity's guess is asserted via
+    _entity_introduced_by_set_provisional and gets no :modified-in yet
+    (mirrors forward walk never emitting :modified-in at an entity's own
+    introduction commit). When an already-provisional entity is found at
+    an even earlier commit, its guess moves to this commit (also getting
+    no :modified-in yet) and the PREVIOUSLY-guessed commit -- now
+    confirmed to be a genuine modification, not the introduction --
+    retroactively receives a :modified-in fact using its OWN commit
+    timestamp (looked up from commit_metadata), not this commit's.
+    Already-authoritative entities are never touched, but a genuine later
+    touch always gets :modified-in (unless #221's unchanged-body check
+    says the body is provably unchanged this commit).
+
+    Known, documented limitation: the retroactive :modified-in for a
+    superseded commit does not re-check #221's unchanged-body narrowing
+    against THAT commit's own diff (only this call's diff has that data) --
+    it is asserted unconditionally. This can rarely over-assert an edge
+    forward walk would have suppressed; it can never produce a missing or
+    misattributed edge. See the design spec for why this is an accepted
+    simplification for this sub-phase.
 
     Returns the claimed commit's hash, or None if the gap was already
     empty (allocator.claim_high() returned None) -- caller's signal to
@@ -548,8 +614,10 @@ def _reverse_fill_claim_and_process(
         f'[{commit_ident} :date "{commit_ts_iso}"]',
     ]
     new_candidates: List[str] = []
-    provisional_moves: List[str] = []
+    provisional_moves: List[Tuple[str, str]] = []  # (ident, superseded_commit_ident)
+    already_authoritative_touched: List[str] = []
     body_hash_by_ident: Dict[str, str] = {}
+    unchanged_by_ident: Dict[str, bool] = {}
 
     for status, file_path, extracted, precomputed, _old_path in file_results:
         if status not in ("A", "M"):
@@ -572,22 +640,56 @@ def _reverse_fill_claim_and_process(
             file_path, extracted, commit_ts_iso, known_before, {}, {}, commit_ident,
             precomputed, {}, {},
         )
-        all_triples.extend(t for t in triples if ":introduced-by" not in t)
+        # This walk owns the write timing of BOTH attributes itself now --
+        # filter both out of _build_code_triples's forward-biased gating.
+        all_triples.extend(
+            t for t in triples if ":introduced-by" not in t and ":modified-in" not in t
+        )
+
+        unchanged_idents = precomputed.get("unchanged_idents", set())
+        for ident in candidate_idents:
+            unchanged_by_ident[ident] = ident in unchanged_idents
 
         new_candidates.extend(set(known_before.keys()) - known_before_snapshot)
         for ident in set(candidate_idents) & known_before_snapshot:
             if _lineage_is_provisional(db, ident):
-                provisional_moves.append(ident)
+                superseded_ident = _entity_introduced_by_query(db, ident)
+                provisional_moves.append((ident, superseded_ident))
+            else:
+                already_authoritative_touched.append(ident)
 
         body_hash_by_ident.update(precomputed.get("body_hashes", {}))
 
     _transact(db, "[" + " ".join(all_triples) + "]", commit_ts_iso, index_con=index_con)
 
-    for ident in new_candidates + provisional_moves:
+    authoritative_modified_triples = [
+        f"[{ident} :modified-in {commit_ident}]"
+        for ident in already_authoritative_touched
+        if not unchanged_by_ident.get(ident, False)
+    ]
+    if authoritative_modified_triples:
+        _transact(
+            db, "[" + " ".join(authoritative_modified_triples) + "]", commit_ts_iso, index_con=index_con,
+        )
+
+    for ident in new_candidates:
         _entity_introduced_by_set_provisional(db, ident, commit_ident, commit_ts_iso, index_con=index_con)
         if ident in body_hash_by_ident:
             _candidate_diff_persist(
                 db, commit_hash, ident, body_hash_by_ident[ident], commit_ts_iso, index_con=index_con,
+            )
+
+    ts_by_commit_ident = {f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata}
+    for ident, superseded_ident in provisional_moves:
+        _entity_introduced_by_set_provisional(db, ident, commit_ident, commit_ts_iso, index_con=index_con)
+        if ident in body_hash_by_ident:
+            _candidate_diff_persist(
+                db, commit_hash, ident, body_hash_by_ident[ident], commit_ts_iso, index_con=index_con,
+            )
+        if superseded_ident is not None and superseded_ident != commit_ident:
+            superseded_ts = ts_by_commit_ident.get(superseded_ident, commit_ts_iso)
+            _transact(
+                db, f"[[{ident} :modified-in {superseded_ident}]]", superseded_ts, index_con=index_con,
             )
 
     _frontier_persist_claim(db, linearization, pos, from_low=False, commit_ts_iso=commit_ts_iso, index_con=index_con)
@@ -598,7 +700,7 @@ def _reverse_fill_claim_and_process(
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `python -m pytest tests/test_mcp_server.py::TestReverseFillClaimAndProcess -v`
-Expected: PASS (all 5 tests).
+Expected: PASS (all 6 tests).
 
 Also run the full existing suite:
 

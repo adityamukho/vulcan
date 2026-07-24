@@ -173,31 +173,85 @@ repeated `claim_high()` calls), for every entity touched by `C`'s diff
    entity_ident) is None` — if the entity has no `:introduced-by` fact yet
    from *either* stream, write its structural facts (`:entity-type`,
    `:description`, `:file`/`:path`, `:contains`, matching forward's
-   candidate-triple shape) as well as its first provisional
-   `:introduced-by` (step 2 below). If the entity already has a fact (from
-   either stream), only a `:modified-in` edge is added — never
-   re-asserted structural attributes, matching forward's existing
-   "written once" invariant (mcp_server.py:6414).
+   candidate-triple shape). If the entity already has a fact (from either
+   stream), no structural attributes are re-asserted — matching forward's
+   existing "written once" invariant (mcp_server.py:6414).
+
+   **Correction (this section was revised after the final whole-branch
+   review of the implementation found step 3 below, as originally
+   written, was internally inconsistent with reusing `_build_code_triples`
+   unchanged — see that review's Critical finding #1 / Spec Issue #7):**
+   `_build_code_triples`'s own `:modified-in` emission is gated by the
+   *same* `entity_valid_from`-membership check as its structural-attribute
+   gate (mcp_server.py: `is_new_module`/`fn_ident not in entity_valid_from`
+   branches) — for forward walk this is correct, because "not yet known"
+   and "this is the introduction commit" are the same event when walking
+   oldest→newest. Reversed, they are *not* the same event: the first
+   commit reverse walk sees an entity at is the *newest* touch, not the
+   introduction, and the commit where reverse walk finally stops finding
+   an even-earlier occurrence (i.e. the true introduction) is by then
+   already "known" to reverse walk from later, already-visited commits.
+   Reusing `_build_code_triples`'s `:modified-in` emission verbatim
+   therefore produces the wrong edge set (misses a real `:modified-in` at
+   the newest touch, adds a spurious one at the true introduction commit).
+   The reverse walk must filter `:modified-in` out of
+   `_build_code_triples`'s output exactly as it already filters
+   `:introduced-by`, and emit `:modified-in` itself per steps 2-3 below.
+
 2. **`:introduced-by`**:
    - **No fact yet** → `_entity_introduced_by_set_provisional(db,
      entity_ident, commit_ident, commit_ts_iso)`, then
      `_candidate_diff_persist(db, commit_hash, entity_ident,
-     _normalized_body_hash(node), commit_ts_iso)`.
+     _normalized_body_hash(node), commit_ts_iso)`. This commit is the
+     current best-guess introduction — no `:modified-in` is emitted for it
+     yet (mirrors forward walk never emitting `:modified-in` at an
+     entity's own introduction commit; see step 3).
    - **Fact exists and is provisional** → reverse walk has now reached an
      *earlier* commit where the same entity is still present, meaning its
-     previous guess was too late. Call
-     `_entity_introduced_by_set_provisional` again with `C`'s
-     `commit_ident` (moves it earlier) and persist a fresh candidate-diff
-     record for `(C, entity_ident)`. The now-stale candidate-diff record at
-     the previously-guessed commit is intentionally left in place — 2c
-     decides how to reconcile a superseded candidate when it reaches that
-     commit chronologically.
+     previous guess was too late. Before moving it, read the
+     currently-guessed commit ident via `_entity_introduced_by_query` (call
+     it `superseded_ident`). Call `_entity_introduced_by_set_provisional`
+     with `C`'s `commit_ident` (moves the guess to `C`) and persist a fresh
+     candidate-diff record for `(C, entity_ident)`. The now-stale
+     candidate-diff record at `superseded_ident` is intentionally left in
+     place — 2c decides how to reconcile a superseded candidate when it
+     reaches that commit chronologically. `C` itself gets no `:modified-in`
+     yet (it is now the tentative introduction); `superseded_ident` is
+     handled by step 3.
    - **Fact exists and is authoritative** → do nothing to `:introduced-by`;
-     only the `:modified-in` edge from step 1 applies.
-3. **`:modified-in`**: always asserted for every entity touched by `C`,
-   regardless of which branch above fired — this edge is order-independent
-   and always authoritative per the issue's own design principle, so it
-   never goes through the provisional marker.
+     the touch still gets a `:modified-in` per step 3.
+3. **`:modified-in`** — converges to exactly the same edge set forward
+   walk would have produced, via two cases:
+   - **Already-authoritative entity touched again**: assert
+     `[entity_ident :modified-in commit_ident]` with `commit_ts_iso` as
+     `valid_from` (this commit's own timestamp) — a genuine later
+     modification of an entity Stream 1 already introduced elsewhere.
+   - **A provisional guess just got superseded** (the second bullet of
+     step 2): assert `[entity_ident :modified-in superseded_ident]` using
+     `superseded_ident`'s *own* commit timestamp as `valid_from` — looked
+     up from `commit_metadata` — not `C`'s timestamp, since the fact
+     "`superseded_ident` modified this entity" became true on
+     `superseded_ident`'s own date, not on `C`'s (`C` is chronologically
+     *earlier* than `superseded_ident`, since reverse walk discovers
+     `superseded_ident`'s falseness-as-introduction only after walking
+     backward past it). A commit newly discovered this call (first
+     sighting) or one that is *never* later superseded gets no
+     `:modified-in` of its own, by construction — matching forward walk's
+     own omission of `:modified-in` at an entity's true introduction
+     commit exactly, once the walk (or a later phase) reaches that
+     entity's true origin.
+
+   **Known, documented limitation**: the retroactive `:modified-in` for a
+   superseded commit does not re-check #221's unchanged-body narrowing
+   against *that* commit's own diff (the current call only has unchanged-
+   body data for `C`'s diff, not `superseded_ident`'s) — it is asserted
+   unconditionally. This can rarely over-assert a `:modified-in` edge
+   forward walk would have suppressed as a no-op touch; it can never
+   produce a *missing* or *misattributed* edge. Revisit if a later phase
+   needs exact parity here — 2c already has each commit's persisted
+   candidate-diff body hash available to correct this precisely during its
+   own sweep, matching the "provisional now, cheap replay correction
+   later" philosophy this design already relies on elsewhere.
 
 ### Driving functions
 
