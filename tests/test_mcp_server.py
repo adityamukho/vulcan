@@ -13967,7 +13967,7 @@ class TestReverseFillClaimAndProcess:
             )
 
         fn_ident = mcp_server._code_ident("function", "auth.py", "login")
-        oldest_hash = linearization[0]  # h0
+        oldest_hash, mid_hash, newest_hash = linearization[0], linearization[1], linearization[2]
         assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{oldest_hash[:12]}"
         assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
         raw = mcp_server._db_execute(
@@ -13975,6 +13975,48 @@ class TestReverseFillClaimAndProcess:
         )
         assert json.loads(raw)["results"] == [[1]]
         assert mcp_server._candidate_diff_read(real_db, oldest_hash, fn_ident) is not None
+
+        # The converged :modified-in set must match what forward walk would
+        # have produced: every later touch except the true introduction
+        # commit itself (h0 gets none -- see the design spec's corrected
+        # "Per-commit algorithm" section and the final whole-branch
+        # review's Critical finding #1 that this test was added to catch).
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{fn_ident} :modified-in ?c]])"
+        )
+        modified_in_commits = {row[0] for row in json.loads(raw)["results"]}
+        assert modified_in_commits == {f":commit/{mid_hash[:12]}", f":commit/{newest_hash[:12]}"}
+
+    def test_two_entities_in_one_commit_get_different_classifications(self, real_db, tmp_path):
+        """A single claimed commit can simultaneously introduce a brand-new
+        entity and add a real touch to an already-authoritative one --
+        the two must not cross-contaminate each other's handling."""
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        linearization, commit_metadata, allocator = self._allocator_and_metadata(repo, real_db)
+
+        extra_ident = mcp_server._code_ident("function", "auth.py", "extra")
+        # Simulate Stream 1 having already confirmed extra() authoritatively,
+        # before Stream 2 ever runs -- extra() first appears at h1, and this
+        # commit (h2, claimed first) also touches it (its body is identical
+        # at h1/h2, but it still shares the file with a genuinely new touch).
+        mcp_server._transact(
+            real_db, f"[[{extra_ident} :introduced-by :commit/preexisting]]", "2025-01-01T00:00:00Z",
+        )
+
+        claimed_hash = mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        commit_ident = f":commit/{claimed_hash[:12]}"
+
+        more_ident = mcp_server._code_ident("function", "auth.py", "more")
+        # more() is genuinely new at h2 -- first sighting, provisional.
+        assert mcp_server._entity_introduced_by_query(real_db, more_ident) == commit_ident
+        assert mcp_server._lineage_is_provisional(real_db, more_ident) is True
+
+        # extra() stays authoritative and untouched on :introduced-by.
+        assert mcp_server._entity_introduced_by_query(real_db, extra_ident) == ":commit/preexisting"
+        assert mcp_server._lineage_is_provisional(real_db, extra_ident) is False
 
     def test_already_authoritative_entity_only_gets_modified_in(self, real_db, tmp_path):
         import mcp_server
