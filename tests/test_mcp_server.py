@@ -6323,6 +6323,65 @@ class TestCandidateDiff:
         assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) == "hash1"
 
 
+class TestEntityIntroducedBySetProvisional:
+    def test_query_absent_returns_none(self, real_db):
+        import mcp_server
+        assert mcp_server._entity_introduced_by_query(real_db, ":function/src-auth-py-login") is None
+
+    def test_first_assert_is_provisional(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._entity_introduced_by_set_provisional(db, entity_ident, ":commit/h2", "2026-01-03T00:00:00Z")
+
+        assert mcp_server._entity_introduced_by_query(db, entity_ident) == ":commit/h2"
+        assert mcp_server._lineage_is_provisional(db, entity_ident) is True
+
+    def test_moving_provisional_value_retracts_old_and_asserts_new(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._entity_introduced_by_set_provisional(db, entity_ident, ":commit/h2", "2026-01-03T00:00:00Z")
+        mcp_server._entity_introduced_by_set_provisional(db, entity_ident, ":commit/h0", "2026-01-01T00:00:00Z")
+
+        assert mcp_server._entity_introduced_by_query(db, entity_ident) == ":commit/h0"
+        raw = mcp_server._db_execute(
+            db, f"(query [:find (count ?c) :where [{entity_ident} :introduced-by ?c]])"
+        )
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_same_value_twice_is_idempotent(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._entity_introduced_by_set_provisional(db, entity_ident, ":commit/h1", "2026-01-02T00:00:00Z")
+        mcp_server._entity_introduced_by_set_provisional(db, entity_ident, ":commit/h1", "2026-01-02T00:00:01Z")
+
+        raw = mcp_server._db_execute(
+            db, f"(query [:find (count ?c) :where [{entity_ident} :introduced-by ?c]])"
+        )
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_never_clobbers_an_authoritative_fact(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+
+        # Simulate forward walk (Stream 1) having already confirmed this
+        # entity authoritatively -- a plain _transact, no lineage marker.
+        mcp_server._transact(
+            db, f"[[{entity_ident} :introduced-by :commit/original]]", "2026-01-01T00:00:00Z",
+        )
+
+        mcp_server._entity_introduced_by_set_provisional(db, entity_ident, ":commit/h5", "2026-01-05T00:00:00Z")
+
+        assert mcp_server._entity_introduced_by_query(db, entity_ident) == ":commit/original"
+        assert mcp_server._lineage_is_provisional(db, entity_ident) is False
+
+
 class TestGitCommitsTopoOrder:
     def test_orders_by_topology_not_committer_date(self, git_repo_diamond_clock_skewed):
         import mcp_server

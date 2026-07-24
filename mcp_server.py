@@ -5225,6 +5225,44 @@ def _candidate_diff_clear(
     _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
 
 
+def _entity_introduced_by_query(db: Any, entity_ident: str) -> Optional[str]:
+    """Return entity_ident's current :introduced-by value (a commit ident
+    string), or None if it has none yet."""
+    raw = _db_execute(db, f"(query [:find ?c :where [{entity_ident} :introduced-by ?c]])")
+    results = json.loads(raw).get("results", [])
+    return results[0][0] if results else None
+
+
+def _entity_introduced_by_set_provisional(
+    db: Any,
+    entity_ident: str,
+    commit_ident: str,
+    commit_ts_iso: str,
+    index_con: Optional[Any] = None,
+) -> None:
+    """Assert or move entity_ident's PROVISIONAL :introduced-by to
+    commit_ident. Never touches an entity whose :introduced-by is already
+    authoritative (a fact exists and _lineage_is_provisional is False) --
+    reverse walk (#222 phase 2b) must never clobber a fact Stream 1 has
+    already confirmed. Idempotent: no-ops the fact write (but still ensures
+    the marker is present) if the current value already equals
+    commit_ident. Query-before-write, retract-then-reassert only if the
+    value genuinely changed -- mirrors _watermark_update's pattern, since
+    re-transacting the same (entity, attribute, value) at a new valid_from
+    creates a duplicate live datom under minigraf's write semantics.
+    """
+    current = _entity_introduced_by_query(db, entity_ident)
+    if current is not None and not _lineage_is_provisional(db, entity_ident):
+        return  # authoritative -- never touch
+    if current == commit_ident:
+        _lineage_mark_provisional(db, entity_ident, commit_ts_iso, index_con=index_con)
+        return
+    if current is not None:
+        _retract(db, f"[[{entity_ident} :introduced-by {current}]]", index_con=index_con)
+    _transact(db, f"[[{entity_ident} :introduced-by {commit_ident}]]", commit_ts_iso, index_con=index_con)
+    _lineage_mark_provisional(db, entity_ident, commit_ts_iso, index_con=index_con)
+
+
 _LAST_RUN_KEYWORD_ATTRS = frozenset({":entity-type"})
 _LAST_RUN_NUMERIC_ATTRS = frozenset({":total-ingested"})
 
