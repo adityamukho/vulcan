@@ -14692,45 +14692,33 @@ class TestCorrectionSweepSelectPosition:
         return linearization, commit_metadata
 
     def _close_gap(self, repo, real_db, linearization, commit_metadata):
-        """Close the gap entirely: claim everything from the low side via a
-        real FrontierAllocator + _frontier_persist_claim (standing in for
-        2d's future ordinary forward walk), then claim the rest from the
-        high side via 2b's real _reverse_fill_claim_and_process."""
+        """Close the gap entirely: alternately claim from low and high sides
+        until the gap is empty. The low side uses _frontier_persist_claim
+        (standing in for 2d's future ordinary forward walk), and the high
+        side uses 2b's real _reverse_fill_claim_and_process."""
         import mcp_server
         import frontier_registry
         allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
-        # Manually initialize frontier-high to cover from position 1 to the end
-        # This simulates Stream 2 claiming everything above position 0
-        if len(linearization) > 1:
-            # Initialize frontier-high at the last position
-            mcp_server._frontier_persist_claim(
-                real_db, linearization, len(linearization) - 1, from_low=False,
-                commit_ts_iso=commit_metadata[len(linearization) - 1][1],
-            )
-            # Then expand it down to position 1 by claiming multiple times
-            for pos in range(len(linearization) - 2, 0, -1):
+        # Alternately claim from low and high to close the gap:
+        # - Claim one from low via _frontier_persist_claim
+        # - Then loop _reverse_fill_claim_and_process until gap is closed
+        while not allocator.is_gap_empty():
+            # Claim one position from low
+            pos = allocator.claim_low()
+            if pos is not None:
                 mcp_server._frontier_persist_claim(
-                    real_db, linearization, pos, from_low=False,
+                    real_db, linearization, pos, from_low=True,
                     commit_ts_iso=commit_metadata[pos][1],
                 )
-        # Reload allocator to pick up frontier-high
-        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
-        # Claim everything from the low side
-        while True:
-            pos = allocator.claim_low()
-            if pos is None:
-                break
-            mcp_server._frontier_persist_claim(
-                real_db, linearization, pos, from_low=True,
-                commit_ts_iso=commit_metadata[pos][1],
-            )
-        # Then claim the remaining from high
-        while True:
-            result = mcp_server._reverse_fill_claim_and_process(
-                real_db, str(repo), linearization, commit_metadata, allocator,
-            )
-            if result is None:
-                break
+            # Reload allocator to reflect the low claim
+            allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+            # Then claim from high until gap is closed
+            while not allocator.is_gap_empty():
+                result = mcp_server._reverse_fill_claim_and_process(
+                    real_db, str(repo), linearization, commit_metadata, allocator,
+                )
+                if result is None:
+                    break
         return allocator
 
     def test_no_op_when_frontier_high_unclaimed(self, real_db, tmp_path):
