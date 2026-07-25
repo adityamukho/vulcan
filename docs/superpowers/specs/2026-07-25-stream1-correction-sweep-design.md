@@ -419,7 +419,8 @@ two at once:
    guess. The entity remains provisional and available for whatever the
    deferred reconciliation (or, for the duplicate-fact case, 2d's own fix)
    turns out to be. `skipped_events += 1`, and (see "Observability" below)
-   log the ident if this call's log budget isn't yet spent.
+   log the ident if `skipped_so_far + skipped_events` is still under
+   `_CORRECTION_SWEEP_LOG_CAP`.
 
 3. **Already authoritative** (`not _lineage_is_provisional(db, ident)`;
    confirmed at an earlier position in this same sweep, or — after this
@@ -446,7 +447,7 @@ two at once:
      rather than merely assert**, below.
    - **Zero or two-or-more distinct values**: the same duplicate-fact risk
      as case 2 — skip, left alone rather than guessed at (`skipped_events
-     += 1`, same logging budget). This sweep only actively reconciles
+     += 1`, same log-cap test). This sweep only actively reconciles
      `:modified-in` when it has an unambiguous single introduction commit
      to compare `C` against.
 
@@ -521,6 +522,8 @@ progress, independent of contiguity from `C0`:
 
 ```python
 _CORRECTION_SWEEP_THROUGH_IDENT = ":ingestion/correction-sweep-through"
+# Max per-ident skip lines on stderr per run; see "Observability".
+_CORRECTION_SWEEP_LOG_CAP = 10
 
 def _correction_sweep_through_query(db: Any) -> Optional[str]:
     """Return the hash of the last commit this sweep has itself confirmed/
@@ -739,6 +742,7 @@ def _correction_sweep_apply(
     commit_ts_iso: str,
     file_results: List[tuple],
     index_con: Optional[Any] = None,
+    skipped_so_far: int = 0,
 ) -> int:
     """DB-bound, parse-free (see "Per-commit algorithm" for the body).
     Reconciles every candidate entity file_results describes for commit_hash
@@ -746,9 +750,22 @@ def _correction_sweep_apply(
     _correction_sweep_through_update and checkpoints. Returns
     skipped_events -- how many candidate idents landed in case 2 or case
     3's ambiguous-value skip, i.e. stayed provisional or unreconciled
-    despite this call visiting their commit; see "Observability" below for
-    the logging that accompanies each one. Never calls
-    _frontier_persist_claim -- frontier-low is not touched by this sweep."""
+    despite this call visiting their commit.
+
+    skipped_so_far is the driving loop's running total of skipped_events
+    from every PREVIOUS call this run, and exists solely to make the stderr
+    log cap work across calls without this function holding any state of its
+    own: it logs a skipped ident only while
+    `skipped_so_far + skipped_events < _CORRECTION_SWEEP_LOG_CAP` (see
+    "Observability"). Deriving the budget from a caller-supplied running
+    total, rather than a module-level counter, is what makes the cap reset
+    per run automatically -- this server is long-lived and runs many
+    ingests, and a module counter would burn its budget on the first one and
+    log nothing ever after. The RETURNED count is never capped; only what
+    reaches stderr is.
+
+    Never calls _frontier_persist_claim -- frontier-low is not touched by
+    this sweep."""
 
 def _correction_sweep_claim_and_process(
     db: Any,
@@ -758,11 +775,13 @@ def _correction_sweep_claim_and_process(
     ignore_patterns: Sequence[str] = (),
     index_con: Optional[Any] = None,
     hash_to_pos: Optional[Dict[str, int]] = None,
+    skipped_so_far: int = 0,
 ) -> Optional[Tuple[str, int]]:
     """Synchronous convenience wrapper composing the three calls below in
     order -- for tests and any caller that doesn't need them on separate
     executors. **2d must not call this directly**; see "Execution context"
-    for why and what to call instead."""
+    for why and what to call instead. skipped_so_far is forwarded to
+    _correction_sweep_apply unchanged (see its docstring)."""
     selected = _correction_sweep_select_position(db, linearization, commit_metadata, hash_to_pos)
     if selected is None:
         return None
@@ -771,7 +790,8 @@ def _correction_sweep_claim_and_process(
         repo_path, commit_hash, ignore_patterns
     )
     skipped_events = _correction_sweep_apply(
-        db, commit_hash, commit_ts_iso, file_results, index_con=index_con
+        db, commit_hash, commit_ts_iso, file_results,
+        index_con=index_con, skipped_so_far=skipped_so_far,
     )
     return commit_hash, skipped_events
 
@@ -784,20 +804,32 @@ def _correction_sweep_walk(
     index_con: Optional[Any] = None,
 ) -> Tuple[int, int]:
     """Build hash_to_pos once and repeatedly call
-    _correction_sweep_claim_and_process (passing it down) until that
-    returns None. Returns (commits_processed, skipped_events) -- summed
-    across every call, both 0 both when the gap-closed precondition isn't
-    met yet (the common case early in a run; callers should not read
-    (0, 0) as "nothing to do, ever") and when the sweep has already fully
-    caught up to frontier-high's :hi-hash. `skipped_events` counts skip
-    *events*, not distinct entities -- see "Observability" for the
-    distinction and why a caller wanting a true census should query the
-    graph instead. Also a synchronous convenience wrapper, same caveat as
+    _correction_sweep_claim_and_process (passing it down, along with the
+    running skipped-events total as skipped_so_far) until that returns
+    None, then call _correction_sweep_log_summary with the final total.
+    Returns (commits_processed, skipped_events) -- summed across every
+    call, both 0 both when the gap-closed precondition isn't met yet (the
+    common case early in a run; callers should not read (0, 0) as "nothing
+    to do, ever") and when the sweep has already fully caught up to
+    frontier-high's :hi-hash. `skipped_events` counts skip *events*, not
+    distinct entities -- see "Observability" for the distinction and why a
+    caller wanting a true census should query the graph instead. Also a
+    synchronous convenience wrapper, same caveat as
     `_correction_sweep_claim_and_process`: 2d should drive the three-step
-    pipeline directly in its own loop, not call this. Run only after both
-    the reverse stream and ordinary claim_low()-driven introduction have
-    permanently finished for the run (see "Why confirming requires the gap
-    to already be closed")."""
+    pipeline directly in its own loop, not call this -- but 2d's loop owes
+    the same two things this one does, threading skipped_so_far through
+    every _correction_sweep_apply call and calling
+    _correction_sweep_log_summary when its own loop ends. Run only after
+    both the reverse stream and ordinary claim_low()-driven introduction
+    have permanently finished for the run (see "Why confirming requires the
+    gap to already be closed")."""
+
+def _correction_sweep_log_summary(skipped_events: int) -> None:
+    """Emit the one-line end-of-sweep summary to stderr if skipped_events is
+    nonzero; no-op otherwise. A named function rather than an inline print
+    in each loop precisely because there are two loops that must say the
+    same thing -- _correction_sweep_walk and 2d's own -- and an operator
+    grepping for this line should not have to know which drove the sweep."""
 ```
 
 Unlike `_reverse_fill_claim_and_process`'s plain `Optional[str]`, this
@@ -847,9 +879,22 @@ commit_hash, commit_ts_iso = selected
 file_results, _, _, _ = await loop.run_in_executor(
     extraction_pool, _extract_commit, repo_path, commit_hash, ignore_patterns,
 )
-skipped_events = await loop.run_in_executor(
-    write_executor, _correction_sweep_apply, db, commit_hash, commit_ts_iso, file_results,
+skipped_events += await loop.run_in_executor(
+    # NOTE the positional index_con and skipped_so_far: run_in_executor takes
+    # *args only, no keyword arguments, so anything defaulted must be passed
+    # positionally (or bound with functools.partial). Dropping index_con here
+    # is silent and nasty -- the graph writes still land, but the persisted
+    # fact index never sees them, so retracted :modified-in rows stay live in
+    # the index and reconciled entities keep stale rows while the graph itself
+    # is correct.
+    write_executor, _correction_sweep_apply,
+    db, commit_hash, commit_ts_iso, file_results, index_con, skipped_events,
 )
+# ... and once the loop ends, exactly as _correction_sweep_walk does. Called
+# inline, not through an executor: it only writes stderr, touching neither the
+# DB nor a parser -- same as _run_ingestion's own inline skip prints
+# (mcp_server.py:7612-7616).
+_correction_sweep_log_summary(skipped_events)
 ```
 
 — never `_correction_sweep_claim_and_process` or `_correction_sweep_walk`
@@ -868,6 +913,30 @@ between each of the three calls, interleaving other event-loop work,
 instead of blocking for a whole pass — which matters more here than
 anywhere else in the design, since per the terminal-pass consequence
 above, this sweep is the single longest-running phase in the whole ingest.
+
+**2d may pipeline extraction ahead; the apparent serial dependency is only
+apparent.** Read literally, the loop above never overlaps parsing with
+writing — commit `N+1`'s `_correction_sweep_select_position` reads the
+watermark commit `N`'s `_correction_sweep_apply` writes, so the extraction
+pool sits idle during every write and `write_executor` during every parse.
+That would give up exactly the overlap `_run_ingestion` already buys itself
+with its bounded sliding window of look-ahead extractions
+(mcp_server.py:7443-7445), on the longest phase of the run. It isn't
+necessary: once the gap-closed precondition holds, `[pos, ceiling_pos]` is
+fixed for the rest of the run (see "Once `pos` is known…" above), so
+successive positions are just successive integers. 2d is free to call
+`_correction_sweep_select_position` **once**, derive the remaining
+positions locally from `linearization`/`commit_metadata`, and keep a
+sliding window of `_extract_commit` futures in flight — subject to one
+hard constraint: **`_correction_sweep_apply` calls must still happen
+strictly in ascending position order**, since each one advances
+`:ingestion/correction-sweep-through` to its own commit and the watermark's
+crash-resume meaning ("everything up to and including this is swept")
+depends on that ordering. Out-of-order application would let a crash leave
+a watermark above commits that were never applied. The synchronous
+wrappers deliberately don't pipeline — they exist for tests, where the
+overlap buys nothing and the strict select→extract→apply sequence is easier
+to reason about.
 
 `_reverse_fill_claim_and_process` has the identical parse-and-write
 conflation in one function body (`mcp_server.py:7317-7411`) — this spec
@@ -888,13 +957,34 @@ walk duplicate `:introduced-by`) are systematic once they occur: either can
 make most or all idents skip at *every* commit for the rest of the range.
 Unconditional per-skip logging in that state is millions of lines onto the
 MCP server's own stderr on a large repository. `_correction_sweep_apply`
-therefore logs at most the first 10 skipped idents it encounters across the
-whole run (a simple counter compared against a constant, not a per-call
-budget — 2d's loop calls this function many times), then a single summary
-line once `_correction_sweep_walk` finishes if `skipped_events > 0`. The
-returned count itself stays exact regardless of the logging cap — capping
-only affects what reaches stderr, never what `_correction_sweep_walk`
-returns.
+therefore logs at most `_CORRECTION_SWEEP_LOG_CAP` (10) skipped idents
+across the whole run, then the driving loop emits one summary line at the
+end. The returned count itself stays exact regardless of the logging cap —
+capping only affects what reaches stderr, never what any of these functions
+return.
+
+**The cap is caller-threaded state, not a module-level counter.** The cap
+spans calls (`_correction_sweep_apply` runs once per commit), but that
+function is otherwise stateless, and the obvious shortcut — a module global
+— has a specific failure mode: this server is long-lived and
+`handle_minigraf_ingest_git` starts a fresh run per invocation, so an
+unreset global would spend its 10 lines on the first ingest of the process
+and log nothing for every ingest after, which is precisely the
+"looks clean, isn't" outcome this whole section exists to prevent. So the
+budget is derived from the driving loop's own running total instead:
+`_correction_sweep_apply` takes `skipped_so_far` and logs only while
+`skipped_so_far + skipped_events < _CORRECTION_SWEEP_LOG_CAP`. It resets
+per run for free, because each loop starts its total at `0`, and the
+function stays pure enough to test by calling it directly with a chosen
+`skipped_so_far`.
+
+**Both driving loops owe the summary line, not just `_correction_sweep_walk`.**
+An earlier draft attached it to `_correction_sweep_walk` alone — which 2d is
+told not to call (see "Execution context"), so the one operator-facing
+output would have existed only on the test-only path. `_correction_sweep_log_summary(skipped_events)`
+is therefore its own small function that both `_correction_sweep_walk` and
+2d's loop call when their loop ends, so the message is identical whichever
+drove the sweep.
 
 **`skipped_events` counts skip events, not distinct unreconciled
 entities, and only within one pass.** Two gaps between the name and a
@@ -1119,12 +1209,33 @@ high side, until `allocator.is_gap_empty()`.
   returned `skipped_events` count still reflects the true (uncapped) total
   — the test that would fail against a naive implementation that either
   logs unconditionally or caps the returned count along with the logging.
+- **The log cap resets per run, and is not a module-level counter**: run
+  the capped-logging scenario above to exhaustion (spending the whole
+  budget), then run a *second* full sweep in the same process against a
+  fresh graph and fixture; assert the second run logs its own per-ident
+  lines rather than none — the direct regression test for the module-global
+  implementation, which would pass the test above and still go silent for
+  every ingest after the first. Equivalently, at the unit level: call
+  `_correction_sweep_apply` directly with `skipped_so_far=0` and again with
+  `skipped_so_far=_CORRECTION_SWEEP_LOG_CAP`, and assert only the first
+  logs.
+- **`_correction_sweep_log_summary` is emitted by a caller-driven loop, not
+  buried in the walk**: assert `_correction_sweep_walk` calls it, and that
+  calling it directly with a nonzero count emits exactly one line and with
+  `0` emits nothing — pinning that 2d, which must not call
+  `_correction_sweep_walk`, has the same one-call obligation available to
+  it and produces a byte-identical message.
 - **`_correction_sweep_select_position` and `_correction_sweep_apply` are
-  independently callable and compose correctly**: call
-  `_correction_sweep_select_position` directly against a closed-gap graph,
-  feed its result's `commit_hash` into a real `_extract_commit` call, feed
-  that into `_correction_sweep_apply` directly, and assert the resulting
-  graph state is identical to what `_correction_sweep_claim_and_process`
-  produces for the same starting state — the test that pins the wrapper is
-  a faithful composition of the three independently-schedulable pieces,
-  not a distinct code path that could drift from them.
+  independently callable and compose correctly**: build **two independent
+  graphs from the same repo fixture** (the sweep mutates the state a second
+  run would start from, so this cannot be two passes over one graph — and a
+  second pass over an already-swept graph would be testing idempotency,
+  which is a different property). Against the first, call
+  `_correction_sweep_claim_and_process`. Against the second, call
+  `_correction_sweep_select_position` directly, feed its returned
+  `commit_hash` into a real `_extract_commit` call, and feed that into
+  `_correction_sweep_apply` directly. Assert the two resulting graph states
+  are identical — the test that pins the wrapper as a faithful composition
+  of the three independently-schedulable pieces, not a distinct code path
+  that could drift from them once 2d starts calling the pieces and only
+  tests call the wrapper.
