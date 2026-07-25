@@ -65,6 +65,23 @@ ingest duration, not a small tail. This isn't a defect in this sweep's own
 logic; it's a real scheduling consequence 2d has to plan around, stated
 here so it isn't discovered only once 2d is being designed.
 
+**Cost:** this sweep calls `_extract_commit` (a `git diff-tree`, a `git
+show` per changed file, and a tree-sitter parse of both sides of each) for
+*every* commit in frontier-high's converged range — duplicating work 2b
+already did over the same commits. For a large converged range that is
+close to a second full extraction pass over the repository, stacked on top
+of the terminal-pass consequence above. This is a deliberate simplicity
+choice, not an oversight: the sweep's classification only strictly needs
+`unchanged_idents` from the parse (which entities `C` touches, and which
+idents to act on, could instead be enumerated from the graph itself — any
+`ident` satisfying `[ident :introduced-by C]` or `[ident :modified-in C]`
+covers everything case 1 and case 3 act on) but `unchanged_idents` is what
+makes the reconcile step in case 3 possible at all, so the parse cannot be
+eliminated outright. A future optimization could enumerate from the graph
+and call `_extract_commit` only when at least one enumerated ident has a
+live `:modified-in` the reconcile step might need to revisit — not adopted
+here, in favor of reusing the same discovery path 2b already established.
+
 ## Scope (2c only)
 
 In scope:
@@ -281,7 +298,24 @@ would therefore be dead code: for a *known* entity it emits nothing but
 `:modified-in` (mcp_server.py:6505-6562), which this sweep would then have
 to filter back out anyway, exactly as 2b does for `:introduced-by`. So this
 sweep skips straight to per-ident classification, using `precomputed`
-directly:
+directly.
+
+**Caveat inherited from 2b, not introduced here:** "already structurally
+complete" assumes 2b's own structural writes are complete and correctly
+timestamped, which a separate review of 2b's own spec found is not
+uniformly true today (2b's `:contains` edges collapse into one batched
+`_transact` rather than the several forward walk deliberately issues, and
+its structural facts keep their first-sighting `valid_from` — later than
+whatever `:introduced-by` a subsequent guess-move settles on, so a query
+`:as-of` the true introduction can return lineage with no structure yet).
+Those are 2b's fixes to make (tracked as "2b1"), not this sweep's — but
+this sweep's case 1 promotes an entity to authoritative based on
+`:introduced-by` alone, so until 2b1 lands, confirming here can promote an
+entity whose structural facts are still incomplete or mistimed. Similarly,
+2b's retroactive `:modified-in` writes can carry a back-dated `valid_from`
+looked up via `ts_by_commit_ident.get(..., commit_ts_iso)`
+(mcp_server.py:7396-7407) that this sweep's case 3 reconciliation — a
+current-time read, not a temporal one — cannot detect or correct.
 
 ```python
 file_results, _gitlink_changes, _gitmodules_map, _renamed_pairs = _extract_commit(
@@ -315,14 +349,21 @@ not a documented guarantee anywhere. So this sweep queries the full set:
 
 ```python
 raw = _db_execute(db, f"(query [:find ?c :where [{ident} :introduced-by ?c]])")
-introduced_by_values = [row[0] for row in json.loads(raw).get("results", [])]
+introduced_by_values = {row[0] for row in json.loads(raw).get("results", [])}
 ```
 
-and every guard below tests `introduced_by_values == [commit_ident]` —
-*exactly one* value, equal to `commit_ident` — never membership
-(`commit_ident in introduced_by_values`) and never the first-row shortcut.
-Zero values or two both fail the equality and fall through to whichever
-branch's `else` is the safe one, below.
+and every guard below tests `introduced_by_values == {commit_ident}` —
+*exactly one distinct* value, equal to `commit_ident` — never membership
+(`commit_ident in introduced_by_values`), never the first-row shortcut, and
+never exact-list equality. The set (not list) comparison matters on its
+own: two live rows with the *same* value (a duplicate that survives
+despite the valid_from-equality idempotency property — e.g. two writes at
+genuinely different `valid_from` that happen to carry an identical value)
+would fail a list-length check but is exactly the single-value case for
+this sweep's purposes; comparing distinct values treats it correctly
+instead of stranding a correctly-guessed entity as provisional forever.
+Zero distinct values or two both fail the equality and fall through to
+whichever branch's `else` is the safe one, below.
 
 Each candidate ident then falls into one of three cases. Every write below
 uses `C`'s own `commit_ts_iso` (the same timestamp 2b itself used when it
@@ -333,8 +374,14 @@ identical `(entity, attribute, value, valid_from)` tuple is a no-op; only a
 *differing* `valid_from` produces a second live datom) rather than a
 duplicate.
 
+This sweep classifies every candidate `ident` by two independent facts:
+whether it's provisional, and how many *distinct* `:introduced-by` values it
+has and what they are. The three cases below are defined so that exactly
+one always applies — no ident falls through all three, and none can match
+two at once:
+
 1. **Provisional, guess matches this commit** (`_lineage_is_provisional(db,
-   ident)` and `introduced_by_values == [commit_ident]`) — per "Why
+   ident)` and `introduced_by_values == {commit_ident}`) — per "Why
    confirming requires the gap to already be closed" above, this is the
    *only* state a provisional entity can be in in this sweep's range once
    the sweep reaches it: Stream 2's guess is guaranteed to already equal
@@ -346,11 +393,11 @@ duplicate.
    No `:modified-in`.
 
 2. **Provisional, anything else** (`_lineage_is_provisional(db, ident)` and
-   `introduced_by_values != [commit_ident]` — zero values, `commit_ident`
-   plus at least one other, or a single different value) — the "guess
-   points elsewhere" state per "Why confirming requires the gap to already
-   be closed" above, and now also the duplicate-fact state above: a
-   correct caller (gap-closed precondition, and no stray second
+   `introduced_by_values != {commit_ident}` — zero distinct values,
+   `commit_ident` plus at least one other, or a single different value) —
+   the "guess points elsewhere" state per "Why confirming requires the gap
+   to already be closed" above, and now also the duplicate-fact state
+   above: a correct caller (gap-closed precondition, and no stray second
    `:introduced-by` from an uncoordinated forward walk) means this
    shouldn't arise for a commit inside this sweep's range, but neither
    condition is something this per-ident classification can verify itself.
@@ -363,31 +410,44 @@ duplicate.
 
 3. **Already authoritative** (`not _lineage_is_provisional(db, ident)`;
    confirmed at an earlier position in this same sweep, or — after this
-   sweep has fully caught up once — simply revisited on a later run) —
-   first, the self-introduction guard: if `introduced_by_values ==
-   [commit_ident]`, `C` *is* this entity's own introduction commit, so skip
-   entirely (no `:modified-in` write or retraction, no candidate-diff
-   touch). This matters for resume-safety: if the process dies after case
-   1's `_lineage_confirm` but before `_correction_sweep_through_update`
-   persists, a re-run revisits `C` and would otherwise find the
-   now-authoritative entity at its own introduction commit and wrongly
-   touch a self-`:modified-in` — a fact class ordinary forward walk never
-   produces (`_build_code_triples` only emits `:modified-in` on its
-   already-known branch, never at introduction). If `introduced_by_values`
-   is anything else (including zero or 2+ values — the same duplicate-fact
-   risk as case 2, left alone here too rather than guessed at), also skip:
-   this sweep only actively reconciles `:modified-in` when it has an
-   unambiguous single introduction commit to compare `C` against.
+   sweep has fully caught up once — simply revisited on a later run),
+   split on `introduced_by_values` into two **non-overlapping**
+   sub-branches (an earlier draft stated these as "self-intro" vs. "anything
+   else, skip", which left no room for the reconcile step to ever run —
+   they must instead partition on the *count* of distinct values, with the
+   value-comparison only deciding *which* of the single-value outcomes
+   applies):
 
-   Otherwise, **reconcile rather than merely assert** — this is where this
-   sweep corrects 2b's documented over-assertion (see Scope), not just
-   re-confirms what's already there:
+   - **Exactly one distinct value**: if it equals `commit_ident`, `C` *is*
+     this entity's own introduction commit — skip entirely (no
+     `:modified-in` write or retraction, no candidate-diff touch). This
+     matters for resume-safety: if the process dies after case 1's
+     `_lineage_confirm` but before `_correction_sweep_through_update`
+     persists, a re-run revisits `C` and would otherwise find the
+     now-authoritative entity at its own introduction commit and wrongly
+     touch a self-`:modified-in` — a fact class ordinary forward walk
+     never produces (`_build_code_triples` only emits `:modified-in` on
+     its already-known branch, never at introduction). If the one distinct
+     value is anything *other* than `commit_ident`, `C` is an ordinary
+     later touch of an unambiguously-introduced entity — **reconcile
+     rather than merely assert**, below.
+   - **Zero or two-or-more distinct values**: the same duplicate-fact risk
+     as case 2 — skip, left alone rather than guessed at. This sweep only
+     actively reconciles `:modified-in` when it has an unambiguous single
+     introduction commit to compare `C` against.
+
+   The reconcile step is where this sweep corrects 2b's documented
+   over-assertion (see Scope), not just re-confirms what's already there —
+   which requires actually checking whether `commit_ident` is among
+   `ident`'s live `:modified-in` values, not a query with an unbound `:find`
+   variable (a bare `[:find ?c :where [ident :modified-in commit_ident]]`
+   never binds `?c` to anything and always returns empty, regardless of
+   whether the fact exists):
 
    ```python
-   raw = _db_execute(
-       db, f"(query [:find ?c :where [{ident} :modified-in {commit_ident}]])"
-   )
-   already_has_modified_in = bool(json.loads(raw).get("results", []))
+   raw = _db_execute(db, f"(query [:find ?c :where [{ident} :modified-in ?c]])")
+   modified_in_values = {row[0] for row in json.loads(raw).get("results", [])}
+   already_has_modified_in = commit_ident in modified_in_values
    if ident in unchanged_idents:
        if already_has_modified_in:
            _retract(db, f"[[{ident} :modified-in {commit_ident}]]", index_con=index_con)
@@ -526,6 +586,24 @@ so this is latent incompleteness, not live corruption. Whoever fixes the
 growth handling should also make this sweep restart from `:lo-hash`
 whenever its position is below `correction-sweep-through`'s.
 
+**`ignore_patterns` must match what 2b used for the same region.** Every
+"2b already wrote a fact for every ident this sweep will find" invariant in
+"Per-commit algorithm" assumes both streams' `_extract_commit(repo_path,
+commit_hash, ignore_patterns)` calls see the same file set.
+`ignore_patterns` comes from `_load_ignore_patterns(repo_path)`, read from
+the working tree once per run (mcp_server.py:7487) — not persisted, and not
+tied to the commit being processed. Within one run this is automatically
+consistent (both streams' calls in that run use the same value); *across*
+runs it is not, if the ignore file changes between the run where 2b claimed
+a region and a later run where this sweep walks it. Newly-ignored files'
+entities are then silently never visited by this sweep (their provisional
+facts and candidate-diff records live forever, uncleared, though nothing is
+corrupted); newly-unignored files yield idents with zero `:introduced-by`
+values, landing harmlessly in case 2's or case 3's skip. Neither corrupts
+data, but both are exactly the kind of silent incompleteness this sweep
+otherwise exists to eliminate — the caller (2d) must pass the same
+`ignore_patterns` the reverse stream used for the region being swept.
+
 `ceiling_pos` reads frontier-high's *persisted* `:hi-hash`
 (`high_bounds[1]`) rather than `len(linearization) - 1`. Those are **not**
 interchangeable across separate runs: within a single run, `claim_high()`'s
@@ -599,17 +677,24 @@ def _correction_sweep_claim_and_process(
     ignore_patterns: Sequence[str] = (),
     index_con: Optional[Any] = None,
     hash_to_pos: Optional[Dict[str, int]] = None,
-) -> Optional[str]:
+) -> Optional[Tuple[str, int]]:
     """Advance the correction sweep by exactly one commit, upward through
     frontier-high's own claimed territory, and reconcile that commit's
-    entities per the three-case algorithm above. Returns the processed
-    commit's hash, or None if there is nothing safe to correct yet: the gap
-    is still open (Stream 2 could still descend past a position this call
-    would confirm -- see "Why confirming requires the gap to already be
-    closed"), frontier-high hasn't claimed anything yet, a required
-    boundary hash is stale, commit_metadata doesn't match linearization, or
-    the sweep has already reached frontier-high's own :hi-hash. No
-    `allocator` parameter -- this reads frontier-low and frontier-high's
+    entities per the three-case algorithm above. Returns (commit_hash,
+    skipped_count) -- skipped_count is how many candidate idents at this
+    commit landed in case 2 or case 3's ambiguous-value skip, i.e. stayed
+    provisional or unreconciled despite the sweep visiting their commit --
+    or None if there is nothing safe to correct yet: the gap is still open
+    (Stream 2 could still descend past a position this call would confirm
+    -- see "Why confirming requires the gap to already be closed"),
+    frontier-high hasn't claimed anything yet, a required boundary hash is
+    stale, commit_metadata doesn't match linearization, or the sweep has
+    already reached frontier-high's own :hi-hash. Every skip also logs the
+    ident to stderr (`[_correction_sweep] left {ident} provisional/
+    unreconciled at {commit_hash}: ...`), matching `_run_ingestion`'s own
+    stderr-on-skip idiom for unreadable commits -- a run in which every
+    entity failed safe must not look identical to a fully successful one.
+    No `allocator` parameter -- this reads frontier-low and frontier-high's
     persisted bounds directly via _frontier_read_bounds and tracks its own
     progress via _correction_sweep_through_query/_update, not the
     allocator's claim_low(); see "Why not claim_low()" above. Never calls
@@ -627,18 +712,63 @@ def _correction_sweep_walk(
     commit_metadata: List[Tuple[str, str, str, str]],
     ignore_patterns: Sequence[str] = (),
     index_con: Optional[Any] = None,
-) -> int:
+) -> Tuple[int, int]:
     """Build hash_to_pos once and repeatedly call
     _correction_sweep_claim_and_process (passing it down) until that
-    returns None. Returns the count of commits processed -- 0 both when the
-    gap-closed precondition isn't met yet (the common case early in a run;
-    callers should not read 0 as "nothing to do, ever") and when the sweep
-    has already fully caught up to frontier-high's :hi-hash. No caller in
-    this sub-phase -- 2d wires this into the real concurrent ingestion
-    loop, run only after both the reverse stream and ordinary
+    returns None. Returns (commits_processed, entities_left_unreconciled) --
+    both 0 both when the gap-closed precondition isn't met yet (the common
+    case early in a run; callers should not read (0, 0) as "nothing to do,
+    ever") and when the sweep has already fully caught up to frontier-
+    high's :hi-hash. A nonzero entities_left_unreconciled with a nonzero
+    commits_processed is the signal 2d should surface prominently (e.g.
+    through handle_minigraf_ingest_status, mirroring how
+    handle_minigraf_audit returns violation lists rather than only a
+    boolean) -- this sweep's entire product is "these lineage facts are now
+    trustworthy", and silently leaving some provisional is a materially
+    different outcome from a clean run even though both return successfully.
+    No caller in this sub-phase -- 2d wires this into the real concurrent
+    ingestion loop, run only after both the reverse stream and ordinary
     claim_low()-driven introduction have permanently finished for the run
     (see "Why confirming requires the gap to already be closed")."""
 ```
+
+### Execution context
+
+Neither function above may run on the event-loop thread. `_run_ingestion`'s
+whole architecture exists to keep exactly this off it: `_extract_commit`
+(a `git diff-tree`, a `git show` per changed file, and a tree-sitter parse
+of both sides of each) runs on the `ProcessPoolExecutor` because
+tree-sitter's GIL-holding C parse was measured to starve the event loop
+(#116), and every `db.execute()`/`checkpoint()` goes through the
+single-worker `write_executor` so an fsync never blocks concurrent
+`call_tool()` requests (mcp_server.py:7440-7466). This sweep's per-commit
+step does both a full `_extract_commit` call and its own
+`_db_execute`/`_transact`/`_retract`/`_db_checkpoint` calls synchronously
+in one function body, exactly the shape that architecture exists to keep
+off the event loop — and, per the terminal-pass consequence above, this
+sweep is the single longest-running phase in the whole ingest, so running
+it inline would be the worst place in the design to get this wrong: no MCP
+request would be served for the duration of a full pass.
+
+This spec does not wire the actual `await`/executor calls — that remains
+2d's job, same as the rest of the concurrency wiring — but it does fix the
+function *shape* 2d has to schedule, since that's what determines whether
+2d even *can* schedule it sanely: `_correction_sweep_claim_and_process`
+processes exactly one commit and returns, which is the right granularity
+for cooperative scheduling (2d can `await` between calls, interleaving
+other event-loop work). What 2d must not do is call
+`_correction_sweep_walk` directly from a coroutine with no `await` inside
+its loop (blocks for the entire pass) or route it through
+`run_in_executor(write_executor, _correction_sweep_walk, ...)` as a single
+call (serializes every one of this sweep's parses behind the same thread
+`_run_ingestion` reserves for writes, which is exactly the contention
+`write_executor`'s single-worker design exists to avoid). The natural
+shape, mirroring `_run_ingestion`'s own loop, is 2d awaiting
+`run_in_executor` calls to *each* piece (extraction on the process pool,
+DB operations on `write_executor`) once per commit, with
+`_correction_sweep_claim_and_process` itself staying a plain synchronous
+function ignorant of asyncio, the same role `_extract_commit` and the
+per-commit DB helpers already play for forward walk.
 
 ### Schema/audit safety, idempotency
 
@@ -804,16 +934,28 @@ high side, until `allocator.is_gap_empty()`.
   afterward, while `_correction_sweep_through_query` has advanced — the
   direct regression test for the bugs both "Why not `claim_low()`" and "Why
   a dedicated watermark" describe.
-- **Full integration**: build a repo with a non-trivial number of commits;
+- **Full integration**: build a repo with a non-trivial number of commits
+  and a fixture constructed so no entity ever lands in case 2 (no
+  hand-injected ambiguous/duplicate `:introduced-by` state — the fixture
+  this design's other tests use for that scenario is deliberately excluded
+  here, since case 2 leaving its candidate-diff record untouched is
+  by-design behavior, not a bug this test should be asserting against);
   close the gap at some meeting point (claim some positions via
   `claim_low()`/`_frontier_persist_claim` from the low side, the rest via
   `_reverse_fill_claim_and_process` from the high side, until
   `allocator.is_gap_empty()`); then run `_correction_sweep_walk` to
-  exhaustion; assert every entity touched within frontier-high's claimed
-  range ends up authoritative (`_lineage_is_provisional` is `False` for all
-  of them), no `:type/candidate-diff` entities remain live, and
+  exhaustion; assert its returned `entities_left_unreconciled` count is `0`,
+  every entity touched within frontier-high's claimed range ends up
+  authoritative (`_lineage_is_provisional` is `False` for all of them), no
+  `:type/candidate-diff` entities remain live, and
   `_correction_sweep_through_query` now equals frontier-high's `:hi-hash` —
   proving the sweep correctly walks all the way through frontier-high's
   claimed territory to its actual persisted ceiling, not the single
   position or the unbounded `len(linearization)` an earlier draft's
   (wrong) bounds would have produced.
+- **`entities_left_unreconciled` counts case-2 skips**: reuse the
+  duplicate-`:introduced-by` fixture from the case-2 multi-value test
+  above; run `_correction_sweep_claim_and_process` over that commit; assert
+  the returned count reflects the skipped entity and that a stderr message
+  naming its ident was emitted — the direct test for the observability fix
+  (a run that skipped everything must not look identical to a clean run).
