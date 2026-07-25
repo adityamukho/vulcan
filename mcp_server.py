@@ -7964,6 +7964,49 @@ def _correction_sweep_claim_and_process(
     return commit_hash, skipped_events
 
 
+def _correction_sweep_walk(
+    db: Any,
+    repo_path: str,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+    ignore_patterns: Sequence[str] = (),
+    index_con: Optional[Any] = None,
+) -> Tuple[int, int]:
+    """Build hash_to_pos once and repeatedly call
+    _correction_sweep_claim_and_process (passing it down, along with the
+    running skipped-events total as skipped_so_far) until that returns
+    None, then call _correction_sweep_log_summary with the final total.
+
+    Returns (commits_processed, skipped_events) -- summed across every
+    call, both 0 both when the gap-closed precondition isn't met yet (the
+    common case early in a run) and when the sweep has already fully
+    caught up to frontier-high's :hi-hash.
+
+    Also a synchronous convenience wrapper, same caveat as
+    _correction_sweep_claim_and_process: 2d should drive the three-step
+    pipeline directly in its own loop, not call this -- but 2d's loop owes
+    the same two things this one does: threading skipped_so_far through
+    every _correction_sweep_apply call, and calling
+    _correction_sweep_log_summary when its own loop ends.
+    """
+    hash_to_pos = {h: i for i, h in enumerate(linearization)}
+    commits_processed = 0
+    skipped_events = 0
+    while True:
+        result = _correction_sweep_claim_and_process(
+            db, repo_path, linearization, commit_metadata,
+            ignore_patterns=ignore_patterns, index_con=index_con,
+            hash_to_pos=hash_to_pos, skipped_so_far=skipped_events,
+        )
+        if result is None:
+            break
+        _commit_hash, call_skipped = result
+        commits_processed += 1
+        skipped_events += call_skipped
+    _correction_sweep_log_summary(skipped_events)
+    return commits_processed, skipped_events
+
+
 async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure.
 

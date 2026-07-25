@@ -15322,3 +15322,121 @@ class TestCorrectionSweepClaimAndProcess:
         results_a = sorted(json.loads(db_a.execute(query))["results"])
         results_b = sorted(json.loads(db_b.execute(query))["results"])
         assert results_a == results_b
+
+
+class TestCorrectionSweepWalk:
+    def _init_repo(self, repo):
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    def _commit(self, repo, filename, content, msg):
+        (repo / filename).write_text(content)
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", msg], cwd=repo, check=True, capture_output=True)
+
+    def _repo_with_n_commits(self, tmp_path, n):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        for i in range(n):
+            self._commit(repo, f"f{i}.py", f"def f{i}(): pass\n", f"h{i}")
+        return repo
+
+    def _linearization_and_metadata(self, repo):
+        import mcp_server
+        import frontier_registry
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        return linearization, commit_metadata
+
+    def _close_gap_at(self, repo, real_db, linearization, commit_metadata, split_pos):
+        """Close the gap with the low side claiming positions [0, split_pos)
+        and the high side (2b) claiming the rest -- split_pos == len(linearization)
+        closes the whole thing from the low side alone."""
+        import mcp_server
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        for _ in range(split_pos):
+            pos = allocator.claim_low()
+            mcp_server._frontier_persist_claim(
+                real_db, linearization, pos, from_low=True, commit_ts_iso=commit_metadata[pos][1],
+            )
+        while not allocator.is_gap_empty():
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+        return allocator
+
+    def test_walks_to_exhaustion_and_returns_counts(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 4)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=0)
+
+        commits_processed, skipped_events = mcp_server._correction_sweep_walk(
+            real_db, str(repo), linearization, commit_metadata,
+        )
+
+        assert commits_processed == 4
+        assert skipped_events == 0
+        assert mcp_server._correction_sweep_through_query(real_db) == linearization[-1]
+
+    def test_returns_zero_zero_when_gap_still_open(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        assert allocator.is_gap_empty() is False
+
+        result = mcp_server._correction_sweep_walk(real_db, str(repo), linearization, commit_metadata)
+        assert result == (0, 0)
+
+    def test_no_op_when_already_fully_swept(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 2)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=0)
+        mcp_server._correction_sweep_walk(real_db, str(repo), linearization, commit_metadata)
+
+        result = mcp_server._correction_sweep_walk(real_db, str(repo), linearization, commit_metadata)
+        assert result == (0, 0)
+
+    def test_frontier_low_and_lineage_confirmed_through_never_touched(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=1)
+
+        low_before = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_LOW_IDENT)
+        lineage_before = mcp_server._lineage_confirmed_through_query(real_db)
+
+        mcp_server._correction_sweep_walk(real_db, str(repo), linearization, commit_metadata)
+
+        low_after = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_LOW_IDENT)
+        lineage_after = mcp_server._lineage_confirmed_through_query(real_db)
+        assert low_after == low_before
+        assert lineage_after == lineage_before
+        assert mcp_server._correction_sweep_through_query(real_db) is not None
+
+    def test_full_integration(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 5)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=2)
+
+        commits_processed, skipped_events = mcp_server._correction_sweep_walk(
+            real_db, str(repo), linearization, commit_metadata,
+        )
+
+        assert commits_processed == 3  # the 3 positions the high side claimed
+        assert skipped_events == 0
+        for i in range(5):
+            fn_ident = mcp_server._code_ident("function", f"f{i}.py", f"f{i}")
+            assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+        raw = mcp_server._db_execute(real_db, "(query [:find ?e :where [?e :entity-type :type/candidate-diff]])")
+        assert json.loads(raw)["results"] == []
+        bounds = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert mcp_server._correction_sweep_through_query(real_db) == bounds[1]
