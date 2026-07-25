@@ -7742,6 +7742,69 @@ def _correction_sweep_through_update(
     _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
 
 
+def _correction_sweep_select_position(
+    db: Any,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+    hash_to_pos: Optional[Dict[str, int]] = None,
+) -> Optional[Tuple[str, str]]:
+    """Returns (commit_hash, commit_ts_iso) for the next commit this sweep
+    should process, upward through frontier-high's own claimed territory,
+    or None if there is nothing safe to correct yet: the gap is still open
+    (Stream 2 could still descend past a position this call would confirm
+    -- see the design spec's "Why confirming requires the gap to already
+    be closed"), frontier-high hasn't claimed anything yet, a required
+    boundary hash is stale, commit_metadata doesn't match linearization, or
+    the sweep has already reached frontier-high's own :hi-hash.
+
+    DB-bound, parse-free -- must run off the event-loop thread (per the
+    design spec's Execution context) but never on the same executor as
+    _extract_commit, since the two must be independently schedulable.
+
+    hash_to_pos, if omitted, is built fresh from linearization -- callers
+    doing a full sweep should build it once and pass it in instead to
+    avoid rebuilding an N-entry map on every one of a full sweep's N calls.
+    """
+    low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
+    high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
+    if low_bounds is None or high_bounds is None:
+        return None  # migration hasn't run yet, or Stream 2 hasn't claimed anything
+
+    if hash_to_pos is None:
+        hash_to_pos = {h: i for i, h in enumerate(linearization)}
+
+    if low_bounds[1] not in hash_to_pos or high_bounds[0] not in hash_to_pos:
+        return None  # a boundary hash is stale (rewritten history); nothing safe to do
+
+    if hash_to_pos[low_bounds[1]] + 1 != hash_to_pos[high_bounds[0]]:
+        return None  # gap still open -- Stream 2 may still descend past a position
+                     # this sweep would otherwise confirm
+
+    if high_bounds[1] not in hash_to_pos:
+        return None  # frontier-high's :hi-hash is stale; nothing safe to do
+    ceiling_pos = hash_to_pos[high_bounds[1]]
+
+    through_hash = _correction_sweep_through_query(db)
+    if through_hash is not None and through_hash in hash_to_pos:
+        pos = hash_to_pos[through_hash] + 1
+    else:
+        # Unset (first-ever call), or a stale hash from rewritten/rebased
+        # history -- (re)start from frontier-high's current lo-hash,
+        # mirroring _frontier_load's own precedent of dropping a bound
+        # that no longer resolves rather than erroring.
+        pos = hash_to_pos[high_bounds[0]]  # already validated above
+
+    if pos > ceiling_pos:
+        return None  # reached frontier-high's own :hi-hash; nothing left to correct
+
+    if len(commit_metadata) != len(linearization) or commit_metadata[pos][0] != linearization[pos]:
+        return None  # commit_metadata violates its stated contract -- nothing safe to
+                     # do, rather than an IndexError or a wrong-commit read
+
+    commit_hash, commit_ts_iso, _author, _subject = commit_metadata[pos]
+    return commit_hash, commit_ts_iso
+
+
 async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure.
 

@@ -14663,3 +14663,202 @@ class TestCorrectionSweepThroughWatermark:
             db, f"(query [:find ?a ?v :where [{mcp_server._LINEAGE_CONFIRMED_THROUGH_IDENT} ?a ?v]])"
         ))["results"])[":description"]
         assert sweep_desc != lineage_desc
+
+
+class TestCorrectionSweepSelectPosition:
+    def _init_repo(self, repo):
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    def _commit(self, repo, filename, content, msg):
+        (repo / filename).write_text(content)
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", msg], cwd=repo, check=True, capture_output=True)
+
+    def _repo_with_n_commits(self, tmp_path, n):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        for i in range(n):
+            self._commit(repo, f"f{i}.py", f"def f{i}(): pass\n", f"h{i}")
+        return repo
+
+    def _linearization_and_metadata(self, repo):
+        import mcp_server
+        import frontier_registry
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        return linearization, commit_metadata
+
+    def _close_gap(self, repo, real_db, linearization, commit_metadata):
+        """Close the gap entirely: claim everything from the low side via a
+        real FrontierAllocator + _frontier_persist_claim (standing in for
+        2d's future ordinary forward walk), then claim the rest from the
+        high side via 2b's real _reverse_fill_claim_and_process."""
+        import mcp_server
+        import frontier_registry
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        # Manually initialize frontier-high to cover from position 1 to the end
+        # This simulates Stream 2 claiming everything above position 0
+        if len(linearization) > 1:
+            # Initialize frontier-high at the last position
+            mcp_server._frontier_persist_claim(
+                real_db, linearization, len(linearization) - 1, from_low=False,
+                commit_ts_iso=commit_metadata[len(linearization) - 1][1],
+            )
+            # Then expand it down to position 1 by claiming multiple times
+            for pos in range(len(linearization) - 2, 0, -1):
+                mcp_server._frontier_persist_claim(
+                    real_db, linearization, pos, from_low=False,
+                    commit_ts_iso=commit_metadata[pos][1],
+                )
+        # Reload allocator to pick up frontier-high
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        # Claim everything from the low side
+        while True:
+            pos = allocator.claim_low()
+            if pos is None:
+                break
+            mcp_server._frontier_persist_claim(
+                real_db, linearization, pos, from_low=True,
+                commit_ts_iso=commit_metadata[pos][1],
+            )
+        # Then claim the remaining from high
+        while True:
+            result = mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+            if result is None:
+                break
+        return allocator
+
+    def test_no_op_when_frontier_high_unclaimed(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 2)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")  # seeds frontier-low only
+
+        result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+        assert result is None
+
+    def test_no_op_while_gap_remains_open(self, real_db, tmp_path):
+        """Direct regression test for the race the design spec's "Why
+        confirming requires the gap to already be closed" section
+        describes: claim only from the high side, leaving a non-empty gap
+        below, and assert select_position refuses to hand out a position
+        even though frontier-high has real claimed territory."""
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        assert allocator.is_gap_empty() is False  # only claimed the newest position so far
+
+        result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+        assert result is None
+
+    def test_returns_frontier_high_lo_hash_once_gap_closed(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        allocator = self._close_gap(repo, real_db, linearization, commit_metadata)
+        assert allocator.is_gap_empty() is True
+
+        result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+        assert result is not None
+        commit_hash, commit_ts_iso = result
+        bounds = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert commit_hash == bounds[0]  # frontier-high's current lo-hash
+        pos = linearization.index(commit_hash)
+        assert commit_ts_iso == commit_metadata[pos][1]
+
+    def test_resumes_from_correction_sweep_through_not_frontier_high_lo_hash(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap(repo, real_db, linearization, commit_metadata)
+
+        first = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+        assert first is not None
+        first_hash, first_ts = first
+        mcp_server._correction_sweep_through_update(real_db, first_hash, first_ts)
+
+        second = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+        assert second is not None
+        second_hash, _second_ts = second
+        assert second_hash != first_hash
+        assert linearization.index(second_hash) == linearization.index(first_hash) + 1
+
+    def test_no_op_once_reached_frontier_high_hi_hash(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 2)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap(repo, real_db, linearization, commit_metadata)
+
+        # Walk to exhaustion by hand (Task 5 builds the real driving loop --
+        # this test only needs select_position's own termination).
+        while True:
+            result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+            if result is None:
+                break
+            mcp_server._correction_sweep_through_update(real_db, result[0], result[1])
+
+        assert mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata) is None
+
+    def test_respects_persisted_hi_hash_not_len_linearization(self, real_db, tmp_path):
+        """On an incremental re-ingest, linearization grows but frontier-
+        high's persisted :hi-hash does not move with it -- the ceiling must
+        stop at the persisted hash, not walk into brand-new, unclaimed
+        commits."""
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 2)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap(repo, real_db, linearization, commit_metadata)
+        while True:
+            result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+            if result is None:
+                break
+            mcp_server._correction_sweep_through_update(real_db, result[0], result[1])
+
+        # Simulate an incremental re-ingest: more commits land, but neither
+        # stream has claimed them yet.
+        self._commit(repo, "new.py", "def new(): pass\n", "h_new")
+        grown_linearization, grown_commit_metadata = self._linearization_and_metadata(repo)
+        assert len(grown_linearization) == 3
+
+        result = mcp_server._correction_sweep_select_position(
+            real_db, grown_linearization, grown_commit_metadata
+        )
+        assert result is None
+
+    def test_falls_back_to_frontier_high_lo_hash_when_stored_hash_is_stale(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap(repo, real_db, linearization, commit_metadata)
+        mcp_server._correction_sweep_through_update(real_db, "deadbeef_not_in_linearization", "2026-01-01T00:00:00Z")
+
+        result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+        assert result is not None
+        commit_hash, _ts = result
+        bounds = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert commit_hash == bounds[0]
+
+    def test_hash_to_pos_reused_when_passed_in(self, real_db, tmp_path):
+        """hash_to_pos, when supplied, is used as-is rather than rebuilt --
+        pass a deliberately wrong map for an unrelated hash to prove the
+        function trusts the caller's map rather than silently recomputing
+        its own."""
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 2)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap(repo, real_db, linearization, commit_metadata)
+        hash_to_pos = {h: i for i, h in enumerate(linearization)}
+
+        result = mcp_server._correction_sweep_select_position(
+            real_db, linearization, commit_metadata, hash_to_pos=hash_to_pos
+        )
+        assert result is not None
