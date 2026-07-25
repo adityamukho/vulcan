@@ -7893,18 +7893,10 @@ def _correction_sweep_apply(
                                 db, f"[[{ident} :modified-in {commit_ident}]]", commit_ts_iso, index_con=index_con,
                             )
                     _candidate_diff_clear(db, commit_hash, ident, index_con=index_con)
-                elif len(introduced_by_values) == 0:
-                    # Not provisional AND no :introduced-by fact at all --
-                    # neither stream has introduced this entity yet (e.g. a
-                    # symbol that first appears at a commit this sweep
-                    # happens to be visiting before the introducing stream
-                    # has). Nothing to reconcile; silently skip rather than
-                    # treat as an anomaly like the 2+ case below.
-                    continue
                 else:
-                    # 2+ distinct live :introduced-by values -- same
-                    # duplicate-fact risk as case 2 -- skip, left alone
-                    # rather than guessed at.
+                    # Zero or 2+ distinct values -- same duplicate-fact
+                    # risk as case 2 -- skip, left alone rather than
+                    # guessed at.
                     skipped_events += 1
                     if skipped_so_far + skipped_events <= _CORRECTION_SWEEP_LOG_CAP:
                         print(

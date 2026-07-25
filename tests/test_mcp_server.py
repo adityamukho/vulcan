@@ -15035,6 +15035,16 @@ class TestCorrectionSweepApply:
         # already wrote the correct :modified-in for h1's genuine change.
         mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by :commit/{h0_hash[:12]}]]", "2025-01-01T00:00:00Z")
         mcp_server._transact(real_db, f"[[{fn_ident} :modified-in {h1_ident}]]", h1_ts)
+        # auth.py's other h1 candidates (the module, and extra() which is
+        # added at h1) are also already-authoritative in any real system --
+        # 2b's real per-commit function assigns :introduced-by to every
+        # candidate it discovers for a commit, including the module ident,
+        # so give both a legitimate single-value authoritative fact here
+        # too, rather than leaving them with zero :introduced-by values.
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        extra_ident = mcp_server._code_ident("function", "auth.py", "extra")
+        mcp_server._transact(real_db, f"[[{module_ident} :introduced-by :commit/{h0_hash[:12]}]]", "2025-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{extra_ident} :introduced-by {h1_ident}]]", "2025-01-01T00:00:00Z")
 
         file_results = self._extract(repo, h1_hash)
         skipped = mcp_server._correction_sweep_apply(real_db, h1_hash, h1_ts, file_results)
@@ -15061,6 +15071,17 @@ class TestCorrectionSweepApply:
         h2_ident = f":commit/{h2_hash[:12]}"
         mcp_server._transact(real_db, f"[[{extra_ident} :introduced-by {h1_ident}]]", "2025-01-01T00:00:00Z")
         mcp_server._transact(real_db, f"[[{extra_ident} :modified-in {h2_ident}]]", h2_ts)  # 2b's over-assertion
+        # auth.py's other h2 candidates (the module, login() which changes
+        # every commit, and more() which is added at h2) are also already-
+        # authoritative in any real system -- give each a legitimate
+        # single-value authoritative :introduced-by fact too, rather than
+        # leaving them with zero :introduced-by values.
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        login_ident = mcp_server._code_ident("function", "auth.py", "login")
+        more_ident = mcp_server._code_ident("function", "auth.py", "more")
+        mcp_server._transact(real_db, f"[[{module_ident} :introduced-by :commit/{commit_metadata[0][0][:12]}]]", "2025-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{login_ident} :introduced-by :commit/{commit_metadata[0][0][:12]}]]", "2025-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{more_ident} :introduced-by {h2_ident}]]", "2025-01-01T00:00:00Z")
 
         file_results = self._extract(repo, h2_hash)
         precomputed_unchanged = [
@@ -15106,6 +15127,15 @@ class TestCorrectionSweepApply:
         fn_ident = mcp_server._code_ident("function", "auth.py", "login")
         wrong_ident = f":commit/{commit_metadata[2][0][:12]}"
         mcp_server._entity_introduced_by_set_provisional(real_db, fn_ident, wrong_ident, "2025-01-01T00:00:00Z")
+        # auth.py's other candidates at h0/h1 (the module, and extra() which
+        # is added at h1) are also already-authoritative in any real system
+        # -- give each a legitimate single-value authoritative
+        # :introduced-by fact once, up front, so they don't spuriously
+        # count as skipped at either commit.
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        extra_ident = mcp_server._code_ident("function", "auth.py", "extra")
+        mcp_server._transact(real_db, f"[[{module_ident} :introduced-by :commit/{h0_hash[:12]}]]", "2025-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{extra_ident} :introduced-by :commit/{h1_hash[:12]}]]", "2025-01-01T00:00:00Z")
 
         skipped_h0 = mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, self._extract(repo, h0_hash))
         skipped_h1 = mcp_server._correction_sweep_apply(
@@ -15129,6 +15159,10 @@ class TestCorrectionSweepApply:
         wrong_ident = ":commit/does-not-matter"
         for ident in idents:
             mcp_server._entity_introduced_by_set_provisional(real_db, ident, wrong_ident, "2025-01-01T00:00:00Z")
+        # The synthetic module ident is also an unconditional candidate --
+        # give it a legitimate single-value authoritative :introduced-by
+        # fact too, so it doesn't spuriously count as a 16th skip.
+        mcp_server._transact(real_db, "[[:module/synthetic :introduced-by :commit/preexisting]]", "2025-01-01T00:00:00Z")
         precomputed = {
             "module_ident": ":module/synthetic",
             "function_entries": [(ident, ident, []) for ident in idents],
