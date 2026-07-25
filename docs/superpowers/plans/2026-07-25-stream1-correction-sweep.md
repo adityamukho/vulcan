@@ -218,20 +218,26 @@ class TestCorrectionSweepSelectPosition:
         return linearization, commit_metadata
 
     def _close_gap(self, repo, real_db, linearization, commit_metadata):
-        """Close the gap entirely: claim everything from the low side via a
-        real FrontierAllocator + _frontier_persist_claim (standing in for
-        2d's future ordinary forward walk), then claim the rest from the
-        high side via 2b's real _reverse_fill_claim_and_process."""
+        """Claim exactly one position from the low side via a real
+        FrontierAllocator + _frontier_persist_claim (standing in for 2d's
+        future ordinary forward walk), then claim the rest from the high
+        side via 2b's real _reverse_fill_claim_and_process until the gap is
+        empty. Claiming the *whole* gap from the low side alone (an
+        unbounded claim_low() loop) would never touch frontier-high at
+        all -- claim_low() alone can empty the gap without claim_high()
+        ever running, since gap_hi only moves when claim_high() does."""
         import mcp_server
         import frontier_registry
         allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
-        while True:
-            pos = allocator.claim_low()
-            if pos is None:
-                break
+        pos = allocator.claim_low()
+        if pos is not None:
             mcp_server._frontier_persist_claim(
                 real_db, linearization, pos, from_low=True,
                 commit_ts_iso=commit_metadata[pos][1],
+            )
+        while not allocator.is_gap_empty():
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
             )
         return allocator
 
@@ -979,17 +985,29 @@ class TestCorrectionSweepClaimAndProcess:
         return linearization, commit_metadata
 
     def _close_gap(self, repo, db, linearization, commit_metadata):
-        """db here is any MiniGrafDb instance -- the real_db fixture in
-        most tests, or a manually-created MiniGrafDb.open_in_memory() in
-        the two-graph composition test below."""
+        """Claim exactly one position from the low side via a real
+        FrontierAllocator + _frontier_persist_claim (standing in for 2d's
+        future ordinary forward walk), then claim the rest from the high
+        side via 2b's real _reverse_fill_claim_and_process until the gap is
+        empty. Claiming the *whole* gap from the low side alone (an
+        unbounded claim_low() loop) would never touch frontier-high at
+        all -- claim_low() alone can empty the gap without claim_high()
+        ever running, since gap_hi only moves when claim_high() does -- so
+        the low side must stop after a bounded number of claims for
+        frontier-high to end up populated. db here is any MiniGrafDb
+        instance -- the real_db fixture in most tests, or a
+        manually-created MiniGrafDb.open_in_memory() in the two-graph
+        composition test below."""
         import mcp_server
         allocator = mcp_server._frontier_load(db, linearization, "2026-01-04T00:00:00Z")
-        while True:
-            pos = allocator.claim_low()
-            if pos is None:
-                break
+        pos = allocator.claim_low()
+        if pos is not None:
             mcp_server._frontier_persist_claim(
                 db, linearization, pos, from_low=True, commit_ts_iso=commit_metadata[pos][1],
+            )
+        while not allocator.is_gap_empty():
+            mcp_server._reverse_fill_claim_and_process(
+                db, str(repo), linearization, commit_metadata, allocator,
             )
         return allocator
 
