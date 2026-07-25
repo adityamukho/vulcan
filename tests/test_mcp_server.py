@@ -14692,40 +14692,40 @@ class TestCorrectionSweepSelectPosition:
         return linearization, commit_metadata
 
     def _close_gap(self, repo, real_db, linearization, commit_metadata):
-        """Close the gap entirely: alternately claim from low and high sides
-        until the gap is empty. The low side uses _frontier_persist_claim
-        (standing in for 2d's future ordinary forward walk), and the high
-        side uses 2b's real _reverse_fill_claim_and_process."""
+        """Claim exactly one position from the low side via a real
+        FrontierAllocator + _frontier_persist_claim (standing in for 2d's
+        future ordinary forward walk), then claim the rest from the high
+        side via 2b's real _reverse_fill_claim_and_process until the gap is
+        empty. Claiming the *whole* gap from the low side alone (an
+        unbounded claim_low() loop) would never touch frontier-high at
+        all -- claim_low() alone can empty the gap without claim_high()
+        ever running, since gap_hi only moves when claim_high() does -- so
+        the low side must stop after a bounded number of claims for
+        frontier-high to end up populated."""
         import mcp_server
-        import frontier_registry
         allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
-        # Alternately claim from low and high to close the gap:
-        # - Claim one from low via _frontier_persist_claim
-        # - Then loop _reverse_fill_claim_and_process until gap is closed
+        pos = allocator.claim_low()
+        if pos is not None:
+            mcp_server._frontier_persist_claim(
+                real_db, linearization, pos, from_low=True, commit_ts_iso=commit_metadata[pos][1],
+            )
         while not allocator.is_gap_empty():
-            # Claim one position from low
-            pos = allocator.claim_low()
-            if pos is not None:
-                mcp_server._frontier_persist_claim(
-                    real_db, linearization, pos, from_low=True,
-                    commit_ts_iso=commit_metadata[pos][1],
-                )
-            # Reload allocator to reflect the low claim
-            allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
-            # Then claim from high until gap is closed
-            while not allocator.is_gap_empty():
-                result = mcp_server._reverse_fill_claim_and_process(
-                    real_db, str(repo), linearization, commit_metadata, allocator,
-                )
-                if result is None:
-                    break
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
         return allocator
 
     def test_no_op_when_frontier_high_unclaimed(self, real_db, tmp_path):
         import mcp_server
         repo = self._repo_with_n_commits(tmp_path, 2)
         linearization, commit_metadata = self._linearization_and_metadata(repo)
-        mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")  # seeds frontier-low only
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        # Genuinely seed frontier-low (a fresh graph seeds neither side), so
+        # this exercises "frontier-low exists, frontier-high doesn't".
+        pos = allocator.claim_low()
+        mcp_server._frontier_persist_claim(
+            real_db, linearization, pos, from_low=True, commit_ts_iso=commit_metadata[pos][1],
+        )
 
         result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
         assert result is None
@@ -14836,10 +14836,10 @@ class TestCorrectionSweepSelectPosition:
         assert commit_hash == bounds[0]
 
     def test_hash_to_pos_reused_when_passed_in(self, real_db, tmp_path):
-        """hash_to_pos, when supplied, is used as-is rather than rebuilt --
-        pass a deliberately wrong map for an unrelated hash to prove the
-        function trusts the caller's map rather than silently recomputing
-        its own."""
+        """Smoke test that the hash_to_pos parameter is accepted: passing a
+        correct, pre-built map still yields a valid result. This does not
+        prove the function trusts the caller's map over recomputing its
+        own -- it would pass identically either way."""
         import mcp_server
         repo = self._repo_with_n_commits(tmp_path, 2)
         linearization, commit_metadata = self._linearization_and_metadata(repo)
@@ -15268,7 +15268,12 @@ class TestCorrectionSweepClaimAndProcess:
         import mcp_server
         repo = self._repo_with_n_commits(tmp_path, 2)
         linearization, commit_metadata = self._linearization_and_metadata(repo)
-        mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")  # frontier-high unclaimed
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        # Genuinely seed frontier-low, leaving frontier-high unclaimed.
+        pos = allocator.claim_low()
+        mcp_server._frontier_persist_claim(
+            real_db, linearization, pos, from_low=True, commit_ts_iso=commit_metadata[pos][1],
+        )
 
         result = mcp_server._correction_sweep_claim_and_process(
             real_db, str(repo), linearization, commit_metadata,

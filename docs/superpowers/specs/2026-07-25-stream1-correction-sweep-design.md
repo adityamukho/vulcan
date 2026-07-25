@@ -756,7 +756,7 @@ def _correction_sweep_apply(
     from every PREVIOUS call this run, and exists solely to make the stderr
     log cap work across calls without this function holding any state of its
     own: it logs a skipped ident only while
-    `skipped_so_far + skipped_events < _CORRECTION_SWEEP_LOG_CAP` (see
+    `skipped_so_far + skipped_events <= _CORRECTION_SWEEP_LOG_CAP` (see
     "Observability"). Deriving the budget from a caller-supplied running
     total, rather than a module-level counter, is what makes the cap reset
     per run automatically -- this server is long-lived and runs many
@@ -973,7 +973,7 @@ and log nothing for every ingest after, which is precisely the
 "looks clean, isn't" outcome this whole section exists to prevent. So the
 budget is derived from the driving loop's own running total instead:
 `_correction_sweep_apply` takes `skipped_so_far` and logs only while
-`skipped_so_far + skipped_events < _CORRECTION_SWEEP_LOG_CAP`. It resets
+`skipped_so_far + skipped_events <= _CORRECTION_SWEEP_LOG_CAP`. It resets
 per run for free, because each loop starts its total at `0`, and the
 function stays pure enough to test by calling it directly with a chosen
 `skipped_so_far`.

@@ -1302,7 +1302,7 @@ def _correction_sweep_walk(
     None, then call _correction_sweep_log_summary with the final total.
 
     Returns (commits_processed, skipped_events) -- summed across every
-    call, both 0 both when the gap-closed precondition isn't met yet (the
+    call, both 0 when the gap-closed precondition isn't met yet (the
     common case early in a run) and when the sweep has already fully
     caught up to frontier-high's :hi-hash.
 
