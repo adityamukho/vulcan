@@ -31,7 +31,8 @@ forward stream still owns lineage correctness.
   earlier occurrence of the same entity.
 - **2c (this spec)** — Stream 1's correction sweep: walks **upward**
   (oldest→newest) through frontier-high's own already-claimed interval —
-  starting at its current `:lo-hash` and proceeding toward `HEAD` — using a
+  starting at its current `:lo-hash` and proceeding toward its own
+  persisted `:hi-hash` — using a
   dedicated watermark for its own resumable progress (**not**
   `:ingestion/lineage-confirmed-through`, and **not** `allocator.claim_low()`;
   see "Why not `claim_low()`" and "Why a dedicated watermark" below),
@@ -54,12 +55,14 @@ In scope:
 
 - A per-commit correction step that advances a dedicated position tracker
   upward through frontier-high's own claimed interval — starting at its
-  current `:lo-hash` on first use, proceeding toward `HEAD` — and, for every
+  current `:lo-hash` on first use, proceeding toward its own persisted
+  `:hi-hash` (not necessarily `HEAD`/`len(linearization) - 1` — see the
+  incremental-re-ingest note under "Position tracker") — and, for every
   entity touched by that commit's "A"/"M" files, reconciles its lineage per
-  the two-case algorithm below.
-- A thin driving loop that repeats the above until the tracker reaches the
-  end of the linearization. Frontier-low is never touched by this sweep,
-  and neither is `:ingestion/lineage-confirmed-through` (see "Why a
+  the three-case algorithm below.
+- A thin driving loop that repeats the above until the tracker reaches
+  frontier-high's own persisted `:hi-hash`. Frontier-low is never touched
+  by this sweep, and neither is `:ingestion/lineage-confirmed-through` (see "Why a
   dedicated watermark" below) — 2c introduces its own new watermark,
   `:ingestion/correction-sweep-through`.
 - Opportunistically clearing stale intermediate candidate-diff records left
@@ -166,24 +169,69 @@ closes (so they describe one contiguous confirmed region again) is 2d's
 job, once it can also make the *ordinary* `claim_low()`-driven walk advance
 `lineage-confirmed-through` for the virgin positions it claims.
 
-**This is also what proves case 2 from an earlier draft (a provisional
-guess pointing at a commit other than the one currently being visited)
-cannot occur inside this sweep's range.** For a commit `C` Stream 2
-claimed, Stream 2 parsed the identical diff (the same invariant the
-per-commit algorithm below relies on) and — per its own per-commit
-algorithm — always moves a candidate's guess *down* to the earliest
-occurrence it has seen. So for any entity `C`'s files touch, Stream 2's
-final persisted guess is necessarily `<= C`'s position, never later. Walking
-`[frontier-high.lo, N-1]` oldest-to-newest, by induction: the sweep reaches
-each entity's true within-range-earliest occurrence *before* any later
-commit that also touches it, because that earliest occurrence's position is
-itself `<= C` for every later `C` — so by the time the sweep would ever
-visit a later `C` for that entity, the entity has already been confirmed
-(case 1, below) at its true earliest position and reads as authoritative,
-not provisional. A guess pointing at some *other*, unvisited commit while
-still provisional is therefore not a state this sweep's own walk can ever
-observe for a commit inside its range — see the "Explicitly deferred"
-bullet above for where that reconciliation actually belongs.
+### Why confirming requires the gap to already be closed
+
+A third earlier draft of this design argued that Stream 2's persisted guess
+for any entity `C` touches is always `<= C`'s position, so by induction a
+provisional guess can never point somewhere other than the commit currently
+being visited. That argument silently assumed Stream 2's guess is *final* —
+true only once Stream 2 can never claim another position. During a real
+concurrent run it is not yet final, and the gap between "not yet final" and
+"final" is exactly where this sweep can corrupt data if it runs too early:
+
+1. Sweep visits `C = frontier-high.lo`, confirms entity `E` (case 1):
+   `:introduced-by = C`, provisional marker dropped.
+2. Stream 2 later claims some `C' < C` (a position still below `C` that it
+   had not yet reached) and finds `E` there too. `_reverse_fill_claim_and_process`'s
+   *sole* gate for whether to move a guess is `_lineage_is_provisional`
+   (mcp_server.py:7369-7373) — since this sweep already confirmed `E`, it no
+   longer reads as provisional, so 2b takes its "already authoritative"
+   branch: writes `[E :modified-in C']` and leaves `:introduced-by` at `C`.
+3. `E` now claims it was introduced at `C` while carrying a `:modified-in`
+   edge at the *earlier* commit `C'` — a contradiction ordinary forward walk
+   can never produce — and it reads as fully authoritative, so 2a's trust
+   predicate will trust it as soon as `lineage-confirmed-through` reaches
+   it. Confirming turned a still-correctable provisional guess into
+   uncorrectable (and wrong) ground truth: the deferred reconciliation this
+   spec relies on (see "Explicitly deferred" above) is described in terms
+   of a *pre-existing provisional guess* to correct, and there is no longer
+   one to find.
+
+This is not an exotic interleaving — it is the expected one once 2d runs
+Stream 1 and Stream 2 concurrently, one descending into the gap while this
+sweep ascends through already-claimed territory. **The precondition that
+makes a confirm sound is that no unclaimed position remains below the
+position being confirmed — i.e. the gap is closed:
+`frontier-low.:hi-hash`'s position `+ 1 == frontier-high.:lo-hash`'s
+position** (equivalently, `allocator.is_gap_empty()`, if an allocator were
+available — it is not, so this sweep checks the equivalent condition
+against the two persisted interval bounds directly). Once the gap is
+closed, `claim_high()` can never return another position for the rest of
+this run (`is_gap_empty()` stays `True` — the gap only shrinks), so Stream
+2 is permanently done: its guess for every entity within frontier-high's
+*entire* range is now genuinely final, and the induction argument above
+holds validly. `_correction_sweep_claim_and_process` therefore checks this
+precondition on every call (both bounds are cheap to re-read) and returns
+`None` — nothing safe to correct yet — until it holds.
+
+Given the precondition holds, the induction argument is exactly as before:
+for a commit `C` Stream 2 claimed, Stream 2's final persisted guess for any
+entity `C`'s files touch is necessarily `<= C`'s position (it always moves
+a candidate's guess *down* to the earliest occurrence seen, never up), so
+walking `[frontier-high.lo, N-1]` oldest-to-newest, the sweep reaches each
+entity's true within-range-earliest occurrence before any later commit that
+also touches it. **Even so, the per-commit algorithm below keeps an
+explicit no-op branch for a provisional guess pointing elsewhere, rather
+than treating that state as unreachable** — the precondition is what a
+*correct caller* guarantees, not something the per-ident classification can
+independently verify, and a naive two-branch implementation that assumes
+the state can't happen does something actively harmful if it ever does
+(confirms an entity at a commit that was never validated as its true
+introduction). See "Explicitly deferred" above for where the genuine
+reconciliation (an entity whose true earliest occurrence lies below
+frontier-high's range entirely, in frontier-low's own territory) belongs —
+that is a different scenario from the one above and remains this sweep's
+own no-op case, not something it can resolve itself.
 
 ### Per-commit algorithm
 
@@ -209,17 +257,23 @@ sweep skips straight to per-ident classification, using `precomputed`
 directly:
 
 ```python
-candidate_idents = (
-    [precomputed["module_ident"]]
-    + [ident for ident, _name, _t in precomputed["function_entries"]]
-    + [ident for ident, _name, _t in precomputed["class_entries"]]
-    + [ident for ident, _name, _t in precomputed["global_entries"]]
-    + [ident for ident, _name, _t in precomputed["field_entries"]]
+file_results, _gitlink_changes, _gitmodules_map, _renamed_pairs = _extract_commit(
+    repo_path, commit_hash, ignore_patterns
 )
-unchanged_idents = precomputed.get("unchanged_idents", set())
+for status, file_path, extracted, precomputed, _old_path in file_results:
+    if status not in ("A", "M"):
+        continue  # "D"/"R" deferred -- see Scope, matches 2b's own cut
+    candidate_idents = (
+        [precomputed["module_ident"]]
+        + [ident for ident, _name, _t in precomputed["function_entries"]]
+        + [ident for ident, _name, _t in precomputed["class_entries"]]
+        + [ident for ident, _name, _t in precomputed["global_entries"]]
+        + [ident for ident, _name, _t in precomputed["field_entries"]]
+    )
+    unchanged_idents = precomputed.get("unchanged_idents", set())
 ```
 
-Each candidate ident then falls into one of two cases. Every write below
+Each candidate ident then falls into one of three cases. Every write below
 uses `C`'s own `commit_ts_iso` (the same timestamp 2b itself used when it
 first wrote at `C`) — this equality is load-bearing, not incidental: it is
 what makes any write this sweep re-issues at a position 2b already touched
@@ -240,7 +294,22 @@ duplicate.
    was already correct) and `_candidate_diff_clear(db, commit_hash, ident,
    index_con=index_con)`. No `:modified-in`.
 
-2. **Already authoritative** (confirmed at an earlier position in this same
+2. **Provisional, guess points elsewhere**
+   (`_lineage_is_provisional(db, ident)` and
+   `_entity_introduced_by_query(db, ident) != commit_ident`) — per "Why
+   confirming requires the gap to already be closed" above, a correct
+   caller (the gap-closed precondition holding) means this state should not
+   arise for a commit inside this sweep's range. It is kept as an explicit
+   branch anyway, not folded into case 1's `else`, precisely because
+   "should not arise" is a caller obligation this per-ident classification
+   cannot itself verify: **leave the entity completely untouched** — no
+   `_lineage_confirm`, no `:introduced-by` change, no candidate-diff
+   touch — so that if the precondition is ever violated, this sweep fails
+   safe (does nothing) rather than confirming an unvalidated guess. The
+   entity remains provisional and available for whatever the deferred
+   reconciliation turns out to be.
+
+3. **Already authoritative** (confirmed at an earlier position in this same
    sweep, or — after this sweep has fully caught up once — simply revisited
    on a later run) — first check whether `C` *is* this entity's own
    introduction commit: if `_entity_introduced_by_query(db, ident) ==
@@ -270,7 +339,9 @@ duplicate.
 A new watermark, structurally identical to `:ingestion/lineage-confirmed-
 through` (`_lineage_confirmed_through_update`'s exact shape: registered
 `:type/ingestion`, same retract-only-if-changed pattern, same required
-`:description` constant) but tracking a different thing — this sweep's own
+`:description` *attribute* — but its own distinct string, "correction sweep
+progress watermark," not a copy of lineage-confirmed-through's; see
+"Schema/audit safety" below) but tracking a different thing — this sweep's own
 progress, independent of contiguity from `C0`:
 
 ```python
@@ -288,13 +359,26 @@ def _correction_sweep_through_update(
     exactly, at a different ident."""
 ```
 
-Position selection, handling both ends being possibly absent or stale:
+Position selection: first the gap-closed precondition ("Why confirming
+requires the gap to already be closed" above), then the ceiling, then the
+resume point — each handling its own absent/stale case:
 
 ```python
+low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
 high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
-if high_bounds is None:
-    return None  # Stream 2 hasn't claimed anything yet -- nothing to correct
+if low_bounds is None or high_bounds is None:
+    return None  # migration hasn't run yet, or Stream 2 hasn't claimed anything
 hash_to_pos = {h: i for i, h in enumerate(linearization)}
+if low_bounds[1] not in hash_to_pos or high_bounds[0] not in hash_to_pos:
+    return None  # a boundary hash is stale (rewritten history); nothing safe to do
+if hash_to_pos[low_bounds[1]] + 1 != hash_to_pos[high_bounds[0]]:
+    return None  # gap still open -- Stream 2 may still descend past a position
+                 # this sweep would otherwise confirm; see the precondition above
+if high_bounds[1] not in hash_to_pos:
+    return None  # frontier-high's :hi-hash is stale -- see the incremental-
+                 # re-ingest note below; nothing safe to do until 2b/2d address it
+ceiling_pos = hash_to_pos[high_bounds[1]]
+
 through_hash = _correction_sweep_through_query(db)
 if through_hash is not None and through_hash in hash_to_pos:
     pos = hash_to_pos[through_hash] + 1
@@ -303,23 +387,68 @@ else:
     # history -- (re)start from frontier-high's current lo-hash, mirroring
     # _frontier_load's own precedent of dropping a bound that no longer
     # resolves (mcp_server.py:4970-4978) rather than erroring.
-    lo_hash, _hi_hash = high_bounds
-    if lo_hash not in hash_to_pos:
-        return None  # frontier-high itself is stale; nothing safe to do
-    pos = hash_to_pos[lo_hash]
-if pos >= len(linearization):
-    return None  # reached HEAD; nothing left to correct
-commit_hash = linearization[pos]
-commit_ts_iso = next(ts for h, ts, _a, _s in commit_metadata if h == commit_hash)
+    pos = hash_to_pos[high_bounds[0]]  # already validated above
+if pos > ceiling_pos:
+    return None  # reached frontier-high's own :hi-hash; nothing left to correct
+commit_hash, commit_ts_iso, _author, _subject = commit_metadata[pos]
+assert commit_hash == linearization[pos]  # see the contract note below
 ```
 
-Once `pos` is known to be `>= frontier-high.lo`'s position at the time this
-call started, the walk needs no further bounds-checking against
-frontier-high for the rest of its run: `[frontier-high.lo, N-1]` only ever
-grows (frontier-high's `:hi-hash` is fixed at `N-1`, and `:lo-hash` only
-moves further down), so every position from the sweep's own resume point
-onward through `N-1` is guaranteed already claimed regardless of how far
-Stream 2 has additionally progressed since.
+`ceiling_pos` reads frontier-high's *persisted* `:hi-hash`
+(`high_bounds[1]`) rather than `len(linearization) - 1`. Those are **not**
+interchangeable across separate runs: within a single run, `claim_high()`'s
+`_extend` never touches `existing.hi_pos`, so the in-memory interval's high
+end genuinely is fixed at the linearization's last position. But on an
+incremental re-ingest, `linearization` is rebuilt fresh and longer while
+`:hi-hash` remains whatever was persisted last time — `_frontier_load`
+reconstructs the high interval as `[pos(lo_hash), pos(hi_hash)]` against
+the *new* linearization (mcp_server.py:4974-4978), so
+`pos(hi_hash) = N_old - 1`, strictly less than `N_new - 1`. Using
+`len(linearization) - 1` as the ceiling would walk the sweep straight into
+`[N_old, N_new - 1]` — brand new commits no stream has claimed yet — and
+every invariant this design relies on would fail there exactly as in the
+gap case above. Stopping at `high_bounds[1]`'s own position avoids this
+regardless of how much the linearization has grown.
+
+**Known dependency, not itself a 2c defect:** `_frontier_persist_claim`
+only updates the moved bound (`:lo-hash` for `claim_high`), never
+`:hi-hash` (mcp_server.py:5012-5014). On an incremental re-ingest, Stream
+2's first `claim_high()` of the new run returns the new `gap_hi`
+(`N_new - 1`, since the reloaded interval no longer reaches the true last
+position) and persists it as the new `:lo-hash`, leaving the persisted
+interval as `[N_new - 1, N_old - 1]` — inverted. This sweep's own ceiling
+check above would then read `high_bounds[1] = N_old - 1` as the ceiling
+while `through_hash`/`high_bounds[0]` sit at `N_new - 1`, well above it —
+`pos > ceiling_pos` immediately, so the sweep silently does nothing rather
+than corrupting anything, but it also makes no progress until 2b or 2d
+fixes the underlying interval-growth handling. Flagged here since 2c is the
+first consumer to read frontier-high's persisted `:lo-hash` as a position
+to walk *from*, which is what exposes it.
+
+`commit_metadata` is assumed **full-history and positionally aligned with
+`linearization`** — the same contract 2b's own tests construct
+(`tests/test_mcp_server.py:13926`, via `_git_commits(repo, None, branch)`)
+and `_reverse_fill_claim_and_process` itself relies on
+(`commit_metadata[pos]`, mcp_server.py:7314). This is *not* what
+`_run_ingestion` currently builds for its own use (a watermark-relative
+list via `_git_commits(repo_path, watermark, branch)`,
+mcp_server.py:7486) — 2d, when it wires this sweep in, must pass the
+full-history list, not `_run_ingestion`'s own watermark-relative one.
+Indexing positionally (`commit_metadata[pos]`) rather than searching by
+hash both matches 2b's convention and avoids a bare `next(...)` with no
+default raising `StopIteration` if the contract is ever violated. Because
+both streams derive `commit_ts_iso` from `_git_commits`'s single
+`strftime("%Y-%m-%dT%H:%M:%SZ")` formatting (mcp_server.py:4130), the two
+streams cannot disagree on the timestamp string for the same commit — this
+is what makes the valid_from-equality argument in "Per-commit algorithm"
+above hold.
+
+Once `pos` is known to be `<= ceiling_pos` at the time this call started,
+the walk needs no further bounds-checking against frontier-high for the
+rest of *this* call — `[frontier-high.lo, ceiling_pos]` is fixed for the
+duration of one call, regardless of how far Stream 2 additionally
+progresses concurrently (its `:lo-hash` can only move further down, never
+past `ceiling_pos`, and `:hi-hash` never moves within a run).
 
 After processing `C`: `_correction_sweep_through_update(db, commit_hash,
 commit_ts_iso, index_con=index_con)`, then one `_db_checkpoint(db)` call —
@@ -340,15 +469,19 @@ def _correction_sweep_claim_and_process(
 ) -> Optional[str]:
     """Advance the correction sweep by exactly one commit, upward through
     frontier-high's own claimed territory, and reconcile that commit's
-    entities per the two-case algorithm above. Returns the processed
-    commit's hash, or None if there is nothing left to correct (frontier-
-    high hasn't claimed anything yet, or the sweep has already reached
-    HEAD). No `allocator` parameter -- this reads frontier-high's persisted
-    bounds directly via _frontier_read_bounds and tracks its own progress
-    via _correction_sweep_through_query/_update, not the allocator's
-    claim_low(); see "Why not claim_low()" above. Never calls
-    _frontier_persist_claim or _lineage_confirmed_through_update -- neither
-    frontier-low nor lineage-confirmed-through is touched by this sweep."""
+    entities per the three-case algorithm above. Returns the processed
+    commit's hash, or None if there is nothing safe to correct yet: the gap
+    is still open (Stream 2 could still descend past a position this call
+    would confirm -- see "Why confirming requires the gap to already be
+    closed"), frontier-high hasn't claimed anything yet, a required
+    boundary hash is stale, or the sweep has already reached frontier-
+    high's own :hi-hash. No `allocator` parameter -- this reads frontier-low
+    and frontier-high's persisted bounds directly via _frontier_read_bounds
+    and tracks its own progress via _correction_sweep_through_query/_update,
+    not the allocator's claim_low(); see "Why not claim_low()" above. Never
+    calls _frontier_persist_claim or _lineage_confirmed_through_update --
+    neither frontier-low nor lineage-confirmed-through is touched by this
+    sweep."""
 
 def _correction_sweep_walk(
     db: Any,
@@ -367,12 +500,17 @@ def _correction_sweep_walk(
 
 ### Schema/audit safety, idempotency
 
-One new entity type, `:ingestion/correction-sweep-through`, reusing the
-already-registered/audited `:type/ingestion` type exactly as
-`:ingestion/lineage-confirmed-through` does — no new schema surface. Case
-1's writes are the same query-before-write primitives 2a/2b already
-established as safe (`_lineage_confirm`, `_candidate_diff_clear`). Case 2's
-`:modified-in` assert, once its guard passes, *is* an unconditional
+`:ingestion/correction-sweep-through` is a new *entity* of the
+already-registered/audited `:type/ingestion` type — the same type
+`:ingestion/lineage-confirmed-through` uses — so no new schema surface.
+Unlike `lineage-confirmed-through`, it gets its own distinct `:description`
+string ("correction sweep progress watermark," not a copy of lineage-
+confirmed-through's) — two `:type/ingestion` entities with byte-identical
+descriptions would both pass audit but be indistinguishable from each
+other in the fact index and in `minigraf_audit` output. Case 1's writes are
+the same query-before-write primitives 2a/2b already established as safe
+(`_lineage_confirm`, `_candidate_diff_clear`). Case 2 writes nothing. Case
+3's `:modified-in` assert, once its guard passes, *is* an unconditional
 `_transact` — it is safe not because of a query-before-write guard but
 because it always uses `C`'s own `commit_ts_iso`, matching what forward
 walk (or 2b, if `C` happens to already carry other facts from it) would
@@ -386,83 +524,123 @@ guard for its safety.
 
 Following `docs/testing-conventions.md` (real `MiniGrafDb`, no mocks), using
 the same `tmp_path / "repo"` real-git-repo fixture pattern already used
-throughout `tests/test_mcp_server.py`'s existing ingestion tests, and (where
-a candidate needs a pre-existing provisional state) `_reverse_fill_claim_and_process`
-itself to set that state up realistically rather than hand-constructing
-facts:
+throughout `tests/test_mcp_server.py`'s existing ingestion tests. Since this
+sweep now requires the gap to be closed before it does anything (see "Why
+confirming requires the gap to already be closed"), most scenarios below
+close it using real functions rather than hand-constructing frontier facts:
+a real `frontier_registry.FrontierAllocator`, `claim_low()` +
+`_frontier_persist_claim(..., from_low=True, ...)` in a loop for the low
+side (standing in for 2d's future ordinary forward walk, which this
+sub-phase doesn't build), and `_reverse_fill_claim_and_process` for the
+high side, until `allocator.is_gap_empty()`.
 
-- **Confirms a correct provisional guess** (case 1): run
-  `_reverse_bulk_fill_walk` first so an entity ends up with a provisional
-  `:introduced-by` pointing at its true earliest commit within Stream 2's
-  claimed range; then run the correction sweep; assert
-  `_lineage_is_provisional` is now `False`, the `:introduced-by` value is
-  unchanged, and the candidate-diff record for that `(commit, entity)` is
-  gone (`_candidate_diff_read` returns `None`).
+- **Sweep is a no-op while the gap remains open** (the precondition itself):
+  claim some positions via `_reverse_fill_claim_and_process` but leave a
+  non-empty gap below them (don't also claim from the low side); call
+  `_correction_sweep_claim_and_process`; assert it returns `None` and
+  writes nothing, even though frontier-high has real provisional facts
+  available to confirm — this is the direct regression test for the race
+  in "Why confirming requires the gap to already be closed": a version of
+  this sweep without the precondition check would confirm here and be
+  wrong the moment Stream 2 claims a still-lower position touching the
+  same entity.
+- **Confirms a correct provisional guess** (case 1): close the gap (as
+  above) so an entity ends up with a provisional `:introduced-by` pointing
+  at its true earliest commit within Stream 2's claimed range; then run
+  the correction sweep; assert `_lineage_is_provisional` is now `False`,
+  the `:introduced-by` value is unchanged, and the candidate-diff record
+  for that `(commit, entity)` is gone (`_candidate_diff_read` returns
+  `None`).
 - **Does not duplicate the claimed commit's metadata**: same setup as
   above; before running the sweep, capture the claimed commit entity's
   total live fact count and its `:hash`/`:author`/`:subject`/`:date`
-  values as written by `_reverse_bulk_fill_walk`; run the sweep; assert the
-  fact count is unchanged and none of those attributes was re-asserted at a
-  *different* `valid_from` — this is the regression test that can actually
-  distinguish a correct implementation (skips the write, or re-issues it
-  idempotently at the same `commit_ts_iso`) from one that writes it at a
-  different timestamp and produces a second live datom.
+  values as written by `_reverse_fill_claim_and_process`; run the sweep;
+  assert the fact count is unchanged and none of those attributes was
+  re-asserted at a *different* `valid_from` — this is the regression test
+  that can actually distinguish a correct implementation (skips the write,
+  or re-issues it idempotently at the same `commit_ts_iso`) from one that
+  writes it at a different timestamp and produces a second live datom.
+- **Leaves an entity untouched when its guess points elsewhere** (case 2,
+  the explicit no-op): with the gap closed, hand-construct a provisional
+  `:introduced-by` pointing at a commit *other* than the one the sweep is
+  about to visit for that same entity (simulating a precondition
+  violation, or the deferred rename/rebirth scenario, directly rather than
+  via a real interleaving); run the sweep over that commit; assert the
+  entity is still provisional, `:introduced-by` is unchanged, and no
+  candidate-diff record was touched — the test that pins "fails safe"
+  rather than "confirms an unvalidated guess."
 - **Skips `:modified-in` at an entity's own introduction commit on a
-  resumed sweep** (case 2's guard): run the correction sweep once so an
-  entity is confirmed authoritative at its true introduction commit; call
-  `_correction_sweep_claim_and_process` again as if resuming after a crash
-  (i.e. without having advanced `_correction_sweep_through_update` past
-  that commit — construct this directly rather than via the real crash
-  path, mirroring how other resume tests in this codebase re-invoke a step
-  function against pre-set state); assert no `:modified-in` fact was
-  created for that entity at its own introduction commit — this is the
-  test that would fail against a naive implementation of case 2 with no
-  self-introduction guard.
-- **Ordinary modification of an already-authoritative entity** (case 2, the
-  general path): an entity already authoritative at some earlier commit
-  (pre-seeded via a real earlier sweep pass, non-provisional); sweep over a
-  later commit that touches it; assert `:modified-in` is added at that
-  later commit and no lineage marker exists.
-- **Opportunistic stale candidate-diff cleanup** (case 2): pre-seed a stale
+  resumed sweep** (case 3's guard): with the gap closed, run the
+  correction sweep once so an entity is confirmed authoritative at its
+  true introduction commit; call `_correction_sweep_claim_and_process`
+  again as if resuming after a crash (i.e. without having advanced
+  `_correction_sweep_through_update` past that commit — construct this
+  directly rather than via the real crash path, mirroring how other resume
+  tests in this codebase re-invoke a step function against pre-set state);
+  assert no `:modified-in` fact was created for that entity at its own
+  introduction commit — this is the test that would fail against a naive
+  implementation of case 3 with no self-introduction guard.
+- **Ordinary modification of an already-authoritative entity** (case 3, the
+  general path): with the gap closed, an entity already authoritative at
+  some earlier commit (pre-seeded via a real earlier sweep pass,
+  non-provisional); sweep over a later commit that touches it; assert
+  `:modified-in` is added at that later commit and no lineage marker
+  exists.
+- **Opportunistic stale candidate-diff cleanup** (case 3): pre-seed a stale
   candidate-diff record at a commit for an entity that's already
   authoritative by the time the sweep reaches that commit (simulating an
   orphaned intermediate guess along a supersession chain); assert the sweep
-  clears it even though that commit falls into the ordinary case-2 path.
+  clears it even though that commit falls into the ordinary case-3 path.
 - **No-op when frontier-high hasn't claimed anything yet**: a graph with
-  only frontier-low/migration state, no `_reverse_bulk_fill_walk` ever run;
-  assert `_correction_sweep_claim_and_process` returns `None` and writes
-  nothing.
-- **Resumes from `correction-sweep-through` on a second call, not from
-  frontier-high's lo-hash again**: run the sweep once (processes frontier-
-  high's then-current lo-hash), then claim one more position via
-  `_reverse_fill_claim_and_process` so frontier-high's lo-hash moves further
-  down; call the correction sweep again; assert it processes the position
-  immediately after where it left off (one above its previous stopping
-  point), not frontier-high's new (lower) lo-hash — proving the dedicated
-  watermark, not frontier-high's current bound, drives resumption.
-- **No-op when the sweep has already reached `HEAD`**: run
-  `_correction_sweep_walk` to exhaustion over the whole claimed range;
+  only frontier-low/migration state, no `_reverse_fill_claim_and_process`
+  ever run; assert `_correction_sweep_claim_and_process` returns `None`
+  and writes nothing.
+- **Resumes from `correction-sweep-through`, not from frontier-high's
+  lo-hash again**: close the gap over a range spanning several commits;
+  call `_correction_sweep_claim_and_process` once (processes frontier-
+  high's lo-hash); call it again; assert it processes the position
+  immediately after the first call's result, not frontier-high's lo-hash
+  again — proving the dedicated watermark, not frontier-high's bound,
+  drives resumption. (Unlike an earlier draft, this cannot be tested via a
+  *further* `claim_high()` after the gap closes — `is_gap_empty()` makes
+  `claim_high()` return `None` forever once closed, which is itself the
+  point of the precondition.)
+- **No-op when the sweep has already reached frontier-high's own
+  `:hi-hash`**: close the gap; run `_correction_sweep_walk` to exhaustion;
   assert a further call to `_correction_sweep_claim_and_process` still
   returns `None` rather than erroring or re-processing the last commit.
+- **Respects frontier-high's persisted `:hi-hash` as the ceiling, not
+  `len(linearization)`**: close the gap and run the sweep to exhaustion
+  against an initial `linearization`; then extend the underlying repo with
+  new commits and rebuild a longer `linearization` (simulating an
+  incremental re-ingest) *without* claiming the new positions via either
+  stream; call the correction sweep again against the longer
+  `linearization`; assert it still returns `None` and does not walk into
+  the newly-added, unclaimed commits — the regression test for the bug an
+  earlier draft's `len(linearization) - 1` ceiling would have produced.
 - **Falls back to frontier-high's current lo-hash when the stored
   `correction-sweep-through` hash is stale**: seed
   `:ingestion/correction-sweep-through` with a hash not present in a fresh
-  `linearization` (simulating rewritten/rebased history); assert the sweep
-  restarts from frontier-high's current lo-hash rather than erroring.
+  `linearization` (simulating rewritten/rebased history), with the gap
+  otherwise closed; assert the sweep restarts from frontier-high's current
+  lo-hash rather than erroring.
 - **Frontier-low and `lineage-confirmed-through` are never touched**:
-  capture frontier-low's persisted interval and
+  close the gap; capture frontier-low's persisted interval and
   `_lineage_confirmed_through_query`'s value before running
   `_correction_sweep_walk`; run it; assert both are byte-for-byte unchanged
   afterward, while `_correction_sweep_through_query` has advanced — the
   direct regression test for the bugs both "Why not `claim_low()`" and "Why
   a dedicated watermark" describe.
-- **Full integration**: call `_reverse_fill_claim_and_process` a fixed
-  number of times directly (not `_reverse_bulk_fill_walk` to exhaustion) so
-  Stream 2 claims down to some position `P` within a larger history, then
-  run `_correction_sweep_walk` to exhaustion; assert every entity touched
-  at or above `P` ends up authoritative (`_lineage_is_provisional` is
-  `False` for all of them), no `:type/candidate-diff` entities remain live,
-  and `_correction_sweep_through_query` now equals `HEAD`'s hash — proving
-  the sweep correctly walks all the way through frontier-high's claimed
-  territory, not just the single position an earlier draft's (wrong) bound
-  would have stopped at.
+- **Full integration**: build a repo with a non-trivial number of commits;
+  close the gap at some meeting point (claim some positions via
+  `claim_low()`/`_frontier_persist_claim` from the low side, the rest via
+  `_reverse_fill_claim_and_process` from the high side, until
+  `allocator.is_gap_empty()`); then run `_correction_sweep_walk` to
+  exhaustion; assert every entity touched within frontier-high's claimed
+  range ends up authoritative (`_lineage_is_provisional` is `False` for all
+  of them), no `:type/candidate-diff` entities remain live, and
+  `_correction_sweep_through_query` now equals frontier-high's `:hi-hash` —
+  proving the sweep correctly walks all the way through frontier-high's
+  claimed territory to its actual persisted ceiling, not the single
+  position or the unbounded `len(linearization)` an earlier draft's
+  (wrong) bounds would have produced.
