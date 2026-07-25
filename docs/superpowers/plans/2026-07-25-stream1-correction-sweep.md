@@ -1193,16 +1193,25 @@ class TestCorrectionSweepWalk:
         return allocator
 
     def test_walks_to_exhaustion_and_returns_counts(self, real_db, tmp_path):
+        """split_pos must be >= 1: frontier-low's persisted bounds don't
+        exist in the DB at all until the first claim_low() position is
+        persisted via _frontier_persist_claim(from_low=True, ...) --
+        split_pos=0 never calls that, so _correction_sweep_select_position's
+        `low_bounds is None` precondition check would always fail even
+        though the in-memory allocator's gap does become logically empty
+        via high-side claims alone. With split_pos=1, one position is
+        claimed by the low side (not part of this sweep's own range), so
+        the correction sweep processes the remaining 3 of 4 commits."""
         import mcp_server
         repo = self._repo_with_n_commits(tmp_path, 4)
         linearization, commit_metadata = self._linearization_and_metadata(repo)
-        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=0)
+        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=1)
 
         commits_processed, skipped_events = mcp_server._correction_sweep_walk(
             real_db, str(repo), linearization, commit_metadata,
         )
 
-        assert commits_processed == 4
+        assert commits_processed == 3
         assert skipped_events == 0
         assert mcp_server._correction_sweep_through_query(real_db) == linearization[-1]
 
@@ -1220,10 +1229,12 @@ class TestCorrectionSweepWalk:
         assert result == (0, 0)
 
     def test_no_op_when_already_fully_swept(self, real_db, tmp_path):
+        """split_pos=1, not 0 -- see test_walks_to_exhaustion_and_returns_counts's
+        docstring for why split_pos=0 never persists frontier-low at all."""
         import mcp_server
         repo = self._repo_with_n_commits(tmp_path, 2)
         linearization, commit_metadata = self._linearization_and_metadata(repo)
-        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=0)
+        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=1)
         mcp_server._correction_sweep_walk(real_db, str(repo), linearization, commit_metadata)
 
         result = mcp_server._correction_sweep_walk(real_db, str(repo), linearization, commit_metadata)
