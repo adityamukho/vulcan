@@ -312,6 +312,15 @@ facts:
   repo with no reverse-walk activity; sweep from the start; assert the
   entity's `:introduced-by` is asserted directly, no `:type/lineage-marker`
   companion entity was ever created, and no candidate-diff record exists.
+  Also query the claimed commit itself and assert its `:type/commit` entity
+  was written (`:entity-type`, `:hash`, `:subject`, `:date` at minimum) —
+  this is new 2c-owned behavior (2c claims commits from the low end that 2b
+  never touched, so unlike case 3's `guessed_ident` handling, nothing else
+  has written this commit's metadata first) and a regression that dropped
+  it would still pass every other case-1 assertion while leaving
+  `:introduced-by` pointing at a dangling `:commit/...` ident. Additionally
+  assert no `:parent` fact exists for the claimed commit, documenting the
+  scope cut rather than leaving it untested.
 - **Confirms a correct provisional guess** (case 2): run
   `_reverse_bulk_fill_walk` first so an entity ends up with a provisional
   `:introduced-by` pointing at its true earliest commit; then run the
