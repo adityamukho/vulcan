@@ -7925,6 +7925,45 @@ def _correction_sweep_log_summary(skipped_events: int) -> None:
         )
 
 
+def _correction_sweep_claim_and_process(
+    db: Any,
+    repo_path: str,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+    ignore_patterns: Sequence[str] = (),
+    index_con: Optional[Any] = None,
+    hash_to_pos: Optional[Dict[str, int]] = None,
+    skipped_so_far: int = 0,
+) -> Optional[Tuple[str, int]]:
+    """Synchronous convenience wrapper composing
+    _correction_sweep_select_position, _extract_commit, and
+    _correction_sweep_apply in order -- for tests and any caller that
+    doesn't need them on separate executors. **2d must not call this
+    directly** from async code: it fuses the CPU-bound parse and the
+    DB-bound writes back into one function body, which can only be
+    scheduled onto one executor as a unit. 2d's real loop should await
+    each of the three pieces on its own executor instead (see the design
+    spec's Execution context).
+
+    Returns (commit_hash, skipped_events), or None if
+    _correction_sweep_select_position found nothing safe to do.
+    skipped_so_far is forwarded to _correction_sweep_apply unchanged (see
+    its docstring for why it exists).
+    """
+    selected = _correction_sweep_select_position(db, linearization, commit_metadata, hash_to_pos)
+    if selected is None:
+        return None
+    commit_hash, commit_ts_iso = selected
+    file_results, _gitlink_changes, _gitmodules_map, _renamed_pairs = _extract_commit(
+        repo_path, commit_hash, ignore_patterns
+    )
+    skipped_events = _correction_sweep_apply(
+        db, commit_hash, commit_ts_iso, file_results,
+        index_con=index_con, skipped_so_far=skipped_so_far,
+    )
+    return commit_hash, skipped_events
+
+
 async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure.
 

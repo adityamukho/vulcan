@@ -15209,3 +15209,116 @@ class TestCorrectionSweepApply:
         err = capsys.readouterr().err
         assert err.strip() != ""
         assert "3" in err
+
+
+class TestCorrectionSweepClaimAndProcess:
+    def _init_repo(self, repo):
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    def _commit(self, repo, filename, content, msg):
+        (repo / filename).write_text(content)
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", msg], cwd=repo, check=True, capture_output=True)
+
+    def _repo_with_n_commits(self, tmp_path, n):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        for i in range(n):
+            self._commit(repo, f"f{i}.py", f"def f{i}(): pass\n", f"h{i}")
+        return repo
+
+    def _linearization_and_metadata(self, repo):
+        import mcp_server
+        import frontier_registry
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        return linearization, commit_metadata
+
+    def _close_gap(self, repo, db, linearization, commit_metadata):
+        """Claim exactly one position from the low side via a real
+        FrontierAllocator + _frontier_persist_claim (standing in for 2d's
+        future ordinary forward walk), then claim the rest from the high
+        side via 2b's real _reverse_fill_claim_and_process until the gap is
+        empty. Claiming the *whole* gap from the low side alone (an
+        unbounded claim_low() loop) would never touch frontier-high at
+        all -- claim_low() alone can empty the gap without claim_high()
+        ever running, since gap_hi only moves when claim_high() does -- so
+        the low side must stop after a bounded number of claims for
+        frontier-high to end up populated. db here is any MiniGrafDb
+        instance -- the real_db fixture in most tests, or a
+        manually-created MiniGrafDb.open_in_memory() in the two-graph
+        composition test below."""
+        import mcp_server
+        allocator = mcp_server._frontier_load(db, linearization, "2026-01-04T00:00:00Z")
+        pos = allocator.claim_low()
+        if pos is not None:
+            mcp_server._frontier_persist_claim(
+                db, linearization, pos, from_low=True, commit_ts_iso=commit_metadata[pos][1],
+            )
+        while not allocator.is_gap_empty():
+            mcp_server._reverse_fill_claim_and_process(
+                db, str(repo), linearization, commit_metadata, allocator,
+            )
+        return allocator
+
+    def test_no_op_propagates_from_select_position(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 2)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")  # frontier-high unclaimed
+
+        result = mcp_server._correction_sweep_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata,
+        )
+        assert result is None
+
+    def test_single_call_round_trip(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap(repo, real_db, linearization, commit_metadata)
+
+        result = mcp_server._correction_sweep_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata,
+        )
+        assert result is not None
+        commit_hash, skipped_events = result
+        bounds = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert commit_hash == bounds[0]
+        assert skipped_events == 0
+        assert mcp_server._correction_sweep_through_query(real_db) == commit_hash
+
+    def test_wrapper_is_a_faithful_composition_of_the_three_pieces(self, tmp_path):
+        """Build TWO independent graphs from the same repo fixture (the
+        sweep mutates the state a second run would start from, so this
+        cannot be two passes over one graph). Against the first, call the
+        wrapper; against the second, call the three pieces directly.
+        Assert the resulting graph states are identical. Both dbs are
+        passed explicitly to every call -- none of these functions touch
+        mcp_server's module-global _db -- so this test needs no real_db
+        fixture and no open_db() call, just two independent
+        MiniGrafDb.open_in_memory() instances."""
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+
+        db_a = MiniGrafDb.open_in_memory()
+        self._close_gap(repo, db_a, linearization, commit_metadata)
+        mcp_server._correction_sweep_claim_and_process(db_a, str(repo), linearization, commit_metadata)
+
+        db_b = MiniGrafDb.open_in_memory()
+        self._close_gap(repo, db_b, linearization, commit_metadata)
+        selected = mcp_server._correction_sweep_select_position(db_b, linearization, commit_metadata)
+        assert selected is not None
+        commit_hash, commit_ts_iso = selected
+        file_results, _, _, _ = mcp_server._extract_commit(str(repo), commit_hash, ())
+        mcp_server._correction_sweep_apply(db_b, commit_hash, commit_ts_iso, file_results)
+
+        query = "(query [:find ?e ?a ?v :where [?e ?a ?v]])"
+        results_a = sorted(json.loads(db_a.execute(query))["results"])
+        results_b = sorted(json.loads(db_b.execute(query))["results"])
+        assert results_a == results_b
