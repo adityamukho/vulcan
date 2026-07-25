@@ -7805,6 +7805,134 @@ def _correction_sweep_select_position(
     return commit_hash, commit_ts_iso
 
 
+def _correction_sweep_apply(
+    db: Any,
+    commit_hash: str,
+    commit_ts_iso: str,
+    file_results: List[tuple],
+    index_con: Optional[Any] = None,
+    skipped_so_far: int = 0,
+) -> int:
+    """Reconciles every candidate entity file_results describes for
+    commit_hash, then records progress via _correction_sweep_through_update
+    and checkpoints. Returns skipped_events -- how many candidate idents
+    landed in the fail-safe skip (provisional with an ambiguous/wrong
+    guess, or already-authoritative with an ambiguous introduced-by count),
+    i.e. stayed provisional or unreconciled despite this call visiting
+    their commit.
+
+    Never calls _extract_commit itself (that's the caller's job, on a
+    different executor -- see the design spec's Execution context) and
+    never writes commit_hash's own :type/commit entity (2b already wrote
+    it for every commit in this sweep's range). DB-bound, parse-free.
+
+    skipped_so_far is the driving loop's running total of skipped_events
+    from every previous call this run -- it exists solely to make the
+    stderr log cap (_CORRECTION_SWEEP_LOG_CAP) work across calls without
+    this function holding any state of its own. Deriving the budget from a
+    caller-supplied running total, rather than a module-level counter, is
+    what makes the cap reset per run automatically: this server is
+    long-lived and runs many ingests, and a module counter would burn its
+    budget on the first one and log nothing ever after. The RETURNED count
+    is never capped; only what reaches stderr is.
+
+    Never calls _frontier_persist_claim -- frontier-low is not touched by
+    this sweep.
+    """
+    commit_ident = f":commit/{commit_hash[:12]}"
+    skipped_events = 0
+
+    for status, _file_path, _extracted, precomputed, _old_path in file_results:
+        if status not in ("A", "M"):
+            continue  # "D"/"R" deferred -- matches 2b's own scope cut
+        candidate_idents = (
+            [precomputed["module_ident"]]
+            + [ident for ident, _name, _t in precomputed["function_entries"]]
+            + [ident for ident, _name, _t in precomputed["class_entries"]]
+            + [ident for ident, _name, _t in precomputed["global_entries"]]
+            + [ident for ident, _name, _t in precomputed["field_entries"]]
+        )
+        unchanged_idents = precomputed.get("unchanged_idents", set())
+
+        for ident in candidate_idents:
+            raw = _db_execute(db, f"(query [:find ?c :where [{ident} :introduced-by ?c]])")
+            introduced_by_values = {row[0] for row in json.loads(raw).get("results", [])}
+
+            if _lineage_is_provisional(db, ident):
+                if introduced_by_values == {commit_ident}:
+                    # Case 1: the provisional guess matches this commit --
+                    # confirm. The :introduced-by fact itself is untouched,
+                    # since its value was already correct.
+                    _lineage_confirm(db, ident, index_con=index_con)
+                    _candidate_diff_clear(db, commit_hash, ident, index_con=index_con)
+                else:
+                    # Case 2: guess points elsewhere, or an ambiguous
+                    # (zero/2+) value count -- fail safe, leave untouched.
+                    skipped_events += 1
+                    if skipped_so_far + skipped_events <= _CORRECTION_SWEEP_LOG_CAP:
+                        print(
+                            f"[_correction_sweep] {ident} left provisional at {commit_hash} "
+                            f"(introduced-by values: {sorted(introduced_by_values)})",
+                            file=sys.stderr,
+                        )
+            else:
+                # Case 3: already authoritative.
+                if len(introduced_by_values) == 1:
+                    (only_value,) = introduced_by_values
+                    if only_value == commit_ident:
+                        continue  # self-introduction guard: no self-:modified-in
+                    raw2 = _db_execute(db, f"(query [:find ?c :where [{ident} :modified-in ?c]])")
+                    modified_in_values = {row[0] for row in json.loads(raw2).get("results", [])}
+                    already_has_modified_in = commit_ident in modified_in_values
+                    if ident in unchanged_idents:
+                        if already_has_modified_in:
+                            _retract(db, f"[[{ident} :modified-in {commit_ident}]]", index_con=index_con)
+                    else:
+                        if not already_has_modified_in:
+                            _transact(
+                                db, f"[[{ident} :modified-in {commit_ident}]]", commit_ts_iso, index_con=index_con,
+                            )
+                    _candidate_diff_clear(db, commit_hash, ident, index_con=index_con)
+                elif len(introduced_by_values) == 0:
+                    # Not provisional AND no :introduced-by fact at all --
+                    # neither stream has introduced this entity yet (e.g. a
+                    # symbol that first appears at a commit this sweep
+                    # happens to be visiting before the introducing stream
+                    # has). Nothing to reconcile; silently skip rather than
+                    # treat as an anomaly like the 2+ case below.
+                    continue
+                else:
+                    # 2+ distinct live :introduced-by values -- same
+                    # duplicate-fact risk as case 2 -- skip, left alone
+                    # rather than guessed at.
+                    skipped_events += 1
+                    if skipped_so_far + skipped_events <= _CORRECTION_SWEEP_LOG_CAP:
+                        print(
+                            f"[_correction_sweep] {ident} left unreconciled at {commit_hash} "
+                            f"(ambiguous introduced-by values: {sorted(introduced_by_values)})",
+                            file=sys.stderr,
+                        )
+
+    _correction_sweep_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
+    _db_checkpoint(db)
+    return skipped_events
+
+
+def _correction_sweep_log_summary(skipped_events: int) -> None:
+    """Emit the one-line end-of-sweep summary to stderr if skipped_events
+    is nonzero; no-op otherwise. A named function rather than an inline
+    print in each loop precisely because there are two loops that must say
+    the same thing -- _correction_sweep_walk (Task 5) and 2d's own -- and
+    an operator grepping for this line should not have to know which drove
+    the sweep.
+    """
+    if skipped_events:
+        print(
+            f"[_correction_sweep] {skipped_events} entities left provisional/unreconciled this run",
+            file=sys.stderr,
+        )
+
+
 async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure.
 

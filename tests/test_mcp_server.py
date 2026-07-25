@@ -14850,3 +14850,328 @@ class TestCorrectionSweepSelectPosition:
             real_db, linearization, commit_metadata, hash_to_pos=hash_to_pos
         )
         assert result is not None
+
+
+class TestCorrectionSweepApply:
+    def _init_repo(self, repo):
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    def _repo_with_evolving_function(self, tmp_path):
+        """Three commits: login() genuinely changes body every commit (h0,
+        h1, h2); extra() is added at h1 and left byte-identical at h2, so
+        #221 marks it unchanged at h2 -- needed for the reconcile-retract
+        test below."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+
+        (repo / "auth.py").write_text("def login():\n    return 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h0"], cwd=repo, check=True, capture_output=True)
+
+        (repo / "auth.py").write_text("def login():\n    return 2\n\ndef extra():\n    pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h1"], cwd=repo, check=True, capture_output=True)
+
+        (repo / "auth.py").write_text(
+            "def login():\n    return 3\n\ndef extra():\n    pass\n\ndef more():\n    pass\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h2"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def _extract(self, repo, commit_hash):
+        import mcp_server
+        file_results, _gitlink, _gitmodules, _renamed = mcp_server._extract_commit(str(repo), commit_hash, ())
+        return file_results
+
+    def test_confirms_correct_provisional_guess(self, real_db, tmp_path):
+        import mcp_server
+        import frontier_registry
+        repo = self._repo_with_evolving_function(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        # Real reverse walk to the end so login()'s guess settles at h0 --
+        # exactly TestReverseFillClaimAndProcess's own converged-state setup.
+        for _ in range(3):
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        h0_hash, h0_ts = linearization[0], commit_metadata[0][1]
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{h0_hash[:12]}"
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+
+        file_results = self._extract(repo, h0_hash)
+        skipped = mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)
+
+        assert skipped == 0
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{h0_hash[:12]}"
+        assert mcp_server._candidate_diff_read(real_db, h0_hash, fn_ident) is None
+
+    def test_does_not_duplicate_commit_metadata(self, real_db, tmp_path):
+        import mcp_server
+        import frontier_registry
+        repo = self._repo_with_evolving_function(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        for _ in range(3):
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+        h0_hash, h0_ts = linearization[0], commit_metadata[0][1]
+        commit_ident = f":commit/{h0_hash[:12]}"
+        before_raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?a ?v :where [{commit_ident} ?a ?v]])"
+        )
+        before = sorted(json.loads(before_raw)["results"])
+
+        file_results = self._extract(repo, h0_hash)
+        mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)
+
+        after_raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?a ?v :where [{commit_ident} ?a ?v]])"
+        )
+        after = sorted(json.loads(after_raw)["results"])
+        assert after == before
+
+    def test_leaves_entity_untouched_when_guess_points_elsewhere(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash, h0_ts = commit_metadata[0][0], commit_metadata[0][1]
+        h1_hash = commit_metadata[1][0]
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        # Hand-construct a provisional guess pointing at the WRONG commit
+        # for the one this call will visit -- simulating a precondition
+        # violation directly rather than via a real interleaving.
+        mcp_server._entity_introduced_by_set_provisional(real_db, fn_ident, f":commit/{h1_hash[:12]}", "2025-01-01T00:00:00Z")
+
+        file_results = self._extract(repo, h0_hash)
+        skipped = mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)
+
+        assert skipped >= 1
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{h1_hash[:12]}"
+
+    def test_fails_safe_on_duplicate_introduced_by_h0_asserted_first(self, real_db, tmp_path):
+        """Two live :introduced-by facts for one entity (the uncoordinated-
+        forward-walk state the design spec defers to 2d) must be a no-op
+        regardless of which fact minigraf's query returns first -- tested
+        here via physical assertion order, in a sibling test via the
+        opposite order, since row order itself isn't observable/controllable
+        from the test, only the insertion order that produces it."""
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash, h0_ts = commit_metadata[0][0], commit_metadata[0][1]
+        h1_hash = commit_metadata[1][0]
+        commit_ident_h0 = f":commit/{h0_hash[:12]}"
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        file_results = self._extract(repo, h0_hash)
+
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {commit_ident_h0}]]", "2025-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by :commit/{h1_hash[:12]}]]", "2025-01-02T00:00:00Z")
+        mcp_server._lineage_mark_provisional(real_db, fn_ident, "2025-01-01T00:00:00Z")
+
+        skipped = mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)
+
+        assert skipped >= 1
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+
+    def test_fails_safe_on_duplicate_introduced_by_h1_asserted_first(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash, h0_ts = commit_metadata[0][0], commit_metadata[0][1]
+        h1_hash = commit_metadata[1][0]
+        commit_ident_h0 = f":commit/{h0_hash[:12]}"
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        file_results = self._extract(repo, h0_hash)
+
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by :commit/{h1_hash[:12]}]]", "2025-01-02T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {commit_ident_h0}]]", "2025-01-01T00:00:00Z")
+        mcp_server._lineage_mark_provisional(real_db, fn_ident, "2025-01-01T00:00:00Z")
+
+        skipped = mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)
+
+        assert skipped >= 1
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+
+    def test_skips_modified_in_at_own_introduction_commit_on_resumed_sweep(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash, h0_ts = commit_metadata[0][0], commit_metadata[0][1]
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        commit_ident = f":commit/{h0_hash[:12]}"
+        mcp_server._entity_introduced_by_set_provisional(real_db, fn_ident, commit_ident, "2025-01-01T00:00:00Z")
+        file_results = self._extract(repo, h0_hash)
+
+        mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)  # confirms (case 1)
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+
+        # Simulate a resumed sweep re-visiting the same commit (e.g. after a
+        # crash between confirming and advancing correction-sweep-through).
+        mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)
+
+        raw = mcp_server._db_execute(real_db, f"(query [:find ?c :where [{fn_ident} :modified-in ?c]])")
+        assert [commit_ident] not in json.loads(raw)["results"]
+
+    def test_ordinary_modification_is_idempotent_when_2b_already_agrees(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash = commit_metadata[0][0]
+        h1_hash, h1_ts = commit_metadata[1][0], commit_metadata[1][1]
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        h1_ident = f":commit/{h1_hash[:12]}"
+        # login() is already authoritative at h0, and 2b (or forward walk)
+        # already wrote the correct :modified-in for h1's genuine change.
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by :commit/{h0_hash[:12]}]]", "2025-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{fn_ident} :modified-in {h1_ident}]]", h1_ts)
+
+        file_results = self._extract(repo, h1_hash)
+        skipped = mcp_server._correction_sweep_apply(real_db, h1_hash, h1_ts, file_results)
+
+        assert skipped == 0
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find (count ?c) :where [{fn_ident} :modified-in ?c]])"
+        )
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_retracts_2b_over_asserted_retroactive_modified_in(self, real_db, tmp_path):
+        """extra() is byte-identical between h1 and h2 (see the fixture
+        docstring), so #221 marks it unchanged at h2 -- but simulate 2b's
+        documented limitation by asserting :modified-in there anyway, then
+        assert this sweep retracts it once it reaches h2 in the ordinary
+        (already-authoritative) path."""
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h1_hash = commit_metadata[1][0]
+        h2_hash, h2_ts = commit_metadata[2][0], commit_metadata[2][1]
+        extra_ident = mcp_server._code_ident("function", "auth.py", "extra")
+        h1_ident = f":commit/{h1_hash[:12]}"
+        h2_ident = f":commit/{h2_hash[:12]}"
+        mcp_server._transact(real_db, f"[[{extra_ident} :introduced-by {h1_ident}]]", "2025-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{extra_ident} :modified-in {h2_ident}]]", h2_ts)  # 2b's over-assertion
+
+        file_results = self._extract(repo, h2_hash)
+        precomputed_unchanged = [
+            precomputed.get("unchanged_idents", set())
+            for _status, _fp, _extracted, precomputed, _old in file_results
+            if precomputed is not None
+        ]
+        assert any(extra_ident in u for u in precomputed_unchanged), (
+            "fixture assumption broken: extra() must read as unchanged at h2"
+        )
+
+        skipped = mcp_server._correction_sweep_apply(real_db, h2_hash, h2_ts, file_results)
+
+        assert skipped == 0
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{extra_ident} :modified-in {h2_ident}]])"
+        )
+        assert json.loads(raw)["results"] == []
+
+    def test_opportunistic_stale_candidate_diff_cleanup(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash = commit_metadata[0][0]
+        h1_hash, h1_ts = commit_metadata[1][0], commit_metadata[1][1]
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by :commit/{h0_hash[:12]}]]", "2025-01-01T00:00:00Z")
+        # An orphaned candidate-diff record from a since-superseded guess.
+        mcp_server._candidate_diff_persist(real_db, h1_hash, fn_ident, "stale-hash", "2025-01-01T00:00:00Z")
+        assert mcp_server._candidate_diff_read(real_db, h1_hash, fn_ident) is not None
+
+        file_results = self._extract(repo, h1_hash)
+        mcp_server._correction_sweep_apply(real_db, h1_hash, h1_ts, file_results)
+
+        assert mcp_server._candidate_diff_read(real_db, h1_hash, fn_ident) is None
+
+    def test_skipped_events_counts_events_not_entities(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash, h0_ts = commit_metadata[0][0], commit_metadata[0][1]
+        h1_hash, h1_ts = commit_metadata[1][0], commit_metadata[1][1]
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        wrong_ident = f":commit/{commit_metadata[2][0][:12]}"
+        mcp_server._entity_introduced_by_set_provisional(real_db, fn_ident, wrong_ident, "2025-01-01T00:00:00Z")
+
+        skipped_h0 = mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, self._extract(repo, h0_hash))
+        skipped_h1 = mcp_server._correction_sweep_apply(
+            real_db, h1_hash, h1_ts, self._extract(repo, h1_hash), skipped_so_far=skipped_h0,
+        )
+
+        assert skipped_h0 == 1
+        assert skipped_h1 == 1  # login() is a candidate at h1 too -- second event, same entity
+
+    def test_skip_logging_capped_with_returned_count_uncapped(self, real_db, tmp_path, capsys):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash, h0_ts = commit_metadata[0][0], commit_metadata[0][1]
+        # 15 synthetic candidate idents in one file entry, each provisional
+        # with a guess pointing elsewhere -- avoids needing 15 real commits
+        # to exercise the logging cap; precomputed's shape is documented in
+        # this task's Interfaces block.
+        n = 15
+        idents = [f":function/synthetic-{i}" for i in range(n)]
+        wrong_ident = ":commit/does-not-matter"
+        for ident in idents:
+            mcp_server._entity_introduced_by_set_provisional(real_db, ident, wrong_ident, "2025-01-01T00:00:00Z")
+        precomputed = {
+            "module_ident": ":module/synthetic",
+            "function_entries": [(ident, ident, []) for ident in idents],
+            "class_entries": [],
+            "global_entries": [],
+            "field_entries": [],
+            "unchanged_idents": set(),
+        }
+        file_results = [("M", "synthetic.py", {}, precomputed, "")]
+
+        skipped = mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)
+
+        assert skipped == n
+        err = capsys.readouterr().err
+        logged_lines = [line for line in err.splitlines() if "synthetic-" in line]
+        assert len(logged_lines) == mcp_server._CORRECTION_SWEEP_LOG_CAP
+
+    def test_log_cap_is_caller_threaded_not_a_module_global(self, real_db, tmp_path, capsys):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash, h0_ts = commit_metadata[0][0], commit_metadata[0][1]
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        wrong_ident = f":commit/{commit_metadata[1][0][:12]}"
+        mcp_server._entity_introduced_by_set_provisional(real_db, fn_ident, wrong_ident, "2025-01-01T00:00:00Z")
+        file_results = self._extract(repo, h0_hash)
+
+        capsys.readouterr()  # clear
+        mcp_server._correction_sweep_apply(
+            real_db, h0_hash, h0_ts, file_results, skipped_so_far=mcp_server._CORRECTION_SWEEP_LOG_CAP,
+        )
+        assert capsys.readouterr().err == ""  # budget already spent by caller's running total
+
+        mcp_server._entity_introduced_by_set_provisional(real_db, fn_ident, wrong_ident, "2025-01-01T00:00:00Z")
+        mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results, skipped_so_far=0)
+        assert "login" in capsys.readouterr().err  # fresh run, budget reset
+
+    def test_correction_sweep_log_summary(self, capsys):
+        import mcp_server
+        mcp_server._correction_sweep_log_summary(0)
+        assert capsys.readouterr().err == ""
+
+        mcp_server._correction_sweep_log_summary(3)
+        err = capsys.readouterr().err
+        assert err.strip() != ""
+        assert "3" in err
