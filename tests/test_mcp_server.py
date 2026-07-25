@@ -15371,13 +15371,13 @@ class TestCorrectionSweepWalk:
         import mcp_server
         repo = self._repo_with_n_commits(tmp_path, 4)
         linearization, commit_metadata = self._linearization_and_metadata(repo)
-        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=0)
+        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=1)
 
         commits_processed, skipped_events = mcp_server._correction_sweep_walk(
             real_db, str(repo), linearization, commit_metadata,
         )
 
-        assert commits_processed == 4
+        assert commits_processed == 3
         assert skipped_events == 0
         assert mcp_server._correction_sweep_through_query(real_db) == linearization[-1]
 
@@ -15398,7 +15398,7 @@ class TestCorrectionSweepWalk:
         import mcp_server
         repo = self._repo_with_n_commits(tmp_path, 2)
         linearization, commit_metadata = self._linearization_and_metadata(repo)
-        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=0)
+        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=1)
         mcp_server._correction_sweep_walk(real_db, str(repo), linearization, commit_metadata)
 
         result = mcp_server._correction_sweep_walk(real_db, str(repo), linearization, commit_metadata)
