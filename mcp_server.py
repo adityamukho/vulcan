@@ -7684,6 +7684,64 @@ def _reverse_bulk_fill_walk(
     return count
 
 
+_CORRECTION_SWEEP_THROUGH_IDENT = ":ingestion/correction-sweep-through"
+# Max per-ident skip lines this sweep writes to stderr per run; see the
+# Observability section of the design spec for why this must be
+# caller-threaded state (skipped_so_far), not a module-level counter.
+_CORRECTION_SWEEP_LOG_CAP = 10
+
+
+def _correction_sweep_through_query(db: Any) -> Optional[str]:
+    """Return the hash of the last commit this sweep has itself confirmed/
+    corrected, or None if it has never successfully processed one yet."""
+    raw = _db_execute(
+        db, f"(query [:find ?h :where [{_CORRECTION_SWEEP_THROUGH_IDENT} :hash ?h]])"
+    )
+    results = json.loads(raw).get("results", [])
+    return results[0][0] if results else None
+
+
+def _correction_sweep_through_update(
+    db: Any, commit_hash: str, commit_ts_iso: str, index_con: Optional[Any] = None
+) -> None:
+    """Record the last commit this sweep processed. Mirrors
+    _lineage_confirmed_through_update's retract-only-if-changed pattern
+    exactly, at a different ident with its own :description -- tracks this
+    sweep's own progress through frontier-high's territory, independent of
+    lineage-confirmed-through's "contiguous from C0" semantics.
+    """
+    current_raw = _db_execute(
+        db, f"(query [:find ?a ?v :where [{_CORRECTION_SWEEP_THROUGH_IDENT} ?a ?v]])"
+    )
+    current: Dict[str, str] = dict(json.loads(current_raw).get("results", []))
+
+    def _edn(attr: str, value: str) -> str:
+        return value if attr == ":entity-type" else f'"{_edn_escape(value)}"'
+
+    constants = {
+        ":entity-type": ":type/ingestion",
+        ":ident": _CORRECTION_SWEEP_THROUGH_IDENT,
+        ":description": "correction sweep progress watermark",
+    }
+
+    to_retract: List[str] = []
+    to_transact: List[str] = []
+    for attr, value in constants.items():
+        if current.get(attr) == value:
+            continue
+        if attr in current:
+            to_retract.append(f"[{_CORRECTION_SWEEP_THROUGH_IDENT} {attr} {_edn(attr, current[attr])}]")
+        to_transact.append(f"[{_CORRECTION_SWEEP_THROUGH_IDENT} {attr} {_edn(attr, value)}]")
+
+    if ":hash" in current:
+        to_retract.append(f"[{_CORRECTION_SWEEP_THROUGH_IDENT} :hash {_edn(':hash', current[':hash'])}]")
+    to_transact.append(f"[{_CORRECTION_SWEEP_THROUGH_IDENT} :hash {_edn(':hash', commit_hash)}]")
+
+    if to_retract:
+        _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+    _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
+
+
 async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure.
 

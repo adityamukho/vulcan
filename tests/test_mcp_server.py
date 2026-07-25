@@ -14604,3 +14604,62 @@ class TestReverseBulkFillWalk:
             real_db, str(repo), linearization, commit_metadata, allocator,
         )
         assert count == 0
+
+
+class TestCorrectionSweepThroughWatermark:
+    def test_unset_reads_as_none(self, real_db):
+        import mcp_server
+        assert mcp_server._correction_sweep_through_query(real_db) is None
+
+    def test_update_then_query_round_trip(self, real_db):
+        import mcp_server
+        db = real_db
+        mcp_server._correction_sweep_through_update(db, "h1", "2026-01-01T00:00:00Z")
+        assert mcp_server._correction_sweep_through_query(db) == "h1"
+
+        mcp_server._correction_sweep_through_update(db, "h2", "2026-01-02T00:00:00Z")
+        assert mcp_server._correction_sweep_through_query(db) == "h2"
+
+    def test_update_does_not_duplicate_hash_fact(self, real_db):
+        import mcp_server
+        db = real_db
+        mcp_server._correction_sweep_through_update(db, "h1", "2026-01-01T00:00:00Z")
+        mcp_server._correction_sweep_through_update(db, "h2", "2026-01-02T00:00:00Z")
+
+        ident = mcp_server._CORRECTION_SWEEP_THROUGH_IDENT
+        raw = mcp_server._db_execute(db, f"(query [:find (count ?h) :where [{ident} :hash ?h]])")
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_entity_carries_expected_constants_and_survives_audit(self, real_db):
+        import mcp_server
+        db = real_db
+        mcp_server._correction_sweep_through_update(db, "h1", "2026-01-01T00:00:00Z")
+
+        ident = mcp_server._CORRECTION_SWEEP_THROUGH_IDENT
+        raw = mcp_server._db_execute(db, f"(query [:find ?a ?v :where [{ident} ?a ?v]])")
+        attrs = dict(json.loads(raw)["results"])
+        assert attrs[":entity-type"] == ":type/ingestion"
+        assert attrs[":ident"] == ident
+        assert isinstance(attrs[":description"], str) and attrs[":description"]
+
+        result = mcp_server.handle_minigraf_audit()
+        assert result["retracted"] == 0
+        assert mcp_server._correction_sweep_through_query(db) == "h1"
+
+    def test_description_is_distinct_from_lineage_confirmed_through(self, real_db):
+        """Two :type/ingestion watermarks with byte-identical :description
+        strings would both pass audit but be indistinguishable from each
+        other in the fact index and in minigraf_audit output -- this
+        watermark must not just copy lineage-confirmed-through's string."""
+        import mcp_server
+        db = real_db
+        mcp_server._correction_sweep_through_update(db, "h1", "2026-01-01T00:00:00Z")
+        mcp_server._lineage_confirmed_through_update(db, "h1", "2026-01-01T00:00:00Z")
+
+        sweep_desc = dict(json.loads(mcp_server._db_execute(
+            db, f"(query [:find ?a ?v :where [{mcp_server._CORRECTION_SWEEP_THROUGH_IDENT} ?a ?v]])"
+        ))["results"])[":description"]
+        lineage_desc = dict(json.loads(mcp_server._db_execute(
+            db, f"(query [:find ?a ?v :where [{mcp_server._LINEAGE_CONFIRMED_THROUGH_IDENT} ?a ?v]])"
+        ))["results"])[":description"]
+        assert sweep_desc != lineage_desc
