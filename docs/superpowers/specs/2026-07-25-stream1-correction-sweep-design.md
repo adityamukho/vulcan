@@ -104,6 +104,38 @@ repeated `claim_low()` calls), reusing the same per-file A/M walk
 `_extract_commit`/`_build_code_triples` that 2b uses for entity
 discovery/parsing (direction-agnostic):
 
+Before any per-file work, `all_triples` is seeded with the claimed commit's
+own `:type/commit` entity — this sweep processes commits `_reverse_fill_claim_and_process`
+never touched (it claims from the *low* end of the gap; 2b only ever claims
+from the high end), so unlike case 3's `guessed_ident` handling, which
+targets a commit 2b already wrote, the commit metadata for `C` itself does
+not exist yet and must be written here, identically to 2b's own shape:
+
+```python
+all_triples: List[str] = [
+    f"[{commit_ident} :entity-type :type/commit]",
+    f'[{commit_ident} :ident "{commit_ident}"]',
+    f'[{commit_ident} :description "{_edn_escape(subject[:120])}"]',
+    f'[{commit_ident} :hash "{commit_hash}"]',
+    f'[{commit_ident} :author "{_edn_escape(author)}"]',
+    f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
+    f'[{commit_ident} :date "{commit_ts_iso}"]',
+]
+```
+
+`:parent` edges are explicitly deferred, matching 2b's own precedent — 2b's
+`_reverse_fill_claim_and_process` writes the same seven commit attributes
+above and also does not write `:parent` (mcp_server.py:7321-7329). Both
+streams currently leave every commit they claim without a `:parent` edge;
+only ordinary forward walk (`_run_ingestion`, mcp_server.py:7982) writes it
+today. This is a known gap shared by 2b and 2c, not something 2c introduces
+new — 2d must decide how (or whether) to backfill `:parent` for commits
+either stream claims once concurrency is wired, since that's the point at
+which the frontier's authoritative region stops corresponding 1:1 with
+"ordinary forward walk processed it."
+
+Per-file candidate discovery then proceeds:
+
 ```python
 candidate_idents = (
     [precomputed["module_ident"]]
@@ -116,6 +148,14 @@ known_before = {
     ident: "known" for ident in candidate_idents
     if _entity_introduced_by_query(db, ident) is not None
 }
+# Snapshot BEFORE calling _build_code_triples -- it mutates known_before in
+# place (its entity_valid_from parameter), inserting every newly introduced
+# ident as a side effect of building that ident's own structural triples.
+# Classifying case 1 against the post-call dict would therefore find every
+# fresh introduction already "known" and skip its authoritative
+# :introduced-by write entirely. Same reason 2b takes a snapshot
+# (mcp_server.py:7351) before its own equivalent call.
+known_before_snapshot = set(known_before.keys())
 triples = _build_code_triples(
     file_path, extracted, commit_ts_iso, known_before, {}, {}, commit_ident,
     precomputed, {}, {},
@@ -124,10 +164,11 @@ triples = _build_code_triples(
 all_triples.extend(t for t in triples if ":introduced-by" not in t and ":modified-in" not in t)
 ```
 
-Each candidate ident then falls into exactly one of four cases:
+Each candidate ident then falls into exactly one of four cases, classified
+against `known_before_snapshot` (never the post-call `known_before`):
 
-1. **No fact yet** (`ident not in known_before`) — neither stream has
-   touched this entity before. This *is* the true chronological
+1. **No fact yet** (`ident not in known_before_snapshot`) — neither stream
+   has touched this entity before. This *is* the true chronological
    introduction, since the sweep walks oldest→newest and nothing earlier
    claimed it. Assert `[ident :introduced-by commit_ident]` directly via
    `_transact` — no provisional marker, no candidate-diff record (nothing
@@ -162,18 +203,23 @@ Each candidate ident then falls into exactly one of four cases:
    - Give `guessed_ident` a retroactive `:modified-in` fact using **its
      own** commit timestamp (looked up from `commit_metadata` via the same
      `ts_by_commit_ident = {f":commit/{h[:12]}": ts for h, ts, _a, _s in
-     commit_metadata}` mapping 2b's step 3 builds) — **unless**
-     `_candidate_diff_read(db, guessed_hash, ident)`'s persisted body hash
-     equals this commit's freshly-computed body hash for `ident` (from
-     `precomputed["body_hashes"]`), meaning the body was actually unchanged
-     between the two commits. This is the fix for 2b's documented
-     limitation, using the persisted hash instead of re-parsing
-     `guessed_ident`'s own diff. `guessed_hash` is recovered directly from
-     `guessed_ident` by stripping its `":commit/"` prefix (`guessed_ident[9:]`)
-     — sufficient because `_candidate_diff_ident` only ever keys on
-     `commit_hash[:12]`, which is exactly what `commit_ident` already
-     truncated to when 2b minted it, so no separate hash→ident reverse
-     lookup is needed.
+     commit_metadata}` mapping 2b's step 3 builds) — **unless both**
+     `_candidate_diff_read(db, guessed_hash, ident)` and
+     `precomputed["body_hashes"].get(ident)` are non-`None` **and** equal,
+     meaning the body was actually unchanged between the two commits. This
+     is the fix for 2b's documented limitation, using the persisted hash
+     instead of re-parsing `guessed_ident`'s own diff. The comparison must
+     fail open (assert `:modified-in` conservatively) whenever either side
+     is `None` — `precomputed["body_hashes"]` deliberately excludes modules
+     (mcp_server.py:6414, function/class/variable/field only) and can be
+     empty on a parse/hash failure, so a bare `==` comparison would treat
+     module idents (and any hash-failure case) as "unchanged" via a
+     `None == None` false positive and wrongly suppress a real edit.
+     `guessed_hash` is recovered directly from `guessed_ident` by stripping
+     its `":commit/"` prefix (`guessed_ident[9:]`) — sufficient because
+     `_candidate_diff_ident` only ever keys on `commit_hash[:12]`, which is
+     exactly what `commit_ident` already truncated to when 2b minted it, so
+     no separate hash→ident reverse lookup is needed.
    - `_candidate_diff_clear` both `(commit_hash, ident)` and
      `(guessed_hash, ident)`.
 
@@ -285,6 +331,13 @@ facts:
   assert no `:modified-in` fact was written for the superseded commit —
   this is the test that would fail against 2b's own documented limitation
   if 2c naively reused its unconditional-assert behavior.
+- **Fails open when a body hash is missing** (case 3's fail-open guard):
+  same reconciliation setup as above, but for a *module* ident (which
+  `precomputed["body_hashes"]` never populates) so both the persisted
+  candidate-diff hash and the current body hash are `None`; assert the
+  retroactive `:modified-in` is still written — this is the test that would
+  catch a naive `==` comparison treating the `None == None` case as
+  "unchanged" and wrongly suppressing a real edit.
 - **Ordinary modification of an already-authoritative entity** (case 4): an
   entity already authoritative (pre-seeded, non-provisional); sweep over a
   commit that touches it; assert `:modified-in` is added and no lineage
