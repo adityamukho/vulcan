@@ -13204,9 +13204,12 @@ class TestRunIngestionGitlinks:
             assert results(
                 f'(query [:find ?x :valid-at "{first_commit_ts}" :where [{ident} :pinned-commit ?x]])'
             ) == [[first_sha]], "old pinned-commit must have been open right after the submodule add"
-            assert results(
-                f'(query [:find ?x :where [{ident} :pinned-commit "{first_sha}"]])'
-            ) == [], "old pinned-commit must be closed (not current) after the bump"
+            # The old sha being closed is covered by the exact equality below:
+            # a still-live first_sha would make this two rows, not one. (An
+            # earlier assertion here queried [:find ?x :where [ident
+            # :pinned-commit "<first_sha>"]] -- ?x bound nowhere in :where, so
+            # it returned [] whether or not the fact was live, and passed
+            # vacuously.)
             assert results(
                 f"(query [:find ?x :where [{ident} :pinned-commit ?x]])"
             ) == [[second_sha]], "current pinned-commit must reflect the bumped submodule sha"
