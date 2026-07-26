@@ -7933,17 +7933,64 @@ def _forward_apply(
             # It is also semantically right on its own terms: the
             # valid_from Stream 2 recorded is a wrong guess, and must
             # never be used as an orig_ts for a close.
-            reconcilable = [
+            #
+            # state.provisional_idents is a PRELOAD SNAPSHOT (see
+            # _preload_provisional_idents), not the authority -- by the
+            # time this commit is reached, the entity may already have
+            # been confirmed authoritative in the DB (reconciled earlier
+            # in this same forward pass, or by a previous run's
+            # correction sweep) without the in-memory set knowing.
+            # Trusting the set alone would still pop entity_valid_from and
+            # hand the ident to _build_code_triples as "new" even though
+            # _forward_reconcile_provisional no-ops on an already-
+            # authoritative entity (see its own provisional check) --
+            # minting a SECOND :introduced-by alongside the authoritative
+            # one already there. That is exactly the two-value ambiguity
+            # _correction_sweep_apply fails safe on and never resolves,
+            # reintroduced through this door. So the set is kept only as
+            # a cheap prefilter; the DB (_lineage_is_provisional) is the
+            # authority actually consulted before an ident is treated as
+            # reconcilable. Every candidate that was in the set is
+            # evicted below regardless of whether it survives that
+            # check -- a stale entry left in place would be retried, and
+            # fail the same way, on every later commit that touches the
+            # entity.
+            candidate_in_set = [
                 ident for ident in _forward_candidate_idents(precomputed)
                 if ident in state.provisional_idents
             ]
+            reconcilable = [
+                ident for ident in candidate_in_set
+                if _lineage_is_provisional(db, ident)
+            ]
+            # Built once per file rather than scanned per ident (matches
+            # _reverse_fill_claim_and_process's candidate_triples_by_ident
+            # precedent) -- a per-ident linear scan here is O(n^2) per file
+            # once there is more than one reconcilable entity.
+            structural_triples_by_ident = (
+                _forward_structural_triples_by_ident(precomputed) if reconcilable else {}
+            )
             for ident in reconcilable:
                 state.entity_valid_from.pop(ident, None)
+                if ident not in structural_triples_by_ident:
+                    # Unreachable in normal operation: _forward_candidate_idents
+                    # and _forward_structural_triples_by_ident scan the same
+                    # five sources. If they ever desynchronize, failing loudly
+                    # beats a silent [] -- that would let
+                    # _forward_reconcile_provisional retract the guess and
+                    # confirm lineage while skipping the re-dating, stranding
+                    # structural facts at the wrong valid-time.
+                    raise RuntimeError(
+                        f"_forward_structural_triples_by_ident has no entry for "
+                        f"{ident!r}, but it came from _forward_candidate_idents, "
+                        "which scans the same five sources -- the two have "
+                        "desynchronized"
+                    )
                 _forward_reconcile_provisional(
-                    db, ident,
-                    _forward_structural_triples(precomputed, ident),
+                    db, ident, structural_triples_by_ident[ident],
                     commit_ts_iso, state.ts_by_commit_ident, index_con=index_con,
                 )
+            for ident in candidate_in_set:
                 state.provisional_idents.discard(ident)
             triples = _build_code_triples(
                 file_path, extracted, commit_ts_iso, state.entity_valid_from,
@@ -8230,9 +8277,11 @@ def _forward_apply(
 
 def _forward_candidate_idents(precomputed: Dict[str, Any]) -> List[str]:
     """Every entity ident a parsed file contributes -- module plus all four
-    child categories. Same collection _reverse_fill_claim_and_process and
-    _correction_sweep_apply perform; kept as one function so the three walks
-    cannot drift on what an entity's candidate set is."""
+    child categories. Mirrors the identical collection kept inline in
+    _reverse_fill_claim_and_process (its own local `candidate_idents`) and in
+    _correction_sweep_apply (same name, same construction) -- those two are
+    NOT wired to call this helper (considered and declined, #222 phase 2d
+    Task 5 review), so all three must be kept in sync by hand."""
     return (
         [precomputed["module_ident"]]
         + [ident for ident, _name, _t in precomputed["function_entries"]]
@@ -8242,17 +8291,24 @@ def _forward_candidate_idents(precomputed: Dict[str, Any]) -> List[str]:
     )
 
 
-def _forward_structural_triples(precomputed: Dict[str, Any], ident: str) -> List[str]:
-    """ident's own candidate triples, for re-dating. A child's own list
-    carries its [parent :contains child] edge, so re-dating a child re-dates
-    its containment edge with it (#222 phase 2b1)."""
-    if ident == precomputed["module_ident"]:
-        return list(precomputed["module_candidate_triples"])
+def _forward_structural_triples_by_ident(precomputed: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Every candidate ident's own structural triples, for re-dating, built
+    once per file instead of scanned per ident (#222 phase 2d Task 5 fix --
+    the previous per-ident linear scan was O(n^2) per file once more than one
+    entity needed reconciling). Matches the existing precedent in
+    _reverse_fill_claim_and_process's candidate_triples_by_ident, which
+    builds the same shape of dict from the same five sources.
+
+    A child's own list carries its [parent :contains child] edge, so
+    re-dating a child re-dates its containment edge with it (#222 phase
+    2b1)."""
+    by_ident: Dict[str, List[str]] = {
+        precomputed["module_ident"]: list(precomputed["module_candidate_triples"]),
+    }
     for entries_key in ("function_entries", "class_entries", "global_entries", "field_entries"):
         for entry_ident, _entry_name, entry_triples in precomputed[entries_key]:
-            if entry_ident == ident:
-                return list(entry_triples)
-    return []
+            by_ident[entry_ident] = list(entry_triples)
+    return by_ident
 
 
 _CORRECTION_SWEEP_THROUGH_IDENT = ":ingestion/correction-sweep-through"

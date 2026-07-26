@@ -15773,6 +15773,91 @@ class TestForwardApplyReconcilesProvisional:
         )
         assert f":commit/{linearization[1][:12]}" in {row[0] for row in json.loads(raw_mod)["results"]}
 
+        # The module ident is provisional too (Stream 2 guessed it at h1
+        # alongside login()) and exercises the distinct module-ident branch
+        # of the reconciliation block/lookup -- not just the function-entry
+        # branch. Same exactly-one-survivor, same confirmed marker.
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        raw_module = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{module_ident} :introduced-by ?c]])",
+        )
+        module_values = {row[0] for row in json.loads(raw_module)["results"]}
+        assert module_values == {f":commit/{linearization[0][:12]}"}, "exactly one, naming h0"
+        assert mcp_server._lineage_is_provisional(real_db, module_ident) is False
+
+    def test_forward_apply_does_not_duplicate_for_a_stale_provisional_snapshot_entry(
+        self, real_db, tmp_path,
+    ):
+        """FIX 1 regression (#222 phase 2d Task 5 review): state.provisional_idents
+        is a preload SNAPSHOT, not the authority. If something else (e.g. the
+        correction sweep) already confirmed an entity authoritative in the DB
+        after the snapshot was taken, the snapshot can still list it as
+        provisional. The forward walk must consult the DB
+        (_lineage_is_provisional) before treating the ident as reconcilable --
+        popping it out of entity_valid_from unconditionally would make
+        _build_code_triples mint a SECOND :introduced-by on top of the
+        existing authoritative one, while _forward_reconcile_provisional
+        (itself DB-backed) no-ops on an already-confirmed entity and never
+        retracts the duplicate. Without the fix this yields two
+        :introduced-by values; with it, exactly one survives."""
+        import mcp_server, frontier_registry
+        repo = self._repo(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        # Stream 2 claims h1 and guesses login() was introduced there.
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+
+        # Take the preload snapshot while the entity is still genuinely
+        # provisional...
+        provisional_snapshot = mcp_server._preload_provisional_idents(real_db)
+        assert fn_ident in provisional_snapshot
+
+        # ...then simulate something else confirming it authoritative in the
+        # DB afterward (the snapshot is now stale for this ident, though the
+        # existing :introduced-by fact itself is untouched).
+        mcp_server._lineage_confirm(real_db, fn_ident)
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+        existing_raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{fn_ident} :introduced-by ?c]])",
+        )
+        assert {row[0] for row in json.loads(existing_raw)["results"]} == {
+            f":commit/{linearization[1][:12]}"
+        }
+
+        # entity_valid_from already knows this entity (mirrors the resumed-run
+        # shape) so an unconditional pop would matter.
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={fn_ident: "2026-06-01T00:00:00Z"},
+            entity_descriptions={fn_ident: "login"}, file_entities={"auth.py": [fn_ident]},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+            provisional_idents=provisional_snapshot,  # stale: still lists fn_ident
+            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
+        )
+        extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
+        mcp_server._forward_apply(
+            real_db, str(repo), state, commit_metadata[0], extracted,
+        )
+
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{fn_ident} :introduced-by ?c]])",
+        )
+        values = {row[0] for row in json.loads(raw)["results"]}
+        assert values == {f":commit/{linearization[1][:12]}"}, (
+            "exactly one :introduced-by must survive -- a stale snapshot "
+            "entry must not cause a second one to be minted"
+        )
+        # The stale entry must be evicted, or it would be retried (and fail
+        # the same way) on every later commit that touches this entity.
+        assert fn_ident not in state.provisional_idents
+
     def test_resumed_run_variant_is_not_suppressed_by_entity_valid_from(self, real_db, tmp_path):
         """The silent failure mode: on a RESUMED run, Stream 2's structural
         facts are already in the preloaded entity_valid_from, so
