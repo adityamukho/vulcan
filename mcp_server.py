@@ -5282,6 +5282,8 @@ def _entity_introduced_by_set_provisional(
     commit_ident: str,
     commit_ts_iso: str,
     index_con: Optional[Any] = None,
+    pos: Optional[int] = None,
+    pos_by_commit_ident: Optional[Dict[str, int]] = None,
 ) -> None:
     """Assert or move entity_ident's PROVISIONAL :introduced-by to
     commit_ident. Never touches an entity whose :introduced-by is already
@@ -5293,6 +5295,23 @@ def _entity_introduced_by_set_provisional(
     value genuinely changed -- mirrors _watermark_update's pattern, since
     re-transacting the same (entity, attribute, value) at a new valid_from
     creates a duplicate live datom under minigraf's write semantics.
+
+    Monotonicity (#222 phase 2b1): when pos and pos_by_commit_ident are
+    supplied, a move is REFUSED unless commit_ident is strictly earlier than
+    the current guess. This docstring always claimed the contract ("reverse
+    walk has now reached an earlier commit") but nothing enforced it, so a
+    re-claim of a higher position -- routine on a resumed run -- dragged the
+    guess forward while the caller's retroactive :modified-in landed at the
+    older, lower commit, producing an entity modified before it was
+    introduced. Forward walk cannot produce that shape, nothing in the graph
+    or the audit detects it, and it persists.
+
+    Positions, never timestamps: committer dates are not monotonic in
+    topological order (clock skew, rebases), which is why
+    build_linearization uses --topo-order at all, so comparing :date values
+    would silently mis-order commits. Both parameters default to None, in
+    which case the guard is skipped and behaviour is exactly as before --
+    2a's existing callers are unaffected; 2b passes them always.
     """
     current = _entity_introduced_by_query(db, entity_ident)
     if current is not None and not _lineage_is_provisional(db, entity_ident):
@@ -5300,6 +5319,16 @@ def _entity_introduced_by_set_provisional(
     if current == commit_ident:
         _lineage_mark_provisional(db, entity_ident, commit_ts_iso, index_con=index_con)
         return
+    if current is not None and pos is not None and pos_by_commit_ident is not None:
+        current_pos = pos_by_commit_ident.get(current)
+        if current_pos is not None and pos >= current_pos:
+            print(
+                f"[_entity_introduced_by_set_provisional] refusing to move "
+                f"{entity_ident}'s guess from {current} (position {current_pos}) "
+                f"to {commit_ident} (position {pos}): a guess may only move earlier",
+                file=sys.stderr,
+            )
+            return
     if current is not None:
         _retract(db, f"[[{entity_ident} :introduced-by {current}]]", index_con=index_con)
     _transact(db, f"[[{entity_ident} :introduced-by {commit_ident}]]", commit_ts_iso, index_con=index_con)
@@ -7370,9 +7399,11 @@ def _reverse_fill_claim_and_process(
         f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
         f'[{commit_ident} :date "{commit_ts_iso}"]',
     ]
+    pos_by_commit_ident = {f":commit/{h[:12]}": i for i, (h, _t, _a, _s) in enumerate(commit_metadata)}
+    ts_by_commit_ident = {f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata}
     new_candidates: List[str] = []
     provisional_moves: List[Tuple[str, str]] = []  # (ident, superseded_commit_ident)
-    already_authoritative_touched: List[str] = []
+    already_authoritative_touched: List[Tuple[str, Optional[str]]] = []
     body_hash_by_ident: Dict[str, str] = {}
     unchanged_by_ident: Dict[str, bool] = {}
 
@@ -7413,38 +7444,93 @@ def _reverse_fill_claim_and_process(
                 superseded_ident = _entity_introduced_by_query(db, ident)
                 provisional_moves.append((ident, superseded_ident))
             else:
-                already_authoritative_touched.append(ident)
+                already_authoritative_touched.append(
+                    (ident, _entity_introduced_by_query(db, ident))
+                )
 
         body_hash_by_ident.update(precomputed.get("body_hashes", {}))
 
-    _transact(db, "[" + " ".join(all_triples) + "]", commit_ts_iso, index_con=index_con)
+    # Split :contains out before batching (#222 phase 2b1). Minigraf's EAVT
+    # pending index lacks value bytes in the key, so batching multiple
+    # [module :contains fn] facts in ONE transact silently keeps only the
+    # last -- five of six containment edges on an ordinary multi-entity file.
+    # Forward walk splits them for exactly this reason (see _run_ingestion's
+    # own one-transact-per-edge loop and _ingest_close's docstring). Only
+    # :contains repeats (entity, attribute) within this batch: the
+    # :modified-in triples below are one per DISTINCT entity, and facts
+    # differing in entity do not collide.
+    contains_triples = [t for t in all_triples if ":contains" in t]
+    other_triples = [t for t in all_triples if ":contains" not in t]
+    _transact(db, "[" + " ".join(other_triples) + "]", commit_ts_iso, index_con=index_con)
+    for contains_triple in contains_triples:
+        _transact(db, "[" + contains_triple + "]", commit_ts_iso, index_con=index_con)
 
-    authoritative_modified_triples = [
-        f"[{ident} :modified-in {commit_ident}]"
-        for ident in already_authoritative_touched
-        if not unchanged_by_ident.get(ident, False)
-    ]
+    # Third of the three write paths the monotonicity invariant covers
+    # (#222 phase 2b1), and the one the 2b review did not list: an entity
+    # whose :introduced-by is already authoritative could still be handed a
+    # :modified-in at an EARLIER claimed commit, with no check at all. That
+    # is also the symptom half of the 2c interleaving (a sweep confirms an
+    # entity, then this walk descends past it). Suppressing the edge does
+    # not fix that entity's lineage -- reverse walk must never clobber an
+    # authoritative :introduced-by -- so 2c's gap-closed precondition stays
+    # load-bearing; this only stops the contradictory fact being written.
+    authoritative_modified_triples = []
+    for ident, intro_ident in already_authoritative_touched:
+        if unchanged_by_ident.get(ident, False):
+            continue
+        intro_pos = pos_by_commit_ident.get(intro_ident) if intro_ident is not None else None
+        if intro_pos is not None and pos <= intro_pos:
+            print(
+                f"[_reverse_fill_claim_and_process] skipping :modified-in for {ident} at "
+                f"position {pos}: not later than its introduction {intro_ident} "
+                f"(position {intro_pos})",
+                file=sys.stderr,
+            )
+            continue
+        authoritative_modified_triples.append(f"[{ident} :modified-in {commit_ident}]")
     if authoritative_modified_triples:
         _transact(
             db, "[" + " ".join(authoritative_modified_triples) + "]", commit_ts_iso, index_con=index_con,
         )
 
     for ident in new_candidates:
-        _entity_introduced_by_set_provisional(db, ident, commit_ident, commit_ts_iso, index_con=index_con)
+        _entity_introduced_by_set_provisional(
+            db, ident, commit_ident, commit_ts_iso, index_con=index_con,
+            pos=pos, pos_by_commit_ident=pos_by_commit_ident,
+        )
         if ident in body_hash_by_ident:
             _candidate_diff_persist(
                 db, commit_hash, ident, body_hash_by_ident[ident], commit_ts_iso, index_con=index_con,
             )
 
-    ts_by_commit_ident = {f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata}
     for ident, superseded_ident in provisional_moves:
-        _entity_introduced_by_set_provisional(db, ident, commit_ident, commit_ts_iso, index_con=index_con)
+        _entity_introduced_by_set_provisional(
+            db, ident, commit_ident, commit_ts_iso, index_con=index_con,
+            pos=pos, pos_by_commit_ident=pos_by_commit_ident,
+        )
         if ident in body_hash_by_ident:
             _candidate_diff_persist(
                 db, commit_hash, ident, body_hash_by_ident[ident], commit_ts_iso, index_con=index_con,
             )
         if superseded_ident is not None and superseded_ident != commit_ident:
-            superseded_ts = ts_by_commit_ident.get(superseded_ident, commit_ts_iso)
+            superseded_pos = pos_by_commit_ident.get(superseded_ident)
+            if superseded_pos is not None and superseded_pos <= pos:
+                # The move was refused (or would be): the "superseded" guess
+                # is not actually later than this commit, so asserting it as
+                # a modification would claim the entity changed at or before
+                # its own introduction.
+                continue
+            superseded_ts = ts_by_commit_ident.get(superseded_ident)
+            if superseded_ts is None:
+                # Falling back to THIS commit's timestamp back-dates the edge
+                # to before the modification it describes -- a fact asserted
+                # valid before it was true. Skip and say so instead.
+                print(
+                    f"[_reverse_fill_claim_and_process] skipping retroactive :modified-in "
+                    f"for {ident} at {superseded_ident}: no timestamp in commit_metadata",
+                    file=sys.stderr,
+                )
+                continue
             _transact(
                 db, f"[[{ident} :modified-in {superseded_ident}]]", superseded_ts, index_con=index_con,
             )
