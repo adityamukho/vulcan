@@ -4973,10 +4973,53 @@ def _frontier_load(
         ))
     high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
     if high_bounds is not None and high_bounds[0] in hash_to_pos and high_bounds[1] in hash_to_pos:
-        intervals.append(frontier_registry.Interval(
-            hash_to_pos[high_bounds[0]], hash_to_pos[high_bounds[1]], frontier_registry.TAG_PROVISIONAL
-        ))
+        hi_lo_pos, hi_hi_pos = hash_to_pos[high_bounds[0]], hash_to_pos[high_bounds[1]]
+        if hi_lo_pos <= hi_hi_pos and hi_hi_pos == len(linearization) - 1:
+            intervals.append(frontier_registry.Interval(
+                hi_lo_pos, hi_hi_pos, frontier_registry.TAG_PROVISIONAL
+            ))
+        else:
+            # Unrepresentable (#222 phase 2b1). Either the pair is inverted
+            # (what the pre-2b1 persist path produced once the linearization
+            # grew), or it no longer reaches the last position -- meaning new
+            # commits have landed above it, so the real state is three spans
+            # (authoritative low, filled high, new unclaimed above) and the
+            # gap now sits ABOVE this interval. One lo/hi pair per side
+            # cannot express that, so drop it and let the region be
+            # re-walked: re-processing an already-processed position is
+            # idempotent, so the graph converges and only work is wasted.
+            #
+            # Retract the facts too, not just the in-memory interval. Leaving
+            # them behind means the next _frontier_persist_claim sees a
+            # non-None `existing` and extends a pair the allocator no longer
+            # believes in, re-creating the inverted state on the first claim
+            # of the new run.
+            #
+            # Folding a 2c-confirmed high region into frontier-low instead
+            # (no re-walk at all) needs :ingestion/correction-sweep-through
+            # and spans all three streams -- that is 2d's, see the 2b1 design
+            # spec's "Why re-ingest is made safe, not efficient".
+            _frontier_discard_interval(
+                db, _FRONTIER_HIGH_IDENT, high_bounds, index_con=index_con
+            )
     return frontier_registry.FrontierAllocator(len(linearization), intervals)
+
+
+def _frontier_discard_interval(
+    db: Any, ident: str, bounds: Tuple[str, str], index_con: Optional[Any] = None
+) -> None:
+    """Retract an interval's four persisted facts, mirroring the set
+    _frontier_persist_claim creates. Used by _frontier_load when a persisted
+    pair cannot faithfully describe the claimed region (see its call site).
+    """
+    tag = ":authoritative" if ident == _FRONTIER_LOW_IDENT else ":provisional"
+    facts = [
+        f"[{ident} :entity-type :type/ingest-interval]",
+        f"[{ident} :tag {tag}]",
+        f'[{ident} :lo-hash "{_edn_escape(bounds[0])}"]',
+        f'[{ident} :hi-hash "{_edn_escape(bounds[1])}"]',
+    ]
+    _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
 
 
 def _frontier_persist_claim(
@@ -7424,8 +7467,20 @@ def _reverse_bulk_fill_walk(
     the gap closes. Returns the count of commits processed. No caller in
     this sub-phase -- 2d wires this into the real concurrent ingestion
     loop alongside the forward stream.
+
+    Stops loudly if a claim ever fails to move strictly downward (#222
+    phase 2b1). This loop is unbounded by construction and drives a git
+    subprocess, a tree-sitter parse, a DB write batch and a _db_checkpoint
+    fsync on every iteration, so an allocator that stops making progress
+    turns it into an unbounded fsync loop inside what 2d intends to run as a
+    background task -- which is exactly what happened before 2b1 fixed
+    FrontierAllocator._extend. The guard stays even though that root cause
+    is fixed: it converts any future allocator regression from a hang into a
+    stop plus a stderr line.
     """
+    hash_to_pos = {h: i for i, h in enumerate(linearization)}
     count = 0
+    last_pos: Optional[int] = None
     while True:
         result = _reverse_fill_claim_and_process(
             db, repo_path, linearization, commit_metadata, allocator,
@@ -7434,6 +7489,15 @@ def _reverse_bulk_fill_walk(
         if result is None:
             break
         count += 1
+        pos = hash_to_pos.get(result)
+        if pos is not None and last_pos is not None and pos >= last_pos:
+            print(
+                f"[_reverse_bulk_fill_walk] no progress: claim returned position {pos} "
+                f"after {last_pos}; stopping after {count} commits to avoid spinning",
+                file=sys.stderr,
+            )
+            break
+        last_pos = pos
     return count
 
 

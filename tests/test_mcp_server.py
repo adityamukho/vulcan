@@ -6006,6 +6006,63 @@ class TestFrontierLoad:
         assert allocator.intervals() == []
 
 
+class TestFrontierLoadNormalisesUnrepresentableIntervals:
+    """The persisted schema holds ONE lo/hi pair per side, which cannot
+    express the post-growth shape (authoritative low region, already-filled
+    high region, then newly-arrived commits above it -- the gap moves ABOVE
+    the high interval). #222 phase 2b1 discards such an interval on load and
+    retracts its facts, so the graph and the allocator agree that the side
+    holds nothing, and the region is simply re-walked (which is safe: the 2b
+    review verified that re-processing an already-processed position is
+    idempotent)."""
+
+    def _seed_high(self, db, lo_hash, hi_hash):
+        import mcp_server
+        facts = [
+            f"[{mcp_server._FRONTIER_HIGH_IDENT} :entity-type :type/ingest-interval]",
+            f"[{mcp_server._FRONTIER_HIGH_IDENT} :tag :provisional]",
+            f'[{mcp_server._FRONTIER_HIGH_IDENT} :lo-hash "{lo_hash}"]',
+            f'[{mcp_server._FRONTIER_HIGH_IDENT} :hi-hash "{hi_hash}"]',
+        ]
+        mcp_server._transact(db, "[" + " ".join(facts) + "]", "2026-01-01T00:00:00Z")
+
+    def test_discards_and_retracts_high_interval_that_no_longer_tops_out(self, real_db):
+        import mcp_server
+        # Run 1 claimed h1..h2 of a 3-commit repo; h3 and h4 have since landed.
+        self._seed_high(real_db, "h1", "h2")
+        grown = ["h0", "h1", "h2", "h3", "h4"]
+
+        allocator = mcp_server._frontier_load(real_db, grown, "2026-01-02T00:00:00Z")
+
+        assert allocator.intervals() == [], "stale high interval must not be reconstructed"
+        assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) is None, (
+            "discarding only in memory leaves the next persist call extending a pair "
+            "the allocator no longer believes in, which re-creates the inverted state"
+        )
+
+    def test_discards_and_retracts_inverted_high_interval(self, real_db):
+        import mcp_server
+        self._seed_high(real_db, "h3", "h1")  # lo above hi: what the old persist path produced
+        linearization = ["h0", "h1", "h2", "h3"]
+
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-02T00:00:00Z")
+
+        assert allocator.intervals() == []
+        assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) is None
+
+    def test_keeps_a_high_interval_that_still_tops_out(self, real_db):
+        import mcp_server
+        linearization = ["h0", "h1", "h2", "h3"]
+        self._seed_high(real_db, "h2", "h3")
+
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-02T00:00:00Z")
+
+        assert allocator.intervals() == [
+            frontier_registry.Interval(2, 3, frontier_registry.TAG_PROVISIONAL)
+        ]
+        assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) == ("h2", "h3")
+
+
 class TestFrontierPersistClaim:
     def test_first_claim_from_low_creates_interval(self, real_db):
         import mcp_server
@@ -14056,6 +14113,67 @@ class TestReverseFillClaimAndProcess:
         assert bounds is not None
         _lo_hash, hi_hash = bounds
         assert hi_hash == linearization[-1]
+
+
+class _NoProgressAllocator:
+    """Stand-in for a FrontierAllocator whose claim_high() stops making
+    progress -- the pre-2b1 behaviour on a grown linearization, where
+    _extend rewrote a stale interval to itself and gap_hi never moved.
+
+    Not a mocked backend (docs/testing-conventions.md): the DB and the git
+    repo in this test are real; only the allocator, a pure in-memory
+    collaborator, is substituted, because after the 2b1 allocator fix no
+    real allocator can reach this state -- which is exactly why the walk
+    still needs its own guard.
+
+    Raises rather than looping forever once called too many times, so a
+    missing guard fails the test instead of hanging the suite.
+    """
+
+    def __init__(self, pos, max_calls=50):
+        self.pos = pos
+        self.calls = 0
+        self.max_calls = max_calls
+
+    def claim_high(self):
+        self.calls += 1
+        if self.calls > self.max_calls:
+            raise AssertionError(
+                f"claim_high() called {self.calls} times without progress -- "
+                "_reverse_bulk_fill_walk has no progress guard"
+            )
+        return self.pos
+
+
+class TestReverseBulkFillWalkProgressGuard:
+    def test_breaks_loudly_when_claim_high_stops_decreasing(self, real_db, tmp_path, capsys):
+        """The walk's loop is unbounded by construction and drives a git
+        subprocess, a tree-sitter parse, a DB write batch and a
+        _db_checkpoint fsync per iteration, inside what 2d intends to run as
+        a background task. It must stop on its own if the allocator ever
+        stops making progress, rather than spinning."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(3):
+            (repo / f"f{i}.py").write_text(f"def f{i}(): pass\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"h{i}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = _NoProgressAllocator(pos=1)
+
+        count = mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        assert allocator.calls < 10, f"walk kept claiming after no progress ({allocator.calls} calls)"
+        assert count >= 1  # the first claim is legitimate work
+        assert "progress" in capsys.readouterr().err.lower()
 
 
 class TestReverseBulkFillWalk:
