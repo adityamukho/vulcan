@@ -6914,6 +6914,24 @@ def _preload_pinned_commits(db: Any) -> Dict[str, tuple]:
     return pinned
 
 
+def _preload_provisional_idents(db: Any) -> Set[str]:
+    """Every tracked ident that currently has a :type/lineage-marker
+    companion entity, i.e. whose :introduced-by is a provisional guess.
+
+    No :status clause is needed: the marker exists ONLY while the entity is
+    provisional -- _lineage_confirm retracts the whole companion entity
+    rather than flipping its :status -- so existence is the test, exactly as
+    _lineage_is_provisional does per-ident. Keeping the two queries the same
+    shape is deliberate: this set is consulted where a per-ident check is
+    too expensive, and the two must never disagree.
+    """
+    raw = _db_execute(
+        db,
+        f"(query [:find ?e :where [?m :entity-type {_LINEAGE_MARKER_ENTITY_TYPE}] [?m :entity ?e]])",
+    )
+    return {row[0] for row in json.loads(raw).get("results", [])}
+
+
 def _load_ingestion_preload_state(repo_path: str) -> tuple:
     """Open the DB and run every startup preload query for _run_ingestion.
 
@@ -6939,10 +6957,12 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     field_class_ident = _preload_field_class_idents(db)
     field_static_ident = _preload_field_static_idents(db)
     unresolved_dep_idents = _preload_unresolved_dep_idents(db, submodule_paths)
+    provisional_idents = _preload_provisional_idents(db)
     return (
         watermark, prior_ingested, entity_valid_from, entity_descriptions,
         file_entities, file_deps, dep_valid_from, pinned_commit_state,
         field_class_ident, field_static_ident, submodule_paths, unresolved_dep_idents,
+        provisional_idents,
     )
 
 
@@ -8096,6 +8116,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 watermark, prior_ingested, entity_valid_from, entity_descriptions,
                 file_entities, file_deps, dep_valid_from, pinned_commit_state,
                 field_class_ident, field_static_ident, submodule_paths, unresolved_dep_idents,
+                provisional_idents,  # consumed by _forward_apply (Task 5)
             ) = await loop.run_in_executor(preload_executor, _load_ingestion_preload_state, repo_path)
         # minigraf exposes no explicit close(): the file lock is only released once
         # every reference to the handle is gone — the worker thread's own `db`

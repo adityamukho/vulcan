@@ -9042,6 +9042,39 @@ class TestPreloadExternalDependencies:
         assert mcp_server._preload_pinned_commits(real_db) == {}
 
 
+class TestPreloadProvisionalIdents:
+    def test_empty_when_no_markers(self, real_db):
+        import mcp_server
+        assert mcp_server._preload_provisional_idents(real_db) == set()
+
+    def test_returns_every_marked_ident(self, real_db):
+        import mcp_server
+        mcp_server._lineage_mark_provisional(real_db, ":code/fn-a", "2026-01-01T00:00:00Z")
+        mcp_server._lineage_mark_provisional(real_db, ":code/fn-b", "2026-01-01T00:00:00Z")
+        assert mcp_server._preload_provisional_idents(real_db) == {":code/fn-a", ":code/fn-b"}
+
+    def test_confirmed_idents_drop_out(self, real_db):
+        """_lineage_confirm retracts the whole companion entity rather than
+        flipping :status, so the set form must agree with the per-ident
+        _lineage_is_provisional check the reconciliation relies on."""
+        import mcp_server
+        mcp_server._lineage_mark_provisional(real_db, ":code/fn-a", "2026-01-01T00:00:00Z")
+        mcp_server._lineage_mark_provisional(real_db, ":code/fn-b", "2026-01-01T00:00:00Z")
+        mcp_server._lineage_confirm(real_db, ":code/fn-a")
+        assert mcp_server._preload_provisional_idents(real_db) == {":code/fn-b"}
+        assert mcp_server._lineage_is_provisional(real_db, ":code/fn-a") is False
+
+    def test_load_ingestion_preload_state_returns_it_last(self, real_db, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        mcp_server._lineage_mark_provisional(real_db, ":code/fn-a", "2026-01-01T00:00:00Z")
+        result = mcp_server._load_ingestion_preload_state(str(repo))
+        assert len(result) == 13
+        assert result[-1] == {":code/fn-a"}
+
+
 class TestIngestTransactFactIndex:
     def test_ingest_transact_writes_to_index_with_explicit_con(self, real_db):
         import mcp_server
