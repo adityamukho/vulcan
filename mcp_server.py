@@ -7684,6 +7684,345 @@ def _reverse_bulk_fill_walk(
     return count
 
 
+_CORRECTION_SWEEP_THROUGH_IDENT = ":ingestion/correction-sweep-through"
+# Max per-ident skip lines this sweep writes to stderr per run; see the
+# Observability section of the design spec for why this must be
+# caller-threaded state (skipped_so_far), not a module-level counter.
+_CORRECTION_SWEEP_LOG_CAP = 10
+
+
+def _correction_sweep_through_query(db: Any) -> Optional[str]:
+    """Return the hash of the last commit this sweep has itself confirmed/
+    corrected, or None if it has never successfully processed one yet."""
+    raw = _db_execute(
+        db, f"(query [:find ?h :where [{_CORRECTION_SWEEP_THROUGH_IDENT} :hash ?h]])"
+    )
+    results = json.loads(raw).get("results", [])
+    return results[0][0] if results else None
+
+
+def _correction_sweep_through_update(
+    db: Any, commit_hash: str, commit_ts_iso: str, index_con: Optional[Any] = None
+) -> None:
+    """Record the last commit this sweep processed. Mirrors
+    _lineage_confirmed_through_update's retract-only-if-changed pattern
+    exactly, at a different ident with its own :description -- tracks this
+    sweep's own progress through frontier-high's territory, independent of
+    lineage-confirmed-through's "contiguous from C0" semantics.
+    """
+    current_raw = _db_execute(
+        db, f"(query [:find ?a ?v :where [{_CORRECTION_SWEEP_THROUGH_IDENT} ?a ?v]])"
+    )
+    current: Dict[str, str] = dict(json.loads(current_raw).get("results", []))
+
+    def _edn(attr: str, value: str) -> str:
+        return value if attr == ":entity-type" else f'"{_edn_escape(value)}"'
+
+    constants = {
+        ":entity-type": ":type/ingestion",
+        ":ident": _CORRECTION_SWEEP_THROUGH_IDENT,
+        ":description": "correction sweep progress watermark",
+    }
+
+    to_retract: List[str] = []
+    to_transact: List[str] = []
+    for attr, value in constants.items():
+        if current.get(attr) == value:
+            continue
+        if attr in current:
+            to_retract.append(f"[{_CORRECTION_SWEEP_THROUGH_IDENT} {attr} {_edn(attr, current[attr])}]")
+        to_transact.append(f"[{_CORRECTION_SWEEP_THROUGH_IDENT} {attr} {_edn(attr, value)}]")
+
+    if ":hash" in current:
+        to_retract.append(f"[{_CORRECTION_SWEEP_THROUGH_IDENT} :hash {_edn(':hash', current[':hash'])}]")
+    to_transact.append(f"[{_CORRECTION_SWEEP_THROUGH_IDENT} :hash {_edn(':hash', commit_hash)}]")
+
+    if to_retract:
+        _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+    _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
+
+
+def _correction_sweep_select_position(
+    db: Any,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+    hash_to_pos: Optional[Dict[str, int]] = None,
+) -> Optional[Tuple[str, str]]:
+    """Returns (commit_hash, commit_ts_iso) for the next commit this sweep
+    should process, upward through frontier-high's own claimed territory,
+    or None if there is nothing safe to correct yet: the gap is still open
+    (Stream 2 could still descend past a position this call would confirm
+    -- see the design spec's "Why confirming requires the gap to already
+    be closed"), frontier-high hasn't claimed anything yet, a required
+    boundary hash is stale, commit_metadata doesn't match linearization, or
+    the sweep has already reached frontier-high's own :hi-hash.
+
+    DB-bound, parse-free -- must run off the event-loop thread (per the
+    design spec's Execution context) but never on the same executor as
+    _extract_commit, since the two must be independently schedulable.
+
+    hash_to_pos, if omitted, is built fresh from linearization -- callers
+    doing a full sweep should build it once and pass it in instead to
+    avoid rebuilding an N-entry map on every one of a full sweep's N calls.
+    """
+    low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
+    high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
+    if high_bounds is None:
+        return None  # Stream 2 hasn't claimed anything -- nothing to correct
+
+    if hash_to_pos is None:
+        hash_to_pos = {h: i for i, h in enumerate(linearization)}
+
+    if high_bounds[0] not in hash_to_pos:
+        return None  # a boundary hash is stale (rewritten history); nothing safe to do
+
+    if low_bounds is None:
+        # An ABSENT frontier-low means an EMPTY low region, not an unknown
+        # one, so its highest claimed position is -1 -- exactly how
+        # FrontierAllocator.gap_lo treats "no interval covers position 0".
+        # A fresh graph seeds neither side, and frontier-low is only created
+        # once the forward stream persists its first claim, so reading
+        # absent as "nothing safe to do" would strand every entity
+        # provisional forever whenever Stream 2 claims the whole history
+        # before Stream 1 claims anything -- reachable in 2d, where the
+        # forward stream does a large preload before its first claim.
+        low_hi_pos = -1
+    else:
+        if low_bounds[1] not in hash_to_pos:
+            return None  # a boundary hash is stale (rewritten history)
+        low_hi_pos = hash_to_pos[low_bounds[1]]
+
+    if low_hi_pos + 1 != hash_to_pos[high_bounds[0]]:
+        return None  # gap still open -- Stream 2 may still descend past a position
+                     # this sweep would otherwise confirm
+
+    if high_bounds[1] not in hash_to_pos:
+        return None  # frontier-high's :hi-hash is stale; nothing safe to do
+    ceiling_pos = hash_to_pos[high_bounds[1]]
+
+    through_hash = _correction_sweep_through_query(db)
+    if through_hash is not None and through_hash in hash_to_pos:
+        pos = hash_to_pos[through_hash] + 1
+    else:
+        # Unset (first-ever call), or a stale hash from rewritten/rebased
+        # history -- (re)start from frontier-high's current lo-hash,
+        # mirroring _frontier_load's own precedent of dropping a bound
+        # that no longer resolves rather than erroring.
+        pos = hash_to_pos[high_bounds[0]]  # already validated above
+
+    if pos > ceiling_pos:
+        return None  # reached frontier-high's own :hi-hash; nothing left to correct
+
+    if len(commit_metadata) != len(linearization) or commit_metadata[pos][0] != linearization[pos]:
+        return None  # commit_metadata violates its stated contract -- nothing safe to
+                     # do, rather than an IndexError or a wrong-commit read
+
+    commit_hash, commit_ts_iso, _author, _subject = commit_metadata[pos]
+    return commit_hash, commit_ts_iso
+
+
+def _correction_sweep_apply(
+    db: Any,
+    commit_hash: str,
+    commit_ts_iso: str,
+    file_results: List[tuple],
+    index_con: Optional[Any] = None,
+    skipped_so_far: int = 0,
+) -> int:
+    """Reconciles every candidate entity file_results describes for
+    commit_hash, then records progress via _correction_sweep_through_update
+    and checkpoints. Returns skipped_events -- how many candidate idents
+    landed in the fail-safe skip (provisional with an ambiguous/wrong
+    guess, or already-authoritative with an ambiguous introduced-by count),
+    i.e. stayed provisional or unreconciled despite this call visiting
+    their commit.
+
+    Never calls _extract_commit itself (that's the caller's job, on a
+    different executor -- see the design spec's Execution context) and
+    never writes commit_hash's own :type/commit entity (2b already wrote
+    it for every commit in this sweep's range). DB-bound, parse-free.
+
+    skipped_so_far is the driving loop's running total of skipped_events
+    from every previous call this run -- it exists solely to make the
+    stderr log cap (_CORRECTION_SWEEP_LOG_CAP) work across calls without
+    this function holding any state of its own. Deriving the budget from a
+    caller-supplied running total, rather than a module-level counter, is
+    what makes the cap reset per run automatically: this server is
+    long-lived and runs many ingests, and a module counter would burn its
+    budget on the first one and log nothing ever after. The RETURNED count
+    is never capped; only what reaches stderr is.
+
+    Never calls _frontier_persist_claim -- frontier-low is not touched by
+    this sweep.
+    """
+    commit_ident = f":commit/{commit_hash[:12]}"
+    skipped_events = 0
+
+    for status, _file_path, _extracted, precomputed, _old_path in file_results:
+        if status not in ("A", "M"):
+            continue  # "D"/"R" deferred -- matches 2b's own scope cut
+        candidate_idents = (
+            [precomputed["module_ident"]]
+            + [ident for ident, _name, _t in precomputed["function_entries"]]
+            + [ident for ident, _name, _t in precomputed["class_entries"]]
+            + [ident for ident, _name, _t in precomputed["global_entries"]]
+            + [ident for ident, _name, _t in precomputed["field_entries"]]
+        )
+        unchanged_idents = precomputed.get("unchanged_idents", set())
+
+        for ident in candidate_idents:
+            raw = _db_execute(db, f"(query [:find ?c :where [{ident} :introduced-by ?c]])")
+            introduced_by_values = {row[0] for row in json.loads(raw).get("results", [])}
+
+            if _lineage_is_provisional(db, ident):
+                if introduced_by_values == {commit_ident}:
+                    # Case 1: the provisional guess matches this commit --
+                    # confirm. The :introduced-by fact itself is untouched,
+                    # since its value was already correct.
+                    _lineage_confirm(db, ident, index_con=index_con)
+                    _candidate_diff_clear(db, commit_hash, ident, index_con=index_con)
+                else:
+                    # Case 2: guess points elsewhere, or an ambiguous
+                    # (zero/2+) value count -- fail safe, leave untouched.
+                    skipped_events += 1
+                    if skipped_so_far + skipped_events <= _CORRECTION_SWEEP_LOG_CAP:
+                        print(
+                            f"[_correction_sweep] {ident} left provisional at {commit_hash} "
+                            f"(introduced-by values: {sorted(introduced_by_values)})",
+                            file=sys.stderr,
+                        )
+            else:
+                # Case 3: already authoritative.
+                if len(introduced_by_values) == 1:
+                    (only_value,) = introduced_by_values
+                    if only_value == commit_ident:
+                        continue  # self-introduction guard: no self-:modified-in
+                    raw2 = _db_execute(db, f"(query [:find ?c :where [{ident} :modified-in ?c]])")
+                    modified_in_values = {row[0] for row in json.loads(raw2).get("results", [])}
+                    already_has_modified_in = commit_ident in modified_in_values
+                    if ident in unchanged_idents:
+                        if already_has_modified_in:
+                            _retract(db, f"[[{ident} :modified-in {commit_ident}]]", index_con=index_con)
+                    else:
+                        if not already_has_modified_in:
+                            _transact(
+                                db, f"[[{ident} :modified-in {commit_ident}]]", commit_ts_iso, index_con=index_con,
+                            )
+                    _candidate_diff_clear(db, commit_hash, ident, index_con=index_con)
+                else:
+                    # Zero or 2+ distinct values -- same duplicate-fact
+                    # risk as case 2 -- skip, left alone rather than
+                    # guessed at.
+                    skipped_events += 1
+                    if skipped_so_far + skipped_events <= _CORRECTION_SWEEP_LOG_CAP:
+                        print(
+                            f"[_correction_sweep] {ident} left unreconciled at {commit_hash} "
+                            f"(ambiguous introduced-by values: {sorted(introduced_by_values)})",
+                            file=sys.stderr,
+                        )
+
+    _correction_sweep_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
+    _db_checkpoint(db)
+    return skipped_events
+
+
+def _correction_sweep_log_summary(skipped_events: int) -> None:
+    """Emit the one-line end-of-sweep summary to stderr if skipped_events
+    is nonzero; no-op otherwise. A named function rather than an inline
+    print in each loop precisely because there are two loops that must say
+    the same thing -- _correction_sweep_walk (Task 5) and 2d's own -- and
+    an operator grepping for this line should not have to know which drove
+    the sweep.
+    """
+    if skipped_events:
+        print(
+            f"[_correction_sweep] {skipped_events} entities left provisional/unreconciled this run",
+            file=sys.stderr,
+        )
+
+
+def _correction_sweep_claim_and_process(
+    db: Any,
+    repo_path: str,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+    ignore_patterns: Sequence[str] = (),
+    index_con: Optional[Any] = None,
+    hash_to_pos: Optional[Dict[str, int]] = None,
+    skipped_so_far: int = 0,
+) -> Optional[Tuple[str, int]]:
+    """Synchronous convenience wrapper composing
+    _correction_sweep_select_position, _extract_commit, and
+    _correction_sweep_apply in order -- for tests and any caller that
+    doesn't need them on separate executors. **2d must not call this
+    directly** from async code: it fuses the CPU-bound parse and the
+    DB-bound writes back into one function body, which can only be
+    scheduled onto one executor as a unit. 2d's real loop should await
+    each of the three pieces on its own executor instead (see the design
+    spec's Execution context).
+
+    Returns (commit_hash, skipped_events), or None if
+    _correction_sweep_select_position found nothing safe to do.
+    skipped_so_far is forwarded to _correction_sweep_apply unchanged (see
+    its docstring for why it exists).
+    """
+    selected = _correction_sweep_select_position(db, linearization, commit_metadata, hash_to_pos)
+    if selected is None:
+        return None
+    commit_hash, commit_ts_iso = selected
+    file_results, _gitlink_changes, _gitmodules_map, _renamed_pairs = _extract_commit(
+        repo_path, commit_hash, ignore_patterns
+    )
+    skipped_events = _correction_sweep_apply(
+        db, commit_hash, commit_ts_iso, file_results,
+        index_con=index_con, skipped_so_far=skipped_so_far,
+    )
+    return commit_hash, skipped_events
+
+
+def _correction_sweep_walk(
+    db: Any,
+    repo_path: str,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+    ignore_patterns: Sequence[str] = (),
+    index_con: Optional[Any] = None,
+) -> Tuple[int, int]:
+    """Build hash_to_pos once and repeatedly call
+    _correction_sweep_claim_and_process (passing it down, along with the
+    running skipped-events total as skipped_so_far) until that returns
+    None, then call _correction_sweep_log_summary with the final total.
+
+    Returns (commits_processed, skipped_events) -- summed across every
+    call, both 0 when the gap-closed precondition isn't met yet (the
+    common case early in a run) and when the sweep has already fully
+    caught up to frontier-high's :hi-hash.
+
+    Also a synchronous convenience wrapper, same caveat as
+    _correction_sweep_claim_and_process: 2d should drive the three-step
+    pipeline directly in its own loop, not call this -- but 2d's loop owes
+    the same two things this one does: threading skipped_so_far through
+    every _correction_sweep_apply call, and calling
+    _correction_sweep_log_summary when its own loop ends.
+    """
+    hash_to_pos = {h: i for i, h in enumerate(linearization)}
+    commits_processed = 0
+    skipped_events = 0
+    while True:
+        result = _correction_sweep_claim_and_process(
+            db, repo_path, linearization, commit_metadata,
+            ignore_patterns=ignore_patterns, index_con=index_con,
+            hash_to_pos=hash_to_pos, skipped_so_far=skipped_events,
+        )
+        if result is None:
+            break
+        _commit_hash, call_skipped = result
+        commits_processed += 1
+        skipped_events += call_skipped
+    _correction_sweep_log_summary(skipped_events)
+    return commits_processed, skipped_events
+
+
 async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure.
 

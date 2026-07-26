@@ -14604,3 +14604,911 @@ class TestReverseBulkFillWalk:
             real_db, str(repo), linearization, commit_metadata, allocator,
         )
         assert count == 0
+
+
+class TestCorrectionSweepThroughWatermark:
+    def test_unset_reads_as_none(self, real_db):
+        import mcp_server
+        assert mcp_server._correction_sweep_through_query(real_db) is None
+
+    def test_update_then_query_round_trip(self, real_db):
+        import mcp_server
+        db = real_db
+        mcp_server._correction_sweep_through_update(db, "h1", "2026-01-01T00:00:00Z")
+        assert mcp_server._correction_sweep_through_query(db) == "h1"
+
+        mcp_server._correction_sweep_through_update(db, "h2", "2026-01-02T00:00:00Z")
+        assert mcp_server._correction_sweep_through_query(db) == "h2"
+
+    def test_update_does_not_duplicate_hash_fact(self, real_db):
+        import mcp_server
+        db = real_db
+        mcp_server._correction_sweep_through_update(db, "h1", "2026-01-01T00:00:00Z")
+        mcp_server._correction_sweep_through_update(db, "h2", "2026-01-02T00:00:00Z")
+
+        ident = mcp_server._CORRECTION_SWEEP_THROUGH_IDENT
+        raw = mcp_server._db_execute(db, f"(query [:find (count ?h) :where [{ident} :hash ?h]])")
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_entity_carries_expected_constants_and_survives_audit(self, real_db):
+        import mcp_server
+        db = real_db
+        mcp_server._correction_sweep_through_update(db, "h1", "2026-01-01T00:00:00Z")
+
+        ident = mcp_server._CORRECTION_SWEEP_THROUGH_IDENT
+        raw = mcp_server._db_execute(db, f"(query [:find ?a ?v :where [{ident} ?a ?v]])")
+        attrs = dict(json.loads(raw)["results"])
+        assert attrs[":entity-type"] == ":type/ingestion"
+        assert attrs[":ident"] == ident
+        assert isinstance(attrs[":description"], str) and attrs[":description"]
+
+        result = mcp_server.handle_minigraf_audit()
+        assert result["retracted"] == 0
+        assert mcp_server._correction_sweep_through_query(db) == "h1"
+
+    def test_description_is_distinct_from_lineage_confirmed_through(self, real_db):
+        """Two :type/ingestion watermarks with byte-identical :description
+        strings would both pass audit but be indistinguishable from each
+        other in the fact index and in minigraf_audit output -- this
+        watermark must not just copy lineage-confirmed-through's string."""
+        import mcp_server
+        db = real_db
+        mcp_server._correction_sweep_through_update(db, "h1", "2026-01-01T00:00:00Z")
+        mcp_server._lineage_confirmed_through_update(db, "h1", "2026-01-01T00:00:00Z")
+
+        sweep_desc = dict(json.loads(mcp_server._db_execute(
+            db, f"(query [:find ?a ?v :where [{mcp_server._CORRECTION_SWEEP_THROUGH_IDENT} ?a ?v]])"
+        ))["results"])[":description"]
+        lineage_desc = dict(json.loads(mcp_server._db_execute(
+            db, f"(query [:find ?a ?v :where [{mcp_server._LINEAGE_CONFIRMED_THROUGH_IDENT} ?a ?v]])"
+        ))["results"])[":description"]
+        assert sweep_desc != lineage_desc
+
+
+class TestCorrectionSweepSelectPosition:
+    def _init_repo(self, repo):
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    def _commit(self, repo, filename, content, msg):
+        (repo / filename).write_text(content)
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", msg], cwd=repo, check=True, capture_output=True)
+
+    def _repo_with_n_commits(self, tmp_path, n):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        for i in range(n):
+            self._commit(repo, f"f{i}.py", f"def f{i}(): pass\n", f"h{i}")
+        return repo
+
+    def _linearization_and_metadata(self, repo):
+        import mcp_server
+        import frontier_registry
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        return linearization, commit_metadata
+
+    def _close_gap(self, repo, real_db, linearization, commit_metadata):
+        """Claim exactly one position from the low side via a real
+        FrontierAllocator + _frontier_persist_claim (standing in for 2d's
+        future ordinary forward walk), then claim the rest from the high
+        side via 2b's real _reverse_fill_claim_and_process until the gap is
+        empty. Claiming the *whole* gap from the low side alone (an
+        unbounded claim_low() loop) would never touch frontier-high at
+        all -- claim_low() alone can empty the gap without claim_high()
+        ever running, since gap_hi only moves when claim_high() does -- so
+        the low side must stop after a bounded number of claims for
+        frontier-high to end up populated."""
+        import mcp_server
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        pos = allocator.claim_low()
+        if pos is not None:
+            mcp_server._frontier_persist_claim(
+                real_db, linearization, pos, from_low=True, commit_ts_iso=commit_metadata[pos][1],
+            )
+        while not allocator.is_gap_empty():
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+        return allocator
+
+    def test_no_op_when_frontier_high_unclaimed(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 2)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        # Genuinely seed frontier-low (a fresh graph seeds neither side), so
+        # this exercises "frontier-low exists, frontier-high doesn't".
+        pos = allocator.claim_low()
+        mcp_server._frontier_persist_claim(
+            real_db, linearization, pos, from_low=True, commit_ts_iso=commit_metadata[pos][1],
+        )
+
+        result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+        assert result is None
+
+    def test_no_op_while_gap_remains_open(self, real_db, tmp_path):
+        """Direct regression test for the race the design spec's "Why
+        confirming requires the gap to already be closed" section
+        describes: claim only from the high side, leaving a non-empty gap
+        below, and assert select_position refuses to hand out a position
+        even though frontier-high has real claimed territory."""
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        assert allocator.is_gap_empty() is False  # only claimed the newest position so far
+
+        result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+        assert result is None
+
+    def test_runs_when_stream_2_claimed_everything_and_frontier_low_never_existed(
+        self, real_db, tmp_path
+    ):
+        """A fresh graph seeds neither frontier side, and frontier-low is
+        only created once the forward stream persists its first claim. If
+        Stream 2 claims the whole history before Stream 1 claims anything
+        -- entirely possible in 2d, since the forward stream does a large
+        preload before its first claim -- the gap is genuinely closed
+        (is_gap_empty() is True, claim_high() returns None forever) but
+        frontier-low does not exist. Treating that as "nothing safe to do"
+        strands every entity provisional for good, so an absent frontier-low
+        must read as an EMPTY low region (its hi position is -1), not as an
+        unknown one -- which is exactly what FrontierAllocator.gap_lo
+        already does when no interval covers position 0."""
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        while not allocator.is_gap_empty():
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+        assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_LOW_IDENT) is None
+        high = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert high[0] == linearization[0]  # Stream 2 reached position 0
+
+        result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+        assert result is not None, "gap is closed; the sweep must not refuse to run"
+        assert result[0] == linearization[0]
+
+    def test_returns_frontier_high_lo_hash_once_gap_closed(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        allocator = self._close_gap(repo, real_db, linearization, commit_metadata)
+        assert allocator.is_gap_empty() is True
+
+        result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+        assert result is not None
+        commit_hash, commit_ts_iso = result
+        bounds = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert commit_hash == bounds[0]  # frontier-high's current lo-hash
+        pos = linearization.index(commit_hash)
+        assert commit_ts_iso == commit_metadata[pos][1]
+
+    def test_resumes_from_correction_sweep_through_not_frontier_high_lo_hash(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap(repo, real_db, linearization, commit_metadata)
+
+        first = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+        assert first is not None
+        first_hash, first_ts = first
+        mcp_server._correction_sweep_through_update(real_db, first_hash, first_ts)
+
+        second = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+        assert second is not None
+        second_hash, _second_ts = second
+        assert second_hash != first_hash
+        assert linearization.index(second_hash) == linearization.index(first_hash) + 1
+
+    def test_no_op_once_reached_frontier_high_hi_hash(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 2)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap(repo, real_db, linearization, commit_metadata)
+
+        # Walk to exhaustion by hand (Task 5 builds the real driving loop --
+        # this test only needs select_position's own termination).
+        while True:
+            result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+            if result is None:
+                break
+            mcp_server._correction_sweep_through_update(real_db, result[0], result[1])
+
+        assert mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata) is None
+
+    def test_respects_persisted_hi_hash_not_len_linearization(self, real_db, tmp_path):
+        """On an incremental re-ingest, linearization grows but frontier-
+        high's persisted :hi-hash does not move with it -- the ceiling must
+        stop at the persisted hash, not walk into brand-new, unclaimed
+        commits."""
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 2)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap(repo, real_db, linearization, commit_metadata)
+        while True:
+            result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+            if result is None:
+                break
+            mcp_server._correction_sweep_through_update(real_db, result[0], result[1])
+
+        # Simulate an incremental re-ingest: more commits land, but neither
+        # stream has claimed them yet.
+        self._commit(repo, "new.py", "def new(): pass\n", "h_new")
+        grown_linearization, grown_commit_metadata = self._linearization_and_metadata(repo)
+        assert len(grown_linearization) == 3
+
+        result = mcp_server._correction_sweep_select_position(
+            real_db, grown_linearization, grown_commit_metadata
+        )
+        assert result is None
+
+    def test_falls_back_to_frontier_high_lo_hash_when_stored_hash_is_stale(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap(repo, real_db, linearization, commit_metadata)
+        mcp_server._correction_sweep_through_update(real_db, "deadbeef_not_in_linearization", "2026-01-01T00:00:00Z")
+
+        result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+        assert result is not None
+        commit_hash, _ts = result
+        bounds = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert commit_hash == bounds[0]
+
+    def test_no_op_when_commit_metadata_violates_its_alignment_contract(self, real_db, tmp_path):
+        """commit_metadata must be full-history and positionally aligned
+        with linearization (i.e. _git_commits(repo, watermark_hash=None)).
+        _run_ingestion builds a watermark-relative list instead, so a 2d
+        wiring mistake would hand this function a shorter list -- which
+        must return None rather than raise IndexError or, worse, read a
+        different commit's metadata and write facts at the wrong
+        timestamp."""
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap(repo, real_db, linearization, commit_metadata)
+        assert mcp_server._correction_sweep_select_position(
+            real_db, linearization, commit_metadata
+        ) is not None  # aligned metadata works
+
+        truncated = commit_metadata[1:]  # what a watermark-relative list looks like
+        assert mcp_server._correction_sweep_select_position(
+            real_db, linearization, truncated
+        ) is None
+
+        # Right length, wrong order. Rotate rather than reverse: reversing an
+        # odd-length list leaves the middle element in place, and that is
+        # exactly the position _close_gap leaves the sweep pointing at, so a
+        # reversed list would slip past the per-position hash check.
+        misaligned = commit_metadata[1:] + commit_metadata[:1]
+        assert mcp_server._correction_sweep_select_position(
+            real_db, linearization, misaligned
+        ) is None
+
+    def test_hash_to_pos_reused_when_passed_in(self, real_db, tmp_path):
+        """Smoke test that the hash_to_pos parameter is accepted: passing a
+        correct, pre-built map still yields a valid result. This does not
+        prove the function trusts the caller's map over recomputing its
+        own -- it would pass identically either way."""
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 2)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap(repo, real_db, linearization, commit_metadata)
+        hash_to_pos = {h: i for i, h in enumerate(linearization)}
+
+        result = mcp_server._correction_sweep_select_position(
+            real_db, linearization, commit_metadata, hash_to_pos=hash_to_pos
+        )
+        assert result is not None
+
+
+class TestCorrectionSweepApply:
+    def _init_repo(self, repo):
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    def _repo_with_evolving_function(self, tmp_path):
+        """Three commits: login() genuinely changes body every commit (h0,
+        h1, h2); extra() is added at h1 and left byte-identical at h2, so
+        #221 marks it unchanged at h2 -- needed for the reconcile-retract
+        test below."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+
+        (repo / "auth.py").write_text("def login():\n    return 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h0"], cwd=repo, check=True, capture_output=True)
+
+        (repo / "auth.py").write_text("def login():\n    return 2\n\ndef extra():\n    pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h1"], cwd=repo, check=True, capture_output=True)
+
+        (repo / "auth.py").write_text(
+            "def login():\n    return 3\n\ndef extra():\n    pass\n\ndef more():\n    pass\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h2"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def _extract(self, repo, commit_hash):
+        import mcp_server
+        file_results, _gitlink, _gitmodules, _renamed = mcp_server._extract_commit(str(repo), commit_hash, ())
+        return file_results
+
+    def test_confirms_correct_provisional_guess(self, real_db, tmp_path):
+        import mcp_server
+        import frontier_registry
+        repo = self._repo_with_evolving_function(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        # Real reverse walk to the end so login()'s guess settles at h0 --
+        # exactly TestReverseFillClaimAndProcess's own converged-state setup.
+        for _ in range(3):
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        h0_hash, h0_ts = linearization[0], commit_metadata[0][1]
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{h0_hash[:12]}"
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+
+        file_results = self._extract(repo, h0_hash)
+        skipped = mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)
+
+        assert skipped == 0
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{h0_hash[:12]}"
+        assert mcp_server._candidate_diff_read(real_db, h0_hash, fn_ident) is None
+
+    def test_does_not_duplicate_commit_metadata(self, real_db, tmp_path):
+        import mcp_server
+        import frontier_registry
+        repo = self._repo_with_evolving_function(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        for _ in range(3):
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+        h0_hash, h0_ts = linearization[0], commit_metadata[0][1]
+        commit_ident = f":commit/{h0_hash[:12]}"
+        before_raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?a ?v :where [{commit_ident} ?a ?v]])"
+        )
+        before = sorted(json.loads(before_raw)["results"])
+
+        file_results = self._extract(repo, h0_hash)
+        mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)
+
+        after_raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?a ?v :where [{commit_ident} ?a ?v]])"
+        )
+        after = sorted(json.loads(after_raw)["results"])
+        assert after == before
+
+    def test_leaves_entity_untouched_when_guess_points_elsewhere(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash, h0_ts = commit_metadata[0][0], commit_metadata[0][1]
+        h1_hash = commit_metadata[1][0]
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        # Hand-construct a provisional guess pointing at the WRONG commit
+        # for the one this call will visit -- simulating a precondition
+        # violation directly rather than via a real interleaving.
+        mcp_server._entity_introduced_by_set_provisional(real_db, fn_ident, f":commit/{h1_hash[:12]}", "2025-01-01T00:00:00Z")
+
+        file_results = self._extract(repo, h0_hash)
+        skipped = mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)
+
+        assert skipped >= 1
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{h1_hash[:12]}"
+
+    def test_fails_safe_on_duplicate_introduced_by_h0_asserted_first(self, real_db, tmp_path):
+        """Two live :introduced-by facts for one entity (the uncoordinated-
+        forward-walk state the design spec defers to 2d) must be a no-op
+        regardless of which fact minigraf's query returns first -- tested
+        here via physical assertion order, in a sibling test via the
+        opposite order, since row order itself isn't observable/controllable
+        from the test, only the insertion order that produces it."""
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash, h0_ts = commit_metadata[0][0], commit_metadata[0][1]
+        h1_hash = commit_metadata[1][0]
+        commit_ident_h0 = f":commit/{h0_hash[:12]}"
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        file_results = self._extract(repo, h0_hash)
+
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {commit_ident_h0}]]", "2025-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by :commit/{h1_hash[:12]}]]", "2025-01-02T00:00:00Z")
+        mcp_server._lineage_mark_provisional(real_db, fn_ident, "2025-01-01T00:00:00Z")
+
+        skipped = mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)
+
+        assert skipped >= 1
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+
+    def test_fails_safe_on_duplicate_introduced_by_h1_asserted_first(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash, h0_ts = commit_metadata[0][0], commit_metadata[0][1]
+        h1_hash = commit_metadata[1][0]
+        commit_ident_h0 = f":commit/{h0_hash[:12]}"
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        file_results = self._extract(repo, h0_hash)
+
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by :commit/{h1_hash[:12]}]]", "2025-01-02T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {commit_ident_h0}]]", "2025-01-01T00:00:00Z")
+        mcp_server._lineage_mark_provisional(real_db, fn_ident, "2025-01-01T00:00:00Z")
+
+        skipped = mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)
+
+        assert skipped >= 1
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+
+    def test_skips_modified_in_at_own_introduction_commit_on_resumed_sweep(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash, h0_ts = commit_metadata[0][0], commit_metadata[0][1]
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        commit_ident = f":commit/{h0_hash[:12]}"
+        mcp_server._entity_introduced_by_set_provisional(real_db, fn_ident, commit_ident, "2025-01-01T00:00:00Z")
+        file_results = self._extract(repo, h0_hash)
+
+        mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)  # confirms (case 1)
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+
+        # Simulate a resumed sweep re-visiting the same commit (e.g. after a
+        # crash between confirming and advancing correction-sweep-through).
+        mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)
+
+        raw = mcp_server._db_execute(real_db, f"(query [:find ?c :where [{fn_ident} :modified-in ?c]])")
+        assert [commit_ident] not in json.loads(raw)["results"]
+
+    def test_ordinary_modification_is_idempotent_when_2b_already_agrees(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash = commit_metadata[0][0]
+        h1_hash, h1_ts = commit_metadata[1][0], commit_metadata[1][1]
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        h1_ident = f":commit/{h1_hash[:12]}"
+        # login() is already authoritative at h0, and 2b (or forward walk)
+        # already wrote the correct :modified-in for h1's genuine change.
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by :commit/{h0_hash[:12]}]]", "2025-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{fn_ident} :modified-in {h1_ident}]]", h1_ts)
+        # auth.py's other h1 candidates (the module, and extra() which is
+        # added at h1) are also already-authoritative in any real system --
+        # 2b's real per-commit function assigns :introduced-by to every
+        # candidate it discovers for a commit, including the module ident,
+        # so give both a legitimate single-value authoritative fact here
+        # too, rather than leaving them with zero :introduced-by values.
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        extra_ident = mcp_server._code_ident("function", "auth.py", "extra")
+        mcp_server._transact(real_db, f"[[{module_ident} :introduced-by :commit/{h0_hash[:12]}]]", "2025-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{extra_ident} :introduced-by {h1_ident}]]", "2025-01-01T00:00:00Z")
+
+        file_results = self._extract(repo, h1_hash)
+        skipped = mcp_server._correction_sweep_apply(real_db, h1_hash, h1_ts, file_results)
+
+        assert skipped == 0
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find (count ?c) :where [{fn_ident} :modified-in ?c]])"
+        )
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_retracts_2b_over_asserted_retroactive_modified_in(self, real_db, tmp_path):
+        """extra() is byte-identical between h1 and h2 (see the fixture
+        docstring), so #221 marks it unchanged at h2 -- but simulate 2b's
+        documented limitation by asserting :modified-in there anyway, then
+        assert this sweep retracts it once it reaches h2 in the ordinary
+        (already-authoritative) path."""
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h1_hash = commit_metadata[1][0]
+        h2_hash, h2_ts = commit_metadata[2][0], commit_metadata[2][1]
+        extra_ident = mcp_server._code_ident("function", "auth.py", "extra")
+        h1_ident = f":commit/{h1_hash[:12]}"
+        h2_ident = f":commit/{h2_hash[:12]}"
+        mcp_server._transact(real_db, f"[[{extra_ident} :introduced-by {h1_ident}]]", "2025-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{extra_ident} :modified-in {h2_ident}]]", h2_ts)  # 2b's over-assertion
+        # auth.py's other h2 candidates (the module, login() which changes
+        # every commit, and more() which is added at h2) are also already-
+        # authoritative in any real system -- give each a legitimate
+        # single-value authoritative :introduced-by fact too, rather than
+        # leaving them with zero :introduced-by values.
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        login_ident = mcp_server._code_ident("function", "auth.py", "login")
+        more_ident = mcp_server._code_ident("function", "auth.py", "more")
+        mcp_server._transact(real_db, f"[[{module_ident} :introduced-by :commit/{commit_metadata[0][0][:12]}]]", "2025-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{login_ident} :introduced-by :commit/{commit_metadata[0][0][:12]}]]", "2025-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{more_ident} :introduced-by {h2_ident}]]", "2025-01-01T00:00:00Z")
+
+        file_results = self._extract(repo, h2_hash)
+        precomputed_unchanged = [
+            precomputed.get("unchanged_idents", set())
+            for _status, _fp, _extracted, precomputed, _old in file_results
+            if precomputed is not None
+        ]
+        assert any(extra_ident in u for u in precomputed_unchanged), (
+            "fixture assumption broken: extra() must read as unchanged at h2"
+        )
+
+        skipped = mcp_server._correction_sweep_apply(real_db, h2_hash, h2_ts, file_results)
+
+        assert skipped == 0
+        # Bind the value and test membership. A query whose :find variable
+        # appears nowhere in :where -- e.g.
+        # [:find ?c :where [extra_ident :modified-in h2_ident]] -- binds ?c
+        # to nothing and returns [] whether or not the fact exists, so
+        # asserting == [] on that form passes even when the retract never
+        # ran. The design spec calls this trap out for exactly this reason.
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{extra_ident} :modified-in ?c]])"
+        )
+        modified_in_values = {row[0] for row in json.loads(raw)["results"]}
+        assert h2_ident not in modified_in_values
+
+    def test_opportunistic_stale_candidate_diff_cleanup(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash = commit_metadata[0][0]
+        h1_hash, h1_ts = commit_metadata[1][0], commit_metadata[1][1]
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by :commit/{h0_hash[:12]}]]", "2025-01-01T00:00:00Z")
+        # An orphaned candidate-diff record from a since-superseded guess.
+        mcp_server._candidate_diff_persist(real_db, h1_hash, fn_ident, "stale-hash", "2025-01-01T00:00:00Z")
+        assert mcp_server._candidate_diff_read(real_db, h1_hash, fn_ident) is not None
+
+        file_results = self._extract(repo, h1_hash)
+        mcp_server._correction_sweep_apply(real_db, h1_hash, h1_ts, file_results)
+
+        assert mcp_server._candidate_diff_read(real_db, h1_hash, fn_ident) is None
+
+    def test_skipped_events_counts_events_not_entities(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash, h0_ts = commit_metadata[0][0], commit_metadata[0][1]
+        h1_hash, h1_ts = commit_metadata[1][0], commit_metadata[1][1]
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        wrong_ident = f":commit/{commit_metadata[2][0][:12]}"
+        mcp_server._entity_introduced_by_set_provisional(real_db, fn_ident, wrong_ident, "2025-01-01T00:00:00Z")
+        # auth.py's other candidates at h0/h1 (the module, and extra() which
+        # is added at h1) are also already-authoritative in any real system
+        # -- give each a legitimate single-value authoritative
+        # :introduced-by fact once, up front, so they don't spuriously
+        # count as skipped at either commit.
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        extra_ident = mcp_server._code_ident("function", "auth.py", "extra")
+        mcp_server._transact(real_db, f"[[{module_ident} :introduced-by :commit/{h0_hash[:12]}]]", "2025-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{extra_ident} :introduced-by :commit/{h1_hash[:12]}]]", "2025-01-01T00:00:00Z")
+
+        skipped_h0 = mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, self._extract(repo, h0_hash))
+        skipped_h1 = mcp_server._correction_sweep_apply(
+            real_db, h1_hash, h1_ts, self._extract(repo, h1_hash), skipped_so_far=skipped_h0,
+        )
+
+        assert skipped_h0 == 1
+        assert skipped_h1 == 1  # login() is a candidate at h1 too -- second event, same entity
+
+    def test_skip_logging_capped_with_returned_count_uncapped(self, real_db, tmp_path, capsys):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash, h0_ts = commit_metadata[0][0], commit_metadata[0][1]
+        # 15 synthetic candidate idents in one file entry, each provisional
+        # with a guess pointing elsewhere -- avoids needing 15 real commits
+        # to exercise the logging cap; precomputed's shape is documented in
+        # this task's Interfaces block.
+        n = 15
+        idents = [f":function/synthetic-{i}" for i in range(n)]
+        wrong_ident = ":commit/does-not-matter"
+        for ident in idents:
+            mcp_server._entity_introduced_by_set_provisional(real_db, ident, wrong_ident, "2025-01-01T00:00:00Z")
+        # The synthetic module ident is also an unconditional candidate --
+        # give it a legitimate single-value authoritative :introduced-by
+        # fact too, so it doesn't spuriously count as a 16th skip.
+        mcp_server._transact(real_db, "[[:module/synthetic :introduced-by :commit/preexisting]]", "2025-01-01T00:00:00Z")
+        precomputed = {
+            "module_ident": ":module/synthetic",
+            "function_entries": [(ident, ident, []) for ident in idents],
+            "class_entries": [],
+            "global_entries": [],
+            "field_entries": [],
+            "unchanged_idents": set(),
+        }
+        file_results = [("M", "synthetic.py", {}, precomputed, "")]
+
+        skipped = mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results)
+
+        assert skipped == n
+        err = capsys.readouterr().err
+        logged_lines = [line for line in err.splitlines() if "synthetic-" in line]
+        assert len(logged_lines) == mcp_server._CORRECTION_SWEEP_LOG_CAP
+
+    def test_log_cap_is_caller_threaded_not_a_module_global(self, real_db, tmp_path, capsys):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        h0_hash, h0_ts = commit_metadata[0][0], commit_metadata[0][1]
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        wrong_ident = f":commit/{commit_metadata[1][0][:12]}"
+        mcp_server._entity_introduced_by_set_provisional(real_db, fn_ident, wrong_ident, "2025-01-01T00:00:00Z")
+        file_results = self._extract(repo, h0_hash)
+
+        capsys.readouterr()  # clear
+        mcp_server._correction_sweep_apply(
+            real_db, h0_hash, h0_ts, file_results, skipped_so_far=mcp_server._CORRECTION_SWEEP_LOG_CAP,
+        )
+        assert capsys.readouterr().err == ""  # budget already spent by caller's running total
+
+        mcp_server._entity_introduced_by_set_provisional(real_db, fn_ident, wrong_ident, "2025-01-01T00:00:00Z")
+        mcp_server._correction_sweep_apply(real_db, h0_hash, h0_ts, file_results, skipped_so_far=0)
+        assert "login" in capsys.readouterr().err  # fresh run, budget reset
+
+    def test_correction_sweep_log_summary(self, capsys):
+        import mcp_server
+        mcp_server._correction_sweep_log_summary(0)
+        assert capsys.readouterr().err == ""
+
+        mcp_server._correction_sweep_log_summary(3)
+        err = capsys.readouterr().err
+        assert err.strip() != ""
+        assert "3" in err
+
+
+class TestCorrectionSweepClaimAndProcess:
+    def _init_repo(self, repo):
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    def _commit(self, repo, filename, content, msg):
+        (repo / filename).write_text(content)
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", msg], cwd=repo, check=True, capture_output=True)
+
+    def _repo_with_n_commits(self, tmp_path, n):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        for i in range(n):
+            self._commit(repo, f"f{i}.py", f"def f{i}(): pass\n", f"h{i}")
+        return repo
+
+    def _linearization_and_metadata(self, repo):
+        import mcp_server
+        import frontier_registry
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        return linearization, commit_metadata
+
+    def _close_gap(self, repo, db, linearization, commit_metadata):
+        """Claim exactly one position from the low side via a real
+        FrontierAllocator + _frontier_persist_claim (standing in for 2d's
+        future ordinary forward walk), then claim the rest from the high
+        side via 2b's real _reverse_fill_claim_and_process until the gap is
+        empty. Claiming the *whole* gap from the low side alone (an
+        unbounded claim_low() loop) would never touch frontier-high at
+        all -- claim_low() alone can empty the gap without claim_high()
+        ever running, since gap_hi only moves when claim_high() does -- so
+        the low side must stop after a bounded number of claims for
+        frontier-high to end up populated. db here is any MiniGrafDb
+        instance -- the real_db fixture in most tests, or a
+        manually-created MiniGrafDb.open_in_memory() in the two-graph
+        composition test below."""
+        import mcp_server
+        allocator = mcp_server._frontier_load(db, linearization, "2026-01-04T00:00:00Z")
+        pos = allocator.claim_low()
+        if pos is not None:
+            mcp_server._frontier_persist_claim(
+                db, linearization, pos, from_low=True, commit_ts_iso=commit_metadata[pos][1],
+            )
+        while not allocator.is_gap_empty():
+            mcp_server._reverse_fill_claim_and_process(
+                db, str(repo), linearization, commit_metadata, allocator,
+            )
+        return allocator
+
+    def test_no_op_propagates_from_select_position(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 2)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        # Genuinely seed frontier-low, leaving frontier-high unclaimed.
+        pos = allocator.claim_low()
+        mcp_server._frontier_persist_claim(
+            real_db, linearization, pos, from_low=True, commit_ts_iso=commit_metadata[pos][1],
+        )
+
+        result = mcp_server._correction_sweep_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata,
+        )
+        assert result is None
+
+    def test_single_call_round_trip(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap(repo, real_db, linearization, commit_metadata)
+
+        result = mcp_server._correction_sweep_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata,
+        )
+        assert result is not None
+        commit_hash, skipped_events = result
+        bounds = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert commit_hash == bounds[0]
+        assert skipped_events == 0
+        assert mcp_server._correction_sweep_through_query(real_db) == commit_hash
+
+    def test_wrapper_is_a_faithful_composition_of_the_three_pieces(self, tmp_path):
+        """Build TWO independent graphs from the same repo fixture (the
+        sweep mutates the state a second run would start from, so this
+        cannot be two passes over one graph). Against the first, call the
+        wrapper; against the second, call the three pieces directly.
+        Assert the resulting graph states are identical. Both dbs are
+        passed explicitly to every call -- none of these functions touch
+        mcp_server's module-global _db -- so this test needs no real_db
+        fixture and no open_db() call, just two independent
+        MiniGrafDb.open_in_memory() instances."""
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+
+        db_a = MiniGrafDb.open_in_memory()
+        self._close_gap(repo, db_a, linearization, commit_metadata)
+        mcp_server._correction_sweep_claim_and_process(db_a, str(repo), linearization, commit_metadata)
+
+        db_b = MiniGrafDb.open_in_memory()
+        self._close_gap(repo, db_b, linearization, commit_metadata)
+        selected = mcp_server._correction_sweep_select_position(db_b, linearization, commit_metadata)
+        assert selected is not None
+        commit_hash, commit_ts_iso = selected
+        file_results, _, _, _ = mcp_server._extract_commit(str(repo), commit_hash, ())
+        mcp_server._correction_sweep_apply(db_b, commit_hash, commit_ts_iso, file_results)
+
+        query = "(query [:find ?e ?a ?v :where [?e ?a ?v]])"
+        results_a = sorted(json.loads(db_a.execute(query))["results"])
+        results_b = sorted(json.loads(db_b.execute(query))["results"])
+        assert results_a == results_b
+
+
+class TestCorrectionSweepWalk:
+    def _init_repo(self, repo):
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+    def _commit(self, repo, filename, content, msg):
+        (repo / filename).write_text(content)
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", msg], cwd=repo, check=True, capture_output=True)
+
+    def _repo_with_n_commits(self, tmp_path, n):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        for i in range(n):
+            self._commit(repo, f"f{i}.py", f"def f{i}(): pass\n", f"h{i}")
+        return repo
+
+    def _linearization_and_metadata(self, repo):
+        import mcp_server
+        import frontier_registry
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        return linearization, commit_metadata
+
+    def _close_gap_at(self, repo, real_db, linearization, commit_metadata, split_pos):
+        """Close the gap with the low side claiming positions [0, split_pos)
+        and the high side (2b) claiming the rest -- split_pos == len(linearization)
+        closes the whole thing from the low side alone."""
+        import mcp_server
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        for _ in range(split_pos):
+            pos = allocator.claim_low()
+            mcp_server._frontier_persist_claim(
+                real_db, linearization, pos, from_low=True, commit_ts_iso=commit_metadata[pos][1],
+            )
+        while not allocator.is_gap_empty():
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+        return allocator
+
+    def test_walks_to_exhaustion_and_returns_counts(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 4)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=1)
+
+        commits_processed, skipped_events = mcp_server._correction_sweep_walk(
+            real_db, str(repo), linearization, commit_metadata,
+        )
+
+        assert commits_processed == 3
+        assert skipped_events == 0
+        assert mcp_server._correction_sweep_through_query(real_db) == linearization[-1]
+
+    def test_returns_zero_zero_when_gap_still_open(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        assert allocator.is_gap_empty() is False
+
+        result = mcp_server._correction_sweep_walk(real_db, str(repo), linearization, commit_metadata)
+        assert result == (0, 0)
+
+    def test_no_op_when_already_fully_swept(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 2)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=1)
+        mcp_server._correction_sweep_walk(real_db, str(repo), linearization, commit_metadata)
+
+        result = mcp_server._correction_sweep_walk(real_db, str(repo), linearization, commit_metadata)
+        assert result == (0, 0)
+
+    def test_frontier_low_and_lineage_confirmed_through_never_touched(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=1)
+
+        low_before = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_LOW_IDENT)
+        lineage_before = mcp_server._lineage_confirmed_through_query(real_db)
+
+        mcp_server._correction_sweep_walk(real_db, str(repo), linearization, commit_metadata)
+
+        low_after = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_LOW_IDENT)
+        lineage_after = mcp_server._lineage_confirmed_through_query(real_db)
+        assert low_after == low_before
+        assert lineage_after == lineage_before
+        assert mcp_server._correction_sweep_through_query(real_db) is not None
+
+    def test_full_integration(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 5)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=2)
+
+        commits_processed, skipped_events = mcp_server._correction_sweep_walk(
+            real_db, str(repo), linearization, commit_metadata,
+        )
+
+        assert commits_processed == 3  # the 3 positions the high side claimed
+        assert skipped_events == 0
+        for i in range(5):
+            fn_ident = mcp_server._code_ident("function", f"f{i}.py", f"f{i}")
+            assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+        raw = mcp_server._db_execute(real_db, "(query [:find ?e :where [?e :entity-type :type/candidate-diff]])")
+        assert json.loads(raw)["results"] == []
+        bounds = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert mcp_server._correction_sweep_through_query(real_db) == bounds[1]
