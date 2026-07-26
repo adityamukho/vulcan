@@ -8023,6 +8023,40 @@ def _correction_sweep_walk(
     return commits_processed, skipped_events
 
 
+_DEFAULT_STREAM_RATIO = (1, 1)
+
+
+def _parse_stream_ratio(raw: Optional[str]) -> Tuple[int, int]:
+    """Parse MINIGRAF_INGEST_STREAM_RATIO ("F:R") into (forward_per_round,
+    reverse_per_round), falling back to 1:1 on anything malformed.
+
+    Never raises. This is read inside the background ingestion coroutine,
+    where a bad env var must degrade to the default rather than become the
+    reason a repository never ingests at all.
+
+    The ratio trades total work against how fast recent history becomes
+    usable: a commit the forward stream claims is parsed once and is
+    authoritative immediately, while a commit the reverse stream claims is
+    parsed twice (reverse walk, then the correction sweep's own
+    _extract_commit call). Total parse cost is N * (1 + reverse_fraction).
+    """
+    if raw is None:
+        return _DEFAULT_STREAM_RATIO
+    try:
+        forward_str, reverse_str = raw.split(":")
+        forward, reverse = int(forward_str.strip()), int(reverse_str.strip())
+        if forward < 1 or reverse < 1:
+            raise ValueError("both sides must be >= 1")
+        return forward, reverse
+    except Exception as e:
+        print(
+            f"[_run_ingestion] ignoring malformed MINIGRAF_INGEST_STREAM_RATIO "
+            f"{raw!r} ({e}); using {_DEFAULT_STREAM_RATIO[0]}:{_DEFAULT_STREAM_RATIO[1]}",
+            file=sys.stderr,
+        )
+        return _DEFAULT_STREAM_RATIO
+
+
 async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure.
 

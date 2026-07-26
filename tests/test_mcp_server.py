@@ -15515,3 +15515,30 @@ class TestCorrectionSweepWalk:
         assert json.loads(raw)["results"] == []
         bounds = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
         assert mcp_server._correction_sweep_through_query(real_db) == bounds[1]
+
+
+class TestParseStreamRatio:
+    def test_default_when_unset(self):
+        import mcp_server
+        assert mcp_server._parse_stream_ratio(None) == (1, 1)
+
+    def test_parses_explicit_ratios(self):
+        import mcp_server
+        assert mcp_server._parse_stream_ratio("1:1") == (1, 1)
+        assert mcp_server._parse_stream_ratio("1:3") == (1, 3)
+        assert mcp_server._parse_stream_ratio("3:1") == (3, 1)
+        assert mcp_server._parse_stream_ratio(" 2 : 5 ") == (2, 5)
+
+    def test_malformed_falls_back_to_default_and_logs_once(self, capsys):
+        import mcp_server
+        for bad in ("x", "", "1", "1:2:3", "0:1", "1:0", "-1:2", "a:b", "1.5:2"):
+            assert mcp_server._parse_stream_ratio(bad) == (1, 1), bad
+        err = capsys.readouterr().err
+        # One line per bad value, and each names the offending value.
+        assert err.count("MINIGRAF_INGEST_STREAM_RATIO") == 9
+
+    def test_does_not_raise_on_any_input(self):
+        """A bad env var must never be the reason a repo never ingests --
+        this runs inside a background coroutine with no user in the loop."""
+        import mcp_server
+        assert mcp_server._parse_stream_ratio("\x00\xff") == (1, 1)
