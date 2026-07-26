@@ -14241,6 +14241,170 @@ class TestEntityIntroducedBySetProvisionalMonotonicity:
         assert mcp_server._entity_introduced_by_query(real_db, ident) == ":commit/c0"
 
 
+class TestReverseFillCandidateDiffLifecycle:
+    def test_superseded_candidate_diff_records_are_cleared_at_move_time(self, real_db, tmp_path):
+        """2b persisted a candidate-diff record for every (claimed commit,
+        entity) pair, on first sighting and on every move -- so storage grew
+        as O(entity touches), not O(entities), for scratch facts whose own
+        helper docstring says they must not "accumulate unbounded across a
+        full ingest". Only the final, lowest guess is a correct record; the
+        superseded one is stale the moment the guess moves, and 2b has
+        superseded_ident right there in hand."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(6):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        login = mcp_server._code_ident("function", "auth.py", "login")
+        raw = mcp_server._db_execute(
+            real_db,
+            f"(query [:find ?rec :where [?rec :entity-type :type/candidate-diff] "
+            f"[?rec :entity {login}]])",
+        )
+        live_records = json.loads(raw)["results"]
+        assert len(live_records) == 1, (
+            f"one record per live guess, not one per touch; got {len(live_records)}"
+        )
+
+
+class TestReverseFillValidTimeParity:
+    def test_structural_facts_are_re_dated_when_the_guess_moves_earlier(self, real_db, tmp_path):
+        """2b wrote an entity's structural facts once, at the timestamp of
+        the commit where the walk first SIGHTED it, and never re-dated them
+        as the guess moved earlier. That leaves a valid-time window where
+        :introduced-by is live for an entity with no type, name or file --
+        so ":as-of the introduction" answers "this entity did not exist",
+        while ":when was it introduced" answers with that very commit."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(3):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        login = mcp_server._code_ident("function", "auth.py", "login")
+        intro_ts = commit_metadata[0][1]
+        raw = mcp_server._db_execute(
+            real_db, f'(query [:find ?a :valid-at "{intro_ts}" :where [{login} ?a ?v]])'
+        )
+        attrs_at_introduction = {row[0] for row in json.loads(raw)["results"]}
+        assert ":introduced-by" in attrs_at_introduction  # 2b already gets this right
+        assert ":entity-type" in attrs_at_introduction, (
+            "an entity live at its own introduction must carry its structure there too; "
+            f"got only {sorted(attrs_at_introduction)}"
+        )
+        assert ":file" in attrs_at_introduction
+
+
+class TestReverseFillParentEdges:
+    def test_claimed_commits_get_parent_edges(self, real_db, tmp_path):
+        """The bootstrap `ancestor` rule is defined purely over :parent, so
+        without these edges ancestor queries return nothing across the whole
+        reverse-filled region. Forward walk writes them, one transact per
+        parent (a merge commit has two, same EAVT reason as :contains)."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(3):
+            (repo / f"f{i}.py").write_text(f"def f{i}(): pass\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        child = f":commit/{linearization[1][:12]}"
+        parent = f":commit/{linearization[0][:12]}"
+        raw = mcp_server._db_execute(real_db, f"(query [:find ?p :where [{child} :parent ?p]])")
+        assert {row[0] for row in json.loads(raw)["results"]} == {parent}
+
+    def test_root_commit_has_no_parent(self, real_db, tmp_path):
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "a.py").write_text("def a(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "c0"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        root = f":commit/{linearization[0][:12]}"
+        raw = mcp_server._db_execute(real_db, f"(query [:find ?p :where [{root} :parent ?p]])")
+        assert json.loads(raw)["results"] == []
+
+
+class TestReverseFillCommitMetadataContract:
+    def test_misaligned_commit_metadata_raises_instead_of_misattributing(self, real_db, tmp_path):
+        """commit_metadata is indexed POSITIONALLY against linearization
+        while _frontier_persist_claim persists linearization[pos], so a
+        watermark-relative list (what _run_ingestion actually builds) makes
+        2b attribute entities to one commit and persist another -- silent,
+        systematic misattribution. 2b is handed a position by an allocator
+        that already claimed it, so it cannot decline: it must raise."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(3):
+            (repo / f"f{i}.py").write_text(f"def f{i}(): pass\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        with pytest.raises(ValueError, match="commit_metadata"):
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata[1:], allocator,
+            )
+
+
 class TestReverseFillResumeOnGrownLinearization:
     """The 2b suite never exercised a resume at all -- every test built its
     allocator from a graph with no persisted frontier. This is the scenario

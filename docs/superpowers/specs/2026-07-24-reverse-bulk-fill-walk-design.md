@@ -59,9 +59,35 @@ sub-phase's tighter cut):
 - The "entity born, removed, and reborn entirely within the open gap" edge
   case from the issue — since 2b never closes a lifecycle segment, this
   case is 2c's reconciliation problem, not 2b's.
-- Reconciling a *stale* candidate-diff record left behind when reverse walk
-  moves a candidate's `:introduced-by` earlier (see below) — 2c's job.
+- ~~Reconciling a *stale* candidate-diff record left behind when reverse walk
+  moves a candidate's `:introduced-by` earlier (see below) — 2c's job.~~
+  **Revised in 2b1:** this walk now clears the superseded record at move
+  time, where `superseded_ident` is already in hand. Deferring it made the
+  records accumulate as O(entity touches) rather than O(entities), which is
+  what `_candidate_diff_clear`'s own docstring says must not happen. 2c's
+  opportunistic cleanup remains, for records orphaned by earlier runs.
 - Wiring into `_run_ingestion` / real concurrency (2d).
+
+Not deferred, and previously missing from both lists (added in 2b1):
+
+- `:parent` edges. Forward walk writes them and the bootstrap `ancestor`
+  rule is defined purely over `:parent`, so omitting them silently made
+  `ancestor` return nothing across the whole reverse-filled region. This
+  walk now emits them via `_git_parent_hashes`. Because the walk reaches a
+  commit's parents *after* the commit itself, the edge briefly points at an
+  entity that does not exist yet and materialises when the walk descends to
+  it (or when the forward stream covers it, for parents below
+  frontier-high's floor) — temporarily dangling and convergent, the same
+  shape as the lineage facts around it, so `ancestor` returns partial
+  results until the region is complete.
+- Valid-time parity for structural facts. They were written once, at the
+  timestamp of the commit where the walk first *sighted* the entity, and
+  never re-dated as the guess moved earlier — leaving a window where
+  `:introduced-by` is live for an entity with no `:entity-type`, name or
+  file, so `:as-of` the introduction answers "did not exist" while
+  `:introduced-by` names that very commit. 2b1 re-dates them on each move.
+  The cost is write amplification: an entity touched N times in the claimed
+  range pays N retract+re-assert cycles instead of one.
 
 ## Design
 
@@ -255,11 +281,18 @@ repeated `claim_high()` calls), for every entity touched by `C`'s diff
 
 ### Driving functions
 
+These signatures are what actually shipped. An earlier draft of this
+section omitted `commit_metadata` entirely and gave `_reverse_bulk_fill_walk`
+a `run_ts_iso` it never had — corrected in 2b1, along with the contract note
+below, since a spec that misdescribes the parameter carrying the
+misalignment hazard is worse than one that omits it.
+
 ```python
 def _reverse_fill_claim_and_process(
     db: Any,
     repo_path: str,
     linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
     allocator: "frontier_registry.FrontierAllocator",
     ignore_patterns: Sequence[str] = (),
     index_con: Optional[Any] = None,
@@ -274,16 +307,40 @@ def _reverse_bulk_fill_walk(
     db: Any,
     repo_path: str,
     linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
     allocator: "frontier_registry.FrontierAllocator",
-    run_ts_iso: str,
     ignore_patterns: Sequence[str] = (),
     index_con: Optional[Any] = None,
 ) -> int:
     """Repeatedly call _reverse_fill_claim_and_process, persisting each
-    claim via _frontier_persist_claim, until the gap closes. Returns the
-    count of commits processed. No caller in this sub-phase -- 2d wires
-    this into the real concurrent ingestion loop."""
+    claim via _frontier_persist_claim, until the gap closes or a claim
+    fails to move strictly downward. Returns the count of commits
+    processed. No caller in this sub-phase -- 2d wires this into the real
+    concurrent ingestion loop."""
 ```
+
+**`commit_metadata`'s contract.** It must be full-history and positionally
+aligned with `linearization` — i.e. `_git_commits(repo, watermark_hash=None)`,
+which shares `git log --topo-order --reverse` with `build_linearization`.
+Both functions index it positionally (`commit_metadata[pos]`) while
+`_frontier_persist_claim` persists `linearization[pos]`, so a misaligned list
+attributes entities to one commit and persists another: silent, systematic
+misattribution. `_run_ingestion` builds a *watermark-relative* list for its
+own use, which is exactly the wrong thing to pass, so 2d must build the
+full-history list separately. Both length and the per-position hash are
+checked on entry and raise `ValueError` — this walk is handed a position by
+an allocator that has already claimed it, so unlike 2c's mirror-image guard
+(which selects its own position and returns `None`) it cannot decline.
+
+**Repeated-`(entity, attribute)` facts cannot share a transact.** Minigraf's
+EAVT pending index omits value bytes from the key, so several facts sharing
+`(entity, attribute, valid_from)` in one `transact` collapse to the last.
+`:contains` (a module or class with N children) and `:parent` (a merge
+commit's two parents) therefore get one transact each, exactly as forward
+walk does; retraction has the same constraint, which the structural
+re-dating below observes. Facts differing in *entity* do not collide, so the
+per-entity `:modified-in` batch is safe. Getting this wrong is silent: the
+graph simply ends up with one edge where it should have N.
 
 Both functions live in `mcp_server.py`, immediately after phase 2a's
 existing functions. Neither is called by `_run_ingestion` in this

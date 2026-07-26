@@ -7364,13 +7364,22 @@ def _reverse_fill_claim_and_process(
     touch always gets :modified-in (unless #221's unchanged-body check
     says the body is provably unchanged this commit).
 
-    Known, documented limitation: the retroactive :modified-in for a
-    superseded commit does not re-check #221's unchanged-body narrowing
-    against THAT commit's own diff (only this call's diff has that data) --
-    it is asserted unconditionally. This can rarely over-assert an edge
-    forward walk would have suppressed; it can never produce a missing or
-    misattributed edge. See the design spec for why this is an accepted
-    simplification for this sub-phase.
+    Known, documented limitation, and who fixes it: the retroactive
+    :modified-in for a superseded commit does not re-check #221's
+    unchanged-body narrowing against THAT commit's own diff, because only
+    this call's diff carries that data -- so it is asserted whenever the
+    superseded commit is genuinely later (see the monotonicity guard
+    above). This can over-assert an edge forward walk would have
+    suppressed; it can never produce a missing or misattributed one.
+
+    2c's correction sweep corrects it, in the ordinary already-authoritative
+    branch of _correction_sweep_apply: walking forward with its own parse in
+    hand, it retracts a :modified-in whose entity reads as unchanged at that
+    commit. Note the shape of the fix -- 2c repairs the fact after the fact
+    rather than this walk preventing the write, which is why this stays a
+    documented limitation here rather than a bug. Phrased carefully because
+    an intermediate draft of 2c's spec dropped the case entirely, leaving it
+    briefly owned by nobody (see the 2b review).
 
     Returns the claimed commit's hash, or None if the gap was already
     empty (allocator.claim_high() returned None) -- caller's signal to
@@ -7379,11 +7388,33 @@ def _reverse_fill_claim_and_process(
     claim -- mirrors _run_ingestion's one-checkpoint-per-commit cadence
     (see the design spec's "Resume-safety / atomicity boundary" section).
     """
+    # commit_metadata is indexed POSITIONALLY against linearization below,
+    # while _frontier_persist_claim persists linearization[pos] -- so a
+    # misaligned list makes this walk attribute entities to one commit and
+    # persist another: silent, systematic misattribution. _run_ingestion
+    # builds a watermark-relative list for its own use
+    # (_git_commits(repo, watermark, branch)), which is exactly the wrong
+    # thing to hand this function. Checked before claim_high() so a bad call
+    # does not consume a position. This raises rather than returning None
+    # (2c's mirror-image guard returns None) because 2c selects its own
+    # position and can decline, whereas this walk has been handed one.
+    if len(commit_metadata) != len(linearization):
+        raise ValueError(
+            "commit_metadata must be full-history and positionally aligned with "
+            f"linearization (got {len(commit_metadata)} entries vs {len(linearization)}); "
+            "pass _git_commits(repo, watermark_hash=None)"
+        )
+
     pos = allocator.claim_high()
     if pos is None:
         return None
 
     commit_hash, commit_ts_iso, author, subject = commit_metadata[pos]
+    if commit_hash != linearization[pos]:
+        raise ValueError(
+            f"commit_metadata[{pos}] is {commit_hash}, but linearization[{pos}] is "
+            f"{linearization[pos]}: the two must be positionally aligned"
+        )
     commit_ident = f":commit/{commit_hash[:12]}"
 
     file_results, _gitlink_changes, _gitmodules_map, _renamed_pairs = _extract_commit(
@@ -7399,6 +7430,7 @@ def _reverse_fill_claim_and_process(
         f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
         f'[{commit_ident} :date "{commit_ts_iso}"]',
     ]
+    candidate_triples_by_ident: Dict[str, List[str]] = {}
     pos_by_commit_ident = {f":commit/{h[:12]}": i for i, (h, _t, _a, _s) in enumerate(commit_metadata)}
     ts_by_commit_ident = {f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata}
     new_candidates: List[str] = []
@@ -7438,6 +7470,17 @@ def _reverse_fill_claim_and_process(
         for ident in candidate_idents:
             unchanged_by_ident[ident] = ident in unchanged_idents
 
+        # Keep each entity's candidate triples so a provisional move can
+        # re-date them (#222 phase 2b1). A child's own list carries its
+        # [parent :contains child] edge, so re-dating a child re-dates its
+        # containment edge with it.
+        candidate_triples_by_ident[precomputed["module_ident"]] = list(
+            precomputed["module_candidate_triples"]
+        )
+        for entries_key in ("function_entries", "class_entries", "global_entries", "field_entries"):
+            for entry_ident, _entry_name, entry_triples in precomputed[entries_key]:
+                candidate_triples_by_ident[entry_ident] = list(entry_triples)
+
         new_candidates.extend(set(known_before.keys()) - known_before_snapshot)
         for ident in set(candidate_idents) & known_before_snapshot:
             if _lineage_is_provisional(db, ident):
@@ -7464,6 +7507,22 @@ def _reverse_fill_claim_and_process(
     _transact(db, "[" + " ".join(other_triples) + "]", commit_ts_iso, index_con=index_con)
     for contains_triple in contains_triples:
         _transact(db, "[" + contains_triple + "]", commit_ts_iso, index_con=index_con)
+
+    # :parent edges (#222 phase 2b1), one transact per parent -- a merge
+    # commit has two, and they share (entity, attribute, valid_from), the
+    # same EAVT collision :contains has. The bootstrap `ancestor` rule is
+    # defined purely over :parent, so without these it returns nothing
+    # across the whole reverse-filled region. Reverse walk reaches a
+    # commit's parents LATER than the commit itself, so the edge points at
+    # an entity that does not exist yet and materialises when the walk
+    # descends to it (or when the forward stream covers it, for parents
+    # below frontier-high's floor): temporarily dangling, and convergent --
+    # the same shape as the lineage facts around it.
+    for parent_hash in _git_parent_hashes(repo_path, commit_hash):
+        _transact(
+            db, f"[[{commit_ident} :parent :commit/{parent_hash[:12]}]]",
+            commit_ts_iso, index_con=index_con,
+        )
 
     # Third of the three write paths the monotonicity invariant covers
     # (#222 phase 2b1), and the one the 2b review did not list: an entity
@@ -7514,6 +7573,44 @@ def _reverse_fill_claim_and_process(
             )
         if superseded_ident is not None and superseded_ident != commit_ident:
             superseded_pos = pos_by_commit_ident.get(superseded_ident)
+            if superseded_pos is None or superseded_pos > pos:
+                # The move happened: this commit is genuinely earlier.
+                #
+                # Re-date the entity's structural facts to match (#222 phase
+                # 2b1). They were written at the timestamp of the commit
+                # where the walk first SIGHTED the entity, which is later
+                # than the guess now is -- leaving a valid-time window where
+                # :introduced-by is live for an entity with no type, name or
+                # file, so ":as-of the introduction" says it did not exist.
+                # _retract targets live rows regardless of their original
+                # valid_from, so this is a straight re-assert at the earlier
+                # timestamp. :contains goes one per call for the same EAVT
+                # reason as above, on the retract side too (see
+                # _ingest_close's docstring).
+                structural = [
+                    t for t in candidate_triples_by_ident.get(ident, [])
+                    if ":introduced-by" not in t
+                ]
+                structural_contains = [t for t in structural if ":contains" in t]
+                structural_other = [t for t in structural if ":contains" not in t]
+                if structural_other:
+                    _retract(db, "[" + " ".join(structural_other) + "]", index_con=index_con)
+                    _transact(
+                        db, "[" + " ".join(structural_other) + "]", commit_ts_iso, index_con=index_con,
+                    )
+                for structural_triple in structural_contains:
+                    _retract(db, "[" + structural_triple + "]", index_con=index_con)
+                    _transact(db, "[" + structural_triple + "]", commit_ts_iso, index_con=index_con)
+
+                # The superseded candidate-diff record is stale the moment
+                # the guess moves off it, and this is the cheapest place to
+                # drop it -- superseded_ident is right here. Without it these
+                # scratch facts accumulate as O(entity touches) rather than
+                # O(entities), which is exactly what _candidate_diff_clear's
+                # own docstring says must not happen.
+                _candidate_diff_clear(
+                    db, superseded_ident[len(":commit/"):], ident, index_con=index_con,
+                )
             if superseded_pos is not None and superseded_pos <= pos:
                 # The move was refused (or would be): the "superseded" guess
                 # is not actually later than this commit, so asserting it as
