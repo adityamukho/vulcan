@@ -15575,3 +15575,140 @@ class TestParseStreamRatio:
         this runs inside a background coroutine with no user in the loop."""
         import mcp_server
         assert mcp_server._parse_stream_ratio("\x00\xff") == (1, 1)
+
+
+class TestForwardReconcileProvisional:
+    def _seed_provisional(self, real_db):
+        """An entity Stream 2 discovered at a late commit and guessed wrong."""
+        import mcp_server
+        guess_ident = ":commit/bbbbbbbbbbbb"
+        structural = [
+            ":code/fn-login :entity-type :type/function",
+            ':code/fn-login :name "login"',
+            ":module/auth :contains :code/fn-login",
+        ]
+        structural_triples = [f"[{t}]" for t in structural]
+        mcp_server._transact(
+            real_db, "[" + " ".join(f"[{t}]" for t in structural if ":contains" not in t) + "]",
+            "2026-06-01T00:00:00Z",
+        )
+        mcp_server._transact(
+            real_db, "[[:module/auth :contains :code/fn-login]]", "2026-06-01T00:00:00Z",
+        )
+        mcp_server._transact(
+            real_db, f"[[:code/fn-login :introduced-by {guess_ident}]]", "2026-06-01T00:00:00Z",
+        )
+        mcp_server._lineage_mark_provisional(real_db, ":code/fn-login", "2026-06-01T00:00:00Z")
+        mcp_server._candidate_diff_persist(
+            real_db, "bbbbbbbbbbbb" + "0" * 28, ":code/fn-login", "hash-b", "2026-06-01T00:00:00Z",
+        )
+        return guess_ident, structural_triples
+
+    def test_returns_none_and_writes_nothing_when_not_provisional(self, real_db):
+        import mcp_server
+        mcp_server._transact(
+            real_db, "[[:code/fn-x :introduced-by :commit/aaaaaaaaaaaa]]", "2026-01-01T00:00:00Z",
+        )
+        result = mcp_server._forward_reconcile_provisional(
+            real_db, ":code/fn-x", [], "2026-01-01T00:00:00Z", {},
+        )
+        assert result is None
+        assert mcp_server._entity_introduced_by_query(real_db, ":code/fn-x") == ":commit/aaaaaaaaaaaa"
+
+    def test_retracts_the_provisional_guess(self, real_db):
+        import mcp_server
+        guess_ident, structural = self._seed_provisional(real_db)
+        mcp_server._forward_reconcile_provisional(
+            real_db, ":code/fn-login", structural, "2026-01-01T00:00:00Z",
+            {guess_ident: "2026-06-01T00:00:00Z"},
+        )
+        # No :introduced-by left at all -- the caller writes the authoritative
+        # one immediately after, via the normal forward emission path.
+        assert mcp_server._entity_introduced_by_query(real_db, ":code/fn-login") is None
+
+    def test_confirms_the_marker_and_clears_the_candidate_diff(self, real_db):
+        import mcp_server
+        guess_ident, structural = self._seed_provisional(real_db)
+        returned = mcp_server._forward_reconcile_provisional(
+            real_db, ":code/fn-login", structural, "2026-01-01T00:00:00Z",
+            {guess_ident: "2026-06-01T00:00:00Z"},
+        )
+        assert returned == guess_ident
+        assert mcp_server._lineage_is_provisional(real_db, ":code/fn-login") is False
+        assert mcp_server._candidate_diff_read(
+            real_db, "bbbbbbbbbbbb" + "0" * 28, ":code/fn-login",
+        ) is None
+
+    def test_writes_modified_in_at_the_guess_commits_own_timestamp(self, real_db):
+        """The guess commit is now known to be a genuine modification rather
+        than the introduction. Dating the edge at the TRUE introduction's
+        timestamp would assert a fact valid before it was true."""
+        import mcp_server
+        guess_ident, structural = self._seed_provisional(real_db)
+        mcp_server._forward_reconcile_provisional(
+            real_db, ":code/fn-login", structural, "2026-01-01T00:00:00Z",
+            {guess_ident: "2026-06-01T00:00:00Z"},
+        )
+        raw = mcp_server._db_execute(
+            real_db,
+            '(query [:find ?c :valid-at "2026-06-02T00:00:00Z" '
+            ':where [:code/fn-login :modified-in ?c]])',
+        )
+        assert [row[0] for row in json.loads(raw)["results"]] == [guess_ident]
+        # Not yet true the day BEFORE the guess commit.
+        raw_before = mcp_server._db_execute(
+            real_db,
+            '(query [:find ?c :valid-at "2026-05-31T00:00:00Z" '
+            ':where [:code/fn-login :modified-in ?c]])',
+        )
+        assert json.loads(raw_before)["results"] == []
+
+    def test_re_dates_structural_facts_to_the_true_introduction(self, real_db):
+        """Otherwise there is a valid-time window where :introduced-by is live
+        for an entity with no type, name or file, so an :as-of query at the
+        true introduction reports the entity as nonexistent."""
+        import mcp_server
+        guess_ident, structural = self._seed_provisional(real_db)
+        mcp_server._forward_reconcile_provisional(
+            real_db, ":code/fn-login", structural, "2026-01-01T00:00:00Z",
+            {guess_ident: "2026-06-01T00:00:00Z"},
+        )
+        raw = mcp_server._db_execute(
+            real_db,
+            '(query [:find ?n :valid-at "2026-02-01T00:00:00Z" '
+            ':where [:code/fn-login :name ?n]])',
+        )
+        assert [row[0] for row in json.loads(raw)["results"]] == ["login"]
+
+    def test_contains_edge_survives_re_dating(self, real_db):
+        """:contains shares (entity, attribute, valid_from) with any sibling
+        edge, so it must be retracted and re-transacted one triple per call
+        -- batching silently keeps only the last (#222 phase 2b1)."""
+        import mcp_server
+        guess_ident, structural = self._seed_provisional(real_db)
+        mcp_server._forward_reconcile_provisional(
+            real_db, ":code/fn-login", structural, "2026-01-01T00:00:00Z",
+            {guess_ident: "2026-06-01T00:00:00Z"},
+        )
+        raw = mcp_server._db_execute(
+            real_db,
+            '(query [:find ?c :valid-at "2026-02-01T00:00:00Z" '
+            ':where [:module/auth :contains ?c]])',
+        )
+        assert [row[0] for row in json.loads(raw)["results"]] == [":code/fn-login"]
+
+    def test_skips_modified_in_when_guess_timestamp_unknown(self, real_db, capsys):
+        """Falling back to the true introduction's timestamp would back-date
+        the edge to before the modification it describes. Skip and say so."""
+        import mcp_server
+        guess_ident, structural = self._seed_provisional(real_db)
+        mcp_server._forward_reconcile_provisional(
+            real_db, ":code/fn-login", structural, "2026-01-01T00:00:00Z", {},
+        )
+        raw = mcp_server._db_execute(
+            real_db, "(query [:find ?c :where [:code/fn-login :modified-in ?c]])",
+        )
+        assert json.loads(raw)["results"] == []
+        assert "no timestamp in commit_metadata" in capsys.readouterr().err
+        # The rest of the reconciliation still happened.
+        assert mcp_server._lineage_is_provisional(real_db, ":code/fn-login") is False

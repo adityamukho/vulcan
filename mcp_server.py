@@ -5335,6 +5335,118 @@ def _entity_introduced_by_set_provisional(
     _lineage_mark_provisional(db, entity_ident, commit_ts_iso, index_con=index_con)
 
 
+def _re_date_structural_facts(
+    db: Any,
+    structural_triples: List[str],
+    new_ts_iso: str,
+    index_con: Optional[Any] = None,
+) -> None:
+    """Retract and re-assert an entity's structural facts at new_ts_iso.
+
+    Used whenever a provisional :introduced-by guess moves to an earlier
+    commit -- by _reverse_apply when the reverse walk finds an even earlier
+    occurrence, and by _forward_reconcile_provisional when the forward walk
+    reaches the true introduction. In both cases the facts were written at
+    the timestamp of the commit where the entity was first SIGHTED, which is
+    later than the introduction now is, leaving a valid-time window where
+    :introduced-by is live for an entity with no type, name or file -- so
+    ":as-of the introduction" reports it as nonexistent.
+
+    _retract targets live rows regardless of their original valid_from, so
+    this is a straight re-assert at the earlier timestamp.
+
+    :contains is retracted and transacted ONE TRIPLE PER CALL, on both
+    sides. Minigraf's EAVT pending index omits value bytes, so facts sharing
+    (entity, attribute, valid_from) in one call collapse to the last -- see
+    #222 phase 2b1, where this cost five of six containment edges on an
+    ordinary multi-entity file, permanently.
+    """
+    contains = [t for t in structural_triples if ":contains" in t]
+    other = [t for t in structural_triples if ":contains" not in t]
+    if other:
+        _retract(db, "[" + " ".join(other) + "]", index_con=index_con)
+        _transact(db, "[" + " ".join(other) + "]", new_ts_iso, index_con=index_con)
+    for triple in contains:
+        _retract(db, "[" + triple + "]", index_con=index_con)
+        _transact(db, "[" + triple + "]", new_ts_iso, index_con=index_con)
+
+
+def _forward_reconcile_provisional(
+    db: Any,
+    entity_ident: str,
+    structural_triples: List[str],
+    true_commit_ts_iso: str,
+    ts_by_commit_ident: Dict[str, str],
+    index_con: Optional[Any] = None,
+) -> Optional[str]:
+    """#222 phase 2d: the forward walk has reached entity_ident's TRUE
+    introduction and found a provisional guess left by Stream 2. Clear the
+    guess so the caller's normal authoritative emission is the only
+    :introduced-by fact that survives.
+
+    Returns the superseded guess's commit ident, or None if entity_ident was
+    not provisional (in which case nothing is written at all).
+
+    Deliberately does NOT write the authoritative :introduced-by itself --
+    the caller's ordinary _build_code_triples output does that, so there is
+    exactly one code path that mints an authoritative introduction and this
+    function cannot drift from it.
+
+    Mirrors the supersede path in _reverse_fill_claim_and_process: the same
+    re-dating of structural facts, the same one-transact-per-:contains
+    splitting, and the same refusal to back-date a :modified-in edge whose
+    commit timestamp is unknown.
+    """
+    guess_ident = _entity_introduced_by_query(db, entity_ident)
+    if not _lineage_is_provisional(db, entity_ident):
+        return None
+
+    # 1. Drop the guess. The caller writes the real one immediately after.
+    if guess_ident is not None:
+        _retract(db, f"[[{entity_ident} :introduced-by {guess_ident}]]", index_con=index_con)
+
+    # 2. Re-date structural facts to the true (earlier) introduction.
+    _re_date_structural_facts(
+        db,
+        [t for t in structural_triples if ":introduced-by" not in t],
+        true_commit_ts_iso,
+        index_con=index_con,
+    )
+
+    # 3. The entity's lineage is authoritative from here on.
+    _lineage_confirm(db, entity_ident, index_con=index_con)
+
+    if guess_ident is None:
+        return None
+
+    # 4. The candidate-diff record is stale the moment the guess moves off it,
+    # and this is the cheapest place to drop it -- guess_ident is right here.
+    _candidate_diff_clear(db, guess_ident[len(":commit/"):], entity_ident, index_con=index_con)
+
+    # 5. The guess commit is now known to be a genuine modification rather
+    # than the introduction, so it earns the :modified-in edge Stream 2
+    # withheld from it. Dated at ITS OWN timestamp, not this commit's.
+    #
+    # This inherits 2b's documented over-assertion: #221's unchanged-body
+    # narrowing cannot be re-checked against the guess commit's own diff,
+    # because only that commit's own parse carries the data. That is already
+    # owned -- the guess commit lies inside frontier-high's territory, so the
+    # correction sweep visits it, finds exactly one :introduced-by (case 3),
+    # and retracts this edge if its own parse says the body was unchanged.
+    guess_ts = ts_by_commit_ident.get(guess_ident)
+    if guess_ts is None:
+        print(
+            f"[_forward_reconcile_provisional] skipping retroactive :modified-in "
+            f"for {entity_ident} at {guess_ident}: no timestamp in commit_metadata",
+            file=sys.stderr,
+        )
+        return guess_ident
+    _transact(
+        db, f"[[{entity_ident} :modified-in {guess_ident}]]", guess_ts, index_con=index_con,
+    )
+    return guess_ident
+
+
 _LAST_RUN_KEYWORD_ATTRS = frozenset({":entity-type"})
 _LAST_RUN_NUMERIC_ATTRS = frozenset({":total-ingested"})
 
