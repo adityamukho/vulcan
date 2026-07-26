@@ -19,7 +19,8 @@
 - **Never call `handle_minigraf_transact` / `handle_minigraf_retract`** from ingestion code. Use internal `_transact` / `_retract`. The public handlers' schema gate rejects `:type/lineage-marker`, `:type/candidate-diff` and `:type/ingest-interval`, all deliberately unregistered in `MINIGRAF_SCHEMA`.
 - **EAVT collision rule:** minigraf's pending index omits value bytes, so facts sharing `(entity, attribute, valid_from)` in ONE `_transact` collapse to the last. `:contains`, `:depends-on` and `:parent` must be transacted **one triple per call**, on the retract side too. Facts differing in entity do not collide.
 - **Positions, never timestamps**, for any ordering comparison. Committer dates are non-monotonic in topological order (this repo's own history has a six-day inversion).
-- **Run the full suite before every commit:** `python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`. Baseline on this branch is **968 passing, 0 failing**. The rule for every task is: **zero failures, and the passing count goes up by exactly the number of tests that task added — never down.** Confirm the baseline yourself before starting Task 1 rather than trusting this number; if it differs, use what you measured. Absolute counts are deliberately not restated per-task, because a task that adds one extra test case would otherwise read as a failure.
+- **Always use the project venv: `.venv/bin/python`, never bare `python`.** The system interpreter lacks the optional tree-sitter grammar packages (`tree_sitter_elixir`, and others), which produces ~120 `ModuleNotFoundError` failures that have nothing to do with your change. Every command in this plan that says `python` means `.venv/bin/python`.
+- **Run the full suite before every commit:** `.venv/bin/python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`. Measured baseline on this branch is **839 passing, 0 failing**. The rule for every task is: **zero failures, and the passing count goes up by exactly the number of tests that task added — never down.** Absolute counts are deliberately not restated per-task, because a task that adds one extra test case would otherwise read as a failure.
 
 ---
 
@@ -67,7 +68,7 @@ class TestParseStreamRatio:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestParseStreamRatio -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestParseStreamRatio -q`
 Expected: FAIL with `AttributeError: module 'mcp_server' has no attribute '_parse_stream_ratio'`
 
 - [ ] **Step 3: Write the implementation**
@@ -111,7 +112,7 @@ def _parse_stream_ratio(raw: Optional[str]) -> Tuple[int, int]:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestParseStreamRatio -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestParseStreamRatio -q`
 Expected: 4 passed
 
 - [ ] **Step 5: Commit**
@@ -173,7 +174,7 @@ class TestPreloadProvisionalIdents:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestPreloadProvisionalIdents -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestPreloadProvisionalIdents -q`
 Expected: FAIL with `AttributeError: ... '_preload_provisional_idents'`
 
 - [ ] **Step 3: Write the implementation**
@@ -213,10 +214,10 @@ In `_run_ingestion` at `mcp_server.py:8061-8065`, add `provisional_idents,` as t
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestPreloadProvisionalIdents -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestPreloadProvisionalIdents -q`
 Expected: 4 passed
 
-Run: `python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
 Expected: zero failures, count up by 4. A `ValueError: too many values to unpack` here means Step 4 was missed.
 
 - [ ] **Step 6: Commit**
@@ -393,7 +394,7 @@ class TestForwardReconcileProvisional:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestForwardReconcileProvisional -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestForwardReconcileProvisional -q`
 Expected: FAIL with `AttributeError: ... '_forward_reconcile_provisional'`
 
 - [ ] **Step 3: Write the implementation**
@@ -486,7 +487,7 @@ def _forward_reconcile_provisional(
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestForwardReconcileProvisional -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestForwardReconcileProvisional -q`
 Expected: 7 passed
 
 - [ ] **Step 5: Commit**
@@ -586,7 +587,7 @@ leaving the existing `except`/`finally` handlers at 8594-8612 exactly as they ar
 
 - [ ] **Step 4: Run the full suite**
 
-Run: `python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
 Expected: zero failures and **exactly the same count as after Task 3** — this task adds no tests, and the existing suite is the only proof the move was faithful. **Any failure here is an extraction error, not a test problem.** Diff the moved code against `git show HEAD~1:mcp_server.py` rather than adjusting a test.
 
 - [ ] **Step 5: Commit**
@@ -745,7 +746,7 @@ class TestForwardApplyReconcilesProvisional:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestForwardApplyReconcilesProvisional -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestForwardApplyReconcilesProvisional -q`
 Expected: FAIL — `_ForwardWalkState` has no `provisional_idents` field
 
 - [ ] **Step 3: Widen the dataclass**
@@ -822,10 +823,10 @@ def _forward_structural_triples(precomputed: Dict[str, Any], ident: str) -> List
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestForwardApplyReconcilesProvisional -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestForwardApplyReconcilesProvisional -q`
 Expected: 3 passed
 
-Run: `python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
 Expected: zero failures, count up by 3
 
 - [ ] **Step 6: Commit**
@@ -906,7 +907,7 @@ class TestReverseApplySplit:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestReverseApplySplit -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestReverseApplySplit -q`
 Expected: FAIL with `AttributeError: ... '_reverse_apply'`
 
 - [ ] **Step 3: Perform the split**
@@ -962,10 +963,10 @@ Note the length guard is duplicated deliberately: it must fire **before** `claim
 
 - [ ] **Step 4: Run the tests**
 
-Run: `python -m pytest tests/test_mcp_server.py -k "ReverseFill or ReverseApply" -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py -k "ReverseFill or ReverseApply" -q`
 Expected: all pass, including every pre-existing `TestReverseFill*` test unchanged
 
-Run: `python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
 Expected: zero failures, count up by 1
 
 - [ ] **Step 5: Commit**
@@ -1065,7 +1066,7 @@ class TestRoundRobinClaimer:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestRoundRobinClaimer -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestRoundRobinClaimer -q`
 Expected: FAIL with `AttributeError: ... '_RoundRobinClaimer'`
 
 - [ ] **Step 3: Write the implementation**
@@ -1122,7 +1123,7 @@ class _RoundRobinClaimer:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestRoundRobinClaimer -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestRoundRobinClaimer -q`
 Expected: 8 passed
 
 - [ ] **Step 5: Commit**
@@ -1339,10 +1340,10 @@ Check whether the file already uses `pytest.mark.asyncio` or an explicit `asynci
 
 - [ ] **Step 7: Run the tests**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestStageAInterleave -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestStageAInterleave -q`
 Expected: 5 passed
 
-Run: `python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
 Expected: all pass. Existing `_run_ingestion` tests that assumed a watermark-relative commit list may need their *expectations* updated — but only where the change is genuinely the new intended behaviour. If a test fails because lineage is now provisional in the upper region, that is correct and expected; Task 9 is what makes it authoritative again.
 
 - [ ] **Step 8: Commit**
@@ -1470,7 +1471,7 @@ class TestStageBCorrectionSweep:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestStageBCorrectionSweep -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestStageBCorrectionSweep -q`
 Expected: FAIL — `_should_fold_lineage_watermark` undefined, and the completed-run assertions fail because no sweep runs yet
 
 - [ ] **Step 3: Write the fold guard**
@@ -1567,10 +1568,10 @@ In `_run_ingestion`, immediately after the `while pending:` loop ends and before
 
 - [ ] **Step 5: Run the tests**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestStageBCorrectionSweep -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestStageBCorrectionSweep -q`
 Expected: 5 passed
 
-Run: `python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
 Expected: all pass
 
 - [ ] **Step 6: Commit**
@@ -1705,7 +1706,7 @@ class TestStagingAndShutdown:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestStagingAndShutdown -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestStagingAndShutdown -q`
 Expected: FAIL — `KeyError: 'phase'`
 
 - [ ] **Step 3: Add the phase key**
@@ -1722,10 +1723,10 @@ Confirm `_ingest_progress["processed"] += 1` remains where it is — once per dr
 
 - [ ] **Step 4: Run the tests**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestStagingAndShutdown -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestStagingAndShutdown -q`
 Expected: 4 passed
 
-Run: `python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
 Expected: all pass
 
 - [ ] **Step 5: Commit**
@@ -1798,7 +1799,7 @@ class TestMultiStreamParityWithForwardOnly:
 
 - [ ] **Step 2: Run it**
 
-Run: `python -m pytest tests/test_mcp_server.py::TestMultiStreamParityWithForwardOnly -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestMultiStreamParityWithForwardOnly -q`
 Expected: PASS
 
 If `:introduced-by` diverges, that is a real bug in Tasks 5/9, not a test to relax. Trace the specific entity: query its `:introduced-by` in both graphs, then check whether it was reconciled (`_preload_provisional_idents` on the multi graph) and whether the sweep visited its guess commit (`_correction_sweep_through_query`).
@@ -1815,7 +1816,7 @@ Add `MINIGRAF_INGEST_STREAM_RATIO` wherever `MINIGRAF_INGEST_WORKERS` is already
 
 - [ ] **Step 4: Run the full suite**
 
-Run: `python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py tests/test_frontier_registry.py -q`
 Expected: all pass, no regressions against the 968 baseline
 
 - [ ] **Step 5: Commit**
