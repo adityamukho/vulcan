@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -7816,6 +7817,393 @@ def _reverse_bulk_fill_walk(
     return count
 
 
+def _forward_apply(
+    db: Any,
+    repo_path: str,
+    state: "_ForwardWalkState",
+    commit: Tuple[str, str, str, str],
+    extracted: Tuple[list, list, dict, list],
+    index_con: Optional[Any] = None,
+) -> None:
+    """Apply one commit's forward-walk writes.
+
+    Moved verbatim out of _run_ingestion's `while pending:` loop (issue #222
+    phase 2d) so a single commit's write section can be driven per-commit by
+    the two-stream interleave. Purely synchronous: the ~10 individual
+    `run_in_executor(write_executor, ...)` submissions the inline body used
+    became direct calls, and the caller submits this whole function to
+    write_executor once instead.
+    """
+    commit_hash, commit_ts_iso, author, subject = commit
+    extracted_files, gitlink_changes, gitmodules_map, renamed_pairs = extracted
+    commit_ident = f":commit/{commit_hash[:12]}"
+    reason = f"git:{commit_hash} {author}: {subject}"
+
+    add_triples: List[str] = [
+        f"[{commit_ident} :entity-type :type/commit]",
+        f'[{commit_ident} :ident "{commit_ident}"]',
+        f'[{commit_ident} :description "{_edn_escape(subject[:120])}"]',
+        f'[{commit_ident} :hash "{commit_hash}"]',
+        f'[{commit_ident} :author "{_edn_escape(author)}"]',
+        f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
+        f'[{commit_ident} :date "{commit_ts_iso}"]',
+    ]
+    close_items: List[tuple] = []  # (triples, original_ts_iso)
+    dep_add_triples: List[str] = []  # :depends-on triples to transact individually
+    # Old paths of files renamed this commit (R status). Their
+    # unmatched child entities / dependency edges are closed in a
+    # final pass after renamed_pairs is consumed (see below).
+    renamed_old_paths: set = set()
+
+    for status, file_path, extracted, precomputed, old_path in extracted_files:
+        if status == "D":
+            # Close module and all known child entities for this file.
+            # Iterate a copy: _forget_closed_entity mutates
+            # state.file_entities[file_path] in place as it purges.
+            idents = list(state.file_entities.get(file_path, [_code_ident("module", file_path)]))
+            module_ident = _code_ident("module", file_path)
+            for ident in idents:
+                orig_ts = state.entity_valid_from.get(ident, commit_ts_iso)
+                desc = state.entity_descriptions.get(ident, "")
+                close_items.append(
+                    (_build_close_triples(
+                        ident, desc, module_ident,
+                        state.field_class_ident.get(ident),
+                        close_entity_type=True, file_value=file_path,
+                        is_static=state.field_static_ident.get(ident),
+                    ), orig_ts)
+                )
+                _forget_closed_entity(
+                    ident, file_path, state.entity_valid_from,
+                    state.entity_descriptions, state.field_class_ident, state.file_entities,
+                    state.field_static_ident,
+                )
+            # Whole file is gone: drop its (now-empty) state.file_entities key
+            # so nothing stale lingers under this path (matches state.file_deps).
+            state.file_entities.pop(file_path, None)
+            # Close all :depends-on edges for the deleted module
+            for dep_ident in state.file_deps.get(file_path, set()):
+                orig_ts = state.dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
+                close_items.append(
+                    ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
+                )
+            state.file_deps.pop(file_path, None)
+        else:  # A or M or R
+            if status == "R" and old_path:
+                renamed_old_paths.add(old_path)
+                old_module_ident = _code_ident("module", old_path)
+                new_module_ident = _code_ident("module", file_path)
+                add_triples.append(f"[{new_module_ident} :renamed-from {old_module_ident}]")
+                # :renamed-to is a brand-new fact that becomes
+                # true at the rename commit and stays true forever
+                # after — it must be transacted open-ended (like
+                # :renamed-from), NOT closed with the old entity's
+                # historical valid window via _ingest_close.
+                add_triples.append(f"[{old_module_ident} :renamed-to {new_module_ident}]")
+                old_desc = state.entity_descriptions.get(old_module_ident, old_path)
+                orig_ts = state.entity_valid_from.get(old_module_ident, commit_ts_iso)
+                close_items.append((
+                    _build_close_triples(
+                        old_module_ident, old_desc, old_module_ident,
+                        close_entity_type=True, file_value=old_path,
+                    ),
+                    orig_ts,
+                ))
+                # Purge the closed old module. Its remaining child
+                # entities under old_path are closed+purged by the
+                # renamed_old_paths pass below, which also pops the
+                # whole state.file_entities[old_path] key — so only the
+                # scalar dicts and the module's own list slot need
+                # dropping here.
+                _forget_closed_entity(
+                    old_module_ident, old_path, state.entity_valid_from,
+                    state.entity_descriptions, state.field_class_ident, state.file_entities,
+                    state.field_static_ident,
+                )
+            previous_idents = set(state.file_entities.get(file_path, []))
+            triples = _build_code_triples(
+                file_path, extracted, commit_ts_iso, state.entity_valid_from,
+                state.entity_descriptions, state.file_entities, commit_ident, precomputed,
+                state.field_class_ident, state.field_static_ident,
+            )
+            add_triples.extend(triples)
+            # Detect entities removed from a modified file.
+            # _build_code_triples only appends to state.file_entities, never removes.
+            # Compare previous idents against the idents derivable from the
+            # current extraction to find what was deleted.
+            if status == "M":
+                module_ident = _code_ident("module", file_path)
+                current_extracted_idents: set = {module_ident}
+                for fn_ident, _fn_name, _fn_triples in precomputed["function_entries"]:
+                    current_extracted_idents.add(fn_ident)
+                for cls_ident, _cls_name, _cls_triples in precomputed["class_entries"]:
+                    current_extracted_idents.add(cls_ident)
+                # Globals and fields are tracked in state.file_entities too
+                # (see _build_code_triples): omitting them here would
+                # make every still-present global/field look "removed"
+                # on any later edit and wrongly close it (#113).
+                for gvar_ident, _gvar_name, _gvar_triples in precomputed["global_entries"]:
+                    current_extracted_idents.add(gvar_ident)
+                for field_ident, _field_name, _field_triples in precomputed["field_entries"]:
+                    current_extracted_idents.add(field_ident)
+                removed_idents = previous_idents - current_extracted_idents
+                # An in-place rename (old->new in the same file) is
+                # closed with :renamed-to linkage by the renamed_pairs
+                # loop below; exclude those old idents here so they are
+                # not ALSO closed as a plain removal (double close).
+                same_file_renamed_old_idents = {
+                    _code_ident(cat, o_file, o_name)
+                    for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
+                    if o_file == file_path
+                }
+                removed_idents -= same_file_renamed_old_idents
+                for ident in removed_idents:
+                    orig_ts = state.entity_valid_from.get(ident, commit_ts_iso)
+                    desc = state.entity_descriptions.get(ident, "")
+                    close_items.append(
+                        (_build_close_triples(
+                            ident, desc, module_ident,
+                            state.field_class_ident.get(ident),
+                            close_entity_type=True, file_value=file_path,
+                            is_static=state.field_static_ident.get(ident),
+                        ), orig_ts)
+                    )
+                    # File survives (M), only this child was removed:
+                    # purge just this ident from the file's list.
+                    _forget_closed_entity(
+                        ident, file_path, state.entity_valid_from,
+                        state.entity_descriptions, state.field_class_ident, state.file_entities,
+                        state.field_static_ident,
+                    )
+            # Compute dep edges for this file and diff against previous.
+            # Resolution itself already happened in _extract_commit
+            # (precomputed["resolved_imports"]) against that commit's
+            # own git-ls-tree state — nothing left to resolve here.
+            module_ident = _code_ident("module", file_path)
+            current_deps: set = set()
+            for import_name, dep_ident, is_resolved in precomputed["resolved_imports"]:
+                if dep_ident != module_ident:
+                    current_deps.add(dep_ident)
+                    is_relative = import_name.startswith(".")
+                    if not is_resolved and not is_relative and dep_ident not in state.entity_valid_from:
+                        add_triples.extend([
+                            f"[{dep_ident} :entity-type :type/external-dependency]",
+                            f'[{dep_ident} :ident "{_edn_escape(dep_ident)}"]',
+                            f'[{dep_ident} :description "{_edn_escape(import_name)}"]',
+                        ])
+                        state.entity_valid_from[dep_ident] = commit_ts_iso
+                        state.entity_descriptions[dep_ident] = import_name
+                        state.unresolved_dep_idents[dep_ident] = import_name
+                        # #112: an already-known submodule may be the real
+                        # target this unresolvable import was reaching for
+                        # (submodule directories are never in state.file_entities,
+                        # so any import into one always falls through here).
+                        for sub_ident, sub_path in state.submodule_paths.items():
+                            if _submodule_path_matches_import(sub_path, import_name):
+                                add_triples.append(f"[{dep_ident} :resolves-to {sub_ident}]")
+            previous_deps = state.file_deps.get(file_path, set())
+            for dep_ident in current_deps - previous_deps:
+                dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")
+                state.dep_valid_from[(module_ident, dep_ident)] = commit_ts_iso
+            if status == "M":
+                for dep_ident in previous_deps - current_deps:
+                    orig_ts = state.dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
+                    close_items.append(
+                        ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
+                    )
+            state.file_deps[file_path] = current_deps
+
+    # Function/class rename linkage (Task 9's renamed_pairs).
+    # Module-level linkage is handled separately per-file
+    # above (Task 5) since it comes from git's own -M
+    # detection, not this commit-wide matcher.
+    for category, old_file, old_name, new_file, new_name in renamed_pairs:
+        old_ident = _code_ident(category, old_file, old_name)
+        new_ident = _code_ident(category, new_file, new_name)
+        add_triples.append(f"[{new_ident} :renamed-from {old_ident}]")
+        # :renamed-to becomes true at the rename commit and stays
+        # open-ended thereafter — transact it via the add path, do
+        # NOT fold it into the old entity's _ingest_close window.
+        add_triples.append(f"[{old_ident} :renamed-to {new_ident}]")
+        old_desc = state.entity_descriptions.get(old_ident, old_name)
+        old_module_ident = _code_ident("module", old_file)
+        orig_ts = state.entity_valid_from.get(old_ident, commit_ts_iso)
+        close_items.append((
+            _build_close_triples(
+                old_ident, old_desc, old_module_ident,
+                state.field_class_ident.get(old_ident),
+                close_entity_type=True, file_value=old_file,
+                is_static=state.field_static_ident.get(old_ident),
+            ),
+            orig_ts,
+        ))
+        _forget_closed_entity(
+            old_ident, old_file, state.entity_valid_from,
+            state.entity_descriptions, state.field_class_ident, state.file_entities,
+            state.field_static_ident,
+        )
+
+    # A file rename (R status) only closes the old MODULE above.
+    # Child entities and dependency edges under the old path are
+    # closed here as plain removals UNLESS the matcher established
+    # a rename continuity edge for them (handled with :renamed-to
+    # by the loop above). This runs after renamed_pairs is fully
+    # consumed so those confirmed renames can be excluded; without
+    # it, unmatched old children/deps leak open forever under the
+    # old path while new ones open under the new path.
+    if renamed_old_paths:
+        renamed_covered_idents = {
+            _code_ident(cat, o_file, o_name)
+            for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
+        }
+        for r_old_path in renamed_old_paths:
+            r_old_module_ident = _code_ident("module", r_old_path)
+            # Iterate a copy: _forget_closed_entity mutates
+            # state.file_entities[r_old_path] in place as it purges.
+            for ident in list(state.file_entities.get(r_old_path, [])):
+                if ident == r_old_module_ident:
+                    continue  # already closed+purged by the R block above
+                if ident in renamed_covered_idents:
+                    continue  # already closed+purged with :renamed-to linkage
+                orig_ts = state.entity_valid_from.get(ident, commit_ts_iso)
+                desc = state.entity_descriptions.get(ident, "")
+                close_items.append(
+                    (_build_close_triples(
+                        ident, desc, r_old_module_ident,
+                        state.field_class_ident.get(ident),
+                        close_entity_type=True, file_value=r_old_path,
+                        is_static=state.field_static_ident.get(ident),
+                    ), orig_ts)
+                )
+                _forget_closed_entity(
+                    ident, r_old_path, state.entity_valid_from,
+                    state.entity_descriptions, state.field_class_ident, state.file_entities,
+                    state.field_static_ident,
+                )
+            # Whole old path is gone (renamed away): drop the key so
+            # no stale ident lingers to be re-discovered by a later
+            # commit that reuses this path (e.g. a shim at old_path).
+            state.file_entities.pop(r_old_path, None)
+            for dep_ident in state.file_deps.get(r_old_path, set()):
+                orig_ts = state.dep_valid_from.get((r_old_module_ident, dep_ident), commit_ts_iso)
+                close_items.append(
+                    ([f"[{r_old_module_ident} :depends-on {dep_ident}]"], orig_ts)
+                )
+            state.file_deps.pop(r_old_path, None)
+
+    # Process gitlink changes (submodule add/bump/remove).
+    # The "remove" case's interaction with the ordinary per-file module-open
+    # logic (elsewhere in this loop) is only sound because real submodule paths
+    # are extensionless (no tree-sitter parser matches them, so no module is
+    # ever opened for a bare gitlink path) — a gitlink path that happened to
+    # carry a recognized source extension is an untested, unreachable-in-practice edge case.
+    for kind, sha, path in gitlink_changes:
+        ext_ident = _code_ident("module", path)
+        if kind == "add":
+            info = gitmodules_map.get(path, {})
+            name = info.get("name", "")
+            url = info.get("url", "")
+            description = name or path
+            ext_triples = [
+                f"[{ext_ident} :entity-type :type/external-dependency]",
+                f'[{ext_ident} :ident "{_edn_escape(ext_ident)}"]',
+                f'[{ext_ident} :description "{_edn_escape(description)}"]',
+                f'[{ext_ident} :path "{_edn_escape(path)}"]',
+                f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]',
+                f"[{ext_ident} :introduced-by {commit_ident}]",
+            ]
+            if name:
+                ext_triples.append(f'[{ext_ident} :submodule-name "{_edn_escape(name)}"]')
+            if url:
+                ext_triples.append(f'[{ext_ident} :submodule-url "{_edn_escape(url)}"]')
+            add_triples.extend(ext_triples)
+            state.entity_valid_from[ext_ident] = commit_ts_iso
+            state.entity_descriptions[ext_ident] = description
+            state.pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
+            state.submodule_paths[ext_ident] = path
+            # #112: link any pre-existing unresolved-import stub whose
+            # import path reaches into this submodule — the ordering in
+            # the issue's own repro (stub created before the submodule
+            # was ever added), which the per-import check above can't
+            # catch since the submodule wasn't known yet at that time.
+            for stub_ident, import_name in state.unresolved_dep_idents.items():
+                if _submodule_path_matches_import(path, import_name):
+                    add_triples.append(f"[{stub_ident} :resolves-to {ext_ident}]")
+        elif kind == "bump":
+            old_sha, orig_ts = state.pinned_commit_state.get(ext_ident, (None, commit_ts_iso))
+            if old_sha is not None:
+                close_items.append(
+                    ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], orig_ts)
+                )
+            add_triples.append(f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]')
+            add_triples.append(f"[{ext_ident} :modified-in {commit_ident}]")
+            state.pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
+        else:  # "remove"
+            orig_ts = state.entity_valid_from.get(ext_ident, commit_ts_iso)
+            desc = state.entity_descriptions.get(ext_ident, "")
+            close_items.append(
+                (_build_close_triples(
+                    ext_ident, desc, ext_ident,
+                    entity_type_kw=":type/external-dependency",
+                    file_value=path,
+                ), orig_ts)
+            )
+            # Submodule removed: purge lifecycle state so a later
+            # re-add at the same path is treated as genuinely new.
+            # (Submodule paths aren't tracked in state.file_entities, so the
+            # path arg is a no-op there, but pass it for consistency.)
+            _forget_closed_entity(
+                ext_ident, path, state.entity_valid_from,
+                state.entity_descriptions, state.field_class_ident, state.file_entities,
+            )
+            old_sha, pin_orig_ts = state.pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
+            if old_sha is not None:
+                close_items.append(
+                    ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], pin_orig_ts)
+                )
+
+    # Split :contains triples out before batching.  Minigraf's EAVT
+    # pending index lacks value bytes in the key, so batching multiple
+    # [module :contains fn] facts in one transact silently drops all
+    # but the last.  Each :contains triple gets its own transact so
+    # they receive distinct tx_counts and avoid the index collision.
+    contains_triples = [t for t in add_triples if ":contains" in t]
+    other_triples = [t for t in add_triples if ":contains" not in t]
+    _ingest_transact(db, other_triples, commit_ts_iso, reason, index_con)
+    for ct in contains_triples:
+        _ingest_transact(db, [ct], commit_ts_iso, reason, index_con)
+    # :depends-on triples transacted individually — same EAVT collision risk
+    # as :contains when multiple deps share the same source module
+    for dt in dep_add_triples:
+        _ingest_transact(db, [dt], commit_ts_iso, reason, index_con)
+    for close_triples, orig_ts in close_items:
+        _ingest_close(db, close_triples, orig_ts, commit_ts_iso, reason, index_con)
+
+    # Ingest :parent edges — one transact per parent to avoid EAVT
+    # collision for merge commits (which have two parent hashes).
+    # Routed through _transact (not a raw _db_execute call) so the
+    # edge also lands in the persisted fact index -- see #118 review
+    # finding: this call site used to build its own raw (transact
+    # ...) string and bypass the index choke point entirely.
+    try:
+        for parent_hash in _git_parent_hashes(repo_path, commit_hash):
+            parent_ident = f":commit/{parent_hash[:12]}"
+            _transact(
+                db,
+                f'[[{commit_ident} :parent {parent_ident}]]',
+                commit_ts_iso,
+                None,
+                None,
+                index_con,
+            )
+    except Exception:
+        pass  # non-fatal; parent edges are best-effort
+
+    _watermark_update(db, commit_hash, commit_ts_iso, reason, index_con)
+    _db_checkpoint(db)
+    _commit_index_writer_safe(index_con)
+
+
 _CORRECTION_SWEEP_THROUGH_IDENT = ":ingestion/correction-sweep-through"
 # Max per-ident skip lines this sweep writes to stderr per run; see the
 # Observability section of the design spec for why this must be
@@ -8189,6 +8577,27 @@ def _parse_stream_ratio(raw: Optional[str]) -> Tuple[int, int]:
         return _DEFAULT_STREAM_RATIO
 
 
+@dataclass
+class _ForwardWalkState:
+    """The forward walk's ten mutable preload dicts, threaded as one object.
+
+    Held by reference, not by value: _forward_apply mutates these in place
+    exactly as the inline loop body it was extracted from did (issue #222
+    phase 2d).
+    """
+
+    entity_valid_from: Dict[str, str]
+    entity_descriptions: Dict[str, str]
+    file_entities: Dict[str, list]
+    file_deps: Dict[str, set]
+    dep_valid_from: Dict[tuple, str]
+    pinned_commit_state: Dict[str, tuple]
+    field_class_ident: Dict[str, str]
+    field_static_ident: Dict[str, bool]
+    submodule_paths: Dict[str, str]
+    unresolved_dep_idents: Dict[str, str]
+
+
 async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure.
 
@@ -8230,6 +8639,18 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 field_class_ident, field_static_ident, submodule_paths, unresolved_dep_idents,
                 provisional_idents,  # consumed by _forward_apply (Task 5)
             ) = await loop.run_in_executor(preload_executor, _load_ingestion_preload_state, repo_path)
+        state = _ForwardWalkState(
+            entity_valid_from=entity_valid_from,
+            entity_descriptions=entity_descriptions,
+            file_entities=file_entities,
+            file_deps=file_deps,
+            dep_valid_from=dep_valid_from,
+            pinned_commit_state=pinned_commit_state,
+            field_class_ident=field_class_ident,
+            field_static_ident=field_static_ident,
+            submodule_paths=submodule_paths,
+            unresolved_dep_idents=unresolved_dep_idents,
+        )
         # minigraf exposes no explicit close(): the file lock is only released once
         # every reference to the handle is gone — the worker thread's own `db`
         # local already went out of scope when it returned above, so clearing
@@ -8384,379 +8805,12 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     # Acquire DB fresh each commit — never hold across yield
                     db = await _ensure_db_async()
                     try:
-                        add_triples: List[str] = [
-                            f"[{commit_ident} :entity-type :type/commit]",
-                            f'[{commit_ident} :ident "{commit_ident}"]',
-                            f'[{commit_ident} :description "{_edn_escape(subject[:120])}"]',
-                            f'[{commit_ident} :hash "{commit_hash}"]',
-                            f'[{commit_ident} :author "{_edn_escape(author)}"]',
-                            f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
-                            f'[{commit_ident} :date "{commit_ts_iso}"]',
-                        ]
-                        close_items: List[tuple] = []  # (triples, original_ts_iso)
-                        dep_add_triples: List[str] = []  # :depends-on triples to transact individually
-                        # Old paths of files renamed this commit (R status). Their
-                        # unmatched child entities / dependency edges are closed in a
-                        # final pass after renamed_pairs is consumed (see below).
-                        renamed_old_paths: set = set()
-
-                        for status, file_path, extracted, precomputed, old_path in extracted_files:
-                            if status == "D":
-                                # Close module and all known child entities for this file.
-                                # Iterate a copy: _forget_closed_entity mutates
-                                # file_entities[file_path] in place as it purges.
-                                idents = list(file_entities.get(file_path, [_code_ident("module", file_path)]))
-                                module_ident = _code_ident("module", file_path)
-                                for ident in idents:
-                                    orig_ts = entity_valid_from.get(ident, commit_ts_iso)
-                                    desc = entity_descriptions.get(ident, "")
-                                    close_items.append(
-                                        (_build_close_triples(
-                                            ident, desc, module_ident,
-                                            field_class_ident.get(ident),
-                                            close_entity_type=True, file_value=file_path,
-                                            is_static=field_static_ident.get(ident),
-                                        ), orig_ts)
-                                    )
-                                    _forget_closed_entity(
-                                        ident, file_path, entity_valid_from,
-                                        entity_descriptions, field_class_ident, file_entities,
-                                        field_static_ident,
-                                    )
-                                # Whole file is gone: drop its (now-empty) file_entities key
-                                # so nothing stale lingers under this path (matches file_deps).
-                                file_entities.pop(file_path, None)
-                                # Close all :depends-on edges for the deleted module
-                                for dep_ident in file_deps.get(file_path, set()):
-                                    orig_ts = dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
-                                    close_items.append(
-                                        ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
-                                    )
-                                file_deps.pop(file_path, None)
-                            else:  # A or M or R
-                                if status == "R" and old_path:
-                                    renamed_old_paths.add(old_path)
-                                    old_module_ident = _code_ident("module", old_path)
-                                    new_module_ident = _code_ident("module", file_path)
-                                    add_triples.append(f"[{new_module_ident} :renamed-from {old_module_ident}]")
-                                    # :renamed-to is a brand-new fact that becomes
-                                    # true at the rename commit and stays true forever
-                                    # after — it must be transacted open-ended (like
-                                    # :renamed-from), NOT closed with the old entity's
-                                    # historical valid window via _ingest_close.
-                                    add_triples.append(f"[{old_module_ident} :renamed-to {new_module_ident}]")
-                                    old_desc = entity_descriptions.get(old_module_ident, old_path)
-                                    orig_ts = entity_valid_from.get(old_module_ident, commit_ts_iso)
-                                    close_items.append((
-                                        _build_close_triples(
-                                            old_module_ident, old_desc, old_module_ident,
-                                            close_entity_type=True, file_value=old_path,
-                                        ),
-                                        orig_ts,
-                                    ))
-                                    # Purge the closed old module. Its remaining child
-                                    # entities under old_path are closed+purged by the
-                                    # renamed_old_paths pass below, which also pops the
-                                    # whole file_entities[old_path] key — so only the
-                                    # scalar dicts and the module's own list slot need
-                                    # dropping here.
-                                    _forget_closed_entity(
-                                        old_module_ident, old_path, entity_valid_from,
-                                        entity_descriptions, field_class_ident, file_entities,
-                                        field_static_ident,
-                                    )
-                                previous_idents = set(file_entities.get(file_path, []))
-                                triples = _build_code_triples(
-                                    file_path, extracted, commit_ts_iso, entity_valid_from,
-                                    entity_descriptions, file_entities, commit_ident, precomputed,
-                                    field_class_ident, field_static_ident,
-                                )
-                                add_triples.extend(triples)
-                                # Detect entities removed from a modified file.
-                                # _build_code_triples only appends to file_entities, never removes.
-                                # Compare previous idents against the idents derivable from the
-                                # current extraction to find what was deleted.
-                                if status == "M":
-                                    module_ident = _code_ident("module", file_path)
-                                    current_extracted_idents: set = {module_ident}
-                                    for fn_ident, _fn_name, _fn_triples in precomputed["function_entries"]:
-                                        current_extracted_idents.add(fn_ident)
-                                    for cls_ident, _cls_name, _cls_triples in precomputed["class_entries"]:
-                                        current_extracted_idents.add(cls_ident)
-                                    # Globals and fields are tracked in file_entities too
-                                    # (see _build_code_triples): omitting them here would
-                                    # make every still-present global/field look "removed"
-                                    # on any later edit and wrongly close it (#113).
-                                    for gvar_ident, _gvar_name, _gvar_triples in precomputed["global_entries"]:
-                                        current_extracted_idents.add(gvar_ident)
-                                    for field_ident, _field_name, _field_triples in precomputed["field_entries"]:
-                                        current_extracted_idents.add(field_ident)
-                                    removed_idents = previous_idents - current_extracted_idents
-                                    # An in-place rename (old->new in the same file) is
-                                    # closed with :renamed-to linkage by the renamed_pairs
-                                    # loop below; exclude those old idents here so they are
-                                    # not ALSO closed as a plain removal (double close).
-                                    same_file_renamed_old_idents = {
-                                        _code_ident(cat, o_file, o_name)
-                                        for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
-                                        if o_file == file_path
-                                    }
-                                    removed_idents -= same_file_renamed_old_idents
-                                    for ident in removed_idents:
-                                        orig_ts = entity_valid_from.get(ident, commit_ts_iso)
-                                        desc = entity_descriptions.get(ident, "")
-                                        close_items.append(
-                                            (_build_close_triples(
-                                                ident, desc, module_ident,
-                                                field_class_ident.get(ident),
-                                                close_entity_type=True, file_value=file_path,
-                                                is_static=field_static_ident.get(ident),
-                                            ), orig_ts)
-                                        )
-                                        # File survives (M), only this child was removed:
-                                        # purge just this ident from the file's list.
-                                        _forget_closed_entity(
-                                            ident, file_path, entity_valid_from,
-                                            entity_descriptions, field_class_ident, file_entities,
-                                            field_static_ident,
-                                        )
-                                # Compute dep edges for this file and diff against previous.
-                                # Resolution itself already happened in _extract_commit
-                                # (precomputed["resolved_imports"]) against that commit's
-                                # own git-ls-tree state — nothing left to resolve here.
-                                module_ident = _code_ident("module", file_path)
-                                current_deps: set = set()
-                                for import_name, dep_ident, is_resolved in precomputed["resolved_imports"]:
-                                    if dep_ident != module_ident:
-                                        current_deps.add(dep_ident)
-                                        is_relative = import_name.startswith(".")
-                                        if not is_resolved and not is_relative and dep_ident not in entity_valid_from:
-                                            add_triples.extend([
-                                                f"[{dep_ident} :entity-type :type/external-dependency]",
-                                                f'[{dep_ident} :ident "{_edn_escape(dep_ident)}"]',
-                                                f'[{dep_ident} :description "{_edn_escape(import_name)}"]',
-                                            ])
-                                            entity_valid_from[dep_ident] = commit_ts_iso
-                                            entity_descriptions[dep_ident] = import_name
-                                            unresolved_dep_idents[dep_ident] = import_name
-                                            # #112: an already-known submodule may be the real
-                                            # target this unresolvable import was reaching for
-                                            # (submodule directories are never in file_entities,
-                                            # so any import into one always falls through here).
-                                            for sub_ident, sub_path in submodule_paths.items():
-                                                if _submodule_path_matches_import(sub_path, import_name):
-                                                    add_triples.append(f"[{dep_ident} :resolves-to {sub_ident}]")
-                                previous_deps = file_deps.get(file_path, set())
-                                for dep_ident in current_deps - previous_deps:
-                                    dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")
-                                    dep_valid_from[(module_ident, dep_ident)] = commit_ts_iso
-                                if status == "M":
-                                    for dep_ident in previous_deps - current_deps:
-                                        orig_ts = dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
-                                        close_items.append(
-                                            ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
-                                        )
-                                file_deps[file_path] = current_deps
-
-                        # Function/class rename linkage (Task 9's renamed_pairs).
-                        # Module-level linkage is handled separately per-file
-                        # above (Task 5) since it comes from git's own -M
-                        # detection, not this commit-wide matcher.
-                        for category, old_file, old_name, new_file, new_name in renamed_pairs:
-                            old_ident = _code_ident(category, old_file, old_name)
-                            new_ident = _code_ident(category, new_file, new_name)
-                            add_triples.append(f"[{new_ident} :renamed-from {old_ident}]")
-                            # :renamed-to becomes true at the rename commit and stays
-                            # open-ended thereafter — transact it via the add path, do
-                            # NOT fold it into the old entity's _ingest_close window.
-                            add_triples.append(f"[{old_ident} :renamed-to {new_ident}]")
-                            old_desc = entity_descriptions.get(old_ident, old_name)
-                            old_module_ident = _code_ident("module", old_file)
-                            orig_ts = entity_valid_from.get(old_ident, commit_ts_iso)
-                            close_items.append((
-                                _build_close_triples(
-                                    old_ident, old_desc, old_module_ident,
-                                    field_class_ident.get(old_ident),
-                                    close_entity_type=True, file_value=old_file,
-                                    is_static=field_static_ident.get(old_ident),
-                                ),
-                                orig_ts,
-                            ))
-                            _forget_closed_entity(
-                                old_ident, old_file, entity_valid_from,
-                                entity_descriptions, field_class_ident, file_entities,
-                                field_static_ident,
-                            )
-
-                        # A file rename (R status) only closes the old MODULE above.
-                        # Child entities and dependency edges under the old path are
-                        # closed here as plain removals UNLESS the matcher established
-                        # a rename continuity edge for them (handled with :renamed-to
-                        # by the loop above). This runs after renamed_pairs is fully
-                        # consumed so those confirmed renames can be excluded; without
-                        # it, unmatched old children/deps leak open forever under the
-                        # old path while new ones open under the new path.
-                        if renamed_old_paths:
-                            renamed_covered_idents = {
-                                _code_ident(cat, o_file, o_name)
-                                for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
-                            }
-                            for r_old_path in renamed_old_paths:
-                                r_old_module_ident = _code_ident("module", r_old_path)
-                                # Iterate a copy: _forget_closed_entity mutates
-                                # file_entities[r_old_path] in place as it purges.
-                                for ident in list(file_entities.get(r_old_path, [])):
-                                    if ident == r_old_module_ident:
-                                        continue  # already closed+purged by the R block above
-                                    if ident in renamed_covered_idents:
-                                        continue  # already closed+purged with :renamed-to linkage
-                                    orig_ts = entity_valid_from.get(ident, commit_ts_iso)
-                                    desc = entity_descriptions.get(ident, "")
-                                    close_items.append(
-                                        (_build_close_triples(
-                                            ident, desc, r_old_module_ident,
-                                            field_class_ident.get(ident),
-                                            close_entity_type=True, file_value=r_old_path,
-                                            is_static=field_static_ident.get(ident),
-                                        ), orig_ts)
-                                    )
-                                    _forget_closed_entity(
-                                        ident, r_old_path, entity_valid_from,
-                                        entity_descriptions, field_class_ident, file_entities,
-                                        field_static_ident,
-                                    )
-                                # Whole old path is gone (renamed away): drop the key so
-                                # no stale ident lingers to be re-discovered by a later
-                                # commit that reuses this path (e.g. a shim at old_path).
-                                file_entities.pop(r_old_path, None)
-                                for dep_ident in file_deps.get(r_old_path, set()):
-                                    orig_ts = dep_valid_from.get((r_old_module_ident, dep_ident), commit_ts_iso)
-                                    close_items.append(
-                                        ([f"[{r_old_module_ident} :depends-on {dep_ident}]"], orig_ts)
-                                    )
-                                file_deps.pop(r_old_path, None)
-
-                        # Process gitlink changes (submodule add/bump/remove).
-                        # The "remove" case's interaction with the ordinary per-file module-open
-                        # logic (elsewhere in this loop) is only sound because real submodule paths
-                        # are extensionless (no tree-sitter parser matches them, so no module is
-                        # ever opened for a bare gitlink path) — a gitlink path that happened to
-                        # carry a recognized source extension is an untested, unreachable-in-practice edge case.
-                        for kind, sha, path in gitlink_changes:
-                            ext_ident = _code_ident("module", path)
-                            if kind == "add":
-                                info = gitmodules_map.get(path, {})
-                                name = info.get("name", "")
-                                url = info.get("url", "")
-                                description = name or path
-                                ext_triples = [
-                                    f"[{ext_ident} :entity-type :type/external-dependency]",
-                                    f'[{ext_ident} :ident "{_edn_escape(ext_ident)}"]',
-                                    f'[{ext_ident} :description "{_edn_escape(description)}"]',
-                                    f'[{ext_ident} :path "{_edn_escape(path)}"]',
-                                    f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]',
-                                    f"[{ext_ident} :introduced-by {commit_ident}]",
-                                ]
-                                if name:
-                                    ext_triples.append(f'[{ext_ident} :submodule-name "{_edn_escape(name)}"]')
-                                if url:
-                                    ext_triples.append(f'[{ext_ident} :submodule-url "{_edn_escape(url)}"]')
-                                add_triples.extend(ext_triples)
-                                entity_valid_from[ext_ident] = commit_ts_iso
-                                entity_descriptions[ext_ident] = description
-                                pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
-                                submodule_paths[ext_ident] = path
-                                # #112: link any pre-existing unresolved-import stub whose
-                                # import path reaches into this submodule — the ordering in
-                                # the issue's own repro (stub created before the submodule
-                                # was ever added), which the per-import check above can't
-                                # catch since the submodule wasn't known yet at that time.
-                                for stub_ident, import_name in unresolved_dep_idents.items():
-                                    if _submodule_path_matches_import(path, import_name):
-                                        add_triples.append(f"[{stub_ident} :resolves-to {ext_ident}]")
-                            elif kind == "bump":
-                                old_sha, orig_ts = pinned_commit_state.get(ext_ident, (None, commit_ts_iso))
-                                if old_sha is not None:
-                                    close_items.append(
-                                        ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], orig_ts)
-                                    )
-                                add_triples.append(f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]')
-                                add_triples.append(f"[{ext_ident} :modified-in {commit_ident}]")
-                                pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
-                            else:  # "remove"
-                                orig_ts = entity_valid_from.get(ext_ident, commit_ts_iso)
-                                desc = entity_descriptions.get(ext_ident, "")
-                                close_items.append(
-                                    (_build_close_triples(
-                                        ext_ident, desc, ext_ident,
-                                        entity_type_kw=":type/external-dependency",
-                                        file_value=path,
-                                    ), orig_ts)
-                                )
-                                # Submodule removed: purge lifecycle state so a later
-                                # re-add at the same path is treated as genuinely new.
-                                # (Submodule paths aren't tracked in file_entities, so the
-                                # path arg is a no-op there, but pass it for consistency.)
-                                _forget_closed_entity(
-                                    ext_ident, path, entity_valid_from,
-                                    entity_descriptions, field_class_ident, file_entities,
-                                )
-                                old_sha, pin_orig_ts = pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
-                                if old_sha is not None:
-                                    close_items.append(
-                                        ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], pin_orig_ts)
-                                    )
-
-                        # Split :contains triples out before batching.  Minigraf's EAVT
-                        # pending index lacks value bytes in the key, so batching multiple
-                        # [module :contains fn] facts in one transact silently drops all
-                        # but the last.  Each :contains triple gets its own transact so
-                        # they receive distinct tx_counts and avoid the index collision.
-                        contains_triples = [t for t in add_triples if ":contains" in t]
-                        other_triples = [t for t in add_triples if ":contains" not in t]
                         await loop.run_in_executor(
-                            write_executor, _ingest_transact, db, other_triples, commit_ts_iso, reason, index_con
+                            write_executor, _forward_apply, db, repo_path, state,
+                            (commit_hash, commit_ts_iso, author, subject),
+                            (extracted_files, gitlink_changes, gitmodules_map, renamed_pairs),
+                            index_con,
                         )
-                        for ct in contains_triples:
-                            await loop.run_in_executor(
-                                write_executor, _ingest_transact, db, [ct], commit_ts_iso, reason, index_con
-                            )
-                        # :depends-on triples transacted individually — same EAVT collision risk
-                        # as :contains when multiple deps share the same source module
-                        for dt in dep_add_triples:
-                            await loop.run_in_executor(
-                                write_executor, _ingest_transact, db, [dt], commit_ts_iso, reason, index_con
-                            )
-                        for close_triples, orig_ts in close_items:
-                            await loop.run_in_executor(
-                                write_executor, _ingest_close, db, close_triples, orig_ts, commit_ts_iso, reason, index_con
-                            )
-
-                        # Ingest :parent edges — one transact per parent to avoid EAVT
-                        # collision for merge commits (which have two parent hashes).
-                        # Routed through _transact (not a raw _db_execute call) so the
-                        # edge also lands in the persisted fact index -- see #118 review
-                        # finding: this call site used to build its own raw (transact
-                        # ...) string and bypass the index choke point entirely.
-                        try:
-                            for parent_hash in _git_parent_hashes(repo_path, commit_hash):
-                                parent_ident = f":commit/{parent_hash[:12]}"
-                                await loop.run_in_executor(
-                                    write_executor,
-                                    _transact,
-                                    db,
-                                    f'[[{commit_ident} :parent {parent_ident}]]',
-                                    commit_ts_iso,
-                                    None,
-                                    None,
-                                    index_con,
-                                )
-                        except Exception:
-                            pass  # non-fatal; parent edges are best-effort
-
-                        await loop.run_in_executor(write_executor, _watermark_update, db, commit_hash, commit_ts_iso, reason, index_con)
-                        await loop.run_in_executor(write_executor, _db_checkpoint, db)
-                        await loop.run_in_executor(write_executor, _commit_index_writer_safe, index_con)
 
                     except Exception as e:
                         # Ordinary per-commit write failure (malformed EDN, a
