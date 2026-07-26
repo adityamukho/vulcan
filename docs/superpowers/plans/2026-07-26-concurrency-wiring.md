@@ -397,7 +397,55 @@ class TestForwardReconcileProvisional:
 Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestForwardReconcileProvisional -q`
 Expected: FAIL with `AttributeError: ... '_forward_reconcile_provisional'`
 
-- [ ] **Step 3: Write the implementation**
+- [ ] **Step 3: Write the shared re-dating helper**
+
+Both this task and `_reverse_apply` (Task 6) re-date an entity's structural
+facts. The `:contains`-one-per-call rule is exactly the kind of invariant that
+rots when duplicated — sub-phase 2b1 exists because a batched `:contains`
+silently dropped five of six containment edges on an ordinary file. One
+implementation, two callers.
+
+```python
+def _re_date_structural_facts(
+    db: Any,
+    structural_triples: List[str],
+    new_ts_iso: str,
+    index_con: Optional[Any] = None,
+) -> None:
+    """Retract and re-assert an entity's structural facts at new_ts_iso.
+
+    Used whenever a provisional :introduced-by guess moves to an earlier
+    commit -- by _reverse_apply when the reverse walk finds an even earlier
+    occurrence, and by _forward_reconcile_provisional when the forward walk
+    reaches the true introduction. In both cases the facts were written at
+    the timestamp of the commit where the entity was first SIGHTED, which is
+    later than the introduction now is, leaving a valid-time window where
+    :introduced-by is live for an entity with no type, name or file -- so
+    ":as-of the introduction" reports it as nonexistent.
+
+    _retract targets live rows regardless of their original valid_from, so
+    this is a straight re-assert at the earlier timestamp.
+
+    :contains is retracted and transacted ONE TRIPLE PER CALL, on both
+    sides. Minigraf's EAVT pending index omits value bytes, so facts sharing
+    (entity, attribute, valid_from) in one call collapse to the last -- see
+    #222 phase 2b1, where this cost five of six containment edges on an
+    ordinary multi-entity file, permanently.
+    """
+    contains = [t for t in structural_triples if ":contains" in t]
+    other = [t for t in structural_triples if ":contains" not in t]
+    if other:
+        _retract(db, "[" + " ".join(other) + "]", index_con=index_con)
+        _transact(db, "[" + " ".join(other) + "]", new_ts_iso, index_con=index_con)
+    for triple in contains:
+        _retract(db, "[" + triple + "]", index_con=index_con)
+        _transact(db, "[" + triple + "]", new_ts_iso, index_con=index_con)
+```
+
+Place it immediately above `_forward_reconcile_provisional`. Task 6 switches
+`_reverse_apply`'s inline copy over to it.
+
+- [ ] **Step 4: Write the implementation**
 
 ```python
 def _forward_reconcile_provisional(
@@ -434,22 +482,13 @@ def _forward_reconcile_provisional(
     if guess_ident is not None:
         _retract(db, f"[[{entity_ident} :introduced-by {guess_ident}]]", index_con=index_con)
 
-    # 2. Re-date structural facts to the true (earlier) introduction. Stream 2
-    # wrote them at the timestamp of the commit where it first SIGHTED the
-    # entity, leaving a valid-time window where :introduced-by is live for an
-    # entity with no type, name or file. _retract targets live rows
-    # regardless of their original valid_from, so this is a straight
-    # re-assert at the earlier timestamp. :contains goes one per call on BOTH
-    # sides (EAVT collision, #222 phase 2b1).
-    structural = [t for t in structural_triples if ":introduced-by" not in t]
-    structural_contains = [t for t in structural if ":contains" in t]
-    structural_other = [t for t in structural if ":contains" not in t]
-    if structural_other:
-        _retract(db, "[" + " ".join(structural_other) + "]", index_con=index_con)
-        _transact(db, "[" + " ".join(structural_other) + "]", true_commit_ts_iso, index_con=index_con)
-    for structural_triple in structural_contains:
-        _retract(db, "[" + structural_triple + "]", index_con=index_con)
-        _transact(db, "[" + structural_triple + "]", true_commit_ts_iso, index_con=index_con)
+    # 2. Re-date structural facts to the true (earlier) introduction.
+    _re_date_structural_facts(
+        db,
+        [t for t in structural_triples if ":introduced-by" not in t],
+        true_commit_ts_iso,
+        index_con=index_con,
+    )
 
     # 3. The entity's lineage is authoritative from here on.
     _lineage_confirm(db, entity_ident, index_con=index_con)
@@ -485,12 +524,12 @@ def _forward_reconcile_provisional(
     return guess_ident
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 5: Run tests to verify they pass**
 
 Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestForwardReconcileProvisional -q`
 Expected: 7 passed
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add mcp_server.py tests/test_mcp_server.py
@@ -916,6 +955,18 @@ Rename the existing function body to `_reverse_apply` with the signature above, 
 - **Delete** from it: the `pos = allocator.claim_high()` / `if pos is None: return None` lines, and the `_extract_commit` call. `pos` and `file_results` are now parameters.
 - **Keep** in it: the `commit_metadata`/`linearization` length and alignment `ValueError` guards (they must run before any write), everything from `all_triples` onward, `_frontier_persist_claim(..., from_low=False, ...)`, and the single `_db_checkpoint(db)`.
 - Change the return type from `Optional[str]` to `str`.
+- **Replace its inline structural re-dating with `_re_date_structural_facts`** (Task 3). The block to replace is the one inside the `provisional_moves` loop that builds `structural`/`structural_contains`/`structural_other` and retracts+re-transacts them. It becomes:
+
+  ```python
+                _re_date_structural_facts(
+                    db,
+                    [t for t in candidate_triples_by_ident.get(ident, []) if ":introduced-by" not in t],
+                    commit_ts_iso,
+                    index_con=index_con,
+                )
+  ```
+
+  The existing `TestReverseFillContainsEdges` and `TestReverseFillValidTimeParity` classes are what prove this substitution is behaviour-preserving — they must pass unchanged.
 
 Then reduce `_reverse_fill_claim_and_process` to:
 
