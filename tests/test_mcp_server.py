@@ -6006,6 +6006,63 @@ class TestFrontierLoad:
         assert allocator.intervals() == []
 
 
+class TestFrontierLoadNormalisesUnrepresentableIntervals:
+    """The persisted schema holds ONE lo/hi pair per side, which cannot
+    express the post-growth shape (authoritative low region, already-filled
+    high region, then newly-arrived commits above it -- the gap moves ABOVE
+    the high interval). #222 phase 2b1 discards such an interval on load and
+    retracts its facts, so the graph and the allocator agree that the side
+    holds nothing, and the region is simply re-walked (which is safe: the 2b
+    review verified that re-processing an already-processed position is
+    idempotent)."""
+
+    def _seed_high(self, db, lo_hash, hi_hash):
+        import mcp_server
+        facts = [
+            f"[{mcp_server._FRONTIER_HIGH_IDENT} :entity-type :type/ingest-interval]",
+            f"[{mcp_server._FRONTIER_HIGH_IDENT} :tag :provisional]",
+            f'[{mcp_server._FRONTIER_HIGH_IDENT} :lo-hash "{lo_hash}"]',
+            f'[{mcp_server._FRONTIER_HIGH_IDENT} :hi-hash "{hi_hash}"]',
+        ]
+        mcp_server._transact(db, "[" + " ".join(facts) + "]", "2026-01-01T00:00:00Z")
+
+    def test_discards_and_retracts_high_interval_that_no_longer_tops_out(self, real_db):
+        import mcp_server
+        # Run 1 claimed h1..h2 of a 3-commit repo; h3 and h4 have since landed.
+        self._seed_high(real_db, "h1", "h2")
+        grown = ["h0", "h1", "h2", "h3", "h4"]
+
+        allocator = mcp_server._frontier_load(real_db, grown, "2026-01-02T00:00:00Z")
+
+        assert allocator.intervals() == [], "stale high interval must not be reconstructed"
+        assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) is None, (
+            "discarding only in memory leaves the next persist call extending a pair "
+            "the allocator no longer believes in, which re-creates the inverted state"
+        )
+
+    def test_discards_and_retracts_inverted_high_interval(self, real_db):
+        import mcp_server
+        self._seed_high(real_db, "h3", "h1")  # lo above hi: what the old persist path produced
+        linearization = ["h0", "h1", "h2", "h3"]
+
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-02T00:00:00Z")
+
+        assert allocator.intervals() == []
+        assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) is None
+
+    def test_keeps_a_high_interval_that_still_tops_out(self, real_db):
+        import mcp_server
+        linearization = ["h0", "h1", "h2", "h3"]
+        self._seed_high(real_db, "h2", "h3")
+
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-02T00:00:00Z")
+
+        assert allocator.intervals() == [
+            frontier_registry.Interval(2, 3, frontier_registry.TAG_PROVISIONAL)
+        ]
+        assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) == ("h2", "h3")
+
+
 class TestFrontierPersistClaim:
     def test_first_claim_from_low_creates_interval(self, real_db):
         import mcp_server
@@ -6321,6 +6378,65 @@ class TestCandidateDiff:
 
         assert result["retracted"] == 0
         assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) == "hash1"
+
+
+class TestEntityIntroducedBySetProvisional:
+    def test_query_absent_returns_none(self, real_db):
+        import mcp_server
+        assert mcp_server._entity_introduced_by_query(real_db, ":function/src-auth-py-login") is None
+
+    def test_first_assert_is_provisional(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._entity_introduced_by_set_provisional(db, entity_ident, ":commit/h2", "2026-01-03T00:00:00Z")
+
+        assert mcp_server._entity_introduced_by_query(db, entity_ident) == ":commit/h2"
+        assert mcp_server._lineage_is_provisional(db, entity_ident) is True
+
+    def test_moving_provisional_value_retracts_old_and_asserts_new(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._entity_introduced_by_set_provisional(db, entity_ident, ":commit/h2", "2026-01-03T00:00:00Z")
+        mcp_server._entity_introduced_by_set_provisional(db, entity_ident, ":commit/h0", "2026-01-01T00:00:00Z")
+
+        assert mcp_server._entity_introduced_by_query(db, entity_ident) == ":commit/h0"
+        raw = mcp_server._db_execute(
+            db, f"(query [:find (count ?c) :where [{entity_ident} :introduced-by ?c]])"
+        )
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_same_value_twice_is_idempotent(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+
+        mcp_server._entity_introduced_by_set_provisional(db, entity_ident, ":commit/h1", "2026-01-02T00:00:00Z")
+        mcp_server._entity_introduced_by_set_provisional(db, entity_ident, ":commit/h1", "2026-01-02T00:00:01Z")
+
+        raw = mcp_server._db_execute(
+            db, f"(query [:find (count ?c) :where [{entity_ident} :introduced-by ?c]])"
+        )
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_never_clobbers_an_authoritative_fact(self, real_db):
+        import mcp_server
+        db = real_db
+        entity_ident = ":function/src-auth-py-login"
+
+        # Simulate forward walk (Stream 1) having already confirmed this
+        # entity authoritatively -- a plain _transact, no lineage marker.
+        mcp_server._transact(
+            db, f"[[{entity_ident} :introduced-by :commit/original]]", "2026-01-01T00:00:00Z",
+        )
+
+        mcp_server._entity_introduced_by_set_provisional(db, entity_ident, ":commit/h5", "2026-01-05T00:00:00Z")
+
+        assert mcp_server._entity_introduced_by_query(db, entity_ident) == ":commit/original"
+        assert mcp_server._lineage_is_provisional(db, entity_ident) is False
 
 
 class TestGitCommitsTopoOrder:
@@ -8526,6 +8642,49 @@ class TestPrecomputeFileTriplesBodyDiff:
         )
         field_ident = mcp_server._code_ident("field", "models.py", "Foo.bar")
         assert field_ident in result["unchanged_idents"]
+
+    def test_body_hashes_populated_for_every_new_side_function(self):
+        import mcp_server
+        parser = self._python_parser()
+        new_nodes = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        result = mcp_server._precompute_file_triples(
+            "auth.py", extracted, ":commit/c1", {}, new_entity_nodes=new_nodes,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert result["body_hashes"][fn_ident] == mcp_server._normalized_body_hash(new_nodes["function"]["login"])
+
+    def test_body_hashes_match_across_textually_identical_bodies(self):
+        import mcp_server
+        parser = self._python_parser()
+        nodes_a = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
+        nodes_b = self._all_nodes(parser, b"def login(user):\n\n    return   user.ok\n")
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        result_a = mcp_server._precompute_file_triples(
+            "auth.py", extracted, ":commit/c1", {}, new_entity_nodes=nodes_a,
+        )
+        result_b = mcp_server._precompute_file_triples(
+            "auth.py", extracted, ":commit/c2", {}, new_entity_nodes=nodes_b,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert result_a["body_hashes"][fn_ident] == result_b["body_hashes"][fn_ident]
+
+    def test_body_hashes_absent_without_new_entity_nodes(self):
+        import mcp_server
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        result = mcp_server._precompute_file_triples("auth.py", extracted, ":commit/c1", {})
+        assert result["body_hashes"] == {}
+
+    def test_module_ident_never_appears_in_body_hashes(self):
+        import mcp_server
+        parser = self._python_parser()
+        new_nodes = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
+        extracted = {"functions": ["login"], "classes": [], "imports": []}
+        result = mcp_server._precompute_file_triples(
+            "auth.py", extracted, ":commit/c1", {}, new_entity_nodes=new_nodes,
+        )
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        assert module_ident not in result["body_hashes"]
 
 
 class TestFieldClassContainment:
@@ -13787,3 +13946,661 @@ class TestFieldClassContainmentE2E:
             )
         }
         assert field_ident not in mod_contains_after
+
+
+class TestReverseFillClaimAndProcess:
+    def _repo_with_evolving_function(self, tmp_path):
+        """Three commits, each genuinely changing auth.py's login() body (not
+        just whitespace -- #221's unchanged-body detection would otherwise
+        suppress :modified-in and complicate the assertions below), plus an
+        unrelated function added at h1/h2 so the file is in each commit's
+        diff for a real reason."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+        (repo / "auth.py").write_text("def login():\n    return 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h0"], cwd=repo, check=True, capture_output=True)
+
+        (repo / "auth.py").write_text("def login():\n    return 2\n\ndef extra():\n    pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h1"], cwd=repo, check=True, capture_output=True)
+
+        (repo / "auth.py").write_text(
+            "def login():\n    return 3\n\ndef extra():\n    pass\n\ndef more():\n    pass\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h2"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def _allocator_and_metadata(self, repo, real_db):
+        import mcp_server
+        import frontier_registry
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        return linearization, commit_metadata, allocator
+
+    def test_gap_empty_returns_none_and_writes_nothing(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        linearization, commit_metadata, allocator = self._allocator_and_metadata(repo, real_db)
+        # Drain the gap entirely first (forward-claim everything low).
+        while allocator.claim_low() is not None:
+            pass
+
+        result = mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        assert result is None
+
+    def test_single_claim_writes_structure_and_provisional_introduced_by(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        linearization, commit_metadata, allocator = self._allocator_and_metadata(repo, real_db)
+
+        claimed_hash = mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        assert claimed_hash == linearization[-1]  # newest commit (h2) claimed first
+
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        commit_ident = f":commit/{claimed_hash[:12]}"
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == commit_ident
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+        assert mcp_server._candidate_diff_read(real_db, claimed_hash, fn_ident) is not None
+
+    def test_walking_backward_moves_introduced_by_to_the_oldest_commit(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        linearization, commit_metadata, allocator = self._allocator_and_metadata(repo, real_db)
+
+        for _ in range(3):
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        oldest_hash, mid_hash, newest_hash = linearization[0], linearization[1], linearization[2]
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{oldest_hash[:12]}"
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find (count ?c) :where [{fn_ident} :introduced-by ?c]])"
+        )
+        assert json.loads(raw)["results"] == [[1]]
+        assert mcp_server._candidate_diff_read(real_db, oldest_hash, fn_ident) is not None
+
+        # The converged :modified-in set must match what forward walk would
+        # have produced: every later touch except the true introduction
+        # commit itself (h0 gets none -- see the design spec's corrected
+        # "Per-commit algorithm" section and the final whole-branch
+        # review's Critical finding #1 that this test was added to catch).
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{fn_ident} :modified-in ?c]])"
+        )
+        modified_in_commits = {row[0] for row in json.loads(raw)["results"]}
+        assert modified_in_commits == {f":commit/{mid_hash[:12]}", f":commit/{newest_hash[:12]}"}
+
+    def test_two_entities_in_one_commit_get_different_classifications(self, real_db, tmp_path):
+        """A single claimed commit can simultaneously introduce a brand-new
+        entity and add a real touch to an already-authoritative one --
+        the two must not cross-contaminate each other's handling."""
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        linearization, commit_metadata, allocator = self._allocator_and_metadata(repo, real_db)
+
+        extra_ident = mcp_server._code_ident("function", "auth.py", "extra")
+        # Simulate Stream 1 having already confirmed extra() authoritatively,
+        # before Stream 2 ever runs -- extra() first appears at h1, and this
+        # commit (h2, claimed first) also touches it (its body is identical
+        # at h1/h2, but it still shares the file with a genuinely new touch).
+        mcp_server._transact(
+            real_db, f"[[{extra_ident} :introduced-by :commit/preexisting]]", "2025-01-01T00:00:00Z",
+        )
+
+        claimed_hash = mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        commit_ident = f":commit/{claimed_hash[:12]}"
+
+        more_ident = mcp_server._code_ident("function", "auth.py", "more")
+        # more() is genuinely new at h2 -- first sighting, provisional.
+        assert mcp_server._entity_introduced_by_query(real_db, more_ident) == commit_ident
+        assert mcp_server._lineage_is_provisional(real_db, more_ident) is True
+
+        # extra() stays authoritative and untouched on :introduced-by.
+        assert mcp_server._entity_introduced_by_query(real_db, extra_ident) == ":commit/preexisting"
+        assert mcp_server._lineage_is_provisional(real_db, extra_ident) is False
+
+    def test_already_authoritative_entity_only_gets_modified_in(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        linearization, commit_metadata, allocator = self._allocator_and_metadata(repo, real_db)
+
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        # Simulate Stream 1 having already confirmed login() authoritatively
+        # at the oldest commit, before Stream 2 ever runs.
+        mcp_server._transact(
+            real_db, f"[[{fn_ident} :introduced-by :commit/preexisting]]", "2025-01-01T00:00:00Z",
+        )
+
+        claimed_hash = mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        commit_ident = f":commit/{claimed_hash[:12]}"
+
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == ":commit/preexisting"
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{fn_ident} :modified-in ?c]])"
+        )
+        assert [commit_ident] in json.loads(raw)["results"]
+
+    def test_frontier_high_interval_advances_by_one(self, real_db, tmp_path):
+        import mcp_server
+        import frontier_registry
+        repo = self._repo_with_evolving_function(tmp_path)
+        linearization, commit_metadata, allocator = self._allocator_and_metadata(repo, real_db)
+
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        bounds = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert bounds is not None
+        _lo_hash, hi_hash = bounds
+        assert hi_hash == linearization[-1]
+
+
+class _NoProgressAllocator:
+    """Stand-in for a FrontierAllocator whose claim_high() stops making
+    progress -- the pre-2b1 behaviour on a grown linearization, where
+    _extend rewrote a stale interval to itself and gap_hi never moved.
+
+    Not a mocked backend (docs/testing-conventions.md): the DB and the git
+    repo in this test are real; only the allocator, a pure in-memory
+    collaborator, is substituted, because after the 2b1 allocator fix no
+    real allocator can reach this state -- which is exactly why the walk
+    still needs its own guard.
+
+    Raises rather than looping forever once called too many times, so a
+    missing guard fails the test instead of hanging the suite.
+    """
+
+    def __init__(self, pos, max_calls=50):
+        self.pos = pos
+        self.calls = 0
+        self.max_calls = max_calls
+
+    def claim_high(self):
+        self.calls += 1
+        if self.calls > self.max_calls:
+            raise AssertionError(
+                f"claim_high() called {self.calls} times without progress -- "
+                "_reverse_bulk_fill_walk has no progress guard"
+            )
+        return self.pos
+
+
+class TestReverseBulkFillWalkProgressGuard:
+    def test_breaks_loudly_when_claim_high_stops_decreasing(self, real_db, tmp_path, capsys):
+        """The walk's loop is unbounded by construction and drives a git
+        subprocess, a tree-sitter parse, a DB write batch and a
+        _db_checkpoint fsync per iteration, inside what 2d intends to run as
+        a background task. It must stop on its own if the allocator ever
+        stops making progress, rather than spinning."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(3):
+            (repo / f"f{i}.py").write_text(f"def f{i}(): pass\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"h{i}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = _NoProgressAllocator(pos=1)
+
+        count = mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        assert allocator.calls < 10, f"walk kept claiming after no progress ({allocator.calls} calls)"
+        assert count >= 1  # the first claim is legitimate work
+        assert "progress" in capsys.readouterr().err.lower()
+
+
+def _assert_no_modified_in_at_or_before_introduction(db, linearization):
+    """Cross-cutting invariant: no entity may carry a :modified-in at a
+    position earlier than, or equal to, its :introduced-by's position.
+
+    Forward walk cannot produce either shape -- _build_code_triples emits
+    :modified-in only on its already-known branch, never at introduction --
+    so both are pure reverse-walk corruption. Positions, never timestamps:
+    committer dates are not monotonic in topological order (this repo's own
+    history has a six-day inversion), which is why build_linearization uses
+    --topo-order in the first place.
+    """
+    import mcp_server
+    pos_by_ident = {f":commit/{h[:12]}": i for i, h in enumerate(linearization)}
+    raw = mcp_server._db_execute(
+        db,
+        "(query [:find ?e ?intro ?mod :where "
+        "[?e :introduced-by ?intro] [?e :modified-in ?mod]])",
+    )
+    violations = []
+    for entity, intro_ident, mod_ident in json.loads(raw)["results"]:
+        intro_pos = pos_by_ident.get(intro_ident)
+        mod_pos = pos_by_ident.get(mod_ident)
+        if intro_pos is None or mod_pos is None:
+            continue
+        if mod_pos <= intro_pos:
+            violations.append((entity, intro_ident, intro_pos, mod_ident, mod_pos))
+    assert not violations, (
+        "entities modified at or before their own introduction: " + repr(violations)
+    )
+
+
+class TestEntityIntroducedBySetProvisionalMonotonicity:
+    def test_refuses_to_move_a_guess_to_a_later_commit(self, real_db):
+        """The helper's contract is 'move the guess DOWN' -- its docstring
+        says reverse walk has reached an *earlier* commit -- but nothing
+        enforced it, so a re-claim of a higher position dragged the guess
+        upward and left :modified-in edges stranded before it."""
+        import mcp_server
+        ident = ":function/f"
+        pos_by = {":commit/c0": 0, ":commit/c1": 1, ":commit/c4": 4}
+        mcp_server._entity_introduced_by_set_provisional(
+            real_db, ident, ":commit/c1", "2026-01-02T00:00:00Z",
+            pos=1, pos_by_commit_ident=pos_by,
+        )
+        mcp_server._entity_introduced_by_set_provisional(
+            real_db, ident, ":commit/c4", "2026-01-05T00:00:00Z",
+            pos=4, pos_by_commit_ident=pos_by,
+        )
+        assert mcp_server._entity_introduced_by_query(real_db, ident) == ":commit/c1"
+
+    def test_still_moves_a_guess_to_an_earlier_commit(self, real_db):
+        import mcp_server
+        ident = ":function/f"
+        pos_by = {":commit/c0": 0, ":commit/c1": 1, ":commit/c4": 4}
+        mcp_server._entity_introduced_by_set_provisional(
+            real_db, ident, ":commit/c4", "2026-01-05T00:00:00Z",
+            pos=4, pos_by_commit_ident=pos_by,
+        )
+        mcp_server._entity_introduced_by_set_provisional(
+            real_db, ident, ":commit/c0", "2026-01-01T00:00:00Z",
+            pos=0, pos_by_commit_ident=pos_by,
+        )
+        assert mcp_server._entity_introduced_by_query(real_db, ident) == ":commit/c0"
+
+
+class TestReverseFillCandidateDiffLifecycle:
+    def test_superseded_candidate_diff_records_are_cleared_at_move_time(self, real_db, tmp_path):
+        """2b persisted a candidate-diff record for every (claimed commit,
+        entity) pair, on first sighting and on every move -- so storage grew
+        as O(entity touches), not O(entities), for scratch facts whose own
+        helper docstring says they must not "accumulate unbounded across a
+        full ingest". Only the final, lowest guess is a correct record; the
+        superseded one is stale the moment the guess moves, and 2b has
+        superseded_ident right there in hand."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(6):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        login = mcp_server._code_ident("function", "auth.py", "login")
+        raw = mcp_server._db_execute(
+            real_db,
+            f"(query [:find ?rec :where [?rec :entity-type :type/candidate-diff] "
+            f"[?rec :entity {login}]])",
+        )
+        live_records = json.loads(raw)["results"]
+        assert len(live_records) == 1, (
+            f"one record per live guess, not one per touch; got {len(live_records)}"
+        )
+
+
+class TestReverseFillValidTimeParity:
+    def test_structural_facts_are_re_dated_when_the_guess_moves_earlier(self, real_db, tmp_path):
+        """2b wrote an entity's structural facts once, at the timestamp of
+        the commit where the walk first SIGHTED it, and never re-dated them
+        as the guess moved earlier. That leaves a valid-time window where
+        :introduced-by is live for an entity with no type, name or file --
+        so ":as-of the introduction" answers "this entity did not exist",
+        while ":when was it introduced" answers with that very commit."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(3):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        login = mcp_server._code_ident("function", "auth.py", "login")
+        intro_ts = commit_metadata[0][1]
+        raw = mcp_server._db_execute(
+            real_db, f'(query [:find ?a :valid-at "{intro_ts}" :where [{login} ?a ?v]])'
+        )
+        attrs_at_introduction = {row[0] for row in json.loads(raw)["results"]}
+        assert ":introduced-by" in attrs_at_introduction  # 2b already gets this right
+        assert ":entity-type" in attrs_at_introduction, (
+            "an entity live at its own introduction must carry its structure there too; "
+            f"got only {sorted(attrs_at_introduction)}"
+        )
+        assert ":file" in attrs_at_introduction
+
+
+class TestReverseFillParentEdges:
+    def test_claimed_commits_get_parent_edges(self, real_db, tmp_path):
+        """The bootstrap `ancestor` rule is defined purely over :parent, so
+        without these edges ancestor queries return nothing across the whole
+        reverse-filled region. Forward walk writes them, one transact per
+        parent (a merge commit has two, same EAVT reason as :contains)."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(3):
+            (repo / f"f{i}.py").write_text(f"def f{i}(): pass\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        child = f":commit/{linearization[1][:12]}"
+        parent = f":commit/{linearization[0][:12]}"
+        raw = mcp_server._db_execute(real_db, f"(query [:find ?p :where [{child} :parent ?p]])")
+        assert {row[0] for row in json.loads(raw)["results"]} == {parent}
+
+    def test_root_commit_has_no_parent(self, real_db, tmp_path):
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "a.py").write_text("def a(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "c0"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        root = f":commit/{linearization[0][:12]}"
+        raw = mcp_server._db_execute(real_db, f"(query [:find ?p :where [{root} :parent ?p]])")
+        assert json.loads(raw)["results"] == []
+
+
+class TestReverseFillCommitMetadataContract:
+    def test_misaligned_commit_metadata_raises_instead_of_misattributing(self, real_db, tmp_path):
+        """commit_metadata is indexed POSITIONALLY against linearization
+        while _frontier_persist_claim persists linearization[pos], so a
+        watermark-relative list (what _run_ingestion actually builds) makes
+        2b attribute entities to one commit and persist another -- silent,
+        systematic misattribution. 2b is handed a position by an allocator
+        that already claimed it, so it cannot decline: it must raise."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(3):
+            (repo / f"f{i}.py").write_text(f"def f{i}(): pass\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        with pytest.raises(ValueError, match="commit_metadata"):
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata[1:], allocator,
+            )
+
+
+class TestReverseFillResumeOnGrownLinearization:
+    """The 2b suite never exercised a resume at all -- every test built its
+    allocator from a graph with no persisted frontier. This is the scenario
+    the 2b review reproduced end to end: claim part of a repo, let new
+    commits land, then run again."""
+
+    def _repo(self, tmp_path, n):
+        repo = tmp_path / "repo"
+        if not repo.exists():
+            repo.mkdir()
+            _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(n):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def test_second_run_terminates_and_keeps_lineage_consistent(self, real_db, tmp_path):
+        import mcp_server
+        import frontier_registry
+        repo = self._repo(tmp_path, 3)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        for _ in range(2):  # claim positions 2 and 1, leaving position 0
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+
+        self._repo(tmp_path, 2)  # two more commits land on HEAD
+        grown = frontier_registry.build_linearization(str(repo))
+        grown_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        assert len(grown) == 5
+        allocator2 = mcp_server._frontier_load(real_db, grown, "2026-01-06T00:00:00Z")
+
+        count = mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), grown, grown_metadata, allocator2,
+        )
+
+        assert count <= len(grown), f"walk re-claimed without progress ({count} commits)"
+        high = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
+        lo_pos, hi_pos = grown.index(high[0]), grown.index(high[1])
+        assert lo_pos <= hi_pos, f"persisted frontier-high is inverted: {high}"
+        _assert_no_modified_in_at_or_before_introduction(real_db, grown)
+
+    def test_partial_second_run_does_not_drag_the_guess_forward(self, real_db, tmp_path):
+        """The invariant has to hold at every persisted point, not only once
+        a walk runs to exhaustion. A run that stops early -- crash, shutdown,
+        or 2d simply yielding -- leaves whatever state the last claim wrote.
+        Here run 1 leaves login's guess at position 1; run 2 then claims
+        position 4 first, and without a monotonicity guard that DRAGS the
+        guess up to 4 while the retroactive :modified-in lands at 1, i.e. an
+        entity modified three commits before it was introduced."""
+        import mcp_server
+        import frontier_registry
+        repo = self._repo(tmp_path, 3)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        for _ in range(2):
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+        login = mcp_server._code_ident("function", "auth.py", "login")
+        assert mcp_server._entity_introduced_by_query(real_db, login) == f":commit/{linearization[1][:12]}"
+
+        self._repo(tmp_path, 2)
+        grown = frontier_registry.build_linearization(str(repo))
+        grown_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator2 = mcp_server._frontier_load(real_db, grown, "2026-01-06T00:00:00Z")
+        for _ in range(2):  # partial: claim positions 4 and 3, then stop
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), grown, grown_metadata, allocator2,
+            )
+
+        _assert_no_modified_in_at_or_before_introduction(real_db, grown)
+        intro = mcp_server._entity_introduced_by_query(real_db, login)
+        assert intro == f":commit/{grown[1][:12]}", (
+            f"guess moved forward to {intro}; it may only ever move earlier"
+        )
+
+
+class TestReverseFillContainsEdges:
+    """Minigraf's EAVT pending index omits value bytes from the key, so
+    several facts sharing (entity, attribute, valid_from) inside ONE
+    transact collapse to the last one. Forward walk splits :contains out
+    for exactly this reason (see _run_ingestion's own one-transact-per-edge
+    loop); 2b batched everything, losing all but one containment edge per
+    parent -- permanently, since no later phase rewrites :contains."""
+
+    def _repo_with_multi_entity_file(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "m.py").write_text(
+            "class Acct:\n"
+            "    bal = 0\n"
+            "    rate = 1\n"
+            "\n"
+            "def a(): pass\n"
+            "def b(): pass\n"
+            "def c(): pass\n"
+        )
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h0"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def _contains(self, db, parent_ident):
+        import mcp_server
+        raw = mcp_server._db_execute(db, f"(query [:find ?c :where [{parent_ident} :contains ?c]])")
+        return {row[0] for row in json.loads(raw)["results"]}
+
+    def test_every_entity_in_a_file_gets_its_containment_edge(self, real_db, tmp_path):
+        import mcp_server
+        import frontier_registry
+        repo = self._repo_with_multi_entity_file(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        module_ident = mcp_server._code_ident("module", "m.py")
+        class_ident = mcp_server._code_ident("class", "m.py", "Acct")
+        expected_module_children = {
+            class_ident,
+            mcp_server._code_ident("field", "m.py", "Acct.bal"),
+            mcp_server._code_ident("field", "m.py", "Acct.rate"),
+            mcp_server._code_ident("function", "m.py", "a"),
+            mcp_server._code_ident("function", "m.py", "b"),
+            mcp_server._code_ident("function", "m.py", "c"),
+        }
+        assert self._contains(real_db, module_ident) == expected_module_children
+        assert self._contains(real_db, class_ident) == {
+            mcp_server._code_ident("field", "m.py", "Acct.bal"),
+            mcp_server._code_ident("field", "m.py", "Acct.rate"),
+        }
+
+
+class TestReverseBulkFillWalk:
+    def test_walks_until_gap_closes_and_returns_count(self, real_db, tmp_path):
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "a.py").write_text("def a(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h0"], cwd=repo, check=True, capture_output=True)
+        (repo / "b.py").write_text("def b(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h1"], cwd=repo, check=True, capture_output=True)
+        (repo / "c.py").write_text("def c(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h2"], cwd=repo, check=True, capture_output=True)
+
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        count = mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        assert count == 3
+        assert allocator.is_gap_empty() is True
+        fn_ident_a = mcp_server._code_ident("function", "a.py", "a")
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident_a) == f":commit/{linearization[0][:12]}"
+
+    def test_gap_already_empty_returns_zero(self, real_db, tmp_path):
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "a.py").write_text("def a(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h0"], cwd=repo, check=True, capture_output=True)
+
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-02T00:00:00Z")
+        while allocator.claim_low() is not None:
+            pass  # drain the gap forward first
+
+        count = mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        assert count == 0

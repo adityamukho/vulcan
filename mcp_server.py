@@ -4973,10 +4973,53 @@ def _frontier_load(
         ))
     high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
     if high_bounds is not None and high_bounds[0] in hash_to_pos and high_bounds[1] in hash_to_pos:
-        intervals.append(frontier_registry.Interval(
-            hash_to_pos[high_bounds[0]], hash_to_pos[high_bounds[1]], frontier_registry.TAG_PROVISIONAL
-        ))
+        hi_lo_pos, hi_hi_pos = hash_to_pos[high_bounds[0]], hash_to_pos[high_bounds[1]]
+        if hi_lo_pos <= hi_hi_pos and hi_hi_pos == len(linearization) - 1:
+            intervals.append(frontier_registry.Interval(
+                hi_lo_pos, hi_hi_pos, frontier_registry.TAG_PROVISIONAL
+            ))
+        else:
+            # Unrepresentable (#222 phase 2b1). Either the pair is inverted
+            # (what the pre-2b1 persist path produced once the linearization
+            # grew), or it no longer reaches the last position -- meaning new
+            # commits have landed above it, so the real state is three spans
+            # (authoritative low, filled high, new unclaimed above) and the
+            # gap now sits ABOVE this interval. One lo/hi pair per side
+            # cannot express that, so drop it and let the region be
+            # re-walked: re-processing an already-processed position is
+            # idempotent, so the graph converges and only work is wasted.
+            #
+            # Retract the facts too, not just the in-memory interval. Leaving
+            # them behind means the next _frontier_persist_claim sees a
+            # non-None `existing` and extends a pair the allocator no longer
+            # believes in, re-creating the inverted state on the first claim
+            # of the new run.
+            #
+            # Folding a 2c-confirmed high region into frontier-low instead
+            # (no re-walk at all) needs :ingestion/correction-sweep-through
+            # and spans all three streams -- that is 2d's, see the 2b1 design
+            # spec's "Why re-ingest is made safe, not efficient".
+            _frontier_discard_interval(
+                db, _FRONTIER_HIGH_IDENT, high_bounds, index_con=index_con
+            )
     return frontier_registry.FrontierAllocator(len(linearization), intervals)
+
+
+def _frontier_discard_interval(
+    db: Any, ident: str, bounds: Tuple[str, str], index_con: Optional[Any] = None
+) -> None:
+    """Retract an interval's four persisted facts, mirroring the set
+    _frontier_persist_claim creates. Used by _frontier_load when a persisted
+    pair cannot faithfully describe the claimed region (see its call site).
+    """
+    tag = ":authoritative" if ident == _FRONTIER_LOW_IDENT else ":provisional"
+    facts = [
+        f"[{ident} :entity-type :type/ingest-interval]",
+        f"[{ident} :tag {tag}]",
+        f'[{ident} :lo-hash "{_edn_escape(bounds[0])}"]',
+        f'[{ident} :hi-hash "{_edn_escape(bounds[1])}"]',
+    ]
+    _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
 
 
 def _frontier_persist_claim(
@@ -5223,6 +5266,73 @@ def _candidate_diff_clear(
         f'[{ident} :body-hash "{_edn_escape(existing)}"]',
     ]
     _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
+
+
+def _entity_introduced_by_query(db: Any, entity_ident: str) -> Optional[str]:
+    """Return entity_ident's current :introduced-by value (a commit ident
+    string), or None if it has none yet."""
+    raw = _db_execute(db, f"(query [:find ?c :where [{entity_ident} :introduced-by ?c]])")
+    results = json.loads(raw).get("results", [])
+    return results[0][0] if results else None
+
+
+def _entity_introduced_by_set_provisional(
+    db: Any,
+    entity_ident: str,
+    commit_ident: str,
+    commit_ts_iso: str,
+    index_con: Optional[Any] = None,
+    pos: Optional[int] = None,
+    pos_by_commit_ident: Optional[Dict[str, int]] = None,
+) -> None:
+    """Assert or move entity_ident's PROVISIONAL :introduced-by to
+    commit_ident. Never touches an entity whose :introduced-by is already
+    authoritative (a fact exists and _lineage_is_provisional is False) --
+    reverse walk (#222 phase 2b) must never clobber a fact Stream 1 has
+    already confirmed. Idempotent: no-ops the fact write (but still ensures
+    the marker is present) if the current value already equals
+    commit_ident. Query-before-write, retract-then-reassert only if the
+    value genuinely changed -- mirrors _watermark_update's pattern, since
+    re-transacting the same (entity, attribute, value) at a new valid_from
+    creates a duplicate live datom under minigraf's write semantics.
+
+    Monotonicity (#222 phase 2b1): when pos and pos_by_commit_ident are
+    supplied, a move is REFUSED unless commit_ident is strictly earlier than
+    the current guess. This docstring always claimed the contract ("reverse
+    walk has now reached an earlier commit") but nothing enforced it, so a
+    re-claim of a higher position -- routine on a resumed run -- dragged the
+    guess forward while the caller's retroactive :modified-in landed at the
+    older, lower commit, producing an entity modified before it was
+    introduced. Forward walk cannot produce that shape, nothing in the graph
+    or the audit detects it, and it persists.
+
+    Positions, never timestamps: committer dates are not monotonic in
+    topological order (clock skew, rebases), which is why
+    build_linearization uses --topo-order at all, so comparing :date values
+    would silently mis-order commits. Both parameters default to None, in
+    which case the guard is skipped and behaviour is exactly as before --
+    2a's existing callers are unaffected; 2b passes them always.
+    """
+    current = _entity_introduced_by_query(db, entity_ident)
+    if current is not None and not _lineage_is_provisional(db, entity_ident):
+        return  # authoritative -- never touch
+    if current == commit_ident:
+        _lineage_mark_provisional(db, entity_ident, commit_ts_iso, index_con=index_con)
+        return
+    if current is not None and pos is not None and pos_by_commit_ident is not None:
+        current_pos = pos_by_commit_ident.get(current)
+        if current_pos is not None and pos >= current_pos:
+            print(
+                f"[_entity_introduced_by_set_provisional] refusing to move "
+                f"{entity_ident}'s guess from {current} (position {current_pos}) "
+                f"to {commit_ident} (position {pos}): a guess may only move earlier",
+                file=sys.stderr,
+            )
+            return
+    if current is not None:
+        _retract(db, f"[[{entity_ident} :introduced-by {current}]]", index_con=index_con)
+    _transact(db, f"[[{entity_ident} :introduced-by {commit_ident}]]", commit_ts_iso, index_con=index_con)
+    _lineage_mark_provisional(db, entity_ident, commit_ts_iso, index_con=index_con)
 
 
 _LAST_RUN_KEYWORD_ATTRS = frozenset({":entity-type"})
@@ -6382,6 +6492,23 @@ def _precompute_file_triples(
     except Exception:
         unchanged_idents = set()
 
+    # #222 phase 2b: per-entity body hash for every entity present on the
+    # NEW side, keyed the same way unchanged_idents is above -- lets the
+    # reverse-bulk-fill walk persist a candidate-diff record (body hash)
+    # for an entity without needing the raw tree-sitter node itself.
+    # Module-level entries are deliberately excluded: there is no
+    # tree-sitter node to hash for a whole file, and candidate-diff
+    # persistence is function/class/variable/field-only (matching
+    # unchanged_idents' own category scope).
+    body_hashes: Dict[str, str] = {}
+    try:
+        new_nodes_for_hash = new_entity_nodes or {}
+        for category in ("function", "class", "variable", "field"):
+            for name, node in new_nodes_for_hash.get(category, {}).items():
+                body_hashes[_code_ident(category, file_path, name)] = _normalized_body_hash(node)
+    except Exception:
+        body_hashes = {}
+
     return {
         "module_ident": module_ident,
         "module_candidate_triples": module_candidate_triples,
@@ -6393,6 +6520,7 @@ def _precompute_file_triples(
         "field_static_map": field_static_map,
         "resolved_imports": resolved_imports,
         "unchanged_idents": unchanged_idents,
+        "body_hashes": body_hashes,
     }
 
 
@@ -7190,6 +7318,370 @@ def _extract_commit(
         gitmodules_map = _git_gitmodules_at(repo_path, commit_hash)
 
     return results, gitlink_changes, gitmodules_map, renamed_pairs
+
+
+def _reverse_fill_claim_and_process(
+    db: Any,
+    repo_path: str,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+    allocator: "frontier_registry.FrontierAllocator",
+    ignore_patterns: Sequence[str] = (),
+    index_con: Optional[Any] = None,
+) -> Optional[str]:
+    """#222 phase 2b: claim exactly one position from the gap's high end
+    (allocator.claim_high()) and process that one commit -- structural
+    facts, :modified-in edges, provisional :introduced-by, and candidate-diff
+    records for every entity the commit's "A"/"M" files touch. "D"/"R"
+    files are skipped entirely (deletions and renames are out of scope for
+    this sub-phase -- see the design spec).
+
+    Reuses _extract_commit/_build_code_triples unchanged for entity
+    discovery/parsing (direction-agnostic). BOTH :introduced-by and
+    :modified-in are filtered out of _build_code_triples's own output and
+    written by this function instead -- _build_code_triples's gate for
+    both attributes is entity_valid_from membership, which for forward
+    walk coincides with "is this the introduction commit" but for reverse
+    walk does not: the first commit reverse walk sees an entity at is the
+    newest touch (not the introduction), and the commit where reverse walk
+    finally stops finding an even-earlier occurrence (the true
+    introduction) is by then already "known" from later, already-visited
+    commits. Reusing _build_code_triples's :modified-in emission verbatim
+    would misclassify both ends. See the design spec's "Per-commit
+    algorithm" section (revised after the final whole-branch review found
+    this defect) for the full derivation.
+
+    :introduced-by: a newly-discovered entity's guess is asserted via
+    _entity_introduced_by_set_provisional and gets no :modified-in yet
+    (mirrors forward walk never emitting :modified-in at an entity's own
+    introduction commit). When an already-provisional entity is found at
+    an even earlier commit, its guess moves to this commit (also getting
+    no :modified-in yet) and the PREVIOUSLY-guessed commit -- now
+    confirmed to be a genuine modification, not the introduction --
+    retroactively receives a :modified-in fact using its OWN commit
+    timestamp (looked up from commit_metadata), not this commit's.
+    Already-authoritative entities are never touched, but a genuine later
+    touch always gets :modified-in (unless #221's unchanged-body check
+    says the body is provably unchanged this commit).
+
+    Known, documented limitation, and who fixes it: the retroactive
+    :modified-in for a superseded commit does not re-check #221's
+    unchanged-body narrowing against THAT commit's own diff, because only
+    this call's diff carries that data -- so it is asserted whenever the
+    superseded commit is genuinely later (see the monotonicity guard
+    above). This can over-assert an edge forward walk would have
+    suppressed; it can never produce a missing or misattributed one.
+
+    2c's correction sweep corrects it, in the ordinary already-authoritative
+    branch of _correction_sweep_apply: walking forward with its own parse in
+    hand, it retracts a :modified-in whose entity reads as unchanged at that
+    commit. Note the shape of the fix -- 2c repairs the fact after the fact
+    rather than this walk preventing the write, which is why this stays a
+    documented limitation here rather than a bug. Phrased carefully because
+    an intermediate draft of 2c's spec dropped the case entirely, leaving it
+    briefly owned by nobody (see the 2b review).
+
+    Returns the claimed commit's hash, or None if the gap was already
+    empty (allocator.claim_high() returned None) -- caller's signal to
+    stop. Writes for one commit are followed by exactly one
+    _db_checkpoint(db) call, after _frontier_persist_claim records the
+    claim -- mirrors _run_ingestion's one-checkpoint-per-commit cadence
+    (see the design spec's "Resume-safety / atomicity boundary" section).
+    """
+    # commit_metadata is indexed POSITIONALLY against linearization below,
+    # while _frontier_persist_claim persists linearization[pos] -- so a
+    # misaligned list makes this walk attribute entities to one commit and
+    # persist another: silent, systematic misattribution. _run_ingestion
+    # builds a watermark-relative list for its own use
+    # (_git_commits(repo, watermark, branch)), which is exactly the wrong
+    # thing to hand this function. Checked before claim_high() so a bad call
+    # does not consume a position. This raises rather than returning None
+    # (2c's mirror-image guard returns None) because 2c selects its own
+    # position and can decline, whereas this walk has been handed one.
+    if len(commit_metadata) != len(linearization):
+        raise ValueError(
+            "commit_metadata must be full-history and positionally aligned with "
+            f"linearization (got {len(commit_metadata)} entries vs {len(linearization)}); "
+            "pass _git_commits(repo, watermark_hash=None)"
+        )
+
+    pos = allocator.claim_high()
+    if pos is None:
+        return None
+
+    commit_hash, commit_ts_iso, author, subject = commit_metadata[pos]
+    if commit_hash != linearization[pos]:
+        raise ValueError(
+            f"commit_metadata[{pos}] is {commit_hash}, but linearization[{pos}] is "
+            f"{linearization[pos]}: the two must be positionally aligned"
+        )
+    commit_ident = f":commit/{commit_hash[:12]}"
+
+    file_results, _gitlink_changes, _gitmodules_map, _renamed_pairs = _extract_commit(
+        repo_path, commit_hash, ignore_patterns
+    )
+
+    all_triples: List[str] = [
+        f"[{commit_ident} :entity-type :type/commit]",
+        f'[{commit_ident} :ident "{commit_ident}"]',
+        f'[{commit_ident} :description "{_edn_escape(subject[:120])}"]',
+        f'[{commit_ident} :hash "{commit_hash}"]',
+        f'[{commit_ident} :author "{_edn_escape(author)}"]',
+        f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
+        f'[{commit_ident} :date "{commit_ts_iso}"]',
+    ]
+    candidate_triples_by_ident: Dict[str, List[str]] = {}
+    pos_by_commit_ident = {f":commit/{h[:12]}": i for i, (h, _t, _a, _s) in enumerate(commit_metadata)}
+    ts_by_commit_ident = {f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata}
+    new_candidates: List[str] = []
+    provisional_moves: List[Tuple[str, str]] = []  # (ident, superseded_commit_ident)
+    already_authoritative_touched: List[Tuple[str, Optional[str]]] = []
+    body_hash_by_ident: Dict[str, str] = {}
+    unchanged_by_ident: Dict[str, bool] = {}
+
+    for status, file_path, extracted, precomputed, _old_path in file_results:
+        if status not in ("A", "M"):
+            continue  # "D"/"R" deferred -- see design spec scope
+
+        candidate_idents = (
+            [precomputed["module_ident"]]
+            + [ident for ident, _name, _t in precomputed["function_entries"]]
+            + [ident for ident, _name, _t in precomputed["class_entries"]]
+            + [ident for ident, _name, _t in precomputed["global_entries"]]
+            + [ident for ident, _name, _t in precomputed["field_entries"]]
+        )
+        known_before: Dict[str, str] = {
+            ident: "known" for ident in candidate_idents
+            if _entity_introduced_by_query(db, ident) is not None
+        }
+        known_before_snapshot = set(known_before.keys())
+
+        triples = _build_code_triples(
+            file_path, extracted, commit_ts_iso, known_before, {}, {}, commit_ident,
+            precomputed, {}, {},
+        )
+        # This walk owns the write timing of BOTH attributes itself now --
+        # filter both out of _build_code_triples's forward-biased gating.
+        all_triples.extend(
+            t for t in triples if ":introduced-by" not in t and ":modified-in" not in t
+        )
+
+        unchanged_idents = precomputed.get("unchanged_idents", set())
+        for ident in candidate_idents:
+            unchanged_by_ident[ident] = ident in unchanged_idents
+
+        # Keep each entity's candidate triples so a provisional move can
+        # re-date them (#222 phase 2b1). A child's own list carries its
+        # [parent :contains child] edge, so re-dating a child re-dates its
+        # containment edge with it.
+        candidate_triples_by_ident[precomputed["module_ident"]] = list(
+            precomputed["module_candidate_triples"]
+        )
+        for entries_key in ("function_entries", "class_entries", "global_entries", "field_entries"):
+            for entry_ident, _entry_name, entry_triples in precomputed[entries_key]:
+                candidate_triples_by_ident[entry_ident] = list(entry_triples)
+
+        new_candidates.extend(set(known_before.keys()) - known_before_snapshot)
+        for ident in set(candidate_idents) & known_before_snapshot:
+            if _lineage_is_provisional(db, ident):
+                superseded_ident = _entity_introduced_by_query(db, ident)
+                provisional_moves.append((ident, superseded_ident))
+            else:
+                already_authoritative_touched.append(
+                    (ident, _entity_introduced_by_query(db, ident))
+                )
+
+        body_hash_by_ident.update(precomputed.get("body_hashes", {}))
+
+    # Split :contains out before batching (#222 phase 2b1). Minigraf's EAVT
+    # pending index lacks value bytes in the key, so batching multiple
+    # [module :contains fn] facts in ONE transact silently keeps only the
+    # last -- five of six containment edges on an ordinary multi-entity file.
+    # Forward walk splits them for exactly this reason (see _run_ingestion's
+    # own one-transact-per-edge loop and _ingest_close's docstring). Only
+    # :contains repeats (entity, attribute) within this batch: the
+    # :modified-in triples below are one per DISTINCT entity, and facts
+    # differing in entity do not collide.
+    contains_triples = [t for t in all_triples if ":contains" in t]
+    other_triples = [t for t in all_triples if ":contains" not in t]
+    _transact(db, "[" + " ".join(other_triples) + "]", commit_ts_iso, index_con=index_con)
+    for contains_triple in contains_triples:
+        _transact(db, "[" + contains_triple + "]", commit_ts_iso, index_con=index_con)
+
+    # :parent edges (#222 phase 2b1), one transact per parent -- a merge
+    # commit has two, and they share (entity, attribute, valid_from), the
+    # same EAVT collision :contains has. The bootstrap `ancestor` rule is
+    # defined purely over :parent, so without these it returns nothing
+    # across the whole reverse-filled region. Reverse walk reaches a
+    # commit's parents LATER than the commit itself, so the edge points at
+    # an entity that does not exist yet and materialises when the walk
+    # descends to it (or when the forward stream covers it, for parents
+    # below frontier-high's floor): temporarily dangling, and convergent --
+    # the same shape as the lineage facts around it.
+    for parent_hash in _git_parent_hashes(repo_path, commit_hash):
+        _transact(
+            db, f"[[{commit_ident} :parent :commit/{parent_hash[:12]}]]",
+            commit_ts_iso, index_con=index_con,
+        )
+
+    # Third of the three write paths the monotonicity invariant covers
+    # (#222 phase 2b1), and the one the 2b review did not list: an entity
+    # whose :introduced-by is already authoritative could still be handed a
+    # :modified-in at an EARLIER claimed commit, with no check at all. That
+    # is also the symptom half of the 2c interleaving (a sweep confirms an
+    # entity, then this walk descends past it). Suppressing the edge does
+    # not fix that entity's lineage -- reverse walk must never clobber an
+    # authoritative :introduced-by -- so 2c's gap-closed precondition stays
+    # load-bearing; this only stops the contradictory fact being written.
+    authoritative_modified_triples = []
+    for ident, intro_ident in already_authoritative_touched:
+        if unchanged_by_ident.get(ident, False):
+            continue
+        intro_pos = pos_by_commit_ident.get(intro_ident) if intro_ident is not None else None
+        if intro_pos is not None and pos <= intro_pos:
+            print(
+                f"[_reverse_fill_claim_and_process] skipping :modified-in for {ident} at "
+                f"position {pos}: not later than its introduction {intro_ident} "
+                f"(position {intro_pos})",
+                file=sys.stderr,
+            )
+            continue
+        authoritative_modified_triples.append(f"[{ident} :modified-in {commit_ident}]")
+    if authoritative_modified_triples:
+        _transact(
+            db, "[" + " ".join(authoritative_modified_triples) + "]", commit_ts_iso, index_con=index_con,
+        )
+
+    for ident in new_candidates:
+        _entity_introduced_by_set_provisional(
+            db, ident, commit_ident, commit_ts_iso, index_con=index_con,
+            pos=pos, pos_by_commit_ident=pos_by_commit_ident,
+        )
+        if ident in body_hash_by_ident:
+            _candidate_diff_persist(
+                db, commit_hash, ident, body_hash_by_ident[ident], commit_ts_iso, index_con=index_con,
+            )
+
+    for ident, superseded_ident in provisional_moves:
+        _entity_introduced_by_set_provisional(
+            db, ident, commit_ident, commit_ts_iso, index_con=index_con,
+            pos=pos, pos_by_commit_ident=pos_by_commit_ident,
+        )
+        if ident in body_hash_by_ident:
+            _candidate_diff_persist(
+                db, commit_hash, ident, body_hash_by_ident[ident], commit_ts_iso, index_con=index_con,
+            )
+        if superseded_ident is not None and superseded_ident != commit_ident:
+            superseded_pos = pos_by_commit_ident.get(superseded_ident)
+            if superseded_pos is None or superseded_pos > pos:
+                # The move happened: this commit is genuinely earlier.
+                #
+                # Re-date the entity's structural facts to match (#222 phase
+                # 2b1). They were written at the timestamp of the commit
+                # where the walk first SIGHTED the entity, which is later
+                # than the guess now is -- leaving a valid-time window where
+                # :introduced-by is live for an entity with no type, name or
+                # file, so ":as-of the introduction" says it did not exist.
+                # _retract targets live rows regardless of their original
+                # valid_from, so this is a straight re-assert at the earlier
+                # timestamp. :contains goes one per call for the same EAVT
+                # reason as above, on the retract side too (see
+                # _ingest_close's docstring).
+                structural = [
+                    t for t in candidate_triples_by_ident.get(ident, [])
+                    if ":introduced-by" not in t
+                ]
+                structural_contains = [t for t in structural if ":contains" in t]
+                structural_other = [t for t in structural if ":contains" not in t]
+                if structural_other:
+                    _retract(db, "[" + " ".join(structural_other) + "]", index_con=index_con)
+                    _transact(
+                        db, "[" + " ".join(structural_other) + "]", commit_ts_iso, index_con=index_con,
+                    )
+                for structural_triple in structural_contains:
+                    _retract(db, "[" + structural_triple + "]", index_con=index_con)
+                    _transact(db, "[" + structural_triple + "]", commit_ts_iso, index_con=index_con)
+
+                # The superseded candidate-diff record is stale the moment
+                # the guess moves off it, and this is the cheapest place to
+                # drop it -- superseded_ident is right here. Without it these
+                # scratch facts accumulate as O(entity touches) rather than
+                # O(entities), which is exactly what _candidate_diff_clear's
+                # own docstring says must not happen.
+                _candidate_diff_clear(
+                    db, superseded_ident[len(":commit/"):], ident, index_con=index_con,
+                )
+            if superseded_pos is not None and superseded_pos <= pos:
+                # The move was refused (or would be): the "superseded" guess
+                # is not actually later than this commit, so asserting it as
+                # a modification would claim the entity changed at or before
+                # its own introduction.
+                continue
+            superseded_ts = ts_by_commit_ident.get(superseded_ident)
+            if superseded_ts is None:
+                # Falling back to THIS commit's timestamp back-dates the edge
+                # to before the modification it describes -- a fact asserted
+                # valid before it was true. Skip and say so instead.
+                print(
+                    f"[_reverse_fill_claim_and_process] skipping retroactive :modified-in "
+                    f"for {ident} at {superseded_ident}: no timestamp in commit_metadata",
+                    file=sys.stderr,
+                )
+                continue
+            _transact(
+                db, f"[[{ident} :modified-in {superseded_ident}]]", superseded_ts, index_con=index_con,
+            )
+
+    _frontier_persist_claim(db, linearization, pos, from_low=False, commit_ts_iso=commit_ts_iso, index_con=index_con)
+    _db_checkpoint(db)
+    return commit_hash
+
+
+def _reverse_bulk_fill_walk(
+    db: Any,
+    repo_path: str,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+    allocator: "frontier_registry.FrontierAllocator",
+    ignore_patterns: Sequence[str] = (),
+    index_con: Optional[Any] = None,
+) -> int:
+    """#222 phase 2b: repeatedly call _reverse_fill_claim_and_process until
+    the gap closes. Returns the count of commits processed. No caller in
+    this sub-phase -- 2d wires this into the real concurrent ingestion
+    loop alongside the forward stream.
+
+    Stops loudly if a claim ever fails to move strictly downward (#222
+    phase 2b1). This loop is unbounded by construction and drives a git
+    subprocess, a tree-sitter parse, a DB write batch and a _db_checkpoint
+    fsync on every iteration, so an allocator that stops making progress
+    turns it into an unbounded fsync loop inside what 2d intends to run as a
+    background task -- which is exactly what happened before 2b1 fixed
+    FrontierAllocator._extend. The guard stays even though that root cause
+    is fixed: it converts any future allocator regression from a hang into a
+    stop plus a stderr line.
+    """
+    hash_to_pos = {h: i for i, h in enumerate(linearization)}
+    count = 0
+    last_pos: Optional[int] = None
+    while True:
+        result = _reverse_fill_claim_and_process(
+            db, repo_path, linearization, commit_metadata, allocator,
+            ignore_patterns=ignore_patterns, index_con=index_con,
+        )
+        if result is None:
+            break
+        count += 1
+        pos = hash_to_pos.get(result)
+        if pos is not None and last_pos is not None and pos >= last_pos:
+            print(
+                f"[_reverse_bulk_fill_walk] no progress: claim returned position {pos} "
+                f"after {last_pos}; stopping after {count} commits to avoid spinning",
+                file=sys.stderr,
+            )
+            break
+        last_pos = pos
+    return count
 
 
 async def _run_ingestion(repo_path: str, branch: str) -> None:
