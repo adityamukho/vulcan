@@ -5393,10 +5393,9 @@ def _forward_reconcile_provisional(
     exactly one code path that mints an authoritative introduction and this
     function cannot drift from it.
 
-    Mirrors the supersede path in _reverse_fill_claim_and_process: the same
-    re-dating of structural facts, the same one-transact-per-:contains
-    splitting, and the same refusal to back-date a :modified-in edge whose
-    commit timestamp is unknown.
+    Mirrors the supersede path in _reverse_apply: the same re-dating of
+    structural facts (via _re_date_structural_facts), and the same refusal
+    to back-date a :modified-in edge whose commit timestamp is unknown.
     """
     guess_ident = _entity_introduced_by_query(db, entity_ident)
     if not _lineage_is_provisional(db, entity_ident):
@@ -7453,36 +7452,43 @@ def _extract_commit(
     return results, gitlink_changes, gitmodules_map, renamed_pairs
 
 
-def _reverse_fill_claim_and_process(
+def _reverse_apply(
     db: Any,
     repo_path: str,
     linearization: List[str],
     commit_metadata: List[Tuple[str, str, str, str]],
-    allocator: "frontier_registry.FrontierAllocator",
-    ignore_patterns: Sequence[str] = (),
+    pos: int,
+    file_results: List[tuple],
     index_con: Optional[Any] = None,
-) -> Optional[str]:
-    """#222 phase 2b: claim exactly one position from the gap's high end
-    (allocator.claim_high()) and process that one commit -- structural
-    facts, :modified-in edges, provisional :introduced-by, and candidate-diff
-    records for every entity the commit's "A"/"M" files touch. "D"/"R"
-    files are skipped entirely (deletions and renames are out of scope for
-    this sub-phase -- see the design spec).
+) -> str:
+    """#222 phase 2b: apply one already-claimed, already-extracted commit --
+    structural facts, :modified-in edges, provisional :introduced-by, and
+    candidate-diff records for every entity the commit's "A"/"M" files
+    touch. "D"/"R" files are skipped entirely (deletions and renames are
+    out of scope for this sub-phase -- see the design spec).
 
-    Reuses _extract_commit/_build_code_triples unchanged for entity
-    discovery/parsing (direction-agnostic). BOTH :introduced-by and
-    :modified-in are filtered out of _build_code_triples's own output and
-    written by this function instead -- _build_code_triples's gate for
-    both attributes is entity_valid_from membership, which for forward
-    walk coincides with "is this the introduction commit" but for reverse
-    walk does not: the first commit reverse walk sees an entity at is the
-    newest touch (not the introduction), and the commit where reverse walk
-    finally stops finding an even-earlier occurrence (the true
-    introduction) is by then already "known" from later, already-visited
-    commits. Reusing _build_code_triples's :modified-in emission verbatim
-    would misclassify both ends. See the design spec's "Per-commit
-    algorithm" section (revised after the final whole-branch review found
-    this defect) for the full derivation.
+    Split out of _reverse_fill_claim_and_process's single body (#222 phase
+    2d): `pos` (from allocator.claim_high()) and `file_results` (from
+    _extract_commit) are now supplied by the caller instead of produced
+    here, so the CPU-bound tree-sitter parse and these DB-bound writes can
+    be scheduled onto separate executors. See
+    _reverse_fill_claim_and_process's own docstring for why that split
+    matters and who is responsible for driving each half.
+
+    Reuses _build_code_triples unchanged for entity discovery/parsing
+    (direction-agnostic). BOTH :introduced-by and :modified-in are filtered
+    out of _build_code_triples's own output and written by this function
+    instead -- _build_code_triples's gate for both attributes is
+    entity_valid_from membership, which for forward walk coincides with
+    "is this the introduction commit" but for reverse walk does not: the
+    first commit reverse walk sees an entity at is the newest touch (not
+    the introduction), and the commit where reverse walk finally stops
+    finding an even-earlier occurrence (the true introduction) is by then
+    already "known" from later, already-visited commits. Reusing
+    _build_code_triples's :modified-in emission verbatim would misclassify
+    both ends. See the design spec's "Per-commit algorithm" section
+    (revised after the final whole-branch review found this defect) for
+    the full derivation.
 
     :introduced-by: a newly-discovered entity's guess is asserted via
     _entity_introduced_by_set_provisional and gets no :modified-in yet
@@ -7514,12 +7520,11 @@ def _reverse_fill_claim_and_process(
     an intermediate draft of 2c's spec dropped the case entirely, leaving it
     briefly owned by nobody (see the 2b review).
 
-    Returns the claimed commit's hash, or None if the gap was already
-    empty (allocator.claim_high() returned None) -- caller's signal to
-    stop. Writes for one commit are followed by exactly one
-    _db_checkpoint(db) call, after _frontier_persist_claim records the
-    claim -- mirrors _run_ingestion's one-checkpoint-per-commit cadence
-    (see the design spec's "Resume-safety / atomicity boundary" section).
+    Returns the applied commit's hash. Writes for one commit are followed
+    by exactly one _db_checkpoint(db) call, after _frontier_persist_claim
+    records the claim -- mirrors _run_ingestion's one-checkpoint-per-commit
+    cadence (see the design spec's "Resume-safety / atomicity boundary"
+    section).
     """
     # commit_metadata is indexed POSITIONALLY against linearization below,
     # while _frontier_persist_claim persists linearization[pos] -- so a
@@ -7527,20 +7532,16 @@ def _reverse_fill_claim_and_process(
     # persist another: silent, systematic misattribution. _run_ingestion
     # builds a watermark-relative list for its own use
     # (_git_commits(repo, watermark, branch)), which is exactly the wrong
-    # thing to hand this function. Checked before claim_high() so a bad call
-    # does not consume a position. This raises rather than returning None
-    # (2c's mirror-image guard returns None) because 2c selects its own
-    # position and can decline, whereas this walk has been handed one.
+    # thing to hand this function. _reverse_fill_claim_and_process checks
+    # this before claim_high() so a bad call does not consume a position;
+    # this copy is duplicated here because 2d calls _reverse_apply directly,
+    # after already claiming pos itself.
     if len(commit_metadata) != len(linearization):
         raise ValueError(
             "commit_metadata must be full-history and positionally aligned with "
             f"linearization (got {len(commit_metadata)} entries vs {len(linearization)}); "
             "pass _git_commits(repo, watermark_hash=None)"
         )
-
-    pos = allocator.claim_high()
-    if pos is None:
-        return None
 
     commit_hash, commit_ts_iso, author, subject = commit_metadata[pos]
     if commit_hash != linearization[pos]:
@@ -7549,10 +7550,6 @@ def _reverse_fill_claim_and_process(
             f"{linearization[pos]}: the two must be positionally aligned"
         )
     commit_ident = f":commit/{commit_hash[:12]}"
-
-    file_results, _gitlink_changes, _gitmodules_map, _renamed_pairs = _extract_commit(
-        repo_path, commit_hash, ignore_patterns
-    )
 
     all_triples: List[str] = [
         f"[{commit_ident} :entity-type :type/commit]",
@@ -7673,7 +7670,7 @@ def _reverse_fill_claim_and_process(
         intro_pos = pos_by_commit_ident.get(intro_ident) if intro_ident is not None else None
         if intro_pos is not None and pos <= intro_pos:
             print(
-                f"[_reverse_fill_claim_and_process] skipping :modified-in for {ident} at "
+                f"[_reverse_apply] skipping :modified-in for {ident} at "
                 f"position {pos}: not later than its introduction {intro_ident} "
                 f"(position {intro_pos})",
                 file=sys.stderr,
@@ -7708,32 +7705,17 @@ def _reverse_fill_claim_and_process(
             superseded_pos = pos_by_commit_ident.get(superseded_ident)
             if superseded_pos is None or superseded_pos > pos:
                 # The move happened: this commit is genuinely earlier.
-                #
                 # Re-date the entity's structural facts to match (#222 phase
-                # 2b1). They were written at the timestamp of the commit
+                # 2b1) -- see _re_date_structural_facts's own docstring for
+                # why (they were written at the timestamp of the commit
                 # where the walk first SIGHTED the entity, which is later
-                # than the guess now is -- leaving a valid-time window where
-                # :introduced-by is live for an entity with no type, name or
-                # file, so ":as-of the introduction" says it did not exist.
-                # _retract targets live rows regardless of their original
-                # valid_from, so this is a straight re-assert at the earlier
-                # timestamp. :contains goes one per call for the same EAVT
-                # reason as above, on the retract side too (see
-                # _ingest_close's docstring).
-                structural = [
-                    t for t in candidate_triples_by_ident.get(ident, [])
-                    if ":introduced-by" not in t
-                ]
-                structural_contains = [t for t in structural if ":contains" in t]
-                structural_other = [t for t in structural if ":contains" not in t]
-                if structural_other:
-                    _retract(db, "[" + " ".join(structural_other) + "]", index_con=index_con)
-                    _transact(
-                        db, "[" + " ".join(structural_other) + "]", commit_ts_iso, index_con=index_con,
-                    )
-                for structural_triple in structural_contains:
-                    _retract(db, "[" + structural_triple + "]", index_con=index_con)
-                    _transact(db, "[" + structural_triple + "]", commit_ts_iso, index_con=index_con)
+                # than the guess now is).
+                _re_date_structural_facts(
+                    db,
+                    [t for t in candidate_triples_by_ident.get(ident, []) if ":introduced-by" not in t],
+                    commit_ts_iso,
+                    index_con=index_con,
+                )
 
                 # The superseded candidate-diff record is stale the moment
                 # the guess moves off it, and this is the cheapest place to
@@ -7756,7 +7738,7 @@ def _reverse_fill_claim_and_process(
                 # to before the modification it describes -- a fact asserted
                 # valid before it was true. Skip and say so instead.
                 print(
-                    f"[_reverse_fill_claim_and_process] skipping retroactive :modified-in "
+                    f"[_reverse_apply] skipping retroactive :modified-in "
                     f"for {ident} at {superseded_ident}: no timestamp in commit_metadata",
                     file=sys.stderr,
                 )
@@ -7768,6 +7750,45 @@ def _reverse_fill_claim_and_process(
     _frontier_persist_claim(db, linearization, pos, from_low=False, commit_ts_iso=commit_ts_iso, index_con=index_con)
     _db_checkpoint(db)
     return commit_hash
+
+
+def _reverse_fill_claim_and_process(
+    db: Any,
+    repo_path: str,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+    allocator: "frontier_registry.FrontierAllocator",
+    ignore_patterns: Sequence[str] = (),
+    index_con: Optional[Any] = None,
+) -> Optional[str]:
+    """Synchronous convenience wrapper: claim one position from the gap's
+    high end and process it. Kept for tests and _reverse_bulk_fill_walk.
+
+    **2d must not call this from async code** -- it fuses the CPU-bound
+    tree-sitter parse and the DB-bound writes into one function body, so it
+    can only be scheduled onto one executor as a unit. On write_executor (a
+    thread) that parse holds the GIL for its whole duration, which is
+    exactly the event-loop starvation #116 introduced the process pool to
+    fix. 2d awaits _extract_commit on the process pool and _reverse_apply on
+    write_executor instead. Same caveat 2c's own wrappers carry.
+
+    Returns the claimed commit's hash, or None if the gap was already empty.
+    """
+    if len(commit_metadata) != len(linearization):
+        raise ValueError(
+            "commit_metadata must be full-history and positionally aligned with "
+            f"linearization (got {len(commit_metadata)} entries vs {len(linearization)}); "
+            "pass _git_commits(repo, watermark_hash=None)"
+        )
+    pos = allocator.claim_high()
+    if pos is None:
+        return None
+    file_results, _gitlink_changes, _gitmodules_map, _renamed_pairs = _extract_commit(
+        repo_path, linearization[pos], ignore_patterns
+    )
+    return _reverse_apply(
+        db, repo_path, linearization, commit_metadata, pos, file_results, index_con=index_con,
+    )
 
 
 def _reverse_bulk_fill_walk(
@@ -8278,7 +8299,8 @@ def _forward_apply(
 def _forward_candidate_idents(precomputed: Dict[str, Any]) -> List[str]:
     """Every entity ident a parsed file contributes -- module plus all four
     child categories. Mirrors the identical collection kept inline in
-    _reverse_fill_claim_and_process (its own local `candidate_idents`) and in
+    _reverse_apply (its own local `candidate_idents`, moved verbatim out of
+    _reverse_fill_claim_and_process by #222 phase 2d Task 6) and in
     _correction_sweep_apply (same name, same construction) -- those two are
     NOT wired to call this helper (considered and declined, #222 phase 2d
     Task 5 review), so all three must be kept in sync by hand."""
@@ -8296,8 +8318,9 @@ def _forward_structural_triples_by_ident(precomputed: Dict[str, Any]) -> Dict[st
     once per file instead of scanned per ident (#222 phase 2d Task 5 fix --
     the previous per-ident linear scan was O(n^2) per file once more than one
     entity needed reconciling). Matches the existing precedent in
-    _reverse_fill_claim_and_process's candidate_triples_by_ident, which
-    builds the same shape of dict from the same five sources.
+    _reverse_apply's candidate_triples_by_ident (moved verbatim out of
+    _reverse_fill_claim_and_process by #222 phase 2d Task 6), which builds
+    the same shape of dict from the same five sources.
 
     A child's own list carries its [parent :contains child] edge, so
     re-dating a child re-dates its containment edge with it (#222 phase

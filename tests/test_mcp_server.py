@@ -14151,6 +14151,47 @@ class TestReverseFillClaimAndProcess:
         assert hi_hash == linearization[-1]
 
 
+class TestReverseApplySplit:
+    def test_split_pieces_compose_to_the_same_graph_as_the_wrapper(self, tmp_path):
+        """Two independent graphs from one repo fixture -- the walk mutates
+        the state a second run would start from, so this cannot be two
+        passes over one graph."""
+        import mcp_server, frontier_registry
+        from minigraf import MiniGrafDb
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login():\n    return 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h0"], cwd=repo, check=True, capture_output=True)
+
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+
+        def snapshot(db):
+            raw = mcp_server._db_execute(db, "(query [:find ?e ?a ?v :where [?e ?a ?v]])")
+            return sorted(tuple(row) for row in json.loads(raw)["results"])
+
+        db_a = MiniGrafDb.open(str(tmp_path / "a.graph"))
+        alloc_a = mcp_server._frontier_load(db_a, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_fill_claim_and_process(
+            db_a, str(repo), linearization, commit_metadata, alloc_a,
+        )
+
+        db_b = MiniGrafDb.open(str(tmp_path / "b.graph"))
+        alloc_b = mcp_server._frontier_load(db_b, linearization, "2026-01-04T00:00:00Z")
+        pos = alloc_b.claim_high()
+        file_results, _g, _m, _r = mcp_server._extract_commit(str(repo), linearization[pos], ())
+        applied = mcp_server._reverse_apply(
+            db_b, str(repo), linearization, commit_metadata, pos, file_results,
+        )
+        assert applied == linearization[pos]
+        assert snapshot(db_a) == snapshot(db_b)
+
+
 class _NoProgressAllocator:
     """Stand-in for a FrontierAllocator whose claim_high() stops making
     progress -- the pre-2b1 behaviour on a grown linearization, where
