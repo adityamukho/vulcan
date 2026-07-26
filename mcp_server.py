@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -7829,7 +7829,7 @@ def _forward_apply(
 
     Moved verbatim out of _run_ingestion's `while pending:` loop (issue #222
     phase 2d) so a single commit's write section can be driven per-commit by
-    the two-stream interleave. Purely synchronous: the ~10 individual
+    the two-stream interleave. Purely synchronous: the eight individual
     `run_in_executor(write_executor, ...)` submissions the inline body used
     became direct calls, and the caller submits this whole function to
     write_executor once instead.
@@ -7921,6 +7921,30 @@ def _forward_apply(
                     state.field_static_ident,
                 )
             previous_idents = set(state.file_entities.get(file_path, []))
+            # #222 phase 2d: an entity Stream 2 already introduced
+            # provisionally is NOT authoritatively introduced, so the
+            # forward walk must treat it as new. Popping it out of
+            # entity_valid_from is what makes _build_code_triples's own
+            # gate (entity_valid_from membership) agree -- deliberately
+            # in preference to widening that function's signature, since
+            # its gate means "is this the introduction" for a forward
+            # walk and nothing else should depend on that meaning.
+            #
+            # It is also semantically right on its own terms: the
+            # valid_from Stream 2 recorded is a wrong guess, and must
+            # never be used as an orig_ts for a close.
+            reconcilable = [
+                ident for ident in _forward_candidate_idents(precomputed)
+                if ident in state.provisional_idents
+            ]
+            for ident in reconcilable:
+                state.entity_valid_from.pop(ident, None)
+                _forward_reconcile_provisional(
+                    db, ident,
+                    _forward_structural_triples(precomputed, ident),
+                    commit_ts_iso, state.ts_by_commit_ident, index_con=index_con,
+                )
+                state.provisional_idents.discard(ident)
             triples = _build_code_triples(
                 file_path, extracted, commit_ts_iso, state.entity_valid_from,
                 state.entity_descriptions, state.file_entities, commit_ident, precomputed,
@@ -8202,6 +8226,33 @@ def _forward_apply(
     _watermark_update(db, commit_hash, commit_ts_iso, reason, index_con)
     _db_checkpoint(db)
     _commit_index_writer_safe(index_con)
+
+
+def _forward_candidate_idents(precomputed: Dict[str, Any]) -> List[str]:
+    """Every entity ident a parsed file contributes -- module plus all four
+    child categories. Same collection _reverse_fill_claim_and_process and
+    _correction_sweep_apply perform; kept as one function so the three walks
+    cannot drift on what an entity's candidate set is."""
+    return (
+        [precomputed["module_ident"]]
+        + [ident for ident, _name, _t in precomputed["function_entries"]]
+        + [ident for ident, _name, _t in precomputed["class_entries"]]
+        + [ident for ident, _name, _t in precomputed["global_entries"]]
+        + [ident for ident, _name, _t in precomputed["field_entries"]]
+    )
+
+
+def _forward_structural_triples(precomputed: Dict[str, Any], ident: str) -> List[str]:
+    """ident's own candidate triples, for re-dating. A child's own list
+    carries its [parent :contains child] edge, so re-dating a child re-dates
+    its containment edge with it (#222 phase 2b1)."""
+    if ident == precomputed["module_ident"]:
+        return list(precomputed["module_candidate_triples"])
+    for entries_key in ("function_entries", "class_entries", "global_entries", "field_entries"):
+        for entry_ident, _entry_name, entry_triples in precomputed[entries_key]:
+            if entry_ident == ident:
+                return list(entry_triples)
+    return []
 
 
 _CORRECTION_SWEEP_THROUGH_IDENT = ":ingestion/correction-sweep-through"
@@ -8596,6 +8647,8 @@ class _ForwardWalkState:
     field_static_ident: Dict[str, bool]
     submodule_paths: Dict[str, str]
     unresolved_dep_idents: Dict[str, str]
+    provisional_idents: Set[str] = field(default_factory=set)
+    ts_by_commit_ident: Dict[str, str] = field(default_factory=dict)
 
 
 async def _run_ingestion(repo_path: str, branch: str) -> None:
@@ -8639,6 +8692,14 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 field_class_ident, field_static_ident, submodule_paths, unresolved_dep_idents,
                 provisional_idents,  # consumed by _forward_apply (Task 5)
             ) = await loop.run_in_executor(preload_executor, _load_ingestion_preload_state, repo_path)
+        # minigraf exposes no explicit close(): the file lock is only released once
+        # every reference to the handle is gone — the worker thread's own `db`
+        # local already went out of scope when it returned above, so clearing
+        # the global here is enough to release the lock.
+        _db = None  # release file lock while enumerating commits
+
+        commits = _git_commits(repo_path, watermark, branch)
+        ignore_patterns = _load_ignore_patterns(repo_path)
         state = _ForwardWalkState(
             entity_valid_from=entity_valid_from,
             entity_descriptions=entity_descriptions,
@@ -8650,15 +8711,12 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             field_static_ident=field_static_ident,
             submodule_paths=submodule_paths,
             unresolved_dep_idents=unresolved_dep_idents,
+            provisional_idents=provisional_idents,
+            # Task 8 introduces the full-history commit_metadata this should
+            # really be built from; until then, the existing (post-watermark)
+            # commits list is what's available here.
+            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commits},
         )
-        # minigraf exposes no explicit close(): the file lock is only released once
-        # every reference to the handle is gone — the worker thread's own `db`
-        # local already went out of scope when it returned above, so clearing
-        # the global here is enough to release the lock.
-        _db = None  # release file lock while enumerating commits
-
-        commits = _git_commits(repo_path, watermark, branch)
-        ignore_patterns = _load_ignore_patterns(repo_path)
         repo_total_result = _subprocess.run(
             ["git", "rev-list", "--count", "HEAD"],
             cwd=repo_path, capture_output=True, text=True,
@@ -8797,10 +8855,6 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
                     last_hash = commit_hash
                     _ingest_progress["current_commit"] = commit_hash
-                    reason = f"git:{commit_hash} {author}: {subject}"
-
-                    # Build commit entity ident from first 12 chars of hash
-                    commit_ident = f":commit/{commit_hash[:12]}"
 
                     # Acquire DB fresh each commit — never hold across yield
                     db = await _ensure_db_async()

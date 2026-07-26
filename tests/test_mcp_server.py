@@ -15712,3 +15712,129 @@ class TestForwardReconcileProvisional:
         assert "no timestamp in commit_metadata" in capsys.readouterr().err
         # The rest of the reconciliation still happened.
         assert mcp_server._lineage_is_provisional(real_db, ":code/fn-login") is False
+
+
+class TestForwardApplyReconcilesProvisional:
+    def _repo(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login():\n    return 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h0"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login():\n    return 2\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h1"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def test_forward_apply_supersedes_a_provisional_guess(self, real_db, tmp_path):
+        """Stream 2 claimed h1 and guessed login() was introduced there. The
+        forward walk then reaches h0, the TRUE introduction. Exactly one
+        :introduced-by must survive, naming h0, with a confirmed marker."""
+        import mcp_server, frontier_registry
+        repo = self._repo(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        # Stream 2 claims the newest commit (h1) and guesses.
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{linearization[1][:12]}"
+
+        # Stream 1 now reaches h0, the true introduction.
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={}, entity_descriptions={}, file_entities={},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+            provisional_idents=mcp_server._preload_provisional_idents(real_db),
+            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
+        )
+        extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
+        mcp_server._forward_apply(
+            real_db, str(repo), state, commit_metadata[0], extracted,
+        )
+
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{fn_ident} :introduced-by ?c]])",
+        )
+        values = {row[0] for row in json.loads(raw)["results"]}
+        assert values == {f":commit/{linearization[0][:12]}"}, "exactly one, naming h0"
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+        # h1 is now a genuine modification.
+        raw_mod = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{fn_ident} :modified-in ?c]])",
+        )
+        assert f":commit/{linearization[1][:12]}" in {row[0] for row in json.loads(raw_mod)["results"]}
+
+    def test_resumed_run_variant_is_not_suppressed_by_entity_valid_from(self, real_db, tmp_path):
+        """The silent failure mode: on a RESUMED run, Stream 2's structural
+        facts are already in the preloaded entity_valid_from, so
+        _build_code_triples would suppress the introduction entirely and the
+        wrong provisional guess would survive forever."""
+        import mcp_server, frontier_registry
+        repo = self._repo(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+
+        # Simulate the resumed-run preload: entity_valid_from ALREADY knows
+        # this entity, because Stream 2 wrote its structural facts last run.
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={fn_ident: "2026-06-01T00:00:00Z"},
+            entity_descriptions={fn_ident: "login"}, file_entities={"auth.py": [fn_ident]},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+            provisional_idents={fn_ident},
+            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
+        )
+        extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
+        mcp_server._forward_apply(
+            real_db, str(repo), state, commit_metadata[0], extracted,
+        )
+
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{fn_ident} :introduced-by ?c]])",
+        )
+        assert {row[0] for row in json.loads(raw)["results"]} == {f":commit/{linearization[0][:12]}"}
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+
+    def test_without_provisional_idents_the_resumed_case_regresses(self, real_db, tmp_path):
+        """Pins that provisional_idents is actually consulted: with it empty,
+        the resumed-run case leaves the wrong guess in place. This is the
+        direct regression test for the silent failure mode."""
+        import mcp_server, frontier_registry
+        repo = self._repo(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={fn_ident: "2026-06-01T00:00:00Z"},
+            entity_descriptions={fn_ident: "login"}, file_entities={"auth.py": [fn_ident]},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+            provisional_idents=set(),   # the bug
+            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
+        )
+        extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
+        mcp_server._forward_apply(
+            real_db, str(repo), state, commit_metadata[0], extracted,
+        )
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{linearization[1][:12]}"
