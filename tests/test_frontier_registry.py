@@ -4,6 +4,7 @@ This module has no DB dependency, so its own real dependency (git) is what
 gets exercised for real here, matching the spirit of
 docs/testing-conventions.md's real-backend rule.
 """
+import itertools
 import os
 import subprocess as _subprocess
 
@@ -157,3 +158,49 @@ class TestFrontierAllocatorClaiming:
         allocator = FrontierAllocator(10, [Interval(0, 4, TAG_AUTHORITATIVE)])
         assert allocator.claim_low() == 5
         assert allocator.intervals() == [Interval(0, 5, TAG_AUTHORITATIVE)]
+
+
+class TestFrontierAllocatorGrownLinearization:
+    """A run that claims from the high end, followed by new commits landing
+    on HEAD, reloads a persisted high interval that no longer reaches the
+    last position -- so claim_high() opens a SECOND provisional interval and
+    _extend has to choose between them. Choosing the first *covering*
+    interval rather than the one adjacent in the direction of growth pins
+    gap_hi forever, which turns _reverse_bulk_fill_walk's `while True` into
+    an unbounded fsync loop (see the 2b review, "never terminates on any
+    incremental re-ingest")."""
+
+    def test_claim_high_strictly_decreases_and_terminates(self):
+        allocator = FrontierAllocator(5, [Interval(1, 2, TAG_PROVISIONAL)])
+        seen = []
+        for _ in range(20):  # bounded so a regression fails instead of hanging
+            pos = allocator.claim_high()
+            if pos is None:
+                break
+            seen.append(pos)
+        assert seen == sorted(set(seen), reverse=True), (
+            f"claim_high() must strictly decrease; got {seen}"
+        )
+        assert allocator.is_gap_empty()
+
+    def test_claim_low_strictly_increases_and_terminates(self):
+        allocator = FrontierAllocator(5, [Interval(2, 3, TAG_AUTHORITATIVE)])
+        seen = []
+        for _ in range(20):
+            pos = allocator.claim_low()
+            if pos is None:
+                break
+            seen.append(pos)
+        assert seen == sorted(set(seen)), f"claim_low() must strictly increase; got {seen}"
+        assert allocator.is_gap_empty()
+
+    def test_same_tag_intervals_coalesce_instead_of_overlapping(self):
+        allocator = FrontierAllocator(5, [Interval(1, 2, TAG_PROVISIONAL)])
+        for _ in range(20):  # bounded: an unbounded loop would hang, not fail
+            if allocator.claim_high() is None:
+                break
+        ivs = allocator.intervals()
+        for a, b in itertools.combinations(ivs, 2):
+            assert a.hi_pos < b.lo_pos or b.hi_pos < a.lo_pos, (
+                f"intervals must stay disjoint, got {ivs}"
+            )
