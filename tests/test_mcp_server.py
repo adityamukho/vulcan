@@ -14748,6 +14748,36 @@ class TestCorrectionSweepSelectPosition:
         result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
         assert result is None
 
+    def test_runs_when_stream_2_claimed_everything_and_frontier_low_never_existed(
+        self, real_db, tmp_path
+    ):
+        """A fresh graph seeds neither frontier side, and frontier-low is
+        only created once the forward stream persists its first claim. If
+        Stream 2 claims the whole history before Stream 1 claims anything
+        -- entirely possible in 2d, since the forward stream does a large
+        preload before its first claim -- the gap is genuinely closed
+        (is_gap_empty() is True, claim_high() returns None forever) but
+        frontier-low does not exist. Treating that as "nothing safe to do"
+        strands every entity provisional for good, so an absent frontier-low
+        must read as an EMPTY low region (its hi position is -1), not as an
+        unknown one -- which is exactly what FrontierAllocator.gap_lo
+        already does when no interval covers position 0."""
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        while not allocator.is_gap_empty():
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+        assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_LOW_IDENT) is None
+        high = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert high[0] == linearization[0]  # Stream 2 reached position 0
+
+        result = mcp_server._correction_sweep_select_position(real_db, linearization, commit_metadata)
+        assert result is not None, "gap is closed; the sweep must not refuse to run"
+        assert result[0] == linearization[0]
+
     def test_returns_frontier_high_lo_hash_once_gap_closed(self, real_db, tmp_path):
         import mcp_server
         repo = self._repo_with_n_commits(tmp_path, 3)
@@ -14834,6 +14864,36 @@ class TestCorrectionSweepSelectPosition:
         commit_hash, _ts = result
         bounds = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
         assert commit_hash == bounds[0]
+
+    def test_no_op_when_commit_metadata_violates_its_alignment_contract(self, real_db, tmp_path):
+        """commit_metadata must be full-history and positionally aligned
+        with linearization (i.e. _git_commits(repo, watermark_hash=None)).
+        _run_ingestion builds a watermark-relative list instead, so a 2d
+        wiring mistake would hand this function a shorter list -- which
+        must return None rather than raise IndexError or, worse, read a
+        different commit's metadata and write facts at the wrong
+        timestamp."""
+        import mcp_server
+        repo = self._repo_with_n_commits(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap(repo, real_db, linearization, commit_metadata)
+        assert mcp_server._correction_sweep_select_position(
+            real_db, linearization, commit_metadata
+        ) is not None  # aligned metadata works
+
+        truncated = commit_metadata[1:]  # what a watermark-relative list looks like
+        assert mcp_server._correction_sweep_select_position(
+            real_db, linearization, truncated
+        ) is None
+
+        # Right length, wrong order. Rotate rather than reverse: reversing an
+        # odd-length list leaves the middle element in place, and that is
+        # exactly the position _close_gap leaves the sweep pointing at, so a
+        # reversed list would slip past the per-position hash check.
+        misaligned = commit_metadata[1:] + commit_metadata[:1]
+        assert mcp_server._correction_sweep_select_position(
+            real_db, linearization, misaligned
+        ) is None
 
     def test_hash_to_pos_reused_when_passed_in(self, real_db, tmp_path):
         """Smoke test that the hash_to_pos parameter is accepted: passing a
@@ -15096,10 +15156,17 @@ class TestCorrectionSweepApply:
         skipped = mcp_server._correction_sweep_apply(real_db, h2_hash, h2_ts, file_results)
 
         assert skipped == 0
+        # Bind the value and test membership. A query whose :find variable
+        # appears nowhere in :where -- e.g.
+        # [:find ?c :where [extra_ident :modified-in h2_ident]] -- binds ?c
+        # to nothing and returns [] whether or not the fact exists, so
+        # asserting == [] on that form passes even when the retract never
+        # ran. The design spec calls this trap out for exactly this reason.
         raw = mcp_server._db_execute(
-            real_db, f"(query [:find ?c :where [{extra_ident} :modified-in {h2_ident}]])"
+            real_db, f"(query [:find ?c :where [{extra_ident} :modified-in ?c]])"
         )
-        assert json.loads(raw)["results"] == []
+        modified_in_values = {row[0] for row in json.loads(raw)["results"]}
+        assert h2_ident not in modified_in_values
 
     def test_opportunistic_stale_candidate_diff_cleanup(self, real_db, tmp_path):
         import mcp_server

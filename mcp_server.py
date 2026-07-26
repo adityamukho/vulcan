@@ -7767,16 +7767,32 @@ def _correction_sweep_select_position(
     """
     low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
     high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
-    if low_bounds is None or high_bounds is None:
-        return None  # migration hasn't run yet, or Stream 2 hasn't claimed anything
+    if high_bounds is None:
+        return None  # Stream 2 hasn't claimed anything -- nothing to correct
 
     if hash_to_pos is None:
         hash_to_pos = {h: i for i, h in enumerate(linearization)}
 
-    if low_bounds[1] not in hash_to_pos or high_bounds[0] not in hash_to_pos:
+    if high_bounds[0] not in hash_to_pos:
         return None  # a boundary hash is stale (rewritten history); nothing safe to do
 
-    if hash_to_pos[low_bounds[1]] + 1 != hash_to_pos[high_bounds[0]]:
+    if low_bounds is None:
+        # An ABSENT frontier-low means an EMPTY low region, not an unknown
+        # one, so its highest claimed position is -1 -- exactly how
+        # FrontierAllocator.gap_lo treats "no interval covers position 0".
+        # A fresh graph seeds neither side, and frontier-low is only created
+        # once the forward stream persists its first claim, so reading
+        # absent as "nothing safe to do" would strand every entity
+        # provisional forever whenever Stream 2 claims the whole history
+        # before Stream 1 claims anything -- reachable in 2d, where the
+        # forward stream does a large preload before its first claim.
+        low_hi_pos = -1
+    else:
+        if low_bounds[1] not in hash_to_pos:
+            return None  # a boundary hash is stale (rewritten history)
+        low_hi_pos = hash_to_pos[low_bounds[1]]
+
+    if low_hi_pos + 1 != hash_to_pos[high_bounds[0]]:
         return None  # gap still open -- Stream 2 may still descend past a position
                      # this sweep would otherwise confirm
 

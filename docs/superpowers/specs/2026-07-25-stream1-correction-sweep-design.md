@@ -564,13 +564,19 @@ resume point — each handling its own absent/stale case:
 ```python
 low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
 high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
-if low_bounds is None or high_bounds is None:
-    return None  # migration hasn't run yet, or Stream 2 hasn't claimed anything
+if high_bounds is None:
+    return None  # Stream 2 hasn't claimed anything -- nothing to correct
 if hash_to_pos is None:
     hash_to_pos = {h: i for i, h in enumerate(linearization)}
-if low_bounds[1] not in hash_to_pos or high_bounds[0] not in hash_to_pos:
+if high_bounds[0] not in hash_to_pos:
     return None  # a boundary hash is stale (rewritten history); nothing safe to do
-if hash_to_pos[low_bounds[1]] + 1 != hash_to_pos[high_bounds[0]]:
+if low_bounds is None:
+    low_hi_pos = -1  # absent frontier-low == EMPTY low region -- see below
+else:
+    if low_bounds[1] not in hash_to_pos:
+        return None  # a boundary hash is stale (rewritten history)
+    low_hi_pos = hash_to_pos[low_bounds[1]]
+if low_hi_pos + 1 != hash_to_pos[high_bounds[0]]:
     return None  # gap still open -- Stream 2 may still descend past a position
                  # this sweep would otherwise confirm; see the precondition above
 if high_bounds[1] not in hash_to_pos:
@@ -598,6 +604,23 @@ if len(commit_metadata) != len(linearization) or commit_metadata[pos][0] != line
 commit_hash, commit_ts_iso, _author, _subject = commit_metadata[pos]
 return commit_hash, commit_ts_iso
 ```
+
+**An absent frontier-low means an empty low region, not an unknown one.** An
+earlier draft of this snippet returned `None` whenever *either* bound was
+absent, which is wrong for the low side and strands the whole sweep. A fresh
+graph seeds neither side (`_frontier_seed_from_watermark` no-ops without a
+pre-#222 watermark), and frontier-low is created only when the forward stream
+persists its first claim — so if Stream 2 claims the entire history before
+Stream 1 claims anything, the gap is genuinely closed (`is_gap_empty()` is
+`True`, `claim_high()` returns `None` forever) while frontier-low does not
+exist. Treating that as "nothing safe to do" leaves every entity provisional
+permanently, which is total failure of this phase rather than a conservative
+fallback. `low_hi_pos = -1` is the correct reading and is exactly what
+`FrontierAllocator.gap_lo` already does when no interval covers position 0
+(`frontier_registry.py:54-57`): the gap starts at 0, so `high.lo == 0` means it
+is closed. The high side keeps returning `None` when absent, because *there*
+absent genuinely does mean "nothing has been claimed, so there is nothing to
+correct".
 
 The contract check above is a real `if`/`return None`, not a bare `assert`:
 the documented violation this guards against (2d accidentally passing
@@ -1140,6 +1163,21 @@ high side, until `allocator.is_gap_empty()`.
   only frontier-low/migration state, no `_reverse_fill_claim_and_process`
   ever run; assert `_correction_sweep_claim_and_process` returns `None`
   and writes nothing.
+- **Runs when Stream 2 claimed everything and frontier-low never existed**:
+  on a fresh graph (neither side seeded), run `_reverse_fill_claim_and_process`
+  until `is_gap_empty()`, without ever claiming from the low side; assert
+  frontier-low is still absent, frontier-high's `:lo-hash` is
+  `linearization[0]`, and the sweep **does** hand out position 0 rather than
+  refusing — the regression test for reading an absent low side as "unknown"
+  instead of "empty".
+- **No-op when `commit_metadata` violates its alignment contract**: with the
+  gap closed, assert the aligned list yields a position, then that a
+  truncated list (what `_run_ingestion`'s watermark-relative list looks
+  like) and a rotated one (right length, wrong order) both yield `None`.
+  Rotate rather than reverse — reversing an odd-length list leaves the middle
+  element in place, which is exactly the position a one-claim-from-the-low-side
+  fixture leaves the sweep pointing at, so a reversed list slips past the
+  per-position hash check and the test would pass vacuously.
 - **Resumes from `correction-sweep-through`, not from frontier-high's
   lo-hash again**: close the gap over a range spanning several commits;
   call `_correction_sweep_claim_and_process` once (processes frontier-
