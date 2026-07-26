@@ -8707,6 +8707,55 @@ def _parse_stream_ratio(raw: Optional[str]) -> Tuple[int, int]:
         return _DEFAULT_STREAM_RATIO
 
 
+class _RoundRobinClaimer:
+    """#222 phase 2d: hands out positions from the shared gap, alternating
+    forward and reverse by a fixed ratio.
+
+    This IS the fairness mechanism. Because claims are handed out in one
+    deterministic sequence rather than raced between two tasks, starvation
+    is not expressible and the interleave is directly assertable in a test.
+    """
+
+    def __init__(
+        self,
+        allocator: "frontier_registry.FrontierAllocator",
+        forward_per_round: int,
+        reverse_per_round: int,
+    ):
+        self._allocator = allocator
+        self._forward_per_round = forward_per_round
+        self._reverse_per_round = reverse_per_round
+        self._taken_in_phase = 0
+        self._forward_phase = True
+
+    def next_claim(self) -> Optional[Tuple[str, int]]:
+        """('fwd', pos) or ('rev', pos), or None once the gap is empty.
+
+        There is deliberately no "the other side might still have work"
+        fallback: claim_low() and claim_high() both return None on exactly
+        the same condition, is_gap_empty(), so they can only ever return
+        None together. A fallthrough would be dead code reading as if the
+        two frontiers could exhaust independently -- they cannot; they share
+        one gap.
+        """
+        if self._forward_phase:
+            pos = self._allocator.claim_low()
+            tag = "fwd"
+            limit = self._forward_per_round
+        else:
+            pos = self._allocator.claim_high()
+            tag = "rev"
+            limit = self._reverse_per_round
+        if pos is None:
+            return None
+
+        self._taken_in_phase += 1
+        if self._taken_in_phase >= limit:
+            self._taken_in_phase = 0
+            self._forward_phase = not self._forward_phase
+        return tag, pos
+
+
 @dataclass
 class _ForwardWalkState:
     """The forward walk's ten mutable preload dicts, threaded as one object.

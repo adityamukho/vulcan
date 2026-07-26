@@ -15964,3 +15964,70 @@ class TestForwardApplyReconcilesProvisional:
         )
         assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
         assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{linearization[1][:12]}"
+
+
+class TestRoundRobinClaimer:
+    def _claimer(self, total, forward, reverse):
+        import mcp_server, frontier_registry
+        allocator = frontier_registry.FrontierAllocator(total, [])
+        return mcp_server._RoundRobinClaimer(allocator, forward, reverse), allocator
+
+    def _drain(self, claimer):
+        out = []
+        while True:
+            claim = claimer.next_claim()
+            if claim is None:
+                return out
+            out.append(claim)
+
+    def test_one_to_one_alternates(self):
+        claimer, _ = self._claimer(6, 1, 1)
+        assert self._drain(claimer) == [
+            ("fwd", 0), ("rev", 5), ("fwd", 1), ("rev", 4), ("fwd", 2), ("rev", 3),
+        ]
+
+    def test_one_to_three(self):
+        claimer, _ = self._claimer(8, 1, 3)
+        assert self._drain(claimer) == [
+            ("fwd", 0), ("rev", 7), ("rev", 6), ("rev", 5),
+            ("fwd", 1), ("rev", 4), ("rev", 3), ("rev", 2),
+        ]
+
+    def test_three_to_one(self):
+        claimer, _ = self._claimer(8, 3, 1)
+        assert self._drain(claimer) == [
+            ("fwd", 0), ("fwd", 1), ("fwd", 2), ("rev", 7),
+            ("fwd", 3), ("fwd", 4), ("fwd", 5), ("rev", 6),
+        ]
+
+    def test_every_position_claimed_exactly_once(self):
+        for total in (1, 2, 3, 7, 20, 33):
+            for ratio in ((1, 1), (1, 3), (3, 1), (2, 5)):
+                claimer, _ = self._claimer(total, *ratio)
+                claims = self._drain(claimer)
+                positions = [pos for _tag, pos in claims]
+                assert sorted(positions) == list(range(total)), (total, ratio)
+
+    def test_forward_ascending_reverse_descending(self):
+        claimer, _ = self._claimer(20, 2, 3)
+        claims = self._drain(claimer)
+        fwd = [pos for tag, pos in claims if tag == "fwd"]
+        rev = [pos for tag, pos in claims if tag == "rev"]
+        assert fwd == sorted(fwd), "forward state machine requires ascending"
+        assert rev == sorted(rev, reverse=True), "2b's monotonicity guard requires descending"
+
+    def test_empty_linearization_yields_nothing(self):
+        claimer, _ = self._claimer(0, 1, 1)
+        assert claimer.next_claim() is None
+
+    def test_single_position_goes_to_whoever_asks_first(self):
+        claimer, _ = self._claimer(1, 1, 1)
+        assert claimer.next_claim() == ("fwd", 0)
+        assert claimer.next_claim() is None
+
+    def test_pre_drained_gap_yields_nothing_immediately(self):
+        """Resume case: the previous run already covered everything."""
+        claimer, allocator = self._claimer(5, 1, 1)
+        while allocator.claim_low() is not None:
+            pass
+        assert claimer.next_claim() is None
