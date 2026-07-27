@@ -7845,6 +7845,8 @@ def _forward_apply(
     commit: Tuple[str, str, str, str],
     extracted: Tuple[list, list, dict, list],
     index_con: Optional[Any] = None,
+    linearization: Optional[List[str]] = None,
+    pos: Optional[int] = None,
 ) -> None:
     """Apply one commit's forward-walk writes.
 
@@ -7854,6 +7856,12 @@ def _forward_apply(
     `run_in_executor(write_executor, ...)` submissions the inline body used
     became direct calls, and the caller submits this whole function to
     write_executor once instead.
+
+    linearization/pos are the allocator's view of this commit. When both are
+    supplied (Stage A's forward stream always does), this also persists the
+    frontier-low claim and advances the lineage-confirmed-through watermark;
+    both default to None so the existing tests that call this function with a
+    bare commit tuple stay valid.
     """
     commit_hash, commit_ts_iso, author, subject = commit
     extracted_files, gitlink_changes, gitmodules_map, renamed_pairs = extracted
@@ -8292,6 +8300,16 @@ def _forward_apply(
         pass  # non-fatal; parent edges are best-effort
 
     _watermark_update(db, commit_hash, commit_ts_iso, reason, index_con)
+    if linearization is not None and pos is not None:
+        _frontier_persist_claim(
+            db, linearization, pos, from_low=True,
+            commit_ts_iso=commit_ts_iso, index_con=index_con,
+        )
+    # The virgin positions this walk claims are authoritative on first write,
+    # so lineage is confirmed contiguously from C0 through here. The sweep
+    # folds its own region in later (Task 9); this watermark must not be
+    # advanced past the forward frontier before that happens.
+    _lineage_confirmed_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
     _db_checkpoint(db)
     _commit_index_writer_safe(index_con)
 
@@ -8826,7 +8844,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # the global here is enough to release the lock.
         _db = None  # release file lock while enumerating commits
 
-        commits = _git_commits(repo_path, watermark, branch)
+        linearization = frontier_registry.build_linearization(repo_path, branch)
+        # FULL history, positionally aligned with linearization. Both
+        # _reverse_apply and _correction_sweep_select_position index it
+        # positionally, and _reverse_apply raises ValueError on a length
+        # mismatch -- a watermark-relative list is exactly the wrong thing
+        # to hand them.
+        commit_metadata = _git_commits(repo_path, None, branch)
         ignore_patterns = _load_ignore_patterns(repo_path)
         state = _ForwardWalkState(
             entity_valid_from=entity_valid_from,
@@ -8840,16 +8864,16 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             submodule_paths=submodule_paths,
             unresolved_dep_idents=unresolved_dep_idents,
             provisional_idents=provisional_idents,
-            # Task 8 introduces the full-history commit_metadata this should
-            # really be built from; until then, the existing (post-watermark)
-            # commits list is what's available here.
-            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commits},
+            # Full-history, so a resumed run's retroactive :modified-in for a
+            # guess commit at or below the watermark still finds a timestamp
+            # (a post-watermark-only map would silently skip it).
+            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
         )
         repo_total_result = _subprocess.run(
             ["git", "rev-list", "--count", "HEAD"],
             cwd=repo_path, capture_output=True, text=True,
         )
-        repo_total = int(repo_total_result.stdout.strip()) if repo_total_result.returncode == 0 else len(commits)
+        repo_total = int(repo_total_result.stdout.strip()) if repo_total_result.returncode == 0 else len(commit_metadata)
         _ingest_progress["total"] = repo_total
         _ingest_progress["status"] = "running"
         _ingest_progress["processed"] = prior_ingested
@@ -8899,6 +8923,23 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         index_path = fact_index.index_path_for(_graph_path or _get_graph_path())
         index_con = await loop.run_in_executor(write_executor, _open_index_writer_safe, index_path)
 
+        # #222 phase 2d: the two streams share one gap. _frontier_load WRITES
+        # (one-time watermark->interval migration, plus the lineage-marker
+        # migration), so it needs a live db and index_con and must run on
+        # write_executor rather than inline on the event-loop thread.
+        run_ts_iso = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.%f"
+        )[:-3] + "Z"
+        db = await _ensure_db_async()
+        allocator = await loop.run_in_executor(
+            write_executor, _frontier_load, db, linearization, run_ts_iso, index_con,
+        )
+        db = None
+        _db = None
+        claimer = _RoundRobinClaimer(
+            allocator, *_parse_stream_ratio(os.environ.get("MINIGRAF_INGEST_STREAM_RATIO"))
+        )
+
         try:
             # Extraction (git show + tree-sitter parse + triple construction) runs
             # in real OS processes, not threads (#116): tree-sitter's C parse holds
@@ -8921,18 +8962,30 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 max_workers=max_workers, mp_context=mp_context
             )
             try:
-                commits_iter = iter(commits)
                 pending: Any = deque()
 
+                # #222 phase 2d: positions come from the shared-gap claimer,
+                # not a plain commit iterator, and each pipeline entry carries
+                # the tag of the stream that claimed it. Extraction is stream-
+                # agnostic (every position goes to the same process pool); only
+                # the write half below dispatches on the tag.
+                #
+                # The pipeline is FIFO, and that is what preserves the ordering
+                # each stream requires: claims are handed out in one
+                # deterministic sequence, appended in that sequence and popped
+                # in it, so "fwd" positions reach _forward_apply strictly
+                # ascending (its state machine's precondition) and "rev"
+                # positions reach _reverse_apply strictly descending (its
+                # monotonicity and progress guards' precondition).
                 def submit_next() -> bool:
-                    try:
-                        commit = next(commits_iter)
-                    except StopIteration:
+                    claim = claimer.next_claim()
+                    if claim is None:
                         return False
+                    tag, pos = claim
                     fut = loop.run_in_executor(
-                        executor, _extract_commit, repo_path, commit[0], ignore_patterns
+                        executor, _extract_commit, repo_path, linearization[pos], ignore_patterns
                     )
-                    pending.append((commit, fut))
+                    pending.append((tag, pos, fut))
                     return True
 
                 for _ in range(pipeline_depth):
@@ -8944,7 +8997,8 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         completed_all = False
                         break
 
-                    (commit_hash, commit_ts_iso, author, subject), fut = pending.popleft()
+                    tag, pos, fut = pending.popleft()
+                    commit_hash, commit_ts_iso, author, subject = commit_metadata[pos]
                     # renamed_pairs (Task 9's 4th _extract_commit return element) is
                     # unpacked here but not yet consumed — Task 10 wires it into
                     # :renamed-from/:renamed-to triple emission for functions/classes.
@@ -8987,12 +9041,18 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     # Acquire DB fresh each commit — never hold across yield
                     db = await _ensure_db_async()
                     try:
-                        await loop.run_in_executor(
-                            write_executor, _forward_apply, db, repo_path, state,
-                            (commit_hash, commit_ts_iso, author, subject),
-                            (extracted_files, gitlink_changes, gitmodules_map, renamed_pairs),
-                            index_con,
-                        )
+                        if tag == "fwd":
+                            await loop.run_in_executor(
+                                write_executor, _forward_apply, db, repo_path, state,
+                                commit_metadata[pos],
+                                (extracted_files, gitlink_changes, gitmodules_map, renamed_pairs),
+                                index_con, linearization, pos,
+                            )
+                        else:
+                            await loop.run_in_executor(
+                                write_executor, _reverse_apply, db, repo_path, linearization,
+                                commit_metadata, pos, extracted_files, index_con,
+                            )
 
                     except Exception as e:
                         # Ordinary per-commit write failure (malformed EDN, a

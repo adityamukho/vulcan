@@ -8161,6 +8161,11 @@ class TestIngestionWrites:
 
         monkeypatch.setattr(mcp_server, "_watermark_query", lambda db: "abc123")
         monkeypatch.setattr(mcp_server, "_git_commits", lambda repo, watermark, branch: [])
+        # #222 phase 2d: which commits get walked is now driven by
+        # build_linearization, not by _git_commits, so simulating an
+        # empty history has to stub both. tmp_path is not a git repo, and
+        # build_linearization runs `git log` with check=True.
+        monkeypatch.setattr(frontier_registry, "build_linearization", lambda repo, branch="HEAD": [])
 
         last_run_calls = []
         monkeypatch.setattr(
@@ -9140,6 +9145,13 @@ class TestRunIngestion:
     @pytest.mark.asyncio
     async def test_watermark_updated_after_each_commit(self, real_db, git_repo, monkeypatch):
         import mcp_server
+        # #222 phase 2d: :ingestion/watermark keeps its "contiguous from C0"
+        # meaning and is advanced by the FORWARD stream only -- the reverse
+        # stream never touches it. Pin the ratio forward-only so the forward
+        # stream claims both of git_repo's commits, which is what makes
+        # "one watermark write per commit" the property under test rather
+        # than a statement about the 1:1 split.
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -9696,6 +9708,7 @@ class TestRunIngestionCommitFaultIsolation:
         import mcp_server
 
         real_git_commits = mcp_server._git_commits
+        real_build_linearization = frontier_registry.build_linearization
 
         def poisoned_git_commits(repo_path, watermark_hash, branch="HEAD"):
             # Inject a commit hash that was never actually created in this
@@ -9706,7 +9719,17 @@ class TestRunIngestionCommitFaultIsolation:
             poisoned = commits[:1] + [("deadbeef" * 5, "2026-01-01T00:00:00Z", "x@x.com", "POISONED")] + commits[1:]
             return poisoned
 
+        # #222 phase 2d: _run_ingestion extracts linearization[pos] and reads
+        # commit_metadata[pos], so the poison has to be injected at the SAME
+        # position in both lists -- injecting it into _git_commits alone would
+        # just misalign the two and trip _reverse_apply's alignment guard
+        # instead of exercising the extraction-failure path this test is about.
+        def poisoned_linearization(repo_path, branch="HEAD"):
+            hashes = real_build_linearization(repo_path, branch)
+            return hashes[:1] + ["deadbeef" * 5] + hashes[1:]
+
         monkeypatch.setattr(mcp_server, "_git_commits", poisoned_git_commits)
+        monkeypatch.setattr(frontier_registry, "build_linearization", poisoned_linearization)
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -9724,13 +9747,21 @@ class TestRunIngestionCommitFaultIsolation:
         import fact_index
 
         real_git_commits = mcp_server._git_commits
+        real_build_linearization = frontier_registry.build_linearization
 
         def poisoned_git_commits(repo_path, watermark_hash, branch="HEAD"):
             commits = real_git_commits(repo_path, watermark_hash, branch)
             poisoned = [commits[0], ("deadbeef" * 5, "2026-01-01T00:00:00Z", "x@x.com", "POISONED")] + commits[1:]
             return poisoned
 
+        # See the sibling test above: the poison must land at the same
+        # position in both the linearization and commit_metadata.
+        def poisoned_linearization(repo_path, branch="HEAD"):
+            hashes = real_build_linearization(repo_path, branch)
+            return [hashes[0], "deadbeef" * 5] + hashes[1:]
+
         monkeypatch.setattr(mcp_server, "_git_commits", poisoned_git_commits)
+        monkeypatch.setattr(frontier_registry, "build_linearization", poisoned_linearization)
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -9816,10 +9847,19 @@ class TestRunIngestionBatchedIndexWrites:
         one final flush-on-close) once batched. The gap between those two
         numbers is what would grow unboundedly on a 1M-fact repo if this
         regressed back to per-triple commits.
+
+        #222 phase 2d: the ratio is pinned forward-only so both of the
+        fixture's commits go through _forward_apply. _reverse_apply
+        (phase 2b, merged) checkpoints the graph per commit but does not
+        call _commit_index_writer_safe, so a reverse-claimed commit
+        contributes no per-commit index commit -- counting a mix would make
+        this assertion a statement about the stream split rather than about
+        batching.
         """
         import mcp_server
         import fact_index
 
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
         commit_calls = []
         open_calls = []
         original_open_writer = fact_index.open_writer
@@ -11393,6 +11433,21 @@ class TestClosedEntityLifecyclePurge:
         timestamp, widening its valid window across the span it was closed for.
     """
 
+    @pytest.fixture(autouse=True)
+    def _forward_only_ratio(self, monkeypatch):
+        """#222 phase 2d: pin ingestion to the forward stream.
+
+        These tests are about the FORWARD walk's close/purge semantics for
+        deleted and renamed paths. "D"/"R" file handling in the reverse-fill
+        and correction-sweep paths is explicitly out of scope for phase 2
+        (docs/superpowers/specs/2026-07-26-concurrency-wiring-design.md,
+        "Out of scope"), so at the default 1:1 ratio the reverse stream would
+        claim the very commit that performs the deletion/rename and skip it.
+        Pinning the ratio forward-only keeps these tests measuring the
+        behaviour they were written to measure.
+        """
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
+
     def _make_progress(self):
         return {"status": "idle", "processed": 0, "total": 0, "current_commit": "",
                 "error": None, "prior_ingested": 0}
@@ -11467,6 +11522,14 @@ class TestClosedEntityLifecyclePurge:
 
 class TestRunIngestionBitemporalClose:
     """Integration tests verifying bi-temporal correctness of entity lifecycle handling."""
+
+    @pytest.fixture(autouse=True)
+    def _forward_only_ratio(self, monkeypatch):
+        """#222 phase 2d: pin ingestion to the forward stream -- see the
+        identically-named fixture on TestClosedEntityLifecyclePurge for the
+        rationale. Every test in this class turns on a deletion or a rename,
+        which only the forward walk handles."""
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
 
     def _make_progress(self):
         return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
@@ -12427,6 +12490,15 @@ class TestTransactValidTimeArgumentOrder:
 class TestRunIngestionBitemporalDeps:
     """Tests verifying that :depends-on edges are written/closed bi-temporally in the commit loop."""
 
+    @pytest.fixture(autouse=True)
+    def _forward_only_ratio(self, monkeypatch):
+        """#222 phase 2d: pin ingestion to the forward stream -- see the
+        identically-named fixture on TestClosedEntityLifecyclePurge.
+        :depends-on edge lifecycle (and its close on a removed import) is
+        forward-walk-owned; the reverse-fill path does not write or close
+        dependency edges."""
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
+
     def _make_progress(self):
         return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
 
@@ -13112,6 +13184,15 @@ class TestResolveModuleImportRelative:
 class TestRunIngestionGitlinks:
     """End-to-end tests for submodule add/bump/remove/flip via _run_ingestion."""
 
+    @pytest.fixture(autouse=True)
+    def _forward_only_ratio(self, monkeypatch):
+        """#222 phase 2d: pin ingestion to the forward stream -- see the
+        identically-named fixture on TestClosedEntityLifecyclePurge.
+        _reverse_apply consumes only _extract_commit's file_results and
+        discards its gitlink_changes/gitmodules_map, so submodule
+        add/bump/remove handling is forward-walk-only."""
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
+
     def _make_progress(self):
         return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
 
@@ -13408,6 +13489,14 @@ class TestSubmoduleDependencyLinking:
     Verified against the REAL minigraf backend (no mock), since the fix reads
     back existing external-dependency rows via a DB query at gitlink-add time.
     """
+
+    @pytest.fixture(autouse=True)
+    def _forward_only_ratio(self, monkeypatch):
+        """#222 phase 2d: pin ingestion to the forward stream -- see the
+        identically-named fixture on TestRunIngestionGitlinks. The
+        :resolves-to linking under test runs in the forward walk's gitlink
+        handling, which the reverse-fill path does not perform."""
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
 
     def _make_progress(self):
         return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
@@ -16031,3 +16120,105 @@ class TestRoundRobinClaimer:
         while allocator.claim_low() is not None:
             pass
         assert claimer.next_claim() is None
+
+
+class TestStageAInterleave:
+    """#222 phase 2d Task 8: _run_ingestion driven by the shared-gap claimer.
+
+    Real on-disk graph throughout (docs/testing-conventions.md Pattern 2):
+    _run_ingestion releases and reopens the DB between every commit, which an
+    in-memory store cannot survive.
+    """
+
+    def _repo(self, tmp_path, n_commits=6):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        # -b master explicitly: init.defaultBranch is machine-configurable, and
+        # every test below passes "master" to _run_ingestion.
+        _subprocess.run(["git", "init", "-b", "master"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(n_commits):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"h{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_both_frontiers_advance_and_meet(self, tmp_path, monkeypatch):
+        """The load-bearing property: a real run must leave frontier-low and
+        frontier-high adjacent, covering every position exactly once."""
+        import mcp_server, frontier_registry
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
+
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+
+        db = MiniGrafDb.open(str(graph))
+        linearization = frontier_registry.build_linearization(str(repo))
+        low = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT)
+        high = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert low is not None and high is not None, "both streams must have claimed"
+        pos = {h: i for i, h in enumerate(linearization)}
+        assert pos[low[0]] == 0
+        assert pos[high[1]] == len(linearization) - 1
+        assert pos[low[1]] + 1 == pos[high[0]], "the two frontiers must be adjacent"
+
+    @pytest.mark.asyncio
+    async def test_forward_heavy_ratio_shifts_the_meeting_point(self, tmp_path, monkeypatch):
+        import mcp_server, frontier_registry
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path, n_commits=8)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "3:1")
+
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+
+        db = MiniGrafDb.open(str(graph))
+        linearization = frontier_registry.build_linearization(str(repo))
+        pos = {h: i for i, h in enumerate(linearization)}
+        low = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT)
+        # 3:1 over 8 positions -> forward takes 6, reverse takes 2.
+        assert pos[low[1]] == 5
+
+    @pytest.mark.asyncio
+    async def test_watermark_matches_frontier_low_hi(self, tmp_path, monkeypatch):
+        """:ingestion/watermark keeps its contiguous-from-C0 meaning: it is
+        advanced by the forward stream only, never by the reverse one."""
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+
+        db = MiniGrafDb.open(str(graph))
+        low = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT)
+        assert mcp_server._watermark_query(db) == low[1]
+
+    @pytest.mark.asyncio
+    async def test_single_commit_repo(self, tmp_path, monkeypatch):
+        import mcp_server
+        repo = self._repo(tmp_path, n_commits=1)
+        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete"
+
+    @pytest.mark.asyncio
+    async def test_second_run_on_unchanged_repo_is_a_no_op(self, tmp_path, monkeypatch):
+        """Resume with an already-empty gap: Stage A must never begin, not
+        spin or re-process."""
+        import mcp_server
+        repo = self._repo(tmp_path)
+        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete"
