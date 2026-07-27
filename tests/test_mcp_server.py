@@ -16802,3 +16802,139 @@ class TestStageBRepairsLifecycleFacts:
             assert len(subjects) == len(set(subjects)), \
                 f"duplicate live {attr} facts after the lifecycle pass: " \
                 f"{sorted(r for r in rows if subjects.count(r[0]) > 1)}"
+
+
+class TestStagingAndShutdown:
+    def _repo(self, tmp_path, n_commits=6):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(n_commits):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"h{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_phase_reaches_sweeping_and_processed_never_exceeds_total(self, tmp_path, monkeypatch):
+        """Stage B's commits are re-visits of positions Stage A already
+        counted -- counting them again would push processed past total.
+
+        NOTE on a deviation from the brief's literal assertion: the brief
+        reads `_ingest_progress["phase"] == "sweeping"` AFTER `_run_ingestion`
+        has already returned. That directly contradicts Task 9's review fix
+        (#222 phase 2d, commit de0a062, finding 3): "phase" describes what a
+        RUNNING ingest is doing and must not outlive the run, because leaving
+        "sweeping" in place after completion made a finished run permanently
+        report {"status": "complete", "phase": "sweeping"} -- exactly the bug
+        that fix corrected, with its own code comment saying so at the clear
+        site. Reverting that would reintroduce a real, previously-flagged
+        defect, so this test instead observes the transition to "sweeping"
+        DURING the run (via a spy on _correction_sweep_apply, the same seam
+        test_sweep_does_not_start_before_stage_a_drains uses) and separately
+        asserts the phase is correctly cleared once the run is over.
+        """
+        import mcp_server
+        repo = self._repo(tmp_path)
+        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+
+        observed_sweeping = False
+        real_apply = mcp_server._correction_sweep_apply
+
+        def spy(db, *args, **kwargs):
+            nonlocal observed_sweeping
+            if mcp_server._ingest_progress["phase"] == "sweeping":
+                observed_sweeping = True
+            return real_apply(db, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert observed_sweeping, "phase must reach 'sweeping' at some point during Stage B"
+        assert mcp_server._ingest_progress["phase"] is None, \
+            "phase must not outlive the run (Task 9 review fix, de0a062)"
+        assert mcp_server._ingest_progress["processed"] <= mcp_server._ingest_progress["total"]
+
+    @pytest.mark.asyncio
+    async def test_sweep_does_not_start_before_stage_a_drains(self, tmp_path, monkeypatch):
+        """The sweep's precondition is a CLOSED gap. Stage A pre-claims up to
+        pipeline_depth positions ahead of persisting them, so the in-memory
+        gap can close while commits are still in flight -- the DB-read
+        precondition is what makes this safe, and this test pins it."""
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+
+        observed = []
+        real_apply = mcp_server._correction_sweep_apply
+
+        def spy(db, *args, **kwargs):
+            observed.append(mcp_server._ingest_progress["phase"])
+            return real_apply(db, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert observed, "the sweep must actually have run"
+        assert set(observed) == {"sweeping"}
+
+    @pytest.mark.asyncio
+    async def test_shutdown_during_stage_a_stops_and_resumes(self, tmp_path, monkeypatch):
+        import mcp_server, frontier_registry
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path, n_commits=10)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+
+        real_forward = mcp_server._forward_apply
+        calls = {"n": 0}
+
+        def stopping_forward(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                mcp_server._shutdown_requested.set()
+            return real_forward(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", stopping_forward)
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "stopped"
+        mcp_server._db = None
+
+        # A run stopped in Stage A must NOT claim confirmed lineage at HEAD.
+        db = MiniGrafDb.open(str(graph))
+        linearization = frontier_registry.build_linearization(str(repo))
+        assert mcp_server._lineage_confirmed_through_query(db) != linearization[-1]
+        db = None
+        mcp_server._db = None
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", real_forward)
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete"
+        mcp_server._db = None
+        db2 = MiniGrafDb.open(str(graph))
+        assert mcp_server._preload_provisional_idents(db2) == set()
+        assert mcp_server._lineage_confirmed_through_query(db2) == linearization[-1]
+
+    @pytest.mark.asyncio
+    async def test_neither_sync_wrapper_is_called_from_run_ingestion(self, tmp_path, monkeypatch):
+        """2c and 2b both document that their sync wrappers must not be
+        called from async code -- each fuses a CPU-bound parse with DB-bound
+        writes into one executor-schedulable unit."""
+        import mcp_server
+        repo = self._repo(tmp_path)
+        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+
+        for name in (
+            "_correction_sweep_claim_and_process",
+            "_correction_sweep_walk",
+            "_reverse_bulk_fill_walk",
+            "_reverse_fill_claim_and_process",
+        ):
+            def boom(*a, _n=name, **k):
+                raise AssertionError(f"{_n} must not be called from _run_ingestion")
+            monkeypatch.setattr(mcp_server, name, boom)
+
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete"

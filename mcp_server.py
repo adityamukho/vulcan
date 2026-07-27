@@ -102,6 +102,7 @@ _ingest_task: Optional[asyncio.Task] = None
 _ingest_progress: Dict[str, Any] = {
     "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
     "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+    "phase": None,
 }
 _shutdown_requested = asyncio.Event()
 
@@ -9000,6 +9001,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         repo_total = int(repo_total_result.stdout.strip()) if repo_total_result.returncode == 0 else len(commit_metadata)
         _ingest_progress["total"] = repo_total
         _ingest_progress["status"] = "running"
+        _ingest_progress["phase"] = "converging"
         _ingest_progress["processed"] = prior_ingested
         _ingest_progress["prior_ingested"] = prior_ingested
 
