@@ -289,7 +289,9 @@ minigraf_ingest_git(repo_path="/path/to/repo")
 
 Once started, inform the user that ingestion is running in the background and move on — do not poll or wait for completion.
 
-Auto-started at MCP server startup — the server creates a background asyncio task that ingests the resolved default branch immediately. Set `MINIGRAF_NO_AUTO_INGEST=1` to suppress this (useful in eval sandboxes). Incremental: reads the `:ingestion/watermark` entity to determine the last ingested commit, then only processes new commits.
+Auto-started at MCP server startup — the server creates a background asyncio task that ingests the resolved default branch immediately. Set `MINIGRAF_NO_AUTO_INGEST=1` to suppress this (useful in eval sandboxes). Incremental, and resumed from two places, not one: `:ingestion/watermark` says where the authoritative walk resumes, and `:ingestion/correction-sweep-through` says how far lineage has been confirmed. The two differ because a commit becomes *queryable* before its lineage is *final* — history above the watermark is ingested with provisional `:introduced-by` guesses that a later confirmation pass upgrades, so an interrupted run can leave the graph fully queryable with its lineage still being settled.
+
+History is walked by two interleaved streams: one forward from the watermark (authoritative), one backward from HEAD (provisional, so recent history becomes queryable first). `MINIGRAF_INGEST_STREAM_RATIO` sets how many commits each takes per round as `"forward:reverse"` (default `1:1`); `MINIGRAF_INGEST_STREAM_RATIO=1000000:1` is effectively a plain oldest-first walk. A malformed value is ignored with a warning and falls back to the default.
 
 By default, `minigraf_ingest_git` (and the auto-start above) resolve which branch to walk instead of blindly following whatever ref is checked out: `MINIGRAF_GIT_BRANCH` wins if set, otherwise the repo's `main` or `master` branch is auto-detected, falling back to `HEAD` only if neither exists. Pass an explicit `branch` argument to override both — useful for on-demand ingestion of a feature branch without disturbing the pinned default.
 
@@ -315,7 +317,8 @@ aren't populated — a subsequent `minigraf_ingest_git` call will still be
 rejected with "already in progress" during this window, same as `running`.
 `stopped` means a graceful shutdown (session end) paused ingestion between commits —
 not a failure; the next `minigraf_ingest_git` call (or server auto-start)
-resumes from the watermark automatically. `skipped` means another live process
+resumes from the watermark — and from `:ingestion/correction-sweep-through` for
+the confirmation pass — automatically. `skipped` means another live process
 already owns the graph lock (its PID is in `owner_pid`) — this server will not
 attempt ingestion on its own; call `minigraf_ingest_git` again later to retry.
 For `error` and `skipped`, a `stale` field may be present: `stale: true` means the

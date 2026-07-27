@@ -4828,6 +4828,47 @@ def _watermark_query(db: Any) -> Optional[str]:
     return results[0][0] if results else None
 
 
+def _commit_date_query(db: Any, commit_hash: Optional[str]) -> Optional[str]:
+    """Return an already-ingested commit's ISO 8601 :date, or None.
+
+    :any-valid-time is required, not cosmetic: a commit's own facts are
+    transacted at THAT COMMIT's timestamp, which can sit in the future
+    relative to wall-clock time (clock skew, doctored committer dates), so a
+    plain query's implicit "as of now" filter can miss them -- the same
+    reason _total_ingested_query gives. Commit facts are never closed, so
+    unlike that function no :db/valid-to filter is needed to pick the live
+    row; a re-walked position can re-transact an identical :date under a
+    fresh valid-from (#156), but every such row carries the same value.
+    """
+    if not commit_hash:
+        return None
+    try:
+        raw = _db_execute(
+            db,
+            f"(query [:find ?d :any-valid-time "
+            f":where [:commit/{commit_hash[:12]} :date ?d]])",
+        )
+        results = json.loads(raw).get("results", [])
+    except Exception:
+        return None
+    return results[0][0] if results else None
+
+
+def _iso_to_epoch_ms(ts_iso: Optional[str]) -> Optional[int]:
+    """Convert an ingest ISO 8601 timestamp to minigraf's epoch-ms valid-time
+    scale, so it can be compared against the :db/valid-from/:db/valid-to
+    pseudo-attributes. Returns None if ts_iso is absent or unparseable."""
+    if not ts_iso:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return int(parsed.timestamp() * 1000)
+
+
 def _total_ingested_query(db: Any) -> int:
     """Return the :total-ingested watermark recorded by the last *completed* run, or 0.
 
@@ -5379,6 +5420,7 @@ def _forward_reconcile_provisional(
     structural_triples: List[str],
     true_commit_ts_iso: str,
     ts_by_commit_ident: Dict[str, str],
+    commit_ident: str,
     index_con: Optional[Any] = None,
 ) -> Optional[str]:
     """#222 phase 2d: the forward walk has reached entity_ident's TRUE
@@ -5395,8 +5437,11 @@ def _forward_reconcile_provisional(
     function cannot drift from it.
 
     Mirrors the supersede path in _reverse_apply: the same re-dating of
-    structural facts (via _re_date_structural_facts), and the same refusal
-    to back-date a :modified-in edge whose commit timestamp is unknown.
+    structural facts (via _re_date_structural_facts), the same refusal to
+    back-date a :modified-in edge whose commit timestamp is unknown, and --
+    what commit_ident is for -- the same refusal to hand the entity a
+    :modified-in edge at its OWN introduction (_reverse_apply's
+    `superseded_ident != commit_ident` guard).
     """
     guess_ident = _entity_introduced_by_query(db, entity_ident)
     if not _lineage_is_provisional(db, entity_ident):
@@ -5425,7 +5470,22 @@ def _forward_reconcile_provisional(
     _candidate_diff_clear(db, guess_ident[len(":commit/"):], entity_ident, index_con=index_con)
 
     # 5. The guess commit is now known to be a genuine modification rather
-    # than the introduction, so it earns the :modified-in edge Stream 2
+    # than the introduction -- UNLESS it is this very commit, which is the
+    # introduction. Stream 2 can guess the right commit and still leave a
+    # provisional marker on it (it claims high-to-low, so the first sighting
+    # of an entity born inside its own region IS that entity's introduction);
+    # the marker then survives whenever the run is interrupted before Stage B
+    # confirms it, and a later run's forward walk re-walks the position after
+    # _frontier_load discards the unrepresentable high interval. Writing the
+    # edge here would assert that the entity was modified at the commit that
+    # created it -- the exact shape _correction_sweep_apply refuses to write
+    # via its own self-introduction guard, and one a forward-only ingest can
+    # never produce. It is also unreachable by the sweep once the position is
+    # forward territory, so it would be permanent.
+    if guess_ident == commit_ident:
+        return guess_ident
+
+    # Otherwise the guess commit earns the :modified-in edge Stream 2
     # withheld from it. Dated at ITS OWN timestamp, not this commit's.
     #
     # This inherits 2b's documented over-assertion: #221's unchanged-body
@@ -6749,10 +6809,44 @@ def _build_code_triples(
     return triples
 
 
-def _preload_known_entities(db: Any, repo_path: str) -> tuple:
+def _preload_known_entities(
+    db: Any, repo_path: str, valid_at: Optional[str] = None
+) -> tuple:
     """Load all existing module/function/class/external-dependency idents from
     the DB, and pre-seed file_entities with all currently tracked files in the
     repo.
+
+    valid_at (#222 phase 2d review, B1) bounds the entity queries to the graph
+    as it stood at the forward walk's RESUME POSITION -- i.e. at the
+    :ingestion/watermark commit's own timestamp -- instead of "now". Before the
+    two-stream ingest, the two were the same thing: the graph never held facts
+    for a commit above the watermark. The reverse stream breaks that. It writes
+    structural facts across the whole frontier-high region, and Stage B's
+    lifecycle pass then applies that region's deletions and renames, so a
+    CURRENT-graph preload hands the resuming forward walk a state describing
+    commits it has not reached yet. Both directions of that mismatch corrupt
+    the graph:
+
+      * an entity born in the reverse region is present in file_entities, is
+        absent from the parse of the (earlier) commit the forward walk is
+        replaying, and so is closed and _forget_closed_entity-purged as a
+        "removed" entity -- with an orig_ts LATER than the close's valid_to,
+        an inverted valid interval;
+      * an entity CLOSED in the reverse region is missing from the state
+        entirely, so replaying an earlier commit that still contains it takes
+        _build_code_triples' introduction branch and mints a second live
+        :introduced-by.
+
+    Passing None restores the pre-#222 behaviour exactly, which is what a
+    fresh graph (no watermark) wants.
+
+    Known residual, deliberately not papered over: valid-time is populated
+    from COMMITTER dates, which are not monotonic in topological order. An
+    entity introduced at or below the watermark by a commit whose date is
+    later than the watermark commit's own date drops out of this snapshot and
+    is treated as new. That is the second bullet above, in a rarer form; it
+    needs a position-indexed preload (the linearization is not available on
+    this code path) rather than a valid-time one to close completely.
 
     external-dependency entities share the module ident namespace and use the
     same "path" attribute as modules, so folding them into this same query
@@ -6792,12 +6886,19 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
     except Exception:
         pass
 
+    # Every clause of the query below is bounded by this one keyword, the
+    # :introduced-by -> :date join included: a commit above the watermark has
+    # a :date fact whose own valid-from is later than valid_at, so the join
+    # simply finds nothing for it.
+    valid_at_clause = f':valid-at "{_edn_escape(valid_at)}" ' if valid_at else ""
+
     for entity_type in ("module", "function", "class", "variable", "field", "external-dependency"):
         path_attr = "path" if entity_type in ("module", "external-dependency") else "file"
         try:
             raw = _db_execute(
                 db,
                 f'(query [:find ?ident ?path ?desc ?date '
+                f'{valid_at_clause}'
                 f':where [?e :entity-type :type/{entity_type}] '
                 f'[?e :ident ?ident] '
                 f'[?e :{path_attr} ?path] '
@@ -6862,6 +6963,16 @@ def _preload_field_class_idents(db: Any) -> Dict[str, str]:
     silently leaked open when a later run closes the field (its module-contains
     edge would still close, but not the class one). Current-time query semantics
     naturally exclude already-closed fields' edges.
+
+    Deliberately NOT bounded to the resume position, unlike the preloads
+    around it (#222 phase 2d review, B1). This is a pure side-table read
+    through .get() at close sites, never a "what existed then" set: an extra
+    entry for a field the forward walk has not reached is inert (nothing
+    looks it up until that field is genuinely closed, at which point the
+    value is right), while a MISSING entry is the leaked-edge bug above. So
+    the failure modes are asymmetric here in the opposite direction, and the
+    unrestricted read is the safer one. _preload_field_static_idents is the
+    same shape and is left alone for the same reason.
     """
     field_class_ident: Dict[str, str] = {}
     try:
@@ -6908,10 +7019,42 @@ def _preload_field_static_idents(db: Any) -> Dict[str, bool]:
 _VALID_TIME_FOREVER_MS = (1 << 63) - 1  # minigraf's i64::MAX "still open" :valid-to sentinel
 
 
+def _valid_time_window_clauses(valid_at_ms: Optional[int]) -> str:
+    """Predicate clauses selecting the facts live at valid_at_ms, for the
+    :any-valid-time preloads that bind ?vf/?vt (#222 phase 2d review, B1).
+
+    valid_at_ms=None keeps the pre-existing "still open right now" test
+    (:valid-to still at the forever sentinel) unchanged. Otherwise the test
+    becomes half-open containment, [?vf, ?vt) ∋ valid_at_ms -- the same
+    boundary rule :valid-at itself uses (a fact starting exactly at the
+    instant is live, one ending exactly at it is not), verified against the
+    backend so the two preload styles cannot disagree at the watermark.
+    The forever sentinel satisfies [(> ?vt valid_at_ms)] for any real
+    timestamp, so still-open facts stay in.
+    """
+    if valid_at_ms is None:
+        return f"[(= ?vt {_VALID_TIME_FOREVER_MS})]"
+    return f"[(<= ?vf {valid_at_ms})] [(> ?vt {valid_at_ms})]"
+
+
 def _preload_known_deps(
-    db: Any, file_entities: Dict[str, List[str]]
+    db: Any, file_entities: Dict[str, List[str]], valid_at_ms: Optional[int] = None
 ) -> tuple:
     """Reload file_deps/dep_valid_from from durable :depends-on facts.
+
+    valid_at_ms is _preload_known_entities' valid_at on minigraf's epoch-ms
+    valid-time scale, and means the same thing: the graph as it stood at the
+    forward walk's resume position (#222 phase 2d review, B1). :depends-on is
+    never written by the reverse stream, but Stage B's lifecycle pass calls
+    _forward_apply(lifecycle_only=True), whose dep_add_triples are NOT gated
+    on that flag -- so a completed two-stream run does leave :depends-on edges
+    above the watermark, and a current-time reload would hand them to a
+    resuming forward walk that then closes them at an earlier commit. This
+    query cannot express the bound as :valid-at, because the
+    :db/valid-from/:db/valid-to pseudo-attributes it needs only bind under
+    :any-valid-time; the equivalent is stated directly as
+    [valid_from, valid_to) containing valid_at_ms, which is exactly
+    :valid-at's own half-open semantics.
 
     Mirrors _preload_known_entities, but :depends-on facts have no
     :introduced-by-style companion edge to a commit's :date, so the
@@ -6964,7 +7107,7 @@ def _preload_known_deps(
             "[?src :depends-on ?dep] "
             "[?src :db/valid-from ?vf] "
             "[?src :db/valid-to ?vt] "
-            f"[(= ?vt {_VALID_TIME_FOREVER_MS})]])"
+            f"{_valid_time_window_clauses(valid_at_ms)}])"
         )
         rows = json.loads(raw).get("results", [])
     except Exception:
@@ -6984,10 +7127,15 @@ def _preload_known_deps(
     return file_deps, dep_valid_from
 
 
-def _preload_pinned_commits(db: Any) -> Dict[str, tuple]:
+def _preload_pinned_commits(db: Any, valid_at_ms: Optional[int] = None) -> Dict[str, tuple]:
     """Reload each external-dependency entity's current :pinned-commit value
     and the timestamp it was set at, mirroring _preload_known_deps's per-fact
     :any-valid-time pattern for :depends-on.
+
+    valid_at_ms carries the same resume-position bound, for the same reason:
+    Stage B's lifecycle pass runs the gitlink handling over the reverse
+    region, so a completed two-stream run can leave a bump recorded above the
+    watermark (#222 phase 2d review, B1).
 
     Needed because :pinned-commit is bi-temporally closed and reopened on
     every bump (see _run_ingestion's gitlink handling) — without this, the
@@ -7013,7 +7161,7 @@ def _preload_pinned_commits(db: Any) -> Dict[str, tuple]:
             "[?e :pinned-commit ?sha] "
             "[?e :db/valid-from ?vf] "
             "[?e :db/valid-to ?vt] "
-            f"[(= ?vt {_VALID_TIME_FOREVER_MS})]])"
+            f"{_valid_time_window_clauses(valid_at_ms)}])"
         )
         rows = json.loads(raw).get("results", [])
     except Exception:
@@ -7037,6 +7185,12 @@ def _preload_provisional_idents(db: Any) -> Set[str]:
     _lineage_is_provisional does per-ident. Keeping the two queries the same
     shape is deliberate: this set is consulted where a per-ident check is
     too expensive, and the two must never disagree.
+
+    Deliberately NOT bounded to the resume position the way the mutable walk
+    state is (#222 phase 2d review, B1). This set is the reconciliation
+    AUTHORITY: its whole job is to name the entities the reverse stream
+    introduced above the watermark, so restricting it to the watermark's
+    valid-time would empty it of exactly the rows it exists to carry.
     """
     raw = _db_execute(
         db,
@@ -7063,10 +7217,26 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     """
     db = _db if _db is not None else _open_db_at_with_extended_retry(_graph_path or _get_graph_path())
     watermark = _watermark_query(db)
+    # #222 phase 2d review, B1: the MUTABLE walk state must describe the graph
+    # at the forward walk's resume position, not "now" -- see
+    # _preload_known_entities' valid_at docstring for what goes wrong
+    # otherwise. The resume position IS the watermark (both the forward walk
+    # and Stage B's lifecycle pass start there), so the bound is that
+    # commit's own :date, read back out of the graph. Wall-clock time would
+    # be wrong twice over: it is not the resume position, and ingest
+    # valid-time is denominated in committer dates, not real time.
+    # No watermark means a fresh graph, where None degrades this to exactly
+    # the pre-#222 unrestricted queries rather than to an empty state.
+    resume_valid_at = _commit_date_query(db, watermark)
+    resume_valid_at_ms = _iso_to_epoch_ms(resume_valid_at)
     prior_ingested = _count_commit_entities(db)
-    entity_valid_from, entity_descriptions, file_entities, submodule_paths = _preload_known_entities(db, repo_path)
-    file_deps, dep_valid_from = _preload_known_deps(db, file_entities)
-    pinned_commit_state = _preload_pinned_commits(db)
+    entity_valid_from, entity_descriptions, file_entities, submodule_paths = _preload_known_entities(
+        db, repo_path, valid_at=resume_valid_at,
+    )
+    file_deps, dep_valid_from = _preload_known_deps(
+        db, file_entities, valid_at_ms=resume_valid_at_ms,
+    )
+    pinned_commit_state = _preload_pinned_commits(db, valid_at_ms=resume_valid_at_ms)
     field_class_ident = _preload_field_class_idents(db)
     field_static_ident = _preload_field_static_idents(db)
     unresolved_dep_idents = _preload_unresolved_dep_idents(db, submodule_paths)
@@ -8086,7 +8256,8 @@ def _forward_apply(
                     )
                 _forward_reconcile_provisional(
                     db, ident, structural_triples_by_ident[ident],
-                    commit_ts_iso, state.ts_by_commit_ident, index_con=index_con,
+                    commit_ts_iso, state.ts_by_commit_ident, commit_ident,
+                    index_con=index_con,
                 )
             for ident in candidate_in_set:
                 state.provisional_idents.discard(ident)
