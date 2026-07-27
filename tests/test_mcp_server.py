@@ -11433,21 +11433,6 @@ class TestClosedEntityLifecyclePurge:
         timestamp, widening its valid window across the span it was closed for.
     """
 
-    @pytest.fixture(autouse=True)
-    def _forward_only_ratio(self, monkeypatch):
-        """#222 phase 2d: pin ingestion to the forward stream.
-
-        These tests are about the FORWARD walk's close/purge semantics for
-        deleted and renamed paths. "D"/"R" file handling in the reverse-fill
-        and correction-sweep paths is explicitly out of scope for phase 2
-        (docs/superpowers/specs/2026-07-26-concurrency-wiring-design.md,
-        "Out of scope"), so at the default 1:1 ratio the reverse stream would
-        claim the very commit that performs the deletion/rename and skip it.
-        Pinning the ratio forward-only keeps these tests measuring the
-        behaviour they were written to measure.
-        """
-        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
-
     def _make_progress(self):
         return {"status": "idle", "processed": 0, "total": 0, "current_commit": "",
                 "error": None, "prior_ingested": 0}
@@ -11473,7 +11458,31 @@ class TestClosedEntityLifecyclePurge:
     @pytest.mark.parametrize("variant", ["rename", "delete"])
     async def test_reused_path_new_entity_is_not_a_ghost(self, tmp_path, monkeypatch, variant):
         """The module re-created at the reused path a.py must have a CURRENT
-        :ident fact (join target for nearly every query)."""
+        :ident fact (join target for nearly every query).
+
+        #222 phase 2d Task 9 STILL PINS this one test forward-only, while the
+        rest of this class now runs at the 1:1 default. The remaining failure
+        is NOT the D/R/gitlink gap Stage B closes -- it is an independent
+        _reverse_apply (phase 2b) defect in A/M territory:
+
+          _build_close_triples never retracts :introduced-by, so a closed
+          entity keeps that fact forever. _reverse_apply's "is this entity
+          already known?" gate is _entity_introduced_by_query(db, ident),
+          which therefore still answers "known" for an ident that was closed
+          and purged by the forward walk. When such a path is RE-CREATED at a
+          position the reverse stream claims, _build_code_triples takes its
+          "already known" branch and emits only :modified-in -- the module
+          never re-asserts :ident/:description/:path and stays a ghost.
+          _correction_sweep_apply cannot repair it either: it reconciles
+          lineage only and never emits structural facts.
+
+        Fixing it means changing _reverse_apply's gate to test liveness (a
+        current :ident) rather than :introduced-by, which is phase-2b surface
+        and out of this task's scope. Measured directly: after a 1:1 run of
+        _reused_path_repo, :module/a-py has a live :introduced-by pointing at
+        the ORIGINAL c1 commit and no live :ident at all.
+        """
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
         repo = _reused_path_repo(tmp_path / "repo", variant)
         db = await self._ingest_and_open(repo, monkeypatch)
 
@@ -11522,14 +11531,6 @@ class TestClosedEntityLifecyclePurge:
 
 class TestRunIngestionBitemporalClose:
     """Integration tests verifying bi-temporal correctness of entity lifecycle handling."""
-
-    @pytest.fixture(autouse=True)
-    def _forward_only_ratio(self, monkeypatch):
-        """#222 phase 2d: pin ingestion to the forward stream -- see the
-        identically-named fixture on TestClosedEntityLifecyclePurge for the
-        rationale. Every test in this class turns on a deletion or a rename,
-        which only the forward walk handles."""
-        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
 
     def _make_progress(self):
         return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
@@ -12490,15 +12491,6 @@ class TestTransactValidTimeArgumentOrder:
 class TestRunIngestionBitemporalDeps:
     """Tests verifying that :depends-on edges are written/closed bi-temporally in the commit loop."""
 
-    @pytest.fixture(autouse=True)
-    def _forward_only_ratio(self, monkeypatch):
-        """#222 phase 2d: pin ingestion to the forward stream -- see the
-        identically-named fixture on TestClosedEntityLifecyclePurge.
-        :depends-on edge lifecycle (and its close on a removed import) is
-        forward-walk-owned; the reverse-fill path does not write or close
-        dependency edges."""
-        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
-
     def _make_progress(self):
         return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
 
@@ -13184,15 +13176,6 @@ class TestResolveModuleImportRelative:
 class TestRunIngestionGitlinks:
     """End-to-end tests for submodule add/bump/remove/flip via _run_ingestion."""
 
-    @pytest.fixture(autouse=True)
-    def _forward_only_ratio(self, monkeypatch):
-        """#222 phase 2d: pin ingestion to the forward stream -- see the
-        identically-named fixture on TestClosedEntityLifecyclePurge.
-        _reverse_apply consumes only _extract_commit's file_results and
-        discards its gitlink_changes/gitmodules_map, so submodule
-        add/bump/remove handling is forward-walk-only."""
-        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
-
     def _make_progress(self):
         return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
 
@@ -13489,14 +13472,6 @@ class TestSubmoduleDependencyLinking:
     Verified against the REAL minigraf backend (no mock), since the fix reads
     back existing external-dependency rows via a DB query at gitlink-add time.
     """
-
-    @pytest.fixture(autouse=True)
-    def _forward_only_ratio(self, monkeypatch):
-        """#222 phase 2d: pin ingestion to the forward stream -- see the
-        identically-named fixture on TestRunIngestionGitlinks. The
-        :resolves-to linking under test runs in the forward walk's gitlink
-        handling, which the reverse-fill path does not perform."""
-        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
 
     def _make_progress(self):
         return {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
@@ -16222,3 +16197,474 @@ class TestStageAInterleave:
         mcp_server._db = None
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete"
+
+
+class TestStageBCorrectionSweep:
+    """#222 phase 2d Task 9: Stage B -- the sequential correction sweep that
+    runs once Stage A's two streams have drained and the shared gap is
+    closed, turning the reverse stream's provisional guesses authoritative.
+
+    Real on-disk graph throughout (docs/testing-conventions.md Pattern 2):
+    _run_ingestion releases and reopens the DB between every commit, which an
+    in-memory store cannot survive.
+    """
+
+    def _repo(self, tmp_path, n_commits=6):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        # -b master explicitly: init.defaultBranch is machine-configurable, and
+        # every test below passes "master" to _run_ingestion.
+        _subprocess.run(["git", "init", "-b", "master"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(n_commits):
+            (repo / "auth.py").write_text(
+                f"def login():\n    return {i}\n\ndef helper_{i}():\n    pass\n"
+            )
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"h{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_completed_run_leaves_no_provisional_markers(self, tmp_path, monkeypatch):
+        """The headline postcondition of phase 2: after a full ingest,
+        every entity's lineage is authoritative."""
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+
+        db = MiniGrafDb.open(str(graph))
+        assert mcp_server._preload_provisional_idents(db) == set()
+
+    @pytest.mark.asyncio
+    async def test_no_entity_has_two_introduced_by_values(self, tmp_path, monkeypatch):
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+
+        db = MiniGrafDb.open(str(graph))
+        raw = mcp_server._db_execute(db, "(query [:find ?e ?c :where [?e :introduced-by ?c]])")
+        pairs = [tuple(row) for row in json.loads(raw)["results"]]
+        entities = [e for e, _c in pairs]
+        assert len(entities) == len(set(entities)), f"duplicate :introduced-by: {pairs}"
+
+    @pytest.mark.asyncio
+    async def test_lineage_confirmed_through_reaches_head(self, tmp_path, monkeypatch):
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+
+        db = MiniGrafDb.open(str(graph))
+        linearization = frontier_registry.build_linearization(str(repo), "master")
+        assert mcp_server._lineage_confirmed_through_query(db) == linearization[-1]
+
+    def test_fold_guard_does_not_fire_when_frontier_high_is_absent(self, real_db, tmp_path):
+        """_correction_sweep_select_position returns None for six reasons,
+        only one of which is 'reached the ceiling'. Folding the watermark on
+        any None would claim lineage is confirmed through HEAD in exactly
+        the cases where the sweep did no work at all."""
+        import mcp_server
+        repo = self._repo(tmp_path, n_commits=3)
+        linearization = frontier_registry.build_linearization(str(repo), "master")
+        commit_metadata = mcp_server._git_commits(str(repo), None, "master")
+        # frontier-high never created: forward claimed everything.
+        mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        assert mcp_server._correction_sweep_select_position(
+            real_db, linearization, commit_metadata,
+        ) is None
+        assert mcp_server._should_fold_lineage_watermark(real_db, linearization) is False
+
+    def test_fold_guard_fires_only_when_sweep_reached_the_ceiling(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo(tmp_path, n_commits=3)
+        linearization = frontier_registry.build_linearization(str(repo), "master")
+        commit_metadata = mcp_server._git_commits(str(repo), None, "master")
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        # Reverse claims the top two, forward the bottom one -> gap closed.
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        pos = allocator.claim_low()
+        mcp_server._frontier_persist_claim(
+            real_db, linearization, pos, from_low=True,
+            commit_ts_iso=commit_metadata[pos][1],
+        )
+        assert mcp_server._should_fold_lineage_watermark(real_db, linearization) is False
+        mcp_server._correction_sweep_walk(
+            real_db, str(repo), linearization, commit_metadata,
+        )
+        assert mcp_server._should_fold_lineage_watermark(real_db, linearization) is True
+
+
+class TestStageBRepairsLifecycleFacts:
+    """#222 phase 2d: the reverse stream skips D/R files and gitlink changes
+    entirely, so at the default 1:1 ratio the newest half of history loses
+    its deletions, renames and submodule bumps. Stage B applies them.
+
+    The oracle here is DIFFERENTIAL wherever it fits: the same repo is
+    ingested twice -- once at the 1:1 default (where the newest half of
+    history is reverse-claimed and repaired by Stage B) and once forward-only
+    via MINIGRAF_INGEST_STREAM_RATIO -- and the two graphs must agree. That is
+    far more durable against unrelated changes in fact shape than
+    hand-enumerated expected facts, and it is exactly the claim under test:
+    a mixed run must produce the same lifecycle facts a forward-only run does.
+    """
+
+    # (find-vars, where-clauses). Every subject is bound through its :ident so
+    # the rows are stable strings rather than minigraf's internal subject UUIDs.
+    _SNAPSHOT_QUERIES = {
+        "entity-type": ("?i ?v", "[?e :ident ?i] [?e :entity-type ?v]"),
+        "description": ("?i ?v", "[?e :ident ?i] [?e :description ?v]"),
+        "introduced-by": ("?i ?v", "[?e :ident ?i] [?e :introduced-by ?v]"),
+        "modified-in": ("?i ?v", "[?e :ident ?i] [?e :modified-in ?v]"),
+        "contains": ("?i ?v", "[?e :ident ?i] [?e :contains ?v]"),
+        "depends-on": ("?i ?v", "[?e :ident ?i] [?e :depends-on ?v]"),
+        "renamed-to": ("?i ?v", "[?e :ident ?i] [?e :renamed-to ?v]"),
+        "renamed-from": ("?i ?v", "[?e :ident ?i] [?e :renamed-from ?v]"),
+        "pinned-commit": ("?i ?v", "[?e :ident ?i] [?e :pinned-commit ?v]"),
+        "static": ("?i ?v", "[?e :ident ?i] [?e :static ?v]"),
+        "path": ("?i ?v", "[?e :ident ?i] [?e :path ?v]"),
+        "file": ("?i ?v", "[?e :ident ?i] [?e :file ?v]"),
+    }
+    # Bookkeeping entities that legitimately differ between the two runs:
+    # frontier-high and :ingestion/correction-sweep-through only exist when a
+    # reverse stream ran at all, and the lineage/candidate companion entities
+    # are transient scratch state.
+    _BOOKKEEPING_PREFIXES = (":ingestion/", ":lineage/", ":candidate/")
+
+    # ---- repo construction -------------------------------------------------
+
+    def _init(self, tmp_path, name="repo"):
+        repo = tmp_path / name
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "master"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def _commit(self, repo, msg, day, paths=None):
+        """Commit with a pinned, distinct calendar day so point-in-time
+        (:valid-at) assertions can target a moment strictly inside an
+        entity's true valid window.
+
+        paths=None stages everything (`git add -A`). Any repo carrying a
+        gitlink MUST pass an explicit list instead: `git add -A` sees the
+        submodule's absent working tree and stages the gitlink's deletion,
+        which silently turns a bump into a remove.
+        """
+        ts = f"2020-01-{day:02d}T00:00:00Z"
+        env = {**os.environ, "GIT_AUTHOR_DATE": ts, "GIT_COMMITTER_DATE": ts}
+        add_args = ["-A"] if paths is None else list(paths)
+        if add_args:
+            _subprocess.run(["git", "add", *add_args], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(
+            ["git", "commit", "-m", msg], cwd=repo, check=True, capture_output=True, env=env,
+        )
+
+    def _add_submodule(self, repo, day, path="modules/lib", name="lib",
+                       url="https://example.com/lib.git"):
+        sub = repo.parent / f"{repo.name}-sub"
+        _subprocess.run(["git", "init", "-q", "-b", "master", str(sub)], check=True, capture_output=True)
+        _subprocess.run(["git", "-C", str(sub), "config", "user.email", "t@t.com"], check=True, capture_output=True)
+        _subprocess.run(["git", "-C", str(sub), "config", "user.name", "T"], check=True, capture_output=True)
+        _subprocess.run(["git", "-C", str(sub), "commit", "--allow-empty", "-m", "e"], check=True, capture_output=True)
+        sub_hash = _subprocess.run(
+            ["git", "-C", str(sub), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        (repo / ".gitmodules").write_text(f'[submodule "{name}"]\n\tpath = {path}\n\turl = {url}\n')
+        _subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", f"160000,{sub_hash},{path}"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        self._commit(repo, "add submodule", day, paths=[".gitmodules"])
+        return sub_hash
+
+    def _bump_submodule(self, repo, day, path="modules/lib", extra_paths=()):
+        sub = repo.parent / f"{repo.name}-sub"
+        _subprocess.run(["git", "-C", str(sub), "commit", "--allow-empty", "-m", "bump"], check=True, capture_output=True)
+        new_hash = _subprocess.run(
+            ["git", "-C", str(sub), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        _subprocess.run(
+            ["git", "update-index", "--cacheinfo", f"160000,{new_hash},{path}"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        self._commit(repo, "bump submodule", day, paths=list(extra_paths))
+        return new_hash
+
+    # ---- ingestion / snapshot helpers -------------------------------------
+
+    async def _ingest(self, repo, graph_path, monkeypatch, ratio):
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", ratio)
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
+        mcp_server._db = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        }
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+        mcp_server._db = None
+
+    def _results(self, graph_path, datalog):
+        import mcp_server
+        from minigraf import MiniGrafDb
+        db = MiniGrafDb.open(str(graph_path))
+        try:
+            return json.loads(mcp_server._db_execute(db, datalog)).get("results", [])
+        finally:
+            db = None  # drop the handle so the file lock is released
+
+    def _snapshot(self, graph_path, valid_at=None):
+        import mcp_server
+        from minigraf import MiniGrafDb
+        clause = f' :valid-at "{valid_at}"' if valid_at else ""
+        db = MiniGrafDb.open(str(graph_path))
+        try:
+            out = {}
+            for label, (find, where) in self._SNAPSHOT_QUERIES.items():
+                raw = mcp_server._db_execute(db, f"(query [:find {find}{clause} :where {where}])")
+                out[label] = sorted(
+                    tuple(row) for row in json.loads(raw).get("results", [])
+                    if not str(row[0]).startswith(self._BOOKKEEPING_PREFIXES)
+                )
+            return out
+        finally:
+            db = None
+
+    async def _assert_graphs_agree(self, repo, tmp_path, monkeypatch, valid_ats=()):
+        """Ingest `repo` twice -- 1:1 default, then forward-only -- and assert
+        the two graphs carry identical facts, at current time and at every
+        supplied point in valid time."""
+        mixed = tmp_path / "mixed.graph"
+        forward = tmp_path / "forward.graph"
+        await self._ingest(repo, mixed, monkeypatch, "1:1")
+        await self._ingest(repo, forward, monkeypatch, f"{10**6}:1")
+        for valid_at in (None,) + tuple(valid_ats):
+            a = self._snapshot(mixed, valid_at)
+            b = self._snapshot(forward, valid_at)
+            for label in self._SNAPSHOT_QUERIES:
+                assert a[label] == b[label], (
+                    f"1:1 and forward-only graphs disagree on {label} "
+                    f"(valid_at={valid_at}):\n  only in 1:1:  "
+                    f"{sorted(set(a[label]) - set(b[label]))}\n  only in fwd: "
+                    f"{sorted(set(b[label]) - set(a[label]))}"
+                )
+        return mixed
+
+    def _assert_reverse_claimed(self, graph_path, repo, positions):
+        """Guard against a vacuous differential: the commits carrying the
+        lifecycle change must actually have landed in frontier-high's
+        territory, otherwise the two runs agree for the boring reason."""
+        import mcp_server
+        from minigraf import MiniGrafDb
+        db = MiniGrafDb.open(str(graph_path))
+        try:
+            high = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        finally:
+            db = None
+        assert high is not None, "the reverse stream claimed nothing -- test is vacuous"
+        linearization = frontier_registry.build_linearization(str(repo), "master")
+        pos = {h: i for i, h in enumerate(linearization)}
+        lo, hi = pos[high[0]], pos[high[1]]
+        for p in positions:
+            assert lo <= p <= hi, (
+                f"position {p} was not reverse-claimed (frontier-high covers "
+                f"{lo}..{hi}) -- this test would pass vacuously"
+            )
+
+    # ---- the tests ---------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_deletion_in_the_reverse_region_is_closed(self, tmp_path, monkeypatch):
+        """A function deleted in a recent commit must not still read as live
+        at HEAD. Without Stage B's lifecycle pass it stays open forever."""
+        import mcp_server
+        repo = self._init(tmp_path)
+        (repo / "a.py").write_text("def alpha():\n    return 1\n")
+        (repo / "b.py").write_text("def beta():\n    return 2\n")
+        self._commit(repo, "c1", 1)
+        (repo / "a.py").write_text("def alpha():\n    return 11\n")
+        self._commit(repo, "c2", 2)
+        (repo / "b.py").write_text("def beta():\n    return 22\n")
+        self._commit(repo, "c3", 3)                       # position 2 -- reverse
+        _subprocess.run(["git", "rm", "b.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "c4 delete b.py", 4)           # position 3 -- reverse
+
+        mixed = await self._assert_graphs_agree(
+            repo, tmp_path, monkeypatch, valid_ats=("2020-01-03T12:00:00Z",),
+        )
+        self._assert_reverse_claimed(mixed, repo, [3])
+
+        module_ident = mcp_server._code_ident("module", "b.py")
+        fn_ident = mcp_server._code_ident("function", "b.py", "beta")
+        for ident in (module_ident, fn_ident):
+            assert self._results(mixed, f"(query [:find ?i :where [{ident} :ident ?i]])") == [], \
+                f"{ident} was deleted at HEAD but still reads as live"
+            # ...and it must still be visible strictly inside its true window.
+            assert self._results(
+                mixed,
+                f'(query [:find ?i :valid-at "2020-01-03T12:00:00Z" :where [{ident} :ident ?i]])',
+            ) == [[ident]], f"{ident} must be live before the delete commit"
+
+    @pytest.mark.asyncio
+    async def test_rename_in_the_reverse_region_emits_both_edges(self, tmp_path, monkeypatch):
+        """:renamed-from AND :renamed-to, and the old module closed.
+
+        The new path is ALSO modified one commit later, which the reverse
+        stream claims first -- so it holds a provisional :introduced-by guess
+        at that later commit which the sweep's rename application must
+        supersede rather than duplicate.
+        """
+        import mcp_server
+        repo = self._init(tmp_path)
+        (repo / "old.py").write_text("def f():\n    return 1\n")
+        (repo / "other.py").write_text("def g():\n    return 1\n")
+        self._commit(repo, "c1", 1)
+        (repo / "other.py").write_text("def g():\n    return 2\n")
+        self._commit(repo, "c2", 2)
+        _subprocess.run(["git", "mv", "old.py", "new.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "c3 rename", 3)                # position 2 -- reverse
+        (repo / "new.py").write_text("def f():\n    return 3\n")
+        self._commit(repo, "c4 edit new.py", 4)           # position 3 -- reverse
+
+        mixed = await self._assert_graphs_agree(repo, tmp_path, monkeypatch)
+        self._assert_reverse_claimed(mixed, repo, [2, 3])
+
+        old_ident = mcp_server._code_ident("module", "old.py")
+        new_ident = mcp_server._code_ident("module", "new.py")
+        assert self._results(
+            mixed, f"(query [:find ?n :where [{old_ident} :renamed-to ?n]])"
+        ) == [[new_ident]], ":renamed-to was never emitted for the reverse-region rename"
+        assert self._results(
+            mixed, f"(query [:find ?o :where [{new_ident} :renamed-from ?o]])"
+        ) == [[old_ident]], ":renamed-from was never emitted for the reverse-region rename"
+        assert self._results(
+            mixed, f"(query [:find ?i :where [{old_ident} :ident ?i]])"
+        ) == [], "the renamed-away module must be closed"
+        # The new path's lineage must be single-valued: the rename is its
+        # introduction, superseding the reverse stream's later guess.
+        intro = self._results(
+            mixed, f"(query [:find ?c :where [{new_ident} :introduced-by ?c]])"
+        )
+        assert len(intro) == 1, f"new path has ambiguous :introduced-by: {intro}"
+
+    @pytest.mark.asyncio
+    async def test_submodule_bump_in_the_reverse_region_updates_pinned_commit(
+        self, tmp_path, monkeypatch
+    ):
+        """Gitlink changes are discarded for reverse-claimed commits in
+        Stage A; the sweep must apply them."""
+        import mcp_server
+        repo = self._init(tmp_path)
+        (repo / "main.py").write_text("def main():\n    return 1\n")
+        self._commit(repo, "c1", 1)
+        first_sha = self._add_submodule(repo, day=2)      # position 1 -- forward
+        (repo / "main.py").write_text("def main():\n    return 2\n")
+        self._commit(repo, "c3", 3, paths=["main.py"])    # position 2 -- reverse
+        second_sha = self._bump_submodule(repo, day=4)    # position 3 -- reverse
+
+        mixed = await self._assert_graphs_agree(repo, tmp_path, monkeypatch)
+        self._assert_reverse_claimed(mixed, repo, [3])
+
+        sub_ident = mcp_server._code_ident("module", "modules/lib")
+        assert self._results(
+            mixed, f"(query [:find ?p :where [{sub_ident} :pinned-commit ?p]])"
+        ) == [[second_sha]], "the bump's new pinned-commit must be the only live one"
+        assert self._results(
+            mixed,
+            f'(query [:find ?p :valid-at "2020-01-03T12:00:00Z" '
+            f":where [{sub_ident} :pinned-commit ?p]])",
+        ) == [[first_sha]], "the original pin must stay visible inside its own window"
+
+    @pytest.mark.asyncio
+    async def test_entity_born_and_deleted_inside_the_reverse_region(self, tmp_path, monkeypatch):
+        """The case that motivates calling _build_code_triples for its dict
+        side effects on A/M files: the entity is absent from the Stage-A
+        entity_valid_from, so without that bookkeeping its close falls back
+        to the DELETE commit's own timestamp and yields a wrong (often
+        zero-width) valid interval."""
+        import mcp_server
+        repo = self._init(tmp_path)
+        (repo / "a.py").write_text("def alpha():\n    return 1\n")
+        self._commit(repo, "c1", 1)
+        (repo / "a.py").write_text("def alpha():\n    return 11\n")
+        self._commit(repo, "c2", 2)
+        (repo / "b.py").write_text("def beta():\n    return 2\n")
+        self._commit(repo, "c3 born", 3)                  # position 2 -- reverse
+        _subprocess.run(["git", "rm", "b.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "c4 died", 4)                  # position 3 -- reverse
+
+        mixed = await self._assert_graphs_agree(
+            repo, tmp_path, monkeypatch, valid_ats=("2020-01-03T12:00:00Z",),
+        )
+        self._assert_reverse_claimed(mixed, repo, [2, 3])
+
+        # Born at c3 (day 3), deleted at c4 (day 4): live strictly between.
+        # A close that fell back to the delete commit's own timestamp would
+        # produce the zero-width window [day4, day4) and fail here.
+        fn_ident = mcp_server._code_ident("function", "b.py", "beta")
+        assert self._results(
+            mixed,
+            f'(query [:find ?d :valid-at "2020-01-03T12:00:00Z" :where [{fn_ident} :description ?d]])',
+        ) == [["beta"]], "entity born and deleted inside the reverse region has a wrong valid window"
+        assert self._results(
+            mixed,
+            f'(query [:find ?d :valid-at "2020-01-02T12:00:00Z" :where [{fn_ident} :description ?d]])',
+        ) == [], "entity must not be visible before its introduction"
+        assert self._results(
+            mixed, f"(query [:find ?d :where [{fn_ident} :description ?d]])"
+        ) == [], "entity must not be visible after its deletion"
+
+    @pytest.mark.asyncio
+    async def test_am_facts_are_not_duplicated_by_the_lifecycle_pass(self, tmp_path, monkeypatch):
+        """lifecycle_only must DISCARD _build_code_triples' output for A/M.
+        Re-transacting the same (entity, attribute, value) under a different
+        valid-from creates a genuinely live duplicate rather than a no-op
+        (#156), so assert exactly one :introduced-by and one :entity-type
+        per entity after a full run over a repo whose reverse region carries
+        a deletion, a rename AND a submodule bump."""
+        import mcp_server
+        repo = self._init(tmp_path)
+        (repo / "a.py").write_text("def alpha():\n    return 1\n")
+        (repo / "b.py").write_text("def beta():\n    return 2\n")
+        self._commit(repo, "c1", 1)
+        (repo / "a.py").write_text("def alpha():\n    return 11\n")
+        self._commit(repo, "c2", 2)
+        self._add_submodule(repo, day=3)                  # position 2 -- forward
+        _subprocess.run(["git", "rm", "b.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "c4 delete b.py", 4, paths=[])  # position 3 -- reverse
+        _subprocess.run(["git", "mv", "a.py", "c.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "c5 rename a.py", 5, paths=[])  # position 4 -- reverse
+        (repo / "c.py").write_text("def alpha():\n    return 111\n")
+        # bump + edit the renamed file in one commit: the reverse stream
+        # claims this position and discards the gitlink half entirely.
+        self._bump_submodule(repo, day=6, extra_paths=["c.py"])  # position 5 -- reverse
+
+        mixed = await self._assert_graphs_agree(repo, tmp_path, monkeypatch)
+        self._assert_reverse_claimed(mixed, repo, [3, 4, 5])
+
+        for attr in (":introduced-by", ":entity-type"):
+            rows = [tuple(r) for r in self._results(
+                mixed, f"(query [:find ?i ?v :where [?e :ident ?i] [?e {attr} ?v]])"
+            ) if not str(r[0]).startswith(self._BOOKKEEPING_PREFIXES)]
+            subjects = [i for i, _v in rows]
+            assert len(subjects) == len(set(subjects)), \
+                f"duplicate live {attr} facts after the lifecycle pass: " \
+                f"{sorted(r for r in rows if subjects.count(r[0]) > 1)}"

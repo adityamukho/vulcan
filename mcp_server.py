@@ -7847,6 +7847,7 @@ def _forward_apply(
     index_con: Optional[Any] = None,
     linearization: Optional[List[str]] = None,
     pos: Optional[int] = None,
+    lifecycle_only: bool = False,
 ) -> None:
     """Apply one commit's forward-walk writes.
 
@@ -7862,13 +7863,53 @@ def _forward_apply(
     frontier-low claim and advances the lineage-confirmed-through watermark;
     both default to None so the existing tests that call this function with a
     bare commit tuple stay valid.
+
+    lifecycle_only (#222 phase 2d, Stage B) restricts this to the facts the
+    REVERSE stream never wrote for a commit in frontier-high's territory --
+    deletions, renames, dependency-edge churn and gitlink changes -- while
+    leaving that commit's "A"/"M" entity facts alone. It is not a re-run of
+    the forward body: nothing wrote D/R or gitlink facts for these commits,
+    so there is nothing to deduplicate against, whereas re-running the A/M
+    emission WOULD duplicate (minigraf mints a genuinely live duplicate when
+    the same (entity, attribute, value) is re-transacted at a different
+    valid-from -- issue #156). Concretely, when true:
+
+    * The commit's own :type/commit entity and its :parent edges are skipped
+      -- _reverse_apply already wrote both for every commit in this range
+      (the same reason _correction_sweep_apply gives for not writing them).
+    * "D" files, "R" files and gitlink changes are processed unchanged. "R"
+      keeps its _build_code_triples emission for the NEW path: the reverse
+      stream skipped renames entirely, so nothing ever wrote those entities.
+    * "A"/"M" files still CALL _build_code_triples, and its returned triples
+      are DISCARDED. This looks redundant and is not: state.entity_valid_from
+      after Stage A covers only positions 0..meeting_point, so an entity
+      introduced INSIDE the reverse region is absent from it and a later
+      deletion of that entity within the same region would close with
+      orig_ts falling back to the delete commit's own timestamp -- a wrong,
+      often zero-width valid interval. Calling the function and dropping its
+      output keeps entity_valid_from / entity_descriptions / file_entities /
+      field_class_ident / field_static_ident current at zero fact cost, and
+      the sweep's ascending order makes the recorded timestamp the correct
+      EARLIEST one (_build_code_triples only writes entity_valid_from[ident]
+      when the ident is not already present).
+    * Provisional-lineage reconciliation is skipped for "A"/"M" --
+      _correction_sweep_apply owns those entities' lineage and has already
+      run for this commit. It is still performed for an "R" file's new path,
+      where the reverse stream may hold a provisional guess at a LATER
+      commit that this rename supersedes; there the DB is consulted
+      directly, because state.provisional_idents is a run-start preload
+      snapshot and is empty on a fresh ingest.
+    * _watermark_update, _frontier_persist_claim and
+      _lineage_confirmed_through_update are skipped. Stage B tracks its own
+      progress through :ingestion/correction-sweep-through, and the forward
+      frontier must not appear to advance into the reverse region.
     """
     commit_hash, commit_ts_iso, author, subject = commit
     extracted_files, gitlink_changes, gitmodules_map, renamed_pairs = extracted
     commit_ident = f":commit/{commit_hash[:12]}"
     reason = f"git:{commit_hash} {author}: {subject}"
 
-    add_triples: List[str] = [
+    add_triples: List[str] = [] if lifecycle_only else [
         f"[{commit_ident} :entity-type :type/commit]",
         f'[{commit_ident} :ident "{commit_ident}"]',
         f'[{commit_ident} :description "{_edn_escape(subject[:120])}"]',
@@ -7984,14 +8025,34 @@ def _forward_apply(
             # check -- a stale entry left in place would be retried, and
             # fail the same way, on every later commit that touches the
             # entity.
-            candidate_in_set = [
-                ident for ident in _forward_candidate_idents(precomputed)
-                if ident in state.provisional_idents
-            ]
-            reconcilable = [
-                ident for ident in candidate_in_set
-                if _lineage_is_provisional(db, ident)
-            ]
+            #
+            # lifecycle_only (Stage B): _correction_sweep_apply owns "A"/"M"
+            # lineage and has already run for this very commit, so
+            # reconciling here would mint a second :introduced-by behind its
+            # back. An "R" file's NEW path is the one case that still needs
+            # it -- nothing wrote those entities in Stage A, so the reverse
+            # stream's provisional guess (if any) sits at a LATER commit that
+            # this rename supersedes. state.provisional_idents cannot be the
+            # prefilter there: it is a run-start snapshot, empty on a fresh
+            # ingest, and the guess was made during this same run.
+            if lifecycle_only:
+                candidate_in_set = []
+                reconcilable = (
+                    [
+                        ident for ident in _forward_candidate_idents(precomputed)
+                        if _lineage_is_provisional(db, ident)
+                    ]
+                    if status == "R" else []
+                )
+            else:
+                candidate_in_set = [
+                    ident for ident in _forward_candidate_idents(precomputed)
+                    if ident in state.provisional_idents
+                ]
+                reconcilable = [
+                    ident for ident in candidate_in_set
+                    if _lineage_is_provisional(db, ident)
+                ]
             # Built once per file rather than scanned per ident (matches
             # _reverse_fill_claim_and_process's candidate_triples_by_ident
             # precedent) -- a per-ident linear scan here is O(n^2) per file
@@ -8026,7 +8087,12 @@ def _forward_apply(
                 state.entity_descriptions, state.file_entities, commit_ident, precomputed,
                 state.field_class_ident, state.field_static_ident,
             )
-            add_triples.extend(triples)
+            # lifecycle_only: called for its dict side effects, output
+            # DISCARDED for "A"/"M" (see this function's docstring). "R" keeps
+            # it -- the reverse stream skipped renames entirely, so nothing
+            # ever wrote the new path's entities.
+            if not lifecycle_only or status == "R":
+                add_triples.extend(triples)
             # Detect entities removed from a modified file.
             # _build_code_triples only appends to state.file_entities, never removes.
             # Compare previous idents against the idents derivable from the
@@ -8285,31 +8351,41 @@ def _forward_apply(
     # edge also lands in the persisted fact index -- see #118 review
     # finding: this call site used to build its own raw (transact
     # ...) string and bypass the index choke point entirely.
-    try:
-        for parent_hash in _git_parent_hashes(repo_path, commit_hash):
-            parent_ident = f":commit/{parent_hash[:12]}"
-            _transact(
-                db,
-                f'[[{commit_ident} :parent {parent_ident}]]',
-                commit_ts_iso,
-                None,
-                None,
-                index_con,
-            )
-    except Exception:
-        pass  # non-fatal; parent edges are best-effort
+    # lifecycle_only: _reverse_apply already wrote this commit's :parent
+    # edges (and its :type/commit entity, skipped at the top of this
+    # function) for every commit in frontier-high's territory.
+    if not lifecycle_only:
+        try:
+            for parent_hash in _git_parent_hashes(repo_path, commit_hash):
+                parent_ident = f":commit/{parent_hash[:12]}"
+                _transact(
+                    db,
+                    f'[[{commit_ident} :parent {parent_ident}]]',
+                    commit_ts_iso,
+                    None,
+                    None,
+                    index_con,
+                )
+        except Exception:
+            pass  # non-fatal; parent edges are best-effort
 
-    _watermark_update(db, commit_hash, commit_ts_iso, reason, index_con)
-    if linearization is not None and pos is not None:
-        _frontier_persist_claim(
-            db, linearization, pos, from_low=True,
-            commit_ts_iso=commit_ts_iso, index_con=index_con,
-        )
-    # The virgin positions this walk claims are authoritative on first write,
-    # so lineage is confirmed contiguously from C0 through here. The sweep
-    # folds its own region in later (Task 9); this watermark must not be
-    # advanced past the forward frontier before that happens.
-    _lineage_confirmed_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
+    # lifecycle_only: Stage B tracks its own progress through
+    # :ingestion/correction-sweep-through (written by _correction_sweep_apply),
+    # and none of these three watermarks may advance into the reverse region --
+    # :ingestion/watermark and :ingestion/lineage-confirmed-through both mean
+    # "contiguous from C0", and frontier-low belongs to the forward stream.
+    if not lifecycle_only:
+        _watermark_update(db, commit_hash, commit_ts_iso, reason, index_con)
+        if linearization is not None and pos is not None:
+            _frontier_persist_claim(
+                db, linearization, pos, from_low=True,
+                commit_ts_iso=commit_ts_iso, index_con=index_con,
+            )
+        # The virgin positions this walk claims are authoritative on first write,
+        # so lineage is confirmed contiguously from C0 through here. The sweep
+        # folds its own region in later (Task 9); this watermark must not be
+        # advanced past the forward frontier before that happens.
+        _lineage_confirmed_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
     _db_checkpoint(db)
     _commit_index_writer_safe(index_con)
 
@@ -8689,6 +8765,29 @@ def _correction_sweep_walk(
         skipped_events += call_skipped
     _correction_sweep_log_summary(skipped_events)
     return commits_processed, skipped_events
+
+
+def _should_fold_lineage_watermark(db: Any, linearization: List[str]) -> bool:
+    """True iff the correction sweep genuinely reached frontier-high's own
+    :hi-hash, so :ingestion/lineage-confirmed-through may be folded forward
+    to it.
+
+    Stage B's loop exit alone must NOT trigger the fold.
+    _correction_sweep_select_position returns None for six different
+    reasons, only one of which is "reached the ceiling": it also returns
+    None when frontier-high is absent, when either boundary hash is stale
+    (rewritten history), when the gap is still open, and when
+    commit_metadata violates its contract. Folding on any None would report
+    lineage as confirmed through HEAD in exactly the situations where the
+    sweep did no work at all.
+    """
+    high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
+    if high_bounds is None:
+        return False
+    through_hash = _correction_sweep_through_query(db)
+    if through_hash is None:
+        return False
+    return through_hash == high_bounds[1] and through_hash in set(linearization)
 
 
 _DEFAULT_STREAM_RATIO = (1, 1)
@@ -9076,6 +9175,84 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
                     _ingest_progress["processed"] += 1
                     await asyncio.sleep(0)  # yield to event loop
+
+                # Stage B: the correction sweep. A third, strictly
+                # SEQUENTIAL pass, not a third concurrent task -- claim_low()
+                # and claim_high() partition one shared gap, so no sequence of
+                # forward claims can reach territory the reverse stream
+                # already claimed, and the sweep's own precondition is that
+                # the gap is already closed.
+                #
+                # Drives 2c's three pieces directly on their correct
+                # executors. _correction_sweep_claim_and_process and
+                # _correction_sweep_walk must NOT be used here: both fuse the
+                # CPU-bound parse and the DB-bound writes into one body.
+                if completed_all:
+                    _ingest_progress["phase"] = "sweeping"
+                    hash_to_pos = {h: i for i, h in enumerate(linearization)}
+                    skipped = 0
+                    db = await _ensure_db_async()
+                    try:
+                        while not _shutdown_requested.is_set():
+                            selected = await loop.run_in_executor(
+                                write_executor, _correction_sweep_select_position,
+                                db, linearization, commit_metadata, hash_to_pos,
+                            )
+                            if selected is None:
+                                break
+                            sweep_hash, sweep_ts = selected
+                            try:
+                                sweep_extracted = await loop.run_in_executor(
+                                    executor, _extract_commit, repo_path, sweep_hash, ignore_patterns,
+                                )
+                                sweep_files = sweep_extracted[0]
+                                skipped += await loop.run_in_executor(
+                                    write_executor, _correction_sweep_apply,
+                                    db, sweep_hash, sweep_ts, sweep_files, index_con, skipped,
+                                )
+                                # Apply the lifecycle facts the reverse stream
+                                # skipped entirely (D/R closes, renames,
+                                # dependency-edge churn, gitlink changes).
+                                # Fresh writes, not re-application -- nothing
+                                # wrote them for these commits. Runs AFTER the
+                                # A/M reconciliation above so an entity's
+                                # lineage is already authoritative before a
+                                # close in the same commit reads its window.
+                                await loop.run_in_executor(
+                                    write_executor, _forward_apply, db, repo_path, state,
+                                    commit_metadata[hash_to_pos[sweep_hash]],
+                                    sweep_extracted, index_con, None, None, True,
+                                )
+                            except concurrent.futures.process.BrokenProcessPool:
+                                raise
+                            except Exception as e:
+                                # A sweep-step failure aborts Stage B only.
+                                # Stage A's work is already persisted, and the
+                                # next run resumes from the sweep watermark.
+                                print(
+                                    f"[_run_ingestion] correction sweep aborted at {sweep_hash}: {e}",
+                                    file=sys.stderr,
+                                )
+                                completed_all = False
+                                break
+                            await asyncio.sleep(0)  # yield to event loop
+                        if _shutdown_requested.is_set():
+                            completed_all = False
+                        _correction_sweep_log_summary(skipped)
+                        # DB-bound like everything else here, so it runs on
+                        # write_executor rather than inline on the event loop.
+                        should_fold = completed_all and await loop.run_in_executor(
+                            write_executor, _should_fold_lineage_watermark, db, linearization,
+                        )
+                        if should_fold:
+                            await loop.run_in_executor(
+                                write_executor, _lineage_confirmed_through_update,
+                                db, linearization[-1], commit_metadata[-1][1], index_con,
+                            )
+                            await loop.run_in_executor(write_executor, _db_checkpoint, db)
+                    finally:
+                        _db = None
+                        db = None
 
                 # Call _ingest_tags and _last_run_write before closing index_con
                 # so they use the batched connection instead of opening new ones
