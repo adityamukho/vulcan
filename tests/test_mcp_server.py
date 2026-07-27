@@ -11500,6 +11500,54 @@ class TestClosedEntityLifecyclePurge:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("variant", ["rename", "delete"])
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "KNOWN pre-existing phase-2b defect, NOT the D/R gap #222 phase 2d "
+            "Stage B closes: _build_close_triples never retracts :introduced-by, "
+            "so a closed-and-purged entity keeps that fact forever, and "
+            "_reverse_apply's known-entity gate -- "
+            "_entity_introduced_by_query(db, ident) is not None -- still answers "
+            "'known' for it. At the 1:1 default, c3 (which re-creates a.py) lands "
+            "in frontier-high's territory, so _build_code_triples takes its "
+            "'already known' branch and emits only :modified-in: the module is "
+            "resurrected as a ghost with no current :ident. Fixing it means "
+            "changing that gate to test liveness, which is out of Task 9's scope."
+        ),
+    )
+    async def test_reused_path_new_entity_is_not_a_ghost_at_default_ratio(
+        self, tmp_path, monkeypatch, variant
+    ):
+        """Companion to the forward-only-pinned variant above, at the 1:1
+        DEFAULT ratio -- the configuration that actually ships.
+
+        The pin alone makes the suite green at exactly the configuration
+        that hides the ghost, with nothing left to notice when the bug is
+        fixed or when it spreads. This test is that alarm: strict=True means
+        it FAILS the day someone repairs _reverse_apply's gate, forcing both
+        the xfail and the forward-only pin to be removed together rather than
+        letting a stale exemption silently mask a later regression.
+        """
+        # Explicitly at the default: an ambient MINIGRAF_INGEST_STREAM_RATIO
+        # would otherwise decide which stream claims c3 and make the xfail
+        # non-deterministic.
+        monkeypatch.delenv("MINIGRAF_INGEST_STREAM_RATIO", raising=False)
+        repo = _reused_path_repo(tmp_path / "repo", variant)
+        db = await self._ingest_and_open(repo, monkeypatch)
+
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "a.py")
+        g_ident = mcp_server._code_ident("function", "a.py", "g")
+
+        module_now = self._results(db, f'(query [:find ?i :where [{module_ident} :ident ?i]])')
+        assert module_now == [[module_ident]], \
+            f"[{variant}] re-created module at reused path has no current :ident (ghost): {module_now}"
+
+        g_now = self._results(db, f'(query [:find ?i :where [{g_ident} :ident ?i]])')
+        assert g_now == [[g_ident]], f"[{variant}] re-created function g missing current :ident: {g_now}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("variant", ["rename", "delete"])
     async def test_reused_path_no_phantom_resurrection_window(self, tmp_path, monkeypatch, variant):
         """The original function f (closed at commit2) must NOT be visible at any
         point-in-time between its close (commit2) and the final commit."""
@@ -16269,6 +16317,92 @@ class TestStageBCorrectionSweep:
         db = MiniGrafDb.open(str(graph))
         linearization = frontier_registry.build_linearization(str(repo), "master")
         assert mcp_server._lineage_confirmed_through_query(db) == linearization[-1]
+
+    @pytest.mark.asyncio
+    async def test_phase_is_cleared_when_the_run_finishes(self, tmp_path, monkeypatch):
+        """"phase" describes what a RUNNING ingest is doing. Stage B sets it to
+        "sweeping" and, before this fix, never cleared it -- so
+        minigraf_ingest_status reported {"status": "complete", "phase":
+        "sweeping"} for the entire remaining life of the server process."""
+        import mcp_server
+        repo = self._repo(tmp_path)
+        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress.get("phase") is None, (
+            f"a finished run still reports phase="
+            f"{mcp_server._ingest_progress.get('phase')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_failure_does_not_advance_the_sweep_watermark(
+        self, tmp_path, monkeypatch
+    ):
+        """Stage B does TWO things per swept commit: _correction_sweep_apply
+        (A/M lineage) and then _forward_apply(lifecycle_only=True) (the D/R
+        and gitlink facts the reverse stream skipped). If the sweep watermark
+        advanced when the first half finished, a failure in the second half
+        would leave :ingestion/correction-sweep-through naming a commit whose
+        deletions, renames and gitlink changes were never written -- and the
+        next run's _correction_sweep_select_position, which resumes at
+        through + 1, would skip that commit permanently and silently.
+
+        So: make the lifecycle pass raise for one specific swept commit and
+        assert the watermark still names its PREDECESSOR, i.e. a subsequent
+        run re-selects the failed commit and reprocesses it whole. Asserted
+        directly by calling _correction_sweep_select_position on the
+        persisted graph afterwards.
+        """
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
+
+        swept: list = []
+        real_forward_apply = mcp_server._forward_apply
+
+        def failing_forward_apply(*args, **kwargs):
+            # _run_ingestion submits this via run_in_executor, which passes
+            # every argument positionally -- lifecycle_only is the 9th.
+            lifecycle_only = args[8] if len(args) > 8 else kwargs.get("lifecycle_only", False)
+            if lifecycle_only:
+                swept.append(args[3][0])  # commit tuple's hash
+                if len(swept) == 2:
+                    raise RuntimeError("lifecycle pass boom")
+            return real_forward_apply(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", failing_forward_apply)
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+
+        # Guard against a vacuous pass: the sweep must genuinely have reached
+        # a second commit and failed on it.
+        assert len(swept) == 2, f"expected the sweep to fail on its 2nd commit, saw {swept}"
+        succeeded_hash, failed_hash = swept
+        assert mcp_server._ingest_progress["status"] == "stopped"
+
+        db = MiniGrafDb.open(str(graph))
+        through = mcp_server._correction_sweep_through_query(db)
+        assert through != failed_hash, (
+            "the sweep watermark names a commit whose lifecycle pass failed -- "
+            "its deletions/renames/gitlink changes are lost forever"
+        )
+        assert through == succeeded_hash, (
+            f"watermark should still name the last fully-swept commit, got {through}"
+        )
+
+        # The real consequence: a subsequent run re-selects the failed commit.
+        linearization = frontier_registry.build_linearization(str(repo), "master")
+        commit_metadata = mcp_server._git_commits(str(repo), None, "master")
+        selected = mcp_server._correction_sweep_select_position(
+            db, linearization, commit_metadata,
+        )
+        assert selected is not None and selected[0] == failed_hash, (
+            f"next run must resume at the failed commit {failed_hash}, got {selected}"
+        )
 
     def test_fold_guard_does_not_fire_when_frontier_high_is_absent(self, real_db, tmp_path):
         """_correction_sweep_select_position returns None for six reasons,

@@ -8036,7 +8036,6 @@ def _forward_apply(
             # prefilter there: it is a run-start snapshot, empty on a fresh
             # ingest, and the guess was made during this same run.
             if lifecycle_only:
-                candidate_in_set = []
                 reconcilable = (
                     [
                         ident for ident in _forward_candidate_idents(precomputed)
@@ -8044,6 +8043,14 @@ def _forward_apply(
                     ]
                     if status == "R" else []
                 )
+                # The eviction invariant above still holds here, it just has a
+                # different source: the preload snapshot is not the prefilter in
+                # this mode, so what must leave the set is exactly what was
+                # reconciled. Leaving these behind (the eviction loop's `[]` in
+                # an earlier revision) meant an R-file ident reconciled during
+                # Stage B stayed in state.provisional_idents and would be
+                # retried by every later commit touching the entity.
+                candidate_in_set = list(reconcilable)
             else:
                 candidate_in_set = [
                     ident for ident in _forward_candidate_idents(precomputed)
@@ -8572,6 +8579,7 @@ def _correction_sweep_apply(
     file_results: List[tuple],
     index_con: Optional[Any] = None,
     skipped_so_far: int = 0,
+    update_watermark: bool = True,
 ) -> int:
     """Reconciles every candidate entity file_results describes for
     commit_hash, then records progress via _correction_sweep_through_update
@@ -8598,6 +8606,22 @@ def _correction_sweep_apply(
 
     Never calls _frontier_persist_claim -- frontier-low is not touched by
     this sweep.
+
+    update_watermark=False suppresses BOTH the trailing
+    _correction_sweep_through_update and the _db_checkpoint that follows it,
+    handing both back to the caller. Only a caller that does MORE per-commit
+    work after this returns should pass False -- 2d's Stage B, which follows
+    every call with _forward_apply(..., lifecycle_only=True) to write the
+    D/R/gitlink facts the reverse stream skipped. If the watermark advanced
+    here, a failure in that lifecycle pass would leave
+    :ingestion/correction-sweep-through naming a commit whose deletions,
+    renames and gitlink changes were never written, and the next run's
+    _correction_sweep_select_position would resume at through + 1 and skip
+    it permanently. Deferring the watermark (and the checkpoint that
+    durably records it) to after the lifecycle pass makes the whole
+    per-commit unit atomic with respect to resume, and keeps the
+    one-checkpoint-per-commit cadence intact. The default True preserves the
+    2c behaviour for every caller that does nothing after this returns.
     """
     commit_ident = f":commit/{commit_hash[:12]}"
     skipped_events = 0
@@ -8665,8 +8689,9 @@ def _correction_sweep_apply(
                             file=sys.stderr,
                         )
 
-    _correction_sweep_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
-    _db_checkpoint(db)
+    if update_watermark:
+        _correction_sweep_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
+        _db_checkpoint(db)
     return skipped_events
 
 
@@ -9206,9 +9231,15 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     executor, _extract_commit, repo_path, sweep_hash, ignore_patterns,
                                 )
                                 sweep_files = sweep_extracted[0]
+                                # update_watermark=False: this commit is only
+                                # half-processed until the lifecycle pass below
+                                # also lands, so the sweep watermark (and its
+                                # checkpoint) is deferred to after it -- see
+                                # _correction_sweep_apply's own docstring.
                                 skipped += await loop.run_in_executor(
                                     write_executor, _correction_sweep_apply,
                                     db, sweep_hash, sweep_ts, sweep_files, index_con, skipped,
+                                    False,
                                 )
                                 # Apply the lifecycle facts the reverse stream
                                 # skipped entirely (D/R closes, renames,
@@ -9223,12 +9254,25 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     commit_metadata[hash_to_pos[sweep_hash]],
                                     sweep_extracted, index_con, None, None, True,
                                 )
+                                # Both halves landed -- only now is this commit
+                                # genuinely swept, so only now may the watermark
+                                # name it. Same one-checkpoint-per-commit cadence
+                                # _correction_sweep_apply had when it owned this.
+                                await loop.run_in_executor(
+                                    write_executor, _correction_sweep_through_update,
+                                    db, sweep_hash, sweep_ts, index_con,
+                                )
+                                await loop.run_in_executor(write_executor, _db_checkpoint, db)
                             except concurrent.futures.process.BrokenProcessPool:
                                 raise
                             except Exception as e:
                                 # A sweep-step failure aborts Stage B only.
-                                # Stage A's work is already persisted, and the
-                                # next run resumes from the sweep watermark.
+                                # Stage A's work is already persisted, and this
+                                # commit's watermark was never advanced (see
+                                # update_watermark=False above), so the next
+                                # run's _correction_sweep_select_position
+                                # re-selects THIS commit and reprocesses it from
+                                # the start -- nothing is silently skipped.
                                 print(
                                     f"[_run_ingestion] correction sweep aborted at {sweep_hash}: {e}",
                                     file=sys.stderr,
@@ -9279,6 +9323,12 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 await loop.run_in_executor(write_executor, _close_index_writer_safe, index_con)
                 await loop.run_in_executor(write_executor, executor.shutdown)
 
+            # "phase" describes what a RUNNING ingest is currently doing, so
+            # it must not outlive the run: leaving Stage B's "sweeping" in
+            # place made a finished run report {"status": "complete", "phase":
+            # "sweeping"} forever. Cleared on every terminal path below, not
+            # just this one.
+            _ingest_progress["phase"] = None
             if completed_all:
                 _ingest_progress["status"] = "complete"
             else:
@@ -9290,6 +9340,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # write_executor is already shut down by the inner finally above by the
         # time we get here (it runs on any exit from that try, including this
         # exception propagating through it) — nothing left to clean up.
+        _ingest_progress["phase"] = None
         _ingest_progress["status"] = "error"
         _ingest_progress["error"] = str(e)
         _ingest_progress["error_at"] = _now_utc_ms()
@@ -9309,6 +9360,7 @@ async def handle_minigraf_ingest_git(
     # and losing (#108).
     holder_pid = _live_lock_holder_pid(_graph_path or _get_graph_path())
     if holder_pid is not None:
+        _ingest_progress["phase"] = None
         _ingest_progress["status"] = "skipped"
         _ingest_progress["owner_pid"] = holder_pid
         return {
@@ -9333,6 +9385,7 @@ async def handle_minigraf_ingest_git(
     _ingest_progress = {
         "status": "starting", "processed": 0, "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        "phase": None,
     }
     _ingest_task = asyncio.create_task(_run_ingestion(repo, branch or _default_git_branch(repo)))
     return {"ok": True, "job_id": "git-ingest", "message": f"Ingestion started for {repo}"}
@@ -9729,6 +9782,7 @@ async def main() -> None:
     _ingest_progress = {
         "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        "phase": None,
     }
     if not os.environ.get("MINIGRAF_NO_AUTO_INGEST"):
         # Proactive check-before-attempt: if another live process already
