@@ -7938,6 +7938,25 @@ class TestIngestionWrites:
         result = mcp_server._watermark_query(real_db)
         assert result == "abc123"
 
+    def test_commit_date_query_is_silent_for_an_empty_watermark(self, real_db, capsys):
+        """A fresh graph has no watermark; None there is the ordinary path
+        and must not produce noise (#222 phase 2d review, minor 4)."""
+        import mcp_server
+        assert mcp_server._commit_date_query(real_db, None) is None
+        assert capsys.readouterr().err == ""
+
+    def test_commit_date_query_warns_when_a_real_watermark_has_no_date(
+        self, real_db, capsys,
+    ):
+        """Returning None for a NON-empty watermark silently degrades every
+        caller's resume bound back to the unbounded, pre-fix B1 queries, so
+        the degradation is announced (#222 phase 2d review, minor 4)."""
+        import mcp_server
+        assert mcp_server._commit_date_query(real_db, "abc123def456") is None
+        err = capsys.readouterr().err
+        assert "abc123def456" in err
+        assert "unbounded" in err
+
     def test_ingest_transact_noop_for_empty_triples(self, real_db):
         import mcp_server
         with execute_spy() as calls:
@@ -9035,6 +9054,71 @@ class TestPreloadExternalDependencies:
         pinned = mcp_server._preload_pinned_commits(real_db)
 
         assert pinned[":module/vendor-lib"] == ("abc123", "2026-01-01T00:00:00.000Z")
+
+    def test_unresolved_stubs_share_the_resume_bound_with_submodule_paths(
+        self, real_db, tmp_path,
+    ):
+        """#222 phase 2d review, B1 follow-up: _preload_unresolved_dep_idents
+        is a minuend whose subtrahend (submodule_paths) is bounded to the
+        resume position, so it must carry the same bound.
+
+        Seeds two REAL submodules with prefix-related paths — one introduced
+        below the watermark, one above it (as a prior run's Stage B would
+        leave it) — plus one genuine unresolved-import stub. Bounded to the
+        watermark, the above-watermark submodule drops out of BOTH sides and
+        only the stub remains. Unbounded (the pre-fix shape, asserted below
+        so the misclassification is pinned and not merely described), it
+        drops out of the subtrahend only and is misclassified as a stub —
+        at which point the replayed gitlink "add" for vendor/lib mints
+        [:module/vendor-lib-extra :resolves-to :module/vendor-lib], since a
+        submodule's :description is `name or path`.
+        """
+        import mcp_server
+
+        real_db.execute(
+            '(transact {:valid-from "2026-01-01T00:00:00Z"} '
+            '[[:module/vendor-lib :entity-type :type/external-dependency] '
+            '[:module/vendor-lib :ident ":module/vendor-lib"] '
+            '[:module/vendor-lib :path "vendor/lib"] '
+            '[:module/vendor-lib :description "vendor/lib"] '
+            '[:module/vendor-lib :introduced-by :commit/c1] '
+            '[:commit/c1 :date "2026-01-01T00:00:00Z"] '
+            # A genuine unresolved-import stub: no :path, ever.
+            '[:module/pkg-missing :entity-type :type/external-dependency] '
+            '[:module/pkg-missing :ident ":module/pkg-missing"] '
+            '[:module/pkg-missing :description "pkg.missing"]])'
+        )
+        # Above the watermark: what a prior run's Stage B leaves behind.
+        real_db.execute(
+            '(transact {:valid-from "2026-06-01T00:00:00Z"} '
+            '[[:module/vendor-lib-extra :entity-type :type/external-dependency] '
+            '[:module/vendor-lib-extra :ident ":module/vendor-lib-extra"] '
+            '[:module/vendor-lib-extra :path "vendor/lib/extra"] '
+            '[:module/vendor-lib-extra :description "vendor/lib/extra"] '
+            '[:module/vendor-lib-extra :introduced-by :commit/c2] '
+            '[:commit/c2 :date "2026-06-01T00:00:00Z"]])'
+        )
+
+        resume_valid_at = "2026-03-01T00:00:00Z"
+        *_, submodule_paths = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=resume_valid_at,
+        )
+        assert submodule_paths == {":module/vendor-lib": "vendor/lib"}, (
+            "precondition: the above-watermark submodule must be out of the subtrahend"
+        )
+
+        bounded = mcp_server._preload_unresolved_dep_idents(
+            real_db, submodule_paths, valid_at=resume_valid_at,
+        )
+        assert bounded == {":module/pkg-missing": "pkg.missing"}
+
+        unbounded = mcp_server._preload_unresolved_dep_idents(real_db, submodule_paths)
+        assert ":module/vendor-lib-extra" in unbounded, (
+            "the pre-fix shape must still misclassify, or this test proves nothing"
+        )
+        assert mcp_server._submodule_path_matches_import(
+            "vendor/lib", unbounded[":module/vendor-lib-extra"]
+        ), "and the gitlink 'add' linking would then fire on it"
 
     def test_preload_pinned_commits_returns_empty_on_query_failure(self, real_db, monkeypatch):
         """Same malformed-query technique as
@@ -14380,8 +14464,9 @@ def _assert_no_modified_in_at_or_before_introduction(db, linearization):
     Forward walk cannot produce either shape -- _build_code_triples emits
     :modified-in only on its already-known branch, never at introduction --
     so both are pure reverse-walk corruption. Positions, never timestamps:
-    committer dates are not monotonic in topological order (this repo's own
-    history has a six-day inversion), which is why build_linearization uses
+    ingest :date values are AUTHOR dates (_git_commits reads `%at`) and are
+    not monotonic in topological order (this repo's own history has a
+    six-day inversion), which is why build_linearization uses
     --topo-order in the first place.
     """
     import mcp_server
@@ -17099,14 +17184,22 @@ class TestMultiStreamParityWithForwardOnly:
         _correction_sweep_apply has an explicit self-introduction guard
         against it, so it is a standing invariant of the graph rather than a
         differential -- asserted on BOTH graphs for that reason.
+
+        Held as a SET of (ident, commit) pairs, not a dict keyed by ident: a
+        close does not retract :introduced-by, and a duplicate introduction
+        leaves an entity with two live :introduced-by rows, so dict() would
+        keep only whichever row came last and this helper could then
+        under-report its own offenders. The duplicate itself is still caught
+        by _assert_parity's _lineage comparison -- this only makes the list
+        printed here accurate.
         """
-        intro = dict(self._query(
+        intro = {(i, c) for i, c in self._query(
             graph_path, "(query [:find ?i ?c :where [?e :ident ?i] [?e :introduced-by ?c]])"
-        ))
+        )}
         modified = self._query(
             graph_path, "(query [:find ?i ?c :where [?e :ident ?i] [?e :modified-in ?c]])"
         )
-        offenders = sorted({(i, c) for i, c in modified if intro.get(i) == c})
+        offenders = sorted({(i, c) for i, c in modified if (i, c) in intro})
         assert offenders == [], (
             f"[{label}] entities carry :modified-in at their own :introduced-by "
             f"commit: {offenders}"
@@ -17347,8 +17440,14 @@ class TestStagingAndShutdown:
         reverse-region entity in a real repo.
 
         Commit dates are pinned and strictly increasing rather than left to
-        wall-clock: ingest valid-time is denominated in committer dates, and
-        a burst of same-second commits is indistinguishable on that axis.
+        wall-clock: ingest valid-time is denominated in AUTHOR dates
+        (_git_commits reads `%at`, not `%ct`), and a burst of same-second
+        commits is indistinguishable on that axis. GIT_AUTHOR_DATE is the
+        one that matters here; GIT_COMMITTER_DATE is set alongside it only
+        so the fixture's two clocks cannot disagree. Author dates are more
+        inversion-prone than committer dates in real histories (rebase,
+        cherry-pick, late merges), which is why this fixture pins them
+        rather than relying on them being ordered.
         """
         repo = tmp_path / "repo"
         repo.mkdir()

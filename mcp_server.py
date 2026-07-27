@@ -4839,6 +4839,13 @@ def _commit_date_query(db: Any, commit_hash: Optional[str]) -> Optional[str]:
     unlike that function no :db/valid-to filter is needed to pick the live
     row; a re-walked position can re-transact an identical :date under a
     fresh valid-from (#156), but every such row carries the same value.
+
+    Returning None for a NON-EMPTY watermark is not benign: it degrades every
+    caller's resume-position bound back to the unrestricted, pre-fix B1
+    queries (see _load_ingestion_preload_state), which is a correctness
+    regression rather than a slow path. The degradation is therefore
+    announced on stderr instead of failing silently. None for an EMPTY
+    watermark is the ordinary fresh-graph case and stays quiet.
     """
     if not commit_hash:
         return None
@@ -4849,9 +4856,21 @@ def _commit_date_query(db: Any, commit_hash: Optional[str]) -> Optional[str]:
             f":where [:commit/{commit_hash[:12]} :date ?d]])",
         )
         results = json.loads(raw).get("results", [])
-    except Exception:
+    except Exception as e:
+        print(
+            f"[ingest] watermark commit {commit_hash[:12]} :date lookup failed "
+            f"({e}); preloads fall back to unbounded current-graph queries",
+            file=sys.stderr,
+        )
         return None
-    return results[0][0] if results else None
+    if not results:
+        print(
+            f"[ingest] watermark commit {commit_hash[:12]} has no :date fact; "
+            f"preloads fall back to unbounded current-graph queries",
+            file=sys.stderr,
+        )
+        return None
+    return results[0][0]
 
 
 def _iso_to_epoch_ms(ts_iso: Optional[str]) -> Optional[int]:
@@ -5349,8 +5368,9 @@ def _entity_introduced_by_set_provisional(
     introduced. Forward walk cannot produce that shape, nothing in the graph
     or the audit detects it, and it persists.
 
-    Positions, never timestamps: committer dates are not monotonic in
-    topological order (clock skew, rebases), which is why
+    Positions, never timestamps: ingest :date values are AUTHOR dates
+    (_git_commits reads `%at`) and are not monotonic in topological order
+    (clock skew, rebases, cherry-picks), which is why
     build_linearization uses --topo-order at all, so comparing :date values
     would silently mis-order commits. Both parameters default to None, in
     which case the guard is skipped and behaviour is exactly as before --
@@ -6841,12 +6861,34 @@ def _preload_known_entities(
     fresh graph (no watermark) wants.
 
     Known residual, deliberately not papered over: valid-time is populated
-    from COMMITTER dates, which are not monotonic in topological order. An
-    entity introduced at or below the watermark by a commit whose date is
-    later than the watermark commit's own date drops out of this snapshot and
-    is treated as new. That is the second bullet above, in a rarer form; it
-    needs a position-indexed preload (the linearization is not available on
-    this code path) rather than a valid-time one to close completely.
+    from AUTHOR dates -- _git_commits reads `%at`, not `%ct` -- which are not
+    monotonic in topological order, and are MORE inversion-prone than
+    committer dates would be (a rebase, a cherry-pick or a long-lived branch
+    merged late all carry the original author date forward, while rewriting
+    the committer date). So this bound is looser than a committer-date bound,
+    and looser still than a position-indexed one.
+
+    The residual therefore runs in BOTH directions, not just one:
+
+      * a commit at or below the watermark dated LATER than the watermark
+        commit -- its entities drop out of this snapshot and are treated as
+        new, i.e. duplicate introduction (the second bullet above, rarer);
+      * a commit ABOVE the watermark dated EARLIER than the watermark commit
+        -- its entities stay in this snapshot, are absent from the parse of
+        the earlier commit being replayed, and are closed and
+        _forget_closed_entity-purged: B1's original DATA-LOSS mode, surviving
+        in narrow form.
+
+    Both are live on this repository: of 552 watermark positions, 6 (118-123)
+    have a strictly-earlier-dated LATER position, and those later positions
+    (124-128, a side branch authored 2026-04-26/27 landing topologically
+    after the 2026-05-02 merges) are confirmed descendants of 118-123 via
+    `git merge-base --is-ancestor`. Consequence for whoever closes this: the
+    eventual ancestry- or position-indexed filter must REPLACE this
+    valid-time bound, not be unioned with it as an "add-back" -- a union only
+    re-admits the benign duplicate-introduction direction and leaves the
+    data-loss direction wide open. (The linearization is not available on
+    this code path, which is why the bound is expressed in valid-time here.)
 
     external-dependency entities share the module ident namespace and use the
     same "path" attribute as modules, so folding them into this same query
@@ -6921,7 +6963,9 @@ def _preload_known_entities(
     return entity_valid_from, entity_descriptions, file_entities, submodule_paths
 
 
-def _preload_unresolved_dep_idents(db: Any, submodule_paths: Dict[str, str]) -> Dict[str, str]:
+def _preload_unresolved_dep_idents(
+    db: Any, submodule_paths: Dict[str, str], valid_at: Optional[str] = None
+) -> Dict[str, str]:
     """Reload ident -> import_name for every unresolved-import stub (#112).
 
     _preload_known_entities' external-dependency branch requires a :path fact,
@@ -6935,12 +6979,33 @@ def _preload_unresolved_dep_idents(db: Any, submodule_paths: Dict[str, str]) -> 
     find and link any stub created in an earlier run (see the gitlink "add"
     handling in _run_ingestion) — without this, only same-run stubs would
     ever get linked.
+
+    valid_at MUST be the same resume-position bound _preload_known_entities
+    was given (#222 phase 2d review, B1), because submodule_paths is that
+    function's OUTPUT: this query is a minuend and submodule_paths is its
+    subtrahend, so bounding one without the other breaks the subtraction. A
+    real submodule created above the watermark by a prior run's Stage B would
+    drop out of the (bounded) subtrahend while staying in an unbounded
+    minuend, and be misclassified as a stub — reaching
+    state.unresolved_dep_idents, where the replayed gitlink "add" handler's
+    _submodule_path_matches_import check can fire on it (a submodule's
+    :description is `name or path`) and mint a bogus
+    [:module/sub-b :resolves-to :module/sub-a].
+
+    Unlike _preload_field_class_idents, this set has no asymmetry arguing for
+    the unrestricted read: an EXTRA entry is the bogus edge above, while a
+    MISSING one (a stub the reverse stream created above the watermark) is
+    merely a link the forward-only oracle would not have made at that
+    position either.
     """
     unresolved: Dict[str, str] = {}
+    valid_at_clause = f':valid-at "{_edn_escape(valid_at)}" ' if valid_at else ""
     try:
         raw = _db_execute(
             db,
-            "(query [:find ?ident ?desc :where "
+            "(query [:find ?ident ?desc "
+            f"{valid_at_clause}"
+            ":where "
             "[?e :entity-type :type/external-dependency] "
             "[?e :ident ?ident] "
             "[?e :description ?desc]])",
@@ -7224,7 +7289,11 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     # and Stage B's lifecycle pass start there), so the bound is that
     # commit's own :date, read back out of the graph. Wall-clock time would
     # be wrong twice over: it is not the resume position, and ingest
-    # valid-time is denominated in committer dates, not real time.
+    # valid-time is denominated in AUTHOR dates (_git_commits reads `%at`,
+    # not `%ct`), not real time. Author dates invert more readily than
+    # committer dates -- see _preload_known_entities' docstring for the
+    # residual this leaves open in BOTH directions, and for why the eventual
+    # ancestry-indexed fix must replace this bound rather than union with it.
     # No watermark means a fresh graph, where None degrades this to exactly
     # the pre-#222 unrestricted queries rather than to an empty state.
     resume_valid_at = _commit_date_query(db, watermark)
@@ -7239,7 +7308,11 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     pinned_commit_state = _preload_pinned_commits(db, valid_at_ms=resume_valid_at_ms)
     field_class_ident = _preload_field_class_idents(db)
     field_static_ident = _preload_field_static_idents(db)
-    unresolved_dep_idents = _preload_unresolved_dep_idents(db, submodule_paths)
+    # Same bound as _preload_known_entities above, and not optional: this
+    # preload subtracts submodule_paths, which that call already bounded.
+    unresolved_dep_idents = _preload_unresolved_dep_idents(
+        db, submodule_paths, valid_at=resume_valid_at,
+    )
     provisional_idents = _preload_provisional_idents(db)
     return (
         watermark, prior_ingested, entity_valid_from, entity_descriptions,
