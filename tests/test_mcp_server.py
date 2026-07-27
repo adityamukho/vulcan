@@ -16,6 +16,7 @@ full rationale and pattern reference.
 """
 import asyncio
 import contextlib
+import datetime
 import json
 import sqlite3
 import sys
@@ -7937,6 +7938,25 @@ class TestIngestionWrites:
         result = mcp_server._watermark_query(real_db)
         assert result == "abc123"
 
+    def test_commit_date_query_is_silent_for_an_empty_watermark(self, real_db, capsys):
+        """A fresh graph has no watermark; None there is the ordinary path
+        and must not produce noise (#222 phase 2d review, minor 4)."""
+        import mcp_server
+        assert mcp_server._commit_date_query(real_db, None) is None
+        assert capsys.readouterr().err == ""
+
+    def test_commit_date_query_warns_when_a_real_watermark_has_no_date(
+        self, real_db, capsys,
+    ):
+        """Returning None for a NON-empty watermark silently degrades every
+        caller's resume bound back to the unbounded, pre-fix B1 queries, so
+        the degradation is announced (#222 phase 2d review, minor 4)."""
+        import mcp_server
+        assert mcp_server._commit_date_query(real_db, "abc123def456") is None
+        err = capsys.readouterr().err
+        assert "abc123def456" in err
+        assert "unbounded" in err
+
     def test_ingest_transact_noop_for_empty_triples(self, real_db):
         import mcp_server
         with execute_spy() as calls:
@@ -8161,6 +8181,11 @@ class TestIngestionWrites:
 
         monkeypatch.setattr(mcp_server, "_watermark_query", lambda db: "abc123")
         monkeypatch.setattr(mcp_server, "_git_commits", lambda repo, watermark, branch: [])
+        # #222 phase 2d: which commits get walked is now driven by
+        # build_linearization, not by _git_commits, so simulating an
+        # empty history has to stub both. tmp_path is not a git repo, and
+        # build_linearization runs `git log` with check=True.
+        monkeypatch.setattr(frontier_registry, "build_linearization", lambda repo, branch="HEAD": [])
 
         last_run_calls = []
         monkeypatch.setattr(
@@ -9030,6 +9055,71 @@ class TestPreloadExternalDependencies:
 
         assert pinned[":module/vendor-lib"] == ("abc123", "2026-01-01T00:00:00.000Z")
 
+    def test_unresolved_stubs_share_the_resume_bound_with_submodule_paths(
+        self, real_db, tmp_path,
+    ):
+        """#222 phase 2d review, B1 follow-up: _preload_unresolved_dep_idents
+        is a minuend whose subtrahend (submodule_paths) is bounded to the
+        resume position, so it must carry the same bound.
+
+        Seeds two REAL submodules with prefix-related paths — one introduced
+        below the watermark, one above it (as a prior run's Stage B would
+        leave it) — plus one genuine unresolved-import stub. Bounded to the
+        watermark, the above-watermark submodule drops out of BOTH sides and
+        only the stub remains. Unbounded (the pre-fix shape, asserted below
+        so the misclassification is pinned and not merely described), it
+        drops out of the subtrahend only and is misclassified as a stub —
+        at which point the replayed gitlink "add" for vendor/lib mints
+        [:module/vendor-lib-extra :resolves-to :module/vendor-lib], since a
+        submodule's :description is `name or path`.
+        """
+        import mcp_server
+
+        real_db.execute(
+            '(transact {:valid-from "2026-01-01T00:00:00Z"} '
+            '[[:module/vendor-lib :entity-type :type/external-dependency] '
+            '[:module/vendor-lib :ident ":module/vendor-lib"] '
+            '[:module/vendor-lib :path "vendor/lib"] '
+            '[:module/vendor-lib :description "vendor/lib"] '
+            '[:module/vendor-lib :introduced-by :commit/c1] '
+            '[:commit/c1 :date "2026-01-01T00:00:00Z"] '
+            # A genuine unresolved-import stub: no :path, ever.
+            '[:module/pkg-missing :entity-type :type/external-dependency] '
+            '[:module/pkg-missing :ident ":module/pkg-missing"] '
+            '[:module/pkg-missing :description "pkg.missing"]])'
+        )
+        # Above the watermark: what a prior run's Stage B leaves behind.
+        real_db.execute(
+            '(transact {:valid-from "2026-06-01T00:00:00Z"} '
+            '[[:module/vendor-lib-extra :entity-type :type/external-dependency] '
+            '[:module/vendor-lib-extra :ident ":module/vendor-lib-extra"] '
+            '[:module/vendor-lib-extra :path "vendor/lib/extra"] '
+            '[:module/vendor-lib-extra :description "vendor/lib/extra"] '
+            '[:module/vendor-lib-extra :introduced-by :commit/c2] '
+            '[:commit/c2 :date "2026-06-01T00:00:00Z"]])'
+        )
+
+        resume_valid_at = "2026-03-01T00:00:00Z"
+        *_, submodule_paths = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=resume_valid_at,
+        )
+        assert submodule_paths == {":module/vendor-lib": "vendor/lib"}, (
+            "precondition: the above-watermark submodule must be out of the subtrahend"
+        )
+
+        bounded = mcp_server._preload_unresolved_dep_idents(
+            real_db, submodule_paths, valid_at=resume_valid_at,
+        )
+        assert bounded == {":module/pkg-missing": "pkg.missing"}
+
+        unbounded = mcp_server._preload_unresolved_dep_idents(real_db, submodule_paths)
+        assert ":module/vendor-lib-extra" in unbounded, (
+            "the pre-fix shape must still misclassify, or this test proves nothing"
+        )
+        assert mcp_server._submodule_path_matches_import(
+            "vendor/lib", unbounded[":module/vendor-lib-extra"]
+        ), "and the gitlink 'add' linking would then fire on it"
+
     def test_preload_pinned_commits_returns_empty_on_query_failure(self, real_db, monkeypatch):
         """Same malformed-query technique as
         TestPreloadKnownDeps.test_query_failure_is_non_fatal: corrupt
@@ -9040,6 +9130,39 @@ class TestPreloadExternalDependencies:
         monkeypatch.setattr(mcp_server, "_VALID_TIME_FOREVER_MS", "))) malformed [[[")
 
         assert mcp_server._preload_pinned_commits(real_db) == {}
+
+
+class TestPreloadProvisionalIdents:
+    def test_empty_when_no_markers(self, real_db):
+        import mcp_server
+        assert mcp_server._preload_provisional_idents(real_db) == set()
+
+    def test_returns_every_marked_ident(self, real_db):
+        import mcp_server
+        mcp_server._lineage_mark_provisional(real_db, ":code/fn-a", "2026-01-01T00:00:00Z")
+        mcp_server._lineage_mark_provisional(real_db, ":code/fn-b", "2026-01-01T00:00:00Z")
+        assert mcp_server._preload_provisional_idents(real_db) == {":code/fn-a", ":code/fn-b"}
+
+    def test_confirmed_idents_drop_out(self, real_db):
+        """_lineage_confirm retracts the whole companion entity rather than
+        flipping :status, so the set form must agree with the per-ident
+        _lineage_is_provisional check the reconciliation relies on."""
+        import mcp_server
+        mcp_server._lineage_mark_provisional(real_db, ":code/fn-a", "2026-01-01T00:00:00Z")
+        mcp_server._lineage_mark_provisional(real_db, ":code/fn-b", "2026-01-01T00:00:00Z")
+        mcp_server._lineage_confirm(real_db, ":code/fn-a")
+        assert mcp_server._preload_provisional_idents(real_db) == {":code/fn-b"}
+        assert mcp_server._lineage_is_provisional(real_db, ":code/fn-a") is False
+
+    def test_load_ingestion_preload_state_returns_it_last(self, real_db, tmp_path):
+        import mcp_server
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        mcp_server._lineage_mark_provisional(real_db, ":code/fn-a", "2026-01-01T00:00:00Z")
+        result = mcp_server._load_ingestion_preload_state(str(repo))
+        assert len(result) == 13
+        assert result[-1] == {":code/fn-a"}
 
 
 class TestIngestTransactFactIndex:
@@ -9107,6 +9230,13 @@ class TestRunIngestion:
     @pytest.mark.asyncio
     async def test_watermark_updated_after_each_commit(self, real_db, git_repo, monkeypatch):
         import mcp_server
+        # #222 phase 2d: :ingestion/watermark keeps its "contiguous from C0"
+        # meaning and is advanced by the FORWARD stream only -- the reverse
+        # stream never touches it. Pin the ratio forward-only so the forward
+        # stream claims both of git_repo's commits, which is what makes
+        # "one watermark write per commit" the property under test rather
+        # than a statement about the 1:1 split.
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -9178,7 +9308,7 @@ class TestRunIngestion:
         leaving the server permanently unable to connect."""
         import mcp_server
 
-        def slow_preload(db, repo_path):
+        def slow_preload(db, repo_path, valid_at=None):
             time.sleep(0.3)
             return {}, {}, {}
 
@@ -9663,6 +9793,7 @@ class TestRunIngestionCommitFaultIsolation:
         import mcp_server
 
         real_git_commits = mcp_server._git_commits
+        real_build_linearization = frontier_registry.build_linearization
 
         def poisoned_git_commits(repo_path, watermark_hash, branch="HEAD"):
             # Inject a commit hash that was never actually created in this
@@ -9673,7 +9804,17 @@ class TestRunIngestionCommitFaultIsolation:
             poisoned = commits[:1] + [("deadbeef" * 5, "2026-01-01T00:00:00Z", "x@x.com", "POISONED")] + commits[1:]
             return poisoned
 
+        # #222 phase 2d: _run_ingestion extracts linearization[pos] and reads
+        # commit_metadata[pos], so the poison has to be injected at the SAME
+        # position in both lists -- injecting it into _git_commits alone would
+        # just misalign the two and trip _reverse_apply's alignment guard
+        # instead of exercising the extraction-failure path this test is about.
+        def poisoned_linearization(repo_path, branch="HEAD"):
+            hashes = real_build_linearization(repo_path, branch)
+            return hashes[:1] + ["deadbeef" * 5] + hashes[1:]
+
         monkeypatch.setattr(mcp_server, "_git_commits", poisoned_git_commits)
+        monkeypatch.setattr(frontier_registry, "build_linearization", poisoned_linearization)
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -9691,13 +9832,21 @@ class TestRunIngestionCommitFaultIsolation:
         import fact_index
 
         real_git_commits = mcp_server._git_commits
+        real_build_linearization = frontier_registry.build_linearization
 
         def poisoned_git_commits(repo_path, watermark_hash, branch="HEAD"):
             commits = real_git_commits(repo_path, watermark_hash, branch)
             poisoned = [commits[0], ("deadbeef" * 5, "2026-01-01T00:00:00Z", "x@x.com", "POISONED")] + commits[1:]
             return poisoned
 
+        # See the sibling test above: the poison must land at the same
+        # position in both the linearization and commit_metadata.
+        def poisoned_linearization(repo_path, branch="HEAD"):
+            hashes = real_build_linearization(repo_path, branch)
+            return [hashes[0], "deadbeef" * 5] + hashes[1:]
+
         monkeypatch.setattr(mcp_server, "_git_commits", poisoned_git_commits)
+        monkeypatch.setattr(frontier_registry, "build_linearization", poisoned_linearization)
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -9783,10 +9932,19 @@ class TestRunIngestionBatchedIndexWrites:
         one final flush-on-close) once batched. The gap between those two
         numbers is what would grow unboundedly on a 1M-fact repo if this
         regressed back to per-triple commits.
+
+        #222 phase 2d: the ratio is pinned forward-only so both of the
+        fixture's commits go through _forward_apply. _reverse_apply
+        (phase 2b, merged) checkpoints the graph per commit but does not
+        call _commit_index_writer_safe, so a reverse-claimed commit
+        contributes no per-commit index commit -- counting a mix would make
+        this assertion a statement about the stream split rather than about
+        batching.
         """
         import mcp_server
         import fact_index
 
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
         commit_calls = []
         open_calls = []
         original_open_writer = fact_index.open_writer
@@ -11385,7 +11543,31 @@ class TestClosedEntityLifecyclePurge:
     @pytest.mark.parametrize("variant", ["rename", "delete"])
     async def test_reused_path_new_entity_is_not_a_ghost(self, tmp_path, monkeypatch, variant):
         """The module re-created at the reused path a.py must have a CURRENT
-        :ident fact (join target for nearly every query)."""
+        :ident fact (join target for nearly every query).
+
+        #222 phase 2d Task 9 STILL PINS this one test forward-only, while the
+        rest of this class now runs at the 1:1 default. The remaining failure
+        is NOT the D/R/gitlink gap Stage B closes -- it is an independent
+        _reverse_apply (phase 2b) defect in A/M territory:
+
+          _build_close_triples never retracts :introduced-by, so a closed
+          entity keeps that fact forever. _reverse_apply's "is this entity
+          already known?" gate is _entity_introduced_by_query(db, ident),
+          which therefore still answers "known" for an ident that was closed
+          and purged by the forward walk. When such a path is RE-CREATED at a
+          position the reverse stream claims, _build_code_triples takes its
+          "already known" branch and emits only :modified-in -- the module
+          never re-asserts :ident/:description/:path and stays a ghost.
+          _correction_sweep_apply cannot repair it either: it reconciles
+          lineage only and never emits structural facts.
+
+        Fixing it means changing _reverse_apply's gate to test liveness (a
+        current :ident) rather than :introduced-by, which is phase-2b surface
+        and out of this task's scope. Measured directly: after a 1:1 run of
+        _reused_path_repo, :module/a-py has a live :introduced-by pointing at
+        the ORIGINAL c1 commit and no live :ident at all.
+        """
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
         repo = _reused_path_repo(tmp_path / "repo", variant)
         db = await self._ingest_and_open(repo, monkeypatch)
 
@@ -11398,6 +11580,61 @@ class TestClosedEntityLifecyclePurge:
             f"[{variant}] re-created module at reused path has no current :ident (ghost): {module_now}"
 
         # The re-created function g must also exist as a genuine current entity.
+        g_now = self._results(db, f'(query [:find ?i :where [{g_ident} :ident ?i]])')
+        assert g_now == [[g_ident]], f"[{variant}] re-created function g missing current :ident: {g_now}"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("variant", ["rename", "delete"])
+    @pytest.mark.xfail(
+        strict=True,
+        # Narrowed to the assertion this test actually makes (#222 phase 2d
+        # whole-branch review, finding (o)). Without raises=, ANY exception
+        # counts as the expected failure -- an unrelated breakage in the
+        # ingest path (a TypeError from a changed signature, a git fixture
+        # that stops building) would keep registering as XFAIL and this
+        # alarm would stay silently disarmed.
+        raises=AssertionError,
+        reason=(
+            "KNOWN pre-existing phase-2b defect, NOT the D/R gap #222 phase 2d "
+            "Stage B closes: _build_close_triples never retracts :introduced-by, "
+            "so a closed-and-purged entity keeps that fact forever, and "
+            "_reverse_apply's known-entity gate -- "
+            "_entity_introduced_by_query(db, ident) is not None -- still answers "
+            "'known' for it. At the 1:1 default, c3 (which re-creates a.py) lands "
+            "in frontier-high's territory, so _build_code_triples takes its "
+            "'already known' branch and emits only :modified-in: the module is "
+            "resurrected as a ghost with no current :ident. Fixing it means "
+            "changing that gate to test liveness, which is out of Task 9's scope."
+        ),
+    )
+    async def test_reused_path_new_entity_is_not_a_ghost_at_default_ratio(
+        self, tmp_path, monkeypatch, variant
+    ):
+        """Companion to the forward-only-pinned variant above, at the 1:1
+        DEFAULT ratio -- the configuration that actually ships.
+
+        The pin alone makes the suite green at exactly the configuration
+        that hides the ghost, with nothing left to notice when the bug is
+        fixed or when it spreads. This test is that alarm: strict=True means
+        it FAILS the day someone repairs _reverse_apply's gate, forcing both
+        the xfail and the forward-only pin to be removed together rather than
+        letting a stale exemption silently mask a later regression.
+        """
+        # Explicitly at the default: an ambient MINIGRAF_INGEST_STREAM_RATIO
+        # would otherwise decide which stream claims c3 and make the xfail
+        # non-deterministic.
+        monkeypatch.delenv("MINIGRAF_INGEST_STREAM_RATIO", raising=False)
+        repo = _reused_path_repo(tmp_path / "repo", variant)
+        db = await self._ingest_and_open(repo, monkeypatch)
+
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "a.py")
+        g_ident = mcp_server._code_ident("function", "a.py", "g")
+
+        module_now = self._results(db, f'(query [:find ?i :where [{module_ident} :ident ?i]])')
+        assert module_now == [[module_ident]], \
+            f"[{variant}] re-created module at reused path has no current :ident (ghost): {module_now}"
+
         g_now = self._results(db, f'(query [:find ?i :where [{g_ident} :ident ?i]])')
         assert g_now == [[g_ident]], f"[{variant}] re-created function g missing current :ident: {g_now}"
 
@@ -14118,6 +14355,47 @@ class TestReverseFillClaimAndProcess:
         assert hi_hash == linearization[-1]
 
 
+class TestReverseApplySplit:
+    def test_split_pieces_compose_to_the_same_graph_as_the_wrapper(self, tmp_path):
+        """Two independent graphs from one repo fixture -- the walk mutates
+        the state a second run would start from, so this cannot be two
+        passes over one graph."""
+        import mcp_server, frontier_registry
+        from minigraf import MiniGrafDb
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login():\n    return 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h0"], cwd=repo, check=True, capture_output=True)
+
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+
+        def snapshot(db):
+            raw = mcp_server._db_execute(db, "(query [:find ?e ?a ?v :where [?e ?a ?v]])")
+            return sorted(tuple(row) for row in json.loads(raw)["results"])
+
+        db_a = MiniGrafDb.open(str(tmp_path / "a.graph"))
+        alloc_a = mcp_server._frontier_load(db_a, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_fill_claim_and_process(
+            db_a, str(repo), linearization, commit_metadata, alloc_a,
+        )
+
+        db_b = MiniGrafDb.open(str(tmp_path / "b.graph"))
+        alloc_b = mcp_server._frontier_load(db_b, linearization, "2026-01-04T00:00:00Z")
+        pos = alloc_b.claim_high()
+        file_results, _g, _m, _r = mcp_server._extract_commit(str(repo), linearization[pos], ())
+        applied = mcp_server._reverse_apply(
+            db_b, str(repo), linearization, commit_metadata, pos, file_results,
+        )
+        assert applied == linearization[pos]
+        assert snapshot(db_a) == snapshot(db_b)
+
+
 class _NoProgressAllocator:
     """Stand-in for a FrontierAllocator whose claim_high() stops making
     progress -- the pre-2b1 behaviour on a grown linearization, where
@@ -14186,8 +14464,9 @@ def _assert_no_modified_in_at_or_before_introduction(db, linearization):
     Forward walk cannot produce either shape -- _build_code_triples emits
     :modified-in only on its already-known branch, never at introduction --
     so both are pure reverse-walk corruption. Positions, never timestamps:
-    committer dates are not monotonic in topological order (this repo's own
-    history has a six-day inversion), which is why build_linearization uses
+    ingest :date values are AUTHOR dates (_git_commits reads `%at`) and are
+    not monotonic in topological order (this repo's own history has a
+    six-day inversion), which is why build_linearization uses
     --topo-order in the first place.
     """
     import mcp_server
@@ -15515,3 +15794,1829 @@ class TestCorrectionSweepWalk:
         assert json.loads(raw)["results"] == []
         bounds = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
         assert mcp_server._correction_sweep_through_query(real_db) == bounds[1]
+
+
+class TestParseStreamRatio:
+    def test_default_when_unset(self):
+        import mcp_server
+        assert mcp_server._parse_stream_ratio(None) == (1, 1)
+
+    def test_parses_explicit_ratios(self):
+        import mcp_server
+        assert mcp_server._parse_stream_ratio("1:1") == (1, 1)
+        assert mcp_server._parse_stream_ratio("1:3") == (1, 3)
+        assert mcp_server._parse_stream_ratio("3:1") == (3, 1)
+        assert mcp_server._parse_stream_ratio(" 2 : 5 ") == (2, 5)
+
+    def test_malformed_falls_back_to_default_and_logs_once(self, capsys):
+        import mcp_server
+        for bad in ("x", "", "1", "1:2:3", "0:1", "1:0", "-1:2", "a:b", "1.5:2"):
+            assert mcp_server._parse_stream_ratio(bad) == (1, 1), bad
+        err = capsys.readouterr().err
+        # One line per bad value, and each names the offending value.
+        assert err.count("MINIGRAF_INGEST_STREAM_RATIO") == 9
+
+    def test_does_not_raise_on_any_input(self):
+        """A bad env var must never be the reason a repo never ingests --
+        this runs inside a background coroutine with no user in the loop."""
+        import mcp_server
+        assert mcp_server._parse_stream_ratio("\x00\xff") == (1, 1)
+
+
+class TestForwardReconcileProvisional:
+    # The commit the forward walk is currently applying, i.e. the entity's
+    # TRUE introduction. Distinct from _seed_provisional's guess commit in
+    # every test here except the self-introduction one below, which is the
+    # whole point of that case (#222 phase 2d review, B2).
+    _TRUE_COMMIT = ":commit/aaaaaaaaaaaa"
+
+    def _seed_provisional(self, real_db):
+        """An entity Stream 2 discovered at a late commit and guessed wrong."""
+        import mcp_server
+        guess_ident = ":commit/bbbbbbbbbbbb"
+        structural = [
+            ":code/fn-login :entity-type :type/function",
+            ':code/fn-login :name "login"',
+            ":module/auth :contains :code/fn-login",
+        ]
+        structural_triples = [f"[{t}]" for t in structural]
+        mcp_server._transact(
+            real_db, "[" + " ".join(f"[{t}]" for t in structural if ":contains" not in t) + "]",
+            "2026-06-01T00:00:00Z",
+        )
+        mcp_server._transact(
+            real_db, "[[:module/auth :contains :code/fn-login]]", "2026-06-01T00:00:00Z",
+        )
+        mcp_server._transact(
+            real_db, f"[[:code/fn-login :introduced-by {guess_ident}]]", "2026-06-01T00:00:00Z",
+        )
+        mcp_server._lineage_mark_provisional(real_db, ":code/fn-login", "2026-06-01T00:00:00Z")
+        mcp_server._candidate_diff_persist(
+            real_db, "bbbbbbbbbbbb" + "0" * 28, ":code/fn-login", "hash-b", "2026-06-01T00:00:00Z",
+        )
+        return guess_ident, structural_triples
+
+    def test_returns_none_and_writes_nothing_when_not_provisional(self, real_db):
+        import mcp_server
+        mcp_server._transact(
+            real_db, "[[:code/fn-x :introduced-by :commit/aaaaaaaaaaaa]]", "2026-01-01T00:00:00Z",
+        )
+        result = mcp_server._forward_reconcile_provisional(
+            real_db, ":code/fn-x", [], "2026-01-01T00:00:00Z", {}, self._TRUE_COMMIT,
+        )
+        assert result is None
+        assert mcp_server._entity_introduced_by_query(real_db, ":code/fn-x") == ":commit/aaaaaaaaaaaa"
+
+    def test_retracts_the_provisional_guess(self, real_db):
+        import mcp_server
+        guess_ident, structural = self._seed_provisional(real_db)
+        mcp_server._forward_reconcile_provisional(
+            real_db, ":code/fn-login", structural, "2026-01-01T00:00:00Z",
+            {guess_ident: "2026-06-01T00:00:00Z"}, self._TRUE_COMMIT,
+        )
+        # No :introduced-by left at all -- the caller writes the authoritative
+        # one immediately after, via the normal forward emission path.
+        assert mcp_server._entity_introduced_by_query(real_db, ":code/fn-login") is None
+
+    def test_confirms_the_marker_and_clears_the_candidate_diff(self, real_db):
+        import mcp_server
+        guess_ident, structural = self._seed_provisional(real_db)
+        returned = mcp_server._forward_reconcile_provisional(
+            real_db, ":code/fn-login", structural, "2026-01-01T00:00:00Z",
+            {guess_ident: "2026-06-01T00:00:00Z"}, self._TRUE_COMMIT,
+        )
+        assert returned == guess_ident
+        assert mcp_server._lineage_is_provisional(real_db, ":code/fn-login") is False
+        assert mcp_server._candidate_diff_read(
+            real_db, "bbbbbbbbbbbb" + "0" * 28, ":code/fn-login",
+        ) is None
+
+    def test_writes_modified_in_at_the_guess_commits_own_timestamp(self, real_db):
+        """The guess commit is now known to be a genuine modification rather
+        than the introduction. Dating the edge at the TRUE introduction's
+        timestamp would assert a fact valid before it was true."""
+        import mcp_server
+        guess_ident, structural = self._seed_provisional(real_db)
+        mcp_server._forward_reconcile_provisional(
+            real_db, ":code/fn-login", structural, "2026-01-01T00:00:00Z",
+            {guess_ident: "2026-06-01T00:00:00Z"}, self._TRUE_COMMIT,
+        )
+        raw = mcp_server._db_execute(
+            real_db,
+            '(query [:find ?c :valid-at "2026-06-02T00:00:00Z" '
+            ':where [:code/fn-login :modified-in ?c]])',
+        )
+        assert [row[0] for row in json.loads(raw)["results"]] == [guess_ident]
+        # Not yet true the day BEFORE the guess commit.
+        raw_before = mcp_server._db_execute(
+            real_db,
+            '(query [:find ?c :valid-at "2026-05-31T00:00:00Z" '
+            ':where [:code/fn-login :modified-in ?c]])',
+        )
+        assert json.loads(raw_before)["results"] == []
+
+    def test_re_dates_structural_facts_to_the_true_introduction(self, real_db):
+        """Otherwise there is a valid-time window where :introduced-by is live
+        for an entity with no type, name or file, so an :as-of query at the
+        true introduction reports the entity as nonexistent."""
+        import mcp_server
+        guess_ident, structural = self._seed_provisional(real_db)
+        mcp_server._forward_reconcile_provisional(
+            real_db, ":code/fn-login", structural, "2026-01-01T00:00:00Z",
+            {guess_ident: "2026-06-01T00:00:00Z"}, self._TRUE_COMMIT,
+        )
+        raw = mcp_server._db_execute(
+            real_db,
+            '(query [:find ?n :valid-at "2026-02-01T00:00:00Z" '
+            ':where [:code/fn-login :name ?n]])',
+        )
+        assert [row[0] for row in json.loads(raw)["results"]] == ["login"]
+
+    def test_contains_edge_survives_re_dating(self, real_db):
+        """:contains shares (entity, attribute, valid_from) with any sibling
+        edge, so it must be retracted and re-transacted one triple per call
+        -- batching silently keeps only the last (#222 phase 2b1)."""
+        import mcp_server
+        guess_ident, structural = self._seed_provisional(real_db)
+        mcp_server._forward_reconcile_provisional(
+            real_db, ":code/fn-login", structural, "2026-01-01T00:00:00Z",
+            {guess_ident: "2026-06-01T00:00:00Z"}, self._TRUE_COMMIT,
+        )
+        raw = mcp_server._db_execute(
+            real_db,
+            '(query [:find ?c :valid-at "2026-02-01T00:00:00Z" '
+            ':where [:module/auth :contains ?c]])',
+        )
+        assert [row[0] for row in json.loads(raw)["results"]] == [":code/fn-login"]
+
+    def test_skips_modified_in_when_guess_timestamp_unknown(self, real_db, capsys):
+        """Falling back to the true introduction's timestamp would back-date
+        the edge to before the modification it describes. Skip and say so."""
+        import mcp_server
+        guess_ident, structural = self._seed_provisional(real_db)
+        mcp_server._forward_reconcile_provisional(
+            real_db, ":code/fn-login", structural, "2026-01-01T00:00:00Z", {},
+            self._TRUE_COMMIT,
+        )
+        raw = mcp_server._db_execute(
+            real_db, "(query [:find ?c :where [:code/fn-login :modified-in ?c]])",
+        )
+        assert json.loads(raw)["results"] == []
+        assert "no timestamp in commit_metadata" in capsys.readouterr().err
+        # The rest of the reconciliation still happened.
+        assert mcp_server._lineage_is_provisional(real_db, ":code/fn-login") is False
+
+    def test_skips_modified_in_when_the_guess_is_this_very_commit(self, real_db):
+        """#222 phase 2d review, B2: Stream 2 claims high-to-low, so the first
+        commit at which it sights an entity born inside its own region IS that
+        entity's introduction -- a correct guess that still carries a
+        provisional marker. When a later run's forward walk re-walks that
+        position it must not "promote" the guess to a modification: the entity
+        would end up :introduced-by and :modified-in the SAME commit, a shape
+        forward-only ingest never produces and _correction_sweep_apply
+        explicitly refuses to write."""
+        import mcp_server
+        guess_ident, structural = self._seed_provisional(real_db)
+        returned = mcp_server._forward_reconcile_provisional(
+            real_db, ":code/fn-login", structural, "2026-06-01T00:00:00Z",
+            {guess_ident: "2026-06-01T00:00:00Z"}, guess_ident,
+        )
+        # Everything else still happens -- only step 5 is withheld.
+        assert returned == guess_ident
+        assert mcp_server._lineage_is_provisional(real_db, ":code/fn-login") is False
+        assert mcp_server._entity_introduced_by_query(real_db, ":code/fn-login") is None
+        raw = mcp_server._db_execute(
+            real_db,
+            '(query [:find ?c :any-valid-time '
+            ':where [:code/fn-login :modified-in ?c]])',
+        )
+        assert json.loads(raw)["results"] == [], (
+            "the entity was handed a :modified-in edge at its own introduction"
+        )
+
+
+class TestForwardApplyReconcilesProvisional:
+    def _repo(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login():\n    return 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h0"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login():\n    return 2\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h1"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def test_forward_apply_supersedes_a_provisional_guess(self, real_db, tmp_path):
+        """Stream 2 claimed h1 and guessed login() was introduced there. The
+        forward walk then reaches h0, the TRUE introduction. Exactly one
+        :introduced-by must survive, naming h0, with a confirmed marker."""
+        import mcp_server, frontier_registry
+        repo = self._repo(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        # Stream 2 claims the newest commit (h1) and guesses.
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{linearization[1][:12]}"
+
+        # Stream 1 now reaches h0, the true introduction.
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={}, entity_descriptions={}, file_entities={},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+            provisional_idents=mcp_server._preload_provisional_idents(real_db),
+            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
+        )
+        extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
+        mcp_server._forward_apply(
+            real_db, str(repo), state, commit_metadata[0], extracted,
+        )
+
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{fn_ident} :introduced-by ?c]])",
+        )
+        values = {row[0] for row in json.loads(raw)["results"]}
+        assert values == {f":commit/{linearization[0][:12]}"}, "exactly one, naming h0"
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+        # h1 is now a genuine modification.
+        raw_mod = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{fn_ident} :modified-in ?c]])",
+        )
+        assert f":commit/{linearization[1][:12]}" in {row[0] for row in json.loads(raw_mod)["results"]}
+
+        # The module ident is provisional too (Stream 2 guessed it at h1
+        # alongside login()) and exercises the distinct module-ident branch
+        # of the reconciliation block/lookup -- not just the function-entry
+        # branch. Same exactly-one-survivor, same confirmed marker.
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        raw_module = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{module_ident} :introduced-by ?c]])",
+        )
+        module_values = {row[0] for row in json.loads(raw_module)["results"]}
+        assert module_values == {f":commit/{linearization[0][:12]}"}, "exactly one, naming h0"
+        assert mcp_server._lineage_is_provisional(real_db, module_ident) is False
+
+    def test_forward_apply_does_not_duplicate_for_a_stale_provisional_snapshot_entry(
+        self, real_db, tmp_path,
+    ):
+        """FIX 1 regression (#222 phase 2d Task 5 review): state.provisional_idents
+        is a preload SNAPSHOT, not the authority. If something else (e.g. the
+        correction sweep) already confirmed an entity authoritative in the DB
+        after the snapshot was taken, the snapshot can still list it as
+        provisional. The forward walk must consult the DB
+        (_lineage_is_provisional) before treating the ident as reconcilable --
+        popping it out of entity_valid_from unconditionally would make
+        _build_code_triples mint a SECOND :introduced-by on top of the
+        existing authoritative one, while _forward_reconcile_provisional
+        (itself DB-backed) no-ops on an already-confirmed entity and never
+        retracts the duplicate. Without the fix this yields two
+        :introduced-by values; with it, exactly one survives."""
+        import mcp_server, frontier_registry
+        repo = self._repo(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        # Stream 2 claims h1 and guesses login() was introduced there.
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+
+        # Take the preload snapshot while the entity is still genuinely
+        # provisional...
+        provisional_snapshot = mcp_server._preload_provisional_idents(real_db)
+        assert fn_ident in provisional_snapshot
+
+        # ...then simulate something else confirming it authoritative in the
+        # DB afterward (the snapshot is now stale for this ident, though the
+        # existing :introduced-by fact itself is untouched).
+        mcp_server._lineage_confirm(real_db, fn_ident)
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+        existing_raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{fn_ident} :introduced-by ?c]])",
+        )
+        assert {row[0] for row in json.loads(existing_raw)["results"]} == {
+            f":commit/{linearization[1][:12]}"
+        }
+
+        # entity_valid_from already knows this entity (mirrors the resumed-run
+        # shape) so an unconditional pop would matter.
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={fn_ident: "2026-06-01T00:00:00Z"},
+            entity_descriptions={fn_ident: "login"}, file_entities={"auth.py": [fn_ident]},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+            provisional_idents=provisional_snapshot,  # stale: still lists fn_ident
+            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
+        )
+        extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
+        mcp_server._forward_apply(
+            real_db, str(repo), state, commit_metadata[0], extracted,
+        )
+
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{fn_ident} :introduced-by ?c]])",
+        )
+        values = {row[0] for row in json.loads(raw)["results"]}
+        assert values == {f":commit/{linearization[1][:12]}"}, (
+            "exactly one :introduced-by must survive -- a stale snapshot "
+            "entry must not cause a second one to be minted"
+        )
+        # The stale entry must be evicted, or it would be retried (and fail
+        # the same way) on every later commit that touches this entity.
+        assert fn_ident not in state.provisional_idents
+
+    def test_resumed_run_variant_is_not_suppressed_by_entity_valid_from(self, real_db, tmp_path):
+        """The silent failure mode: on a RESUMED run, Stream 2's structural
+        facts are already in the preloaded entity_valid_from, so
+        _build_code_triples would suppress the introduction entirely and the
+        wrong provisional guess would survive forever."""
+        import mcp_server, frontier_registry
+        repo = self._repo(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+
+        # Simulate the resumed-run preload: entity_valid_from ALREADY knows
+        # this entity, because Stream 2 wrote its structural facts last run.
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={fn_ident: "2026-06-01T00:00:00Z"},
+            entity_descriptions={fn_ident: "login"}, file_entities={"auth.py": [fn_ident]},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+            provisional_idents={fn_ident},
+            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
+        )
+        extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
+        mcp_server._forward_apply(
+            real_db, str(repo), state, commit_metadata[0], extracted,
+        )
+
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{fn_ident} :introduced-by ?c]])",
+        )
+        assert {row[0] for row in json.loads(raw)["results"]} == {f":commit/{linearization[0][:12]}"}
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+
+    def test_without_provisional_idents_the_resumed_case_regresses(self, real_db, tmp_path):
+        """Pins that provisional_idents is actually consulted: with it empty,
+        the resumed-run case leaves the wrong guess in place. This is the
+        direct regression test for the silent failure mode."""
+        import mcp_server, frontier_registry
+        repo = self._repo(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={fn_ident: "2026-06-01T00:00:00Z"},
+            entity_descriptions={fn_ident: "login"}, file_entities={"auth.py": [fn_ident]},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+            provisional_idents=set(),   # the bug
+            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
+        )
+        extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
+        mcp_server._forward_apply(
+            real_db, str(repo), state, commit_metadata[0], extracted,
+        )
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{linearization[1][:12]}"
+
+
+class TestRoundRobinClaimer:
+    def _claimer(self, total, forward, reverse):
+        import mcp_server, frontier_registry
+        allocator = frontier_registry.FrontierAllocator(total, [])
+        return mcp_server._RoundRobinClaimer(allocator, forward, reverse), allocator
+
+    def _drain(self, claimer):
+        out = []
+        while True:
+            claim = claimer.next_claim()
+            if claim is None:
+                return out
+            out.append(claim)
+
+    def test_one_to_one_alternates(self):
+        claimer, _ = self._claimer(6, 1, 1)
+        assert self._drain(claimer) == [
+            ("fwd", 0), ("rev", 5), ("fwd", 1), ("rev", 4), ("fwd", 2), ("rev", 3),
+        ]
+
+    def test_one_to_three(self):
+        claimer, _ = self._claimer(8, 1, 3)
+        assert self._drain(claimer) == [
+            ("fwd", 0), ("rev", 7), ("rev", 6), ("rev", 5),
+            ("fwd", 1), ("rev", 4), ("rev", 3), ("rev", 2),
+        ]
+
+    def test_three_to_one(self):
+        claimer, _ = self._claimer(8, 3, 1)
+        assert self._drain(claimer) == [
+            ("fwd", 0), ("fwd", 1), ("fwd", 2), ("rev", 7),
+            ("fwd", 3), ("fwd", 4), ("fwd", 5), ("rev", 6),
+        ]
+
+    def test_every_position_claimed_exactly_once(self):
+        for total in (1, 2, 3, 7, 20, 33):
+            for ratio in ((1, 1), (1, 3), (3, 1), (2, 5)):
+                claimer, _ = self._claimer(total, *ratio)
+                claims = self._drain(claimer)
+                positions = [pos for _tag, pos in claims]
+                assert sorted(positions) == list(range(total)), (total, ratio)
+
+    def test_forward_ascending_reverse_descending(self):
+        claimer, _ = self._claimer(20, 2, 3)
+        claims = self._drain(claimer)
+        fwd = [pos for tag, pos in claims if tag == "fwd"]
+        rev = [pos for tag, pos in claims if tag == "rev"]
+        assert fwd == sorted(fwd), "forward state machine requires ascending"
+        assert rev == sorted(rev, reverse=True), "2b's monotonicity guard requires descending"
+
+    def test_empty_linearization_yields_nothing(self):
+        claimer, _ = self._claimer(0, 1, 1)
+        assert claimer.next_claim() is None
+
+    def test_single_position_goes_to_whoever_asks_first(self):
+        claimer, _ = self._claimer(1, 1, 1)
+        assert claimer.next_claim() == ("fwd", 0)
+        assert claimer.next_claim() is None
+
+    def test_pre_drained_gap_yields_nothing_immediately(self):
+        """Resume case: the previous run already covered everything."""
+        claimer, allocator = self._claimer(5, 1, 1)
+        while allocator.claim_low() is not None:
+            pass
+        assert claimer.next_claim() is None
+
+
+class TestStageAInterleave:
+    """#222 phase 2d Task 8: _run_ingestion driven by the shared-gap claimer.
+
+    Real on-disk graph throughout (docs/testing-conventions.md Pattern 2):
+    _run_ingestion releases and reopens the DB between every commit, which an
+    in-memory store cannot survive.
+    """
+
+    def _repo(self, tmp_path, n_commits=6):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        # -b master explicitly: init.defaultBranch is machine-configurable, and
+        # every test below passes "master" to _run_ingestion.
+        _subprocess.run(["git", "init", "-b", "master"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(n_commits):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"h{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_both_frontiers_advance_and_meet(self, tmp_path, monkeypatch):
+        """The load-bearing property: a real run must leave frontier-low and
+        frontier-high adjacent, covering every position exactly once."""
+        import mcp_server, frontier_registry
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
+
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+
+        db = MiniGrafDb.open(str(graph))
+        linearization = frontier_registry.build_linearization(str(repo))
+        low = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT)
+        high = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert low is not None and high is not None, "both streams must have claimed"
+        pos = {h: i for i, h in enumerate(linearization)}
+        assert pos[low[0]] == 0
+        assert pos[high[1]] == len(linearization) - 1
+        assert pos[low[1]] + 1 == pos[high[0]], "the two frontiers must be adjacent"
+
+    @pytest.mark.asyncio
+    async def test_forward_heavy_ratio_shifts_the_meeting_point(self, tmp_path, monkeypatch):
+        import mcp_server, frontier_registry
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path, n_commits=8)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "3:1")
+
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+
+        db = MiniGrafDb.open(str(graph))
+        linearization = frontier_registry.build_linearization(str(repo))
+        pos = {h: i for i, h in enumerate(linearization)}
+        low = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT)
+        # 3:1 over 8 positions -> forward takes 6, reverse takes 2.
+        assert pos[low[1]] == 5
+
+    @pytest.mark.asyncio
+    async def test_watermark_matches_frontier_low_hi(self, tmp_path, monkeypatch):
+        """:ingestion/watermark keeps its contiguous-from-C0 meaning: it is
+        advanced by the forward stream only, never by the reverse one."""
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+
+        db = MiniGrafDb.open(str(graph))
+        low = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT)
+        assert mcp_server._watermark_query(db) == low[1]
+
+    @pytest.mark.asyncio
+    async def test_single_commit_repo(self, tmp_path, monkeypatch):
+        import mcp_server
+        repo = self._repo(tmp_path, n_commits=1)
+        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete"
+
+    @pytest.mark.asyncio
+    async def test_second_run_on_unchanged_repo_is_a_no_op(self, tmp_path, monkeypatch):
+        """Resume with an already-empty gap: Stage A must never begin, not
+        spin or re-process."""
+        import mcp_server
+        repo = self._repo(tmp_path)
+        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete"
+
+
+class TestStageBCorrectionSweep:
+    """#222 phase 2d Task 9: Stage B -- the sequential correction sweep that
+    runs once Stage A's two streams have drained and the shared gap is
+    closed, turning the reverse stream's provisional guesses authoritative.
+
+    Real on-disk graph throughout (docs/testing-conventions.md Pattern 2):
+    _run_ingestion releases and reopens the DB between every commit, which an
+    in-memory store cannot survive.
+    """
+
+    def _repo(self, tmp_path, n_commits=6):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        # -b master explicitly: init.defaultBranch is machine-configurable, and
+        # every test below passes "master" to _run_ingestion.
+        _subprocess.run(["git", "init", "-b", "master"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(n_commits):
+            (repo / "auth.py").write_text(
+                f"def login():\n    return {i}\n\ndef helper_{i}():\n    pass\n"
+            )
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"h{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_completed_run_leaves_no_provisional_markers(self, tmp_path, monkeypatch):
+        """The headline postcondition of phase 2: after a full ingest,
+        every entity's lineage is authoritative."""
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+
+        db = MiniGrafDb.open(str(graph))
+        assert mcp_server._preload_provisional_idents(db) == set()
+
+    @pytest.mark.asyncio
+    async def test_no_entity_has_two_introduced_by_values(self, tmp_path, monkeypatch):
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+
+        db = MiniGrafDb.open(str(graph))
+        raw = mcp_server._db_execute(db, "(query [:find ?e ?c :where [?e :introduced-by ?c]])")
+        pairs = [tuple(row) for row in json.loads(raw)["results"]]
+        entities = [e for e, _c in pairs]
+        assert len(entities) == len(set(entities)), f"duplicate :introduced-by: {pairs}"
+
+    @pytest.mark.asyncio
+    async def test_lineage_confirmed_through_reaches_head(self, tmp_path, monkeypatch):
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+
+        db = MiniGrafDb.open(str(graph))
+        linearization = frontier_registry.build_linearization(str(repo), "master")
+        assert mcp_server._lineage_confirmed_through_query(db) == linearization[-1]
+
+    @pytest.mark.asyncio
+    async def test_phase_is_cleared_when_the_run_finishes(self, tmp_path, monkeypatch):
+        """"phase" describes what a RUNNING ingest is doing. Stage B sets it to
+        "sweeping" and, before this fix, never cleared it -- so
+        minigraf_ingest_status reported {"status": "complete", "phase":
+        "sweeping"} for the entire remaining life of the server process."""
+        import mcp_server
+        repo = self._repo(tmp_path)
+        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress.get("phase") is None, (
+            f"a finished run still reports phase="
+            f"{mcp_server._ingest_progress.get('phase')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_failure_does_not_advance_the_sweep_watermark(
+        self, tmp_path, monkeypatch
+    ):
+        """Stage B does TWO things per swept commit: _correction_sweep_apply
+        (A/M lineage) and then _forward_apply(lifecycle_only=True) (the D/R
+        and gitlink facts the reverse stream skipped). If the sweep watermark
+        advanced when the first half finished, a failure in the second half
+        would leave :ingestion/correction-sweep-through naming a commit whose
+        deletions, renames and gitlink changes were never written -- and the
+        next run's _correction_sweep_select_position, which resumes at
+        through + 1, would skip that commit permanently and silently.
+
+        So: make the lifecycle pass raise for one specific swept commit and
+        assert the watermark still names its PREDECESSOR, i.e. a subsequent
+        run re-selects the failed commit and reprocesses it whole. Asserted
+        directly by calling _correction_sweep_select_position on the
+        persisted graph afterwards.
+        """
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
+
+        swept: list = []
+        real_forward_apply = mcp_server._forward_apply
+
+        def failing_forward_apply(*args, **kwargs):
+            # _run_ingestion submits this via run_in_executor, which passes
+            # every argument positionally -- lifecycle_only is the 9th.
+            lifecycle_only = args[8] if len(args) > 8 else kwargs.get("lifecycle_only", False)
+            if lifecycle_only:
+                swept.append(args[3][0])  # commit tuple's hash
+                if len(swept) == 2:
+                    raise RuntimeError("lifecycle pass boom")
+            return real_forward_apply(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", failing_forward_apply)
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+
+        # Guard against a vacuous pass: the sweep must genuinely have reached
+        # a second commit and failed on it.
+        assert len(swept) == 2, f"expected the sweep to fail on its 2nd commit, saw {swept}"
+        succeeded_hash, failed_hash = swept
+        assert mcp_server._ingest_progress["status"] == "stopped"
+
+        db = MiniGrafDb.open(str(graph))
+        through = mcp_server._correction_sweep_through_query(db)
+        assert through != failed_hash, (
+            "the sweep watermark names a commit whose lifecycle pass failed -- "
+            "its deletions/renames/gitlink changes are lost forever"
+        )
+        assert through == succeeded_hash, (
+            f"watermark should still name the last fully-swept commit, got {through}"
+        )
+
+        # The real consequence: a subsequent run re-selects the failed commit.
+        linearization = frontier_registry.build_linearization(str(repo), "master")
+        commit_metadata = mcp_server._git_commits(str(repo), None, "master")
+        selected = mcp_server._correction_sweep_select_position(
+            db, linearization, commit_metadata,
+        )
+        assert selected is not None and selected[0] == failed_hash, (
+            f"next run must resume at the failed commit {failed_hash}, got {selected}"
+        )
+
+    def test_fold_guard_does_not_fire_when_frontier_high_is_absent(self, real_db, tmp_path):
+        """_correction_sweep_select_position returns None for six reasons,
+        only one of which is 'reached the ceiling'. Folding the watermark on
+        any None would claim lineage is confirmed through HEAD in exactly
+        the cases where the sweep did no work at all."""
+        import mcp_server
+        repo = self._repo(tmp_path, n_commits=3)
+        linearization = frontier_registry.build_linearization(str(repo), "master")
+        commit_metadata = mcp_server._git_commits(str(repo), None, "master")
+        # frontier-high never created: forward claimed everything.
+        mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        assert mcp_server._correction_sweep_select_position(
+            real_db, linearization, commit_metadata,
+        ) is None
+        assert mcp_server._should_fold_lineage_watermark(real_db, linearization) is False
+
+    def test_fold_guard_fires_only_when_sweep_reached_the_ceiling(self, real_db, tmp_path):
+        import mcp_server
+        repo = self._repo(tmp_path, n_commits=3)
+        linearization = frontier_registry.build_linearization(str(repo), "master")
+        commit_metadata = mcp_server._git_commits(str(repo), None, "master")
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        # Reverse claims the top two, forward the bottom one -> gap closed.
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        pos = allocator.claim_low()
+        mcp_server._frontier_persist_claim(
+            real_db, linearization, pos, from_low=True,
+            commit_ts_iso=commit_metadata[pos][1],
+        )
+        assert mcp_server._should_fold_lineage_watermark(real_db, linearization) is False
+        mcp_server._correction_sweep_walk(
+            real_db, str(repo), linearization, commit_metadata,
+        )
+        assert mcp_server._should_fold_lineage_watermark(real_db, linearization) is True
+
+
+class TestStageBRepairsLifecycleFacts:
+    """#222 phase 2d: the reverse stream skips D/R files and gitlink changes
+    entirely, so at the default 1:1 ratio the newest half of history loses
+    its deletions, renames and submodule bumps. Stage B applies them.
+
+    The oracle here is DIFFERENTIAL wherever it fits: the same repo is
+    ingested twice -- once at the 1:1 default (where the newest half of
+    history is reverse-claimed and repaired by Stage B) and once forward-only
+    via MINIGRAF_INGEST_STREAM_RATIO -- and the two graphs must agree. That is
+    far more durable against unrelated changes in fact shape than
+    hand-enumerated expected facts, and it is exactly the claim under test:
+    a mixed run must produce the same lifecycle facts a forward-only run does.
+    """
+
+    # (find-vars, where-clauses). Every subject is bound through its :ident so
+    # the rows are stable strings rather than minigraf's internal subject UUIDs.
+    _SNAPSHOT_QUERIES = {
+        "entity-type": ("?i ?v", "[?e :ident ?i] [?e :entity-type ?v]"),
+        "description": ("?i ?v", "[?e :ident ?i] [?e :description ?v]"),
+        "introduced-by": ("?i ?v", "[?e :ident ?i] [?e :introduced-by ?v]"),
+        "modified-in": ("?i ?v", "[?e :ident ?i] [?e :modified-in ?v]"),
+        "contains": ("?i ?v", "[?e :ident ?i] [?e :contains ?v]"),
+        "depends-on": ("?i ?v", "[?e :ident ?i] [?e :depends-on ?v]"),
+        "renamed-to": ("?i ?v", "[?e :ident ?i] [?e :renamed-to ?v]"),
+        "renamed-from": ("?i ?v", "[?e :ident ?i] [?e :renamed-from ?v]"),
+        "pinned-commit": ("?i ?v", "[?e :ident ?i] [?e :pinned-commit ?v]"),
+        "static": ("?i ?v", "[?e :ident ?i] [?e :static ?v]"),
+        "path": ("?i ?v", "[?e :ident ?i] [?e :path ?v]"),
+        "file": ("?i ?v", "[?e :ident ?i] [?e :file ?v]"),
+    }
+    # Bookkeeping entities that legitimately differ between the two runs:
+    # frontier-high and :ingestion/correction-sweep-through only exist when a
+    # reverse stream ran at all, and the lineage/candidate companion entities
+    # are transient scratch state.
+    _BOOKKEEPING_PREFIXES = (":ingestion/", ":lineage/", ":candidate/")
+
+    # ---- repo construction -------------------------------------------------
+
+    def _init(self, tmp_path, name="repo"):
+        repo = tmp_path / name
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "master"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def _commit(self, repo, msg, day, paths=None):
+        """Commit with a pinned, distinct calendar day so point-in-time
+        (:valid-at) assertions can target a moment strictly inside an
+        entity's true valid window.
+
+        paths=None stages everything (`git add -A`). Any repo carrying a
+        gitlink MUST pass an explicit list instead: `git add -A` sees the
+        submodule's absent working tree and stages the gitlink's deletion,
+        which silently turns a bump into a remove.
+        """
+        ts = f"2020-01-{day:02d}T00:00:00Z"
+        env = {**os.environ, "GIT_AUTHOR_DATE": ts, "GIT_COMMITTER_DATE": ts}
+        add_args = ["-A"] if paths is None else list(paths)
+        if add_args:
+            _subprocess.run(["git", "add", *add_args], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(
+            ["git", "commit", "-m", msg], cwd=repo, check=True, capture_output=True, env=env,
+        )
+
+    def _add_submodule(self, repo, day, path="modules/lib", name="lib",
+                       url="https://example.com/lib.git"):
+        sub = repo.parent / f"{repo.name}-sub"
+        _subprocess.run(["git", "init", "-q", "-b", "master", str(sub)], check=True, capture_output=True)
+        _subprocess.run(["git", "-C", str(sub), "config", "user.email", "t@t.com"], check=True, capture_output=True)
+        _subprocess.run(["git", "-C", str(sub), "config", "user.name", "T"], check=True, capture_output=True)
+        _subprocess.run(["git", "-C", str(sub), "commit", "--allow-empty", "-m", "e"], check=True, capture_output=True)
+        sub_hash = _subprocess.run(
+            ["git", "-C", str(sub), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        (repo / ".gitmodules").write_text(f'[submodule "{name}"]\n\tpath = {path}\n\turl = {url}\n')
+        _subprocess.run(
+            ["git", "update-index", "--add", "--cacheinfo", f"160000,{sub_hash},{path}"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        self._commit(repo, "add submodule", day, paths=[".gitmodules"])
+        return sub_hash
+
+    def _bump_submodule(self, repo, day, path="modules/lib", extra_paths=()):
+        sub = repo.parent / f"{repo.name}-sub"
+        _subprocess.run(["git", "-C", str(sub), "commit", "--allow-empty", "-m", "bump"], check=True, capture_output=True)
+        new_hash = _subprocess.run(
+            ["git", "-C", str(sub), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        _subprocess.run(
+            ["git", "update-index", "--cacheinfo", f"160000,{new_hash},{path}"],
+            cwd=repo, check=True, capture_output=True,
+        )
+        self._commit(repo, "bump submodule", day, paths=list(extra_paths))
+        return new_hash
+
+    # ---- ingestion / snapshot helpers -------------------------------------
+
+    async def _ingest(self, repo, graph_path, monkeypatch, ratio):
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", ratio)
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
+        mcp_server._db = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        }
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+        mcp_server._db = None
+
+    def _results(self, graph_path, datalog):
+        import mcp_server
+        from minigraf import MiniGrafDb
+        db = MiniGrafDb.open(str(graph_path))
+        try:
+            return json.loads(mcp_server._db_execute(db, datalog)).get("results", [])
+        finally:
+            db = None  # drop the handle so the file lock is released
+
+    def _snapshot(self, graph_path, valid_at=None):
+        import mcp_server
+        from minigraf import MiniGrafDb
+        clause = f' :valid-at "{valid_at}"' if valid_at else ""
+        db = MiniGrafDb.open(str(graph_path))
+        try:
+            out = {}
+            for label, (find, where) in self._SNAPSHOT_QUERIES.items():
+                raw = mcp_server._db_execute(db, f"(query [:find {find}{clause} :where {where}])")
+                out[label] = sorted(
+                    tuple(row) for row in json.loads(raw).get("results", [])
+                    if not str(row[0]).startswith(self._BOOKKEEPING_PREFIXES)
+                )
+            return out
+        finally:
+            db = None
+
+    async def _assert_graphs_agree(self, repo, tmp_path, monkeypatch, valid_ats=()):
+        """Ingest `repo` twice -- 1:1 default, then forward-only -- and assert
+        the two graphs carry identical facts, at current time and at every
+        supplied point in valid time."""
+        mixed = tmp_path / "mixed.graph"
+        forward = tmp_path / "forward.graph"
+        await self._ingest(repo, mixed, monkeypatch, "1:1")
+        await self._ingest(repo, forward, monkeypatch, f"{10**6}:1")
+        for valid_at in (None,) + tuple(valid_ats):
+            a = self._snapshot(mixed, valid_at)
+            b = self._snapshot(forward, valid_at)
+            for label in self._SNAPSHOT_QUERIES:
+                assert a[label] == b[label], (
+                    f"1:1 and forward-only graphs disagree on {label} "
+                    f"(valid_at={valid_at}):\n  only in 1:1:  "
+                    f"{sorted(set(a[label]) - set(b[label]))}\n  only in fwd: "
+                    f"{sorted(set(b[label]) - set(a[label]))}"
+                )
+        return mixed
+
+    def _assert_reverse_claimed(self, graph_path, repo, positions):
+        """Guard against a vacuous differential: the commits carrying the
+        lifecycle change must actually have landed in frontier-high's
+        territory, otherwise the two runs agree for the boring reason."""
+        import mcp_server
+        from minigraf import MiniGrafDb
+        db = MiniGrafDb.open(str(graph_path))
+        try:
+            high = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        finally:
+            db = None
+        assert high is not None, "the reverse stream claimed nothing -- test is vacuous"
+        linearization = frontier_registry.build_linearization(str(repo), "master")
+        pos = {h: i for i, h in enumerate(linearization)}
+        lo, hi = pos[high[0]], pos[high[1]]
+        for p in positions:
+            assert lo <= p <= hi, (
+                f"position {p} was not reverse-claimed (frontier-high covers "
+                f"{lo}..{hi}) -- this test would pass vacuously"
+            )
+
+    # ---- the tests ---------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_deletion_in_the_reverse_region_is_closed(self, tmp_path, monkeypatch):
+        """A function deleted in a recent commit must not still read as live
+        at HEAD. Without Stage B's lifecycle pass it stays open forever."""
+        import mcp_server
+        repo = self._init(tmp_path)
+        (repo / "a.py").write_text("def alpha():\n    return 1\n")
+        (repo / "b.py").write_text("def beta():\n    return 2\n")
+        self._commit(repo, "c1", 1)
+        (repo / "a.py").write_text("def alpha():\n    return 11\n")
+        self._commit(repo, "c2", 2)
+        (repo / "b.py").write_text("def beta():\n    return 22\n")
+        self._commit(repo, "c3", 3)                       # position 2 -- reverse
+        _subprocess.run(["git", "rm", "b.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "c4 delete b.py", 4)           # position 3 -- reverse
+
+        mixed = await self._assert_graphs_agree(
+            repo, tmp_path, monkeypatch, valid_ats=("2020-01-03T12:00:00Z",),
+        )
+        self._assert_reverse_claimed(mixed, repo, [3])
+
+        module_ident = mcp_server._code_ident("module", "b.py")
+        fn_ident = mcp_server._code_ident("function", "b.py", "beta")
+        for ident in (module_ident, fn_ident):
+            assert self._results(mixed, f"(query [:find ?i :where [{ident} :ident ?i]])") == [], \
+                f"{ident} was deleted at HEAD but still reads as live"
+            # ...and it must still be visible strictly inside its true window.
+            assert self._results(
+                mixed,
+                f'(query [:find ?i :valid-at "2020-01-03T12:00:00Z" :where [{ident} :ident ?i]])',
+            ) == [[ident]], f"{ident} must be live before the delete commit"
+
+    @pytest.mark.asyncio
+    async def test_rename_in_the_reverse_region_emits_both_edges(self, tmp_path, monkeypatch):
+        """:renamed-from AND :renamed-to, and the old module closed.
+
+        The new path is ALSO modified one commit later, which the reverse
+        stream claims first -- so it holds a provisional :introduced-by guess
+        at that later commit which the sweep's rename application must
+        supersede rather than duplicate.
+        """
+        import mcp_server
+        repo = self._init(tmp_path)
+        (repo / "old.py").write_text("def f():\n    return 1\n")
+        (repo / "other.py").write_text("def g():\n    return 1\n")
+        self._commit(repo, "c1", 1)
+        (repo / "other.py").write_text("def g():\n    return 2\n")
+        self._commit(repo, "c2", 2)
+        _subprocess.run(["git", "mv", "old.py", "new.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "c3 rename", 3)                # position 2 -- reverse
+        (repo / "new.py").write_text("def f():\n    return 3\n")
+        self._commit(repo, "c4 edit new.py", 4)           # position 3 -- reverse
+
+        mixed = await self._assert_graphs_agree(repo, tmp_path, monkeypatch)
+        self._assert_reverse_claimed(mixed, repo, [2, 3])
+
+        old_ident = mcp_server._code_ident("module", "old.py")
+        new_ident = mcp_server._code_ident("module", "new.py")
+        assert self._results(
+            mixed, f"(query [:find ?n :where [{old_ident} :renamed-to ?n]])"
+        ) == [[new_ident]], ":renamed-to was never emitted for the reverse-region rename"
+        assert self._results(
+            mixed, f"(query [:find ?o :where [{new_ident} :renamed-from ?o]])"
+        ) == [[old_ident]], ":renamed-from was never emitted for the reverse-region rename"
+        assert self._results(
+            mixed, f"(query [:find ?i :where [{old_ident} :ident ?i]])"
+        ) == [], "the renamed-away module must be closed"
+        # The new path's lineage must be single-valued: the rename is its
+        # introduction, superseding the reverse stream's later guess.
+        intro = self._results(
+            mixed, f"(query [:find ?c :where [{new_ident} :introduced-by ?c]])"
+        )
+        assert len(intro) == 1, f"new path has ambiguous :introduced-by: {intro}"
+
+    @pytest.mark.asyncio
+    async def test_submodule_bump_in_the_reverse_region_updates_pinned_commit(
+        self, tmp_path, monkeypatch
+    ):
+        """Gitlink changes are discarded for reverse-claimed commits in
+        Stage A; the sweep must apply them."""
+        import mcp_server
+        repo = self._init(tmp_path)
+        (repo / "main.py").write_text("def main():\n    return 1\n")
+        self._commit(repo, "c1", 1)
+        first_sha = self._add_submodule(repo, day=2)      # position 1 -- forward
+        (repo / "main.py").write_text("def main():\n    return 2\n")
+        self._commit(repo, "c3", 3, paths=["main.py"])    # position 2 -- reverse
+        second_sha = self._bump_submodule(repo, day=4)    # position 3 -- reverse
+
+        mixed = await self._assert_graphs_agree(repo, tmp_path, monkeypatch)
+        self._assert_reverse_claimed(mixed, repo, [3])
+
+        sub_ident = mcp_server._code_ident("module", "modules/lib")
+        assert self._results(
+            mixed, f"(query [:find ?p :where [{sub_ident} :pinned-commit ?p]])"
+        ) == [[second_sha]], "the bump's new pinned-commit must be the only live one"
+        assert self._results(
+            mixed,
+            f'(query [:find ?p :valid-at "2020-01-03T12:00:00Z" '
+            f":where [{sub_ident} :pinned-commit ?p]])",
+        ) == [[first_sha]], "the original pin must stay visible inside its own window"
+
+    @pytest.mark.asyncio
+    async def test_entity_born_and_deleted_inside_the_reverse_region(self, tmp_path, monkeypatch):
+        """The case that motivates calling _build_code_triples for its dict
+        side effects on A/M files: the entity is absent from the Stage-A
+        entity_valid_from, so without that bookkeeping its close falls back
+        to the DELETE commit's own timestamp and yields a wrong (often
+        zero-width) valid interval."""
+        import mcp_server
+        repo = self._init(tmp_path)
+        (repo / "a.py").write_text("def alpha():\n    return 1\n")
+        self._commit(repo, "c1", 1)
+        (repo / "a.py").write_text("def alpha():\n    return 11\n")
+        self._commit(repo, "c2", 2)
+        (repo / "b.py").write_text("def beta():\n    return 2\n")
+        self._commit(repo, "c3 born", 3)                  # position 2 -- reverse
+        _subprocess.run(["git", "rm", "b.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "c4 died", 4)                  # position 3 -- reverse
+
+        mixed = await self._assert_graphs_agree(
+            repo, tmp_path, monkeypatch, valid_ats=("2020-01-03T12:00:00Z",),
+        )
+        self._assert_reverse_claimed(mixed, repo, [2, 3])
+
+        # Born at c3 (day 3), deleted at c4 (day 4): live strictly between.
+        # A close that fell back to the delete commit's own timestamp would
+        # produce the zero-width window [day4, day4) and fail here.
+        fn_ident = mcp_server._code_ident("function", "b.py", "beta")
+        assert self._results(
+            mixed,
+            f'(query [:find ?d :valid-at "2020-01-03T12:00:00Z" :where [{fn_ident} :description ?d]])',
+        ) == [["beta"]], "entity born and deleted inside the reverse region has a wrong valid window"
+        assert self._results(
+            mixed,
+            f'(query [:find ?d :valid-at "2020-01-02T12:00:00Z" :where [{fn_ident} :description ?d]])',
+        ) == [], "entity must not be visible before its introduction"
+        assert self._results(
+            mixed, f"(query [:find ?d :where [{fn_ident} :description ?d]])"
+        ) == [], "entity must not be visible after its deletion"
+
+    @pytest.mark.asyncio
+    async def test_am_facts_are_not_duplicated_by_the_lifecycle_pass(self, tmp_path, monkeypatch):
+        """lifecycle_only must DISCARD _build_code_triples' output for A/M.
+        Re-transacting the same (entity, attribute, value) under a different
+        valid-from creates a genuinely live duplicate rather than a no-op
+        (#156), so assert exactly one :introduced-by and one :entity-type
+        per entity after a full run over a repo whose reverse region carries
+        a deletion, a rename AND a submodule bump."""
+        import mcp_server
+        repo = self._init(tmp_path)
+        (repo / "a.py").write_text("def alpha():\n    return 1\n")
+        (repo / "b.py").write_text("def beta():\n    return 2\n")
+        self._commit(repo, "c1", 1)
+        (repo / "a.py").write_text("def alpha():\n    return 11\n")
+        self._commit(repo, "c2", 2)
+        self._add_submodule(repo, day=3)                  # position 2 -- forward
+        _subprocess.run(["git", "rm", "b.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "c4 delete b.py", 4, paths=[])  # position 3 -- reverse
+        _subprocess.run(["git", "mv", "a.py", "c.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "c5 rename a.py", 5, paths=[])  # position 4 -- reverse
+        (repo / "c.py").write_text("def alpha():\n    return 111\n")
+        # bump + edit the renamed file in one commit: the reverse stream
+        # claims this position and discards the gitlink half entirely.
+        self._bump_submodule(repo, day=6, extra_paths=["c.py"])  # position 5 -- reverse
+
+        mixed = await self._assert_graphs_agree(repo, tmp_path, monkeypatch)
+        self._assert_reverse_claimed(mixed, repo, [3, 4, 5])
+
+        for attr in (":introduced-by", ":entity-type"):
+            rows = [tuple(r) for r in self._results(
+                mixed, f"(query [:find ?i ?v :where [?e :ident ?i] [?e {attr} ?v]])"
+            ) if not str(r[0]).startswith(self._BOOKKEEPING_PREFIXES)]
+            subjects = [i for i, _v in rows]
+            assert len(subjects) == len(set(subjects)), \
+                f"duplicate live {attr} facts after the lifecycle pass: " \
+                f"{sorted(r for r in rows if subjects.count(r[0]) > 1)}"
+
+
+class TestMultiStreamParityWithForwardOnly:
+    """#222 phase 2d Task 11: the payoff for the whole phase.
+
+    Stage A's converging streams and Stage B's correction sweep are only
+    worth anything if together they land the lineage a plain forward walk
+    would have landed. That is one assertion, and this is it: ingest the
+    same repo twice -- once at the shipping 1:1 default, once forward-only
+    via a forward ratio large enough that the forward stream drains the
+    whole gap before the reverse stream ever claims -- and require the two
+    graphs to agree.
+
+    Where TestStageBRepairsLifecycleFacts drills into one lifecycle event
+    per tiny repo, this one runs a single longer history whose newest third
+    (the region the reverse stream claims at 1:1) carries a deletion, a
+    rename and a post-rename edit at once, so the meeting point, the
+    provisional-lineage reconciliation and the sweep's lifecycle-repair pass
+    are all exercised together.
+
+    NOTE ON THE FIXTURE: it deliberately contains NO path reuse -- nothing
+    is re-created at a path that was earlier deleted or renamed away. That
+    is not to hide anything; it is because path reuse hits a KNOWN,
+    out-of-scope phase-2b defect (_build_close_triples never retracts
+    :introduced-by, so _reverse_apply's known-entity gate resurrects a
+    ghost) which is already pinned by
+    TestClosedEntityLifecyclePurge::test_reused_path_new_entity_is_not_a_ghost
+    and its strict-xfail companion. Mixing that failure into the parity
+    oracle would only make this test say something the pins already say,
+    while destroying its ability to report a genuine parity break.
+    """
+
+    # frontier-high and :ingestion/correction-sweep-through only exist when a
+    # reverse stream ran at all; :lineage/ and :candidate/ are transient
+    # scratch state. All of them legitimately differ between the two runs.
+    _BOOKKEEPING_PREFIXES = (":ingestion/", ":lineage/", ":candidate/")
+
+    def _commit(self, repo, msg, day, paths=None):
+        ts = f"2021-03-{day:02d}T00:00:00Z"
+        env = {**os.environ, "GIT_AUTHOR_DATE": ts, "GIT_COMMITTER_DATE": ts}
+        _subprocess.run(
+            ["git", "add", *(["-A"] if paths is None else list(paths))],
+            cwd=repo, check=True, capture_output=True,
+        )
+        _subprocess.run(
+            ["git", "commit", "-m", msg], cwd=repo, check=True, capture_output=True, env=env,
+        )
+
+    def _repo(self, tmp_path):
+        """Nine commits. Positions are linearization indices (0 = oldest).
+
+        At the 1:1 default the claimer alternates F0, R8, F1, R7, F2, R6,
+        F3, R5, F4 -- so frontier-high covers 5..8 and every lifecycle event
+        below lands in reverse-claimed territory. _assert_reverse_claimed
+        re-derives that from the persisted frontier rather than trusting it.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "master"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+
+        # p0: three files born together.
+        (repo / "auth.py").write_text(
+            "def login():\n    return 0\n\ndef helper():\n    return 0\n"
+        )
+        (repo / "util.py").write_text("CONST = 0\n\ndef normalize(s):\n    return s\n")
+        (repo / "legacy.py").write_text("def old_api():\n    return 'legacy'\n")
+        self._commit(repo, "c1 initial", 1)
+
+        # p1..p5: plain modifications, plus one new file, spanning the
+        # forward region and the low end of the reverse region.
+        (repo / "auth.py").write_text(
+            "def login():\n    return 1\n\ndef helper():\n    return 0\n"
+        )
+        self._commit(repo, "c2 edit auth", 2)
+        (repo / "util.py").write_text("CONST = 2\n\ndef normalize(s):\n    return s.strip()\n")
+        self._commit(repo, "c3 edit util", 3)
+        (repo / "feature.py").write_text("import util\n\ndef run():\n    return util.CONST\n")
+        (repo / "auth.py").write_text(
+            "def login():\n    return 3\n\ndef helper():\n    return 3\n"
+        )
+        self._commit(repo, "c4 add feature, edit auth", 4)
+        (repo / "legacy.py").write_text("def old_api():\n    return 'still here'\n")
+        self._commit(repo, "c5 edit legacy", 5)
+        (repo / "feature.py").write_text(
+            "import util\n\ndef run():\n    return util.CONST + 1\n\ndef extra():\n    pass\n"
+        )
+        # auth.py is touched here too, on purpose: this is the LAST "M" on
+        # auth.py before `audit` is born in it at p8, and a resuming forward
+        # walk that thinks `audit` already exists replays exactly this commit
+        # and closes it as a removal (#222 phase 2d review, B1). Without an
+        # auth.py edit between the meeting point and p8 that bug has no
+        # commit to fire on.
+        (repo / "auth.py").write_text(
+            "def login():\n    return 5\n\ndef helper():\n    return 3\n"
+        )
+        self._commit(repo, "c6 edit feature and auth", 6)
+
+        # p6: a DELETION in the reverse region. The reverse stream skips D
+        # files entirely, so only Stage B's lifecycle pass can close these.
+        _subprocess.run(["git", "rm", "legacy.py"], cwd=repo, check=True, capture_output=True)
+        self._commit(repo, "c7 delete legacy.py", 7, paths=[])
+
+        # p7: a RENAME in the reverse region, to a path never used before.
+        # git mv refuses a missing destination directory, so make it first.
+        (repo / "helpers").mkdir()
+        _subprocess.run(
+            ["git", "mv", "util.py", "helpers/util.py"], cwd=repo, check=True, capture_output=True,
+        )
+        self._commit(repo, "c8 rename util.py", 8, paths=[])
+
+        # p8: edit the renamed path. The reverse stream claims this position
+        # BEFORE it claims the rename, so it holds a provisional :introduced-by
+        # guess here that the sweep's rename application must supersede.
+        #
+        # `audit` is BORN here, at the very top of the reverse region, and is
+        # the fixture's only entity whose reverse-stream first sighting IS its
+        # own introduction (auth.py is not touched again above p8, so the
+        # guess never moves). It carries both halves of the phase 2d review:
+        # a resuming forward walk must not close it while replaying the
+        # earlier commits that legitimately lack it (B1), and when that walk
+        # reaches p8 and reconciles the guess it must not then assert
+        # [audit :modified-in p8] on top of [audit :introduced-by p8] (B2).
+        (repo / "helpers" / "util.py").write_text(
+            "CONST = 8\n\ndef normalize(s):\n    return s.strip().lower()\n"
+        )
+        (repo / "auth.py").write_text(
+            "def login():\n    return 8\n\ndef helper():\n    return 3\n"
+            "\ndef audit():\n    return 'audit'\n"
+        )
+        self._commit(repo, "c9 edit renamed util and auth", 9)
+        return repo
+
+    def _new_commit(self, repo):
+        """One more commit on top of _repo's nine -- what lands between two
+        sessions, and what makes _frontier_load hand the whole previous
+        reverse region back to the gap (its high interval no longer reaches
+        the last position, so it is unrepresentable and gets discarded)."""
+        (repo / "auth.py").write_text(
+            "def login():\n    return 9\n\ndef helper():\n    return 9\n"
+            "\ndef audit():\n    return 'audit'\n"
+        )
+        self._commit(repo, "c10 edit auth again", 10)
+
+    def _reset_progress(self):
+        import mcp_server
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        }
+
+    async def _ingest(self, repo, graph_path, monkeypatch, ratio):
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", ratio)
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
+        mcp_server._db = None
+        self._reset_progress()
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+        mcp_server._db = None  # release the file lock before reopening to query
+
+    async def _ingest_interrupted(self, repo, graph_path, monkeypatch, stop_after):
+        """Ingest at the 1:1 default but request shutdown from inside the
+        stop_after'th _forward_apply, so Stage A stops with the reverse
+        stream's claims persisted and its lineage still provisional."""
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
+        mcp_server._db = None
+        self._reset_progress()
+
+        real_forward = mcp_server._forward_apply
+        calls = {"n": 0}
+
+        def stopping_forward(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == stop_after:
+                mcp_server._shutdown_requested.set()
+            return real_forward(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", stopping_forward)
+        try:
+            await mcp_server._run_ingestion(str(repo), "master")
+        finally:
+            monkeypatch.setattr(mcp_server, "_forward_apply", real_forward)
+        assert mcp_server._ingest_progress["status"] == "stopped", mcp_server._ingest_progress
+        mcp_server._db = None
+
+    def _raw_query(self, graph_path, datalog):
+        import mcp_server
+        from minigraf import MiniGrafDb
+        db = MiniGrafDb.open(str(graph_path))
+        try:
+            rows = json.loads(mcp_server._db_execute(db, datalog)).get("results", [])
+        finally:
+            db = None
+        return sorted(tuple(r) for r in rows)
+
+    def _query(self, graph_path, datalog):
+        """_raw_query minus the bookkeeping entities the two runs
+        legitimately differ on."""
+        return [
+            r for r in self._raw_query(graph_path, datalog)
+            if not str(r[0]).startswith(self._BOOKKEEPING_PREFIXES)
+        ]
+
+    # The rest of the fact shape, beyond the :introduced-by and live-:ident
+    # oracles asserted first. Bound through :ident on purpose: `?e` alone is
+    # minigraf's internal subject, which is not stable across two
+    # separately-built graphs.
+    _SNAPSHOT_QUERIES = {
+        "modified-in": "[?e :ident ?i] [?e :modified-in ?v]",
+        "entity-type": "[?e :ident ?i] [?e :entity-type ?v]",
+        "description": "[?e :ident ?i] [?e :description ?v]",
+        "path": "[?e :ident ?i] [?e :path ?v]",
+        "file": "[?e :ident ?i] [?e :file ?v]",
+        "contains": "[?e :ident ?i] [?e :contains ?v]",
+        "depends-on": "[?e :ident ?i] [?e :depends-on ?v]",
+        "renamed-to": "[?e :ident ?i] [?e :renamed-to ?v]",
+        "renamed-from": "[?e :ident ?i] [?e :renamed-from ?v]",
+    }
+
+    def _snapshot(self, graph_path):
+        return {
+            label: self._query(graph_path, f"(query [:find ?i ?v :where {where}])")
+            for label, where in self._SNAPSHOT_QUERIES.items()
+        }
+
+    def _lineage(self, graph_path):
+        """Every live entity's :introduced-by, keyed by :ident.
+
+        Bound through :ident on purpose. `?e` alone is minigraf's internal
+        subject, which is not stable across two separately-built graphs, and
+        joining through :ident additionally means an entity the forward walk
+        closed (no live :ident) drops out -- so a deletion the mixed run
+        failed to apply shows up here as an extra row rather than hiding
+        behind the fact that a close does not retract :introduced-by.
+        """
+        return self._query(
+            graph_path, "(query [:find ?i ?c :where [?e :ident ?i] [?e :introduced-by ?c]])"
+        )
+
+    def _live_idents(self, graph_path):
+        return self._query(graph_path, "(query [:find ?i :where [?e :ident ?i]])")
+
+    def _assert_no_self_modification(self, graph_path, label):
+        """No entity may be :modified-in the same commit it is :introduced-by.
+
+        #222 phase 2d review, B2. A forward-only ingest cannot produce that
+        shape (_build_code_triples emits one or the other, never both) and
+        _correction_sweep_apply has an explicit self-introduction guard
+        against it, so it is a standing invariant of the graph rather than a
+        differential -- asserted on BOTH graphs for that reason.
+
+        Held as a SET of (ident, commit) pairs, not a dict keyed by ident: a
+        close does not retract :introduced-by, and a duplicate introduction
+        leaves an entity with two live :introduced-by rows, so dict() would
+        keep only whichever row came last and this helper could then
+        under-report its own offenders. The duplicate itself is still caught
+        by _assert_parity's _lineage comparison -- this only makes the list
+        printed here accurate.
+        """
+        intro = {(i, c) for i, c in self._query(
+            graph_path, "(query [:find ?i ?c :where [?e :ident ?i] [?e :introduced-by ?c]])"
+        )}
+        modified = self._query(
+            graph_path, "(query [:find ?i ?c :where [?e :ident ?i] [?e :modified-in ?c]])"
+        )
+        offenders = sorted({(i, c) for i, c in modified if (i, c) in intro})
+        assert offenders == [], (
+            f"[{label}] entities carry :modified-in at their own :introduced-by "
+            f"commit: {offenders}"
+        )
+
+    def _assert_parity(self, multi, forward_only):
+        """The whole oracle: the two graphs must agree on lineage, on which
+        entities are live, and on the rest of the fact shape -- and neither
+        may carry a provisional marker or a self-modification.
+
+        Extracted from test_introduced_by_matches_a_forward_only_ingest
+        unchanged (#222 phase 2d review, findings (t)/B2) so the incremental
+        re-ingest tests below measure the graph against exactly the same
+        oracle rather than a weaker restatement of it.
+        """
+        import mcp_server
+
+        multi_lineage = self._lineage(multi)
+        forward_lineage = self._lineage(forward_only)
+        assert multi_lineage, "no lineage facts at all -- the ingest did nothing"
+        assert multi_lineage == forward_lineage, (
+            "1:1 and forward-only graphs disagree on :introduced-by\n"
+            f"  only in 1:1:  {sorted(set(multi_lineage) - set(forward_lineage))}\n"
+            f"  only in fwd:  {sorted(set(forward_lineage) - set(multi_lineage))}"
+        )
+
+        # Lifecycle guard: :introduced-by is never retracted by a close, so
+        # lineage parity alone would not notice an entity that should have
+        # been closed but has no :introduced-by row of its own to betray it.
+        # It is also the half that catches B1 -- an entity a resuming forward
+        # walk wrongly closed as "removed" drops out of :ident here.
+        multi_live = self._live_idents(multi)
+        forward_live = self._live_idents(forward_only)
+        assert multi_live == forward_live, (
+            "1:1 and forward-only graphs disagree on which entities are live\n"
+            f"  only in 1:1:  {sorted(set(multi_live) - set(forward_live))}\n"
+            f"  only in fwd:  {sorted(set(forward_live) - set(multi_live))}"
+        )
+
+        # Checked BEFORE the fact-shape comparison below, which would
+        # otherwise report a self-modification as an anonymous :modified-in
+        # diff. This says what is actually wrong with the row.
+        self._assert_no_self_modification(multi, "1:1")
+        self._assert_no_self_modification(forward_only, "forward-only")
+
+        # The remaining fact shape must agree too -- a rename that landed as
+        # an unrelated birth would still satisfy the two oracles above if it
+        # happened to pick the same commit, but not :renamed-to/:renamed-from
+        # or :contains.
+        multi_snapshot = self._snapshot(multi)
+        forward_snapshot = self._snapshot(forward_only)
+        for label in self._SNAPSHOT_QUERIES:
+            a, b = multi_snapshot[label], forward_snapshot[label]
+            assert a == b, (
+                f"1:1 and forward-only graphs disagree on {label}\n"
+                f"  only in 1:1:  {sorted(set(a) - set(b))}\n"
+                f"  only in fwd:  {sorted(set(b) - set(a))}"
+            )
+
+        # Marker companions carry no :ident of their own -- they are reached
+        # through :entity, exactly as _preload_provisional_idents reaches them.
+        marker_q = (
+            "(query [:find ?e :where "
+            f"[?m :entity-type {mcp_server._LINEAGE_MARKER_ENTITY_TYPE}] [?m :entity ?e]])"
+        )
+        assert self._raw_query(multi, marker_q) == [], (
+            "the 1:1 run left provisional lineage markers behind -- Stage B's "
+            "reconciliation never confirmed them: "
+            f"{self._raw_query(multi, marker_q)}"
+        )
+        assert self._raw_query(forward_only, marker_q) == [], \
+            "a forward-only run should never create a provisional lineage marker"
+
+        return multi_live
+
+    def _assert_reverse_claimed(self, graph_path, repo, positions):
+        """Guard against a vacuous differential: if the reverse stream never
+        claimed the lifecycle commits, the two runs agree for a boring
+        reason and this test proves nothing."""
+        import mcp_server
+        from minigraf import MiniGrafDb
+        db = MiniGrafDb.open(str(graph_path))
+        try:
+            high = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        finally:
+            db = None
+        assert high is not None, "the reverse stream claimed nothing -- test is vacuous"
+        linearization = frontier_registry.build_linearization(str(repo), "master")
+        pos = {h: i for i, h in enumerate(linearization)}
+        lo, hi = pos[high[0]], pos[high[1]]
+        for p in positions:
+            assert lo <= p <= hi, (
+                f"position {p} was not reverse-claimed (frontier-high covers "
+                f"{lo}..{hi}) -- this test would pass vacuously"
+            )
+
+    @pytest.mark.asyncio
+    async def test_introduced_by_matches_a_forward_only_ingest(self, tmp_path, monkeypatch):
+        repo = self._repo(tmp_path)
+        multi = tmp_path / "multi.graph"
+        forward_only = tmp_path / "fwd.graph"
+
+        await self._ingest(repo, multi, monkeypatch, "1:1")
+        # Forward-only: give the forward stream the entire range by making the
+        # reverse side never get a turn before the gap is exhausted.
+        await self._ingest(repo, forward_only, monkeypatch, f"{10**6}:1")
+
+        # Non-vacuity: the deletion (p6), the rename (p7) and the post-rename
+        # edit (p8) must all have been reverse-claimed in the 1:1 run.
+        self._assert_reverse_claimed(multi, repo, [6, 7, 8])
+
+        # The oracle itself. Stage B's A/M lineage RECONCILIATION half is
+        # deliberately invisible in the fact shape it compares whenever the
+        # reverse stream's guess was already the right commit, which is the
+        # common case (feature.py's `extra` is born at p5, inside the reverse
+        # region, so the reverse walk guesses p5 correctly and there is
+        # nothing to correct). What reconciliation alone does is retract the
+        # :type/lineage-marker companion that says "provisional". Measured:
+        # disabling _correction_sweep_apply leaves exactly `extra` marked and
+        # changes no other fact, so without _assert_parity's marker assertion
+        # the reconciliation half of Stage B would be untested here. A
+        # forward-only run never creates a marker at all, so it stays a
+        # differential.
+        multi_live = self._assert_parity(multi, forward_only)
+
+        # ...and the agreed-on graph is one that really did see the lifecycle
+        # events, so parity is not agreement on an inert history.
+        import mcp_server
+        live = {i for (i,) in multi_live}
+        assert mcp_server._code_ident("module", "legacy.py") not in live, \
+            "the deleted module is still live -- Stage B's lifecycle pass did nothing"
+        assert mcp_server._code_ident("module", "util.py") not in live, \
+            "the renamed-away module is still live"
+        assert mcp_server._code_ident("module", "helpers/util.py") in live, \
+            "the rename destination was never created"
+
+    @pytest.mark.asyncio
+    async def test_incremental_re_ingest_matches_a_forward_only_ingest(
+        self, tmp_path, monkeypatch
+    ):
+        """#222 phase 2d review, B1: the oracle above, run over a SECOND
+        ingest of the same graph after a new commit lands.
+
+        This is the shape every real session has -- the plugin auto-ingests at
+        server start, and _frontier_load discards the previous run's high
+        interval the moment HEAD moves past it, handing the whole previous
+        reverse region back to the gap. The resuming forward walk therefore
+        re-walks commits whose entities the reverse stream (and Stage B) have
+        already written, ABOVE :ingestion/watermark. Before the fix, the
+        current-graph preload handed those entities to the forward walk as
+        "previously known", the earlier commits it replayed did not contain
+        them, and they were closed and purged as removals -- so
+        :module/helpers-util-py and friends simply vanished from the graph.
+        """
+        repo = self._repo(tmp_path)
+        multi = tmp_path / "multi.graph"
+        forward_only = tmp_path / "fwd.graph"
+
+        await self._ingest(repo, multi, monkeypatch, "1:1")
+        # Non-vacuity twice over: entities exclusive to the reverse region
+        # (helpers/util.py's, born at p7) are what the resumed walk can lose.
+        self._assert_reverse_claimed(multi, repo, [6, 7, 8])
+
+        self._new_commit(repo)
+
+        await self._ingest(repo, multi, monkeypatch, "1:1")
+        await self._ingest(repo, forward_only, monkeypatch, f"{10**6}:1")
+
+        multi_live = self._assert_parity(multi, forward_only)
+
+        import mcp_server
+        live = {i for (i,) in multi_live}
+        assert mcp_server._code_ident("module", "helpers/util.py") in live, \
+            "the rename destination born in the previous run's reverse region " \
+            "was closed by the resumed forward walk"
+        assert mcp_server._code_ident("function", "feature.py", "extra") in live, \
+            "the function born inside the previous run's reverse region was " \
+            "closed by the resumed forward walk"
+
+    @pytest.mark.asyncio
+    async def test_re_ingest_after_an_interrupted_run_matches_forward_only(
+        self, tmp_path, monkeypatch
+    ):
+        """The same regression, reached the other way (#222 phase 2d review,
+        B1 and B2).
+
+        A run stopped mid-Stage-A leaves the reverse stream's claims durable
+        and its lineage still PROVISIONAL -- Stage B never ran. The next run
+        then both resumes the forward walk into that region and reconciles
+        those guesses, which is where B2's self-:modified-in appears: the
+        reverse stream's first sighting of an entity born inside its own
+        region IS that entity's introduction (`audit`, at p8), so the guess
+        and the commit the forward walk is applying are the same commit.
+
+        The resumed run is deliberately forward-heavy, not 1:1. Both bugs
+        need the FORWARD stream to reach the positions the previous run's
+        reverse stream wrote; at 1:1 over the re-opened gap the reverse
+        stream re-claims the top of the range and the forward walk never
+        arrives, so a 1:1 resume here would pass vacuously. The
+        clean-completed-run variant above covers the 1:1 resume.
+        """
+        repo = self._repo(tmp_path)
+        multi = tmp_path / "multi.graph"
+        forward_only = tmp_path / "fwd.graph"
+
+        # Stop from inside the fourth forward apply: at 1:1 the claimer has
+        # by then run F0, R8, F1, R7, F2, R6, F3, so positions 6..8 are
+        # durably reverse-claimed with their lineage still provisional.
+        await self._ingest_interrupted(repo, multi, monkeypatch, stop_after=4)
+        self._assert_reverse_claimed(multi, repo, [6, 7, 8])
+
+        self._new_commit(repo)
+
+        await self._ingest(repo, multi, monkeypatch, f"{10**6}:1")
+        await self._ingest(repo, forward_only, monkeypatch, f"{10**6}:1")
+
+        multi_live = self._assert_parity(multi, forward_only)
+
+        import mcp_server
+        live = {i for (i,) in multi_live}
+        assert mcp_server._code_ident("function", "auth.py", "audit") in live, \
+            "the function born in the interrupted run's reverse region was " \
+            "closed by the resumed forward walk"
+
+
+class TestStagingAndShutdown:
+    def _repo(self, tmp_path, n_commits=6):
+        """A linear auth.py history where the newest third also carries a
+        function that does NOT exist earlier.
+
+        That last part is load-bearing (#222 phase 2d review, findings B1 and
+        (t)). This fixture originally wrote the identical `def login()` body
+        in every commit, so every commit parsed to the identical entity set
+        and NO entity was ever exclusive to the region the reverse stream
+        claims -- which is precisely why
+        test_shutdown_during_stage_a_stops_and_resumes could resume cleanly
+        while the resumed forward walk was silently closing and purging every
+        reverse-region entity in a real repo.
+
+        Commit dates are pinned and strictly increasing rather than left to
+        wall-clock: ingest valid-time is denominated in AUTHOR dates
+        (_git_commits reads `%at`, not `%ct`), and a burst of same-second
+        commits is indistinguishable on that axis. GIT_AUTHOR_DATE is the
+        one that matters here; GIT_COMMITTER_DATE is set alongside it only
+        so the fixture's two clocks cannot disagree. Author dates are more
+        inversion-prone than committer dates in real histories (rebase,
+        cherry-pick, late merges), which is why this fixture pins them
+        rather than relying on them being ordered.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        # `helper` is introduced in the newest third, i.e. inside
+        # frontier-high's territory at the 1:1 default. `audit` is introduced
+        # in the LAST commit alone, so it is exclusive to the reverse region
+        # even when a run is interrupted after a single reverse claim -- the
+        # narrowest case, and the one test_shutdown_during_stage_a_stops_and_
+        # resumes exercises.
+        helper_from = n_commits - max(1, n_commits // 3)
+        for i in range(n_commits):
+            body = f"def login():\n    return {i}\n"
+            if i >= helper_from:
+                body += "\ndef helper():\n    return 0\n"
+            if i == n_commits - 1:
+                body += "\ndef audit():\n    return 0\n"
+            (repo / "auth.py").write_text(body)
+            ts = (
+                datetime.datetime(2021, 3, 1, tzinfo=datetime.timezone.utc)
+                + datetime.timedelta(days=i)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            env = {**os.environ, "GIT_AUTHOR_DATE": ts, "GIT_COMMITTER_DATE": ts}
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(
+                ["git", "commit", "-m", f"h{i}"], cwd=repo, check=True,
+                capture_output=True, env=env,
+            )
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_phase_reaches_sweeping_and_processed_never_exceeds_total(self, tmp_path, monkeypatch):
+        """Stage B's commits are re-visits of positions Stage A already
+        counted -- counting them again would push processed past total.
+
+        NOTE on a deviation from the brief's literal assertion: the brief
+        reads `_ingest_progress["phase"] == "sweeping"` AFTER `_run_ingestion`
+        has already returned. That directly contradicts Task 9's review fix
+        (#222 phase 2d, commit de0a062, finding 3): "phase" describes what a
+        RUNNING ingest is doing and must not outlive the run, because leaving
+        "sweeping" in place after completion made a finished run permanently
+        report {"status": "complete", "phase": "sweeping"} -- exactly the bug
+        that fix corrected, with its own code comment saying so at the clear
+        site. Reverting that would reintroduce a real, previously-flagged
+        defect, so this test instead observes the transition to "sweeping"
+        DURING the run (via a spy on _correction_sweep_apply, the same seam
+        test_sweep_does_not_start_before_stage_a_drains uses) and separately
+        asserts the phase is correctly cleared once the run is over.
+        """
+        import mcp_server
+        repo = self._repo(tmp_path)
+        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+
+        observed_sweeping = False
+        real_apply = mcp_server._correction_sweep_apply
+
+        def spy(db, *args, **kwargs):
+            nonlocal observed_sweeping
+            if mcp_server._ingest_progress["phase"] == "sweeping":
+                observed_sweeping = True
+            return real_apply(db, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert observed_sweeping, "phase must reach 'sweeping' at some point during Stage B"
+        assert mcp_server._ingest_progress["phase"] is None, \
+            "phase must not outlive the run (Task 9 review fix, de0a062)"
+        assert mcp_server._ingest_progress["processed"] <= mcp_server._ingest_progress["total"]
+
+    @pytest.mark.asyncio
+    async def test_sweep_does_not_start_before_stage_a_drains(self, tmp_path, monkeypatch):
+        """The sweep's precondition is a CLOSED gap. Stage A pre-claims up to
+        pipeline_depth positions ahead of persisting them, so the in-memory
+        gap can close while commits are still in flight -- the DB-read
+        precondition is what makes this safe, and this test pins it."""
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+
+        observed = []
+        real_apply = mcp_server._correction_sweep_apply
+
+        def spy(db, *args, **kwargs):
+            observed.append(mcp_server._ingest_progress["phase"])
+            return real_apply(db, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", spy)
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert observed, "the sweep must actually have run"
+        assert set(observed) == {"sweeping"}
+
+    @pytest.mark.asyncio
+    async def test_shutdown_during_stage_a_stops_and_resumes(self, tmp_path, monkeypatch):
+        import mcp_server, frontier_registry
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path, n_commits=10)
+        graph = tmp_path / "g.graph"
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+
+        real_forward = mcp_server._forward_apply
+        calls = {"n": 0}
+
+        def stopping_forward(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                mcp_server._shutdown_requested.set()
+            return real_forward(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", stopping_forward)
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "stopped"
+        mcp_server._db = None
+
+        # A run stopped in Stage A must NOT claim confirmed lineage at HEAD.
+        db = MiniGrafDb.open(str(graph))
+        linearization = frontier_registry.build_linearization(str(repo))
+        assert mcp_server._lineage_confirmed_through_query(db) != linearization[-1]
+        db = None
+        mcp_server._db = None
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", real_forward)
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete"
+        mcp_server._db = None
+        db2 = MiniGrafDb.open(str(graph))
+        assert mcp_server._preload_provisional_idents(db2) == set()
+        assert mcp_server._lineage_confirmed_through_query(db2) == linearization[-1]
+
+        # #222 phase 2d review, B1: "resumed cleanly" has to mean the graph
+        # still holds what the interrupted run wrote. `audit` exists only in
+        # the last commit and `helper` only in the newest third -- the region
+        # the reverse stream claims -- so the resuming forward walk replays
+        # commits that legitimately lack them, and before the fix closed and
+        # purged them as removals. Asserted through :ident, which a close
+        # retracts (unlike :introduced-by, which it does not).
+        for name in ("helper", "audit"):
+            ident = mcp_server._code_ident("function", "auth.py", name)
+            live = json.loads(mcp_server._db_execute(
+                db2, f'(query [:find ?i :where [{ident} :ident ?i]])'
+            ))["results"]
+            assert live == [[ident]], (
+                f"`{name}`, born in the reverse-claimed region, did not survive "
+                f"the resume: {live}"
+            )
+        db2 = None
+        mcp_server._db = None
+
+    @pytest.mark.asyncio
+    async def test_neither_sync_wrapper_is_called_from_run_ingestion(self, tmp_path, monkeypatch):
+        """2c and 2b both document that their sync wrappers must not be
+        called from async code -- each fuses a CPU-bound parse with DB-bound
+        writes into one executor-schedulable unit."""
+        import mcp_server
+        repo = self._repo(tmp_path)
+        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+
+        for name in (
+            "_correction_sweep_claim_and_process",
+            "_correction_sweep_walk",
+            "_reverse_bulk_fill_walk",
+            "_reverse_fill_claim_and_process",
+        ):
+            def boom(*a, _n=name, **k):
+                raise AssertionError(f"{_n} must not be called from _run_ingestion")
+            monkeypatch.setattr(mcp_server, name, boom)
+
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete"

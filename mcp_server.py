@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -101,6 +102,7 @@ _ingest_task: Optional[asyncio.Task] = None
 _ingest_progress: Dict[str, Any] = {
     "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
     "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+    "phase": None,
 }
 _shutdown_requested = asyncio.Event()
 
@@ -4826,6 +4828,66 @@ def _watermark_query(db: Any) -> Optional[str]:
     return results[0][0] if results else None
 
 
+def _commit_date_query(db: Any, commit_hash: Optional[str]) -> Optional[str]:
+    """Return an already-ingested commit's ISO 8601 :date, or None.
+
+    :any-valid-time is required, not cosmetic: a commit's own facts are
+    transacted at THAT COMMIT's timestamp, which can sit in the future
+    relative to wall-clock time (clock skew, doctored committer dates), so a
+    plain query's implicit "as of now" filter can miss them -- the same
+    reason _total_ingested_query gives. Commit facts are never closed, so
+    unlike that function no :db/valid-to filter is needed to pick the live
+    row; a re-walked position can re-transact an identical :date under a
+    fresh valid-from (#156), but every such row carries the same value.
+
+    Returning None for a NON-EMPTY watermark is not benign: it degrades every
+    caller's resume-position bound back to the unrestricted, pre-fix B1
+    queries (see _load_ingestion_preload_state), which is a correctness
+    regression rather than a slow path. The degradation is therefore
+    announced on stderr instead of failing silently. None for an EMPTY
+    watermark is the ordinary fresh-graph case and stays quiet.
+    """
+    if not commit_hash:
+        return None
+    try:
+        raw = _db_execute(
+            db,
+            f"(query [:find ?d :any-valid-time "
+            f":where [:commit/{commit_hash[:12]} :date ?d]])",
+        )
+        results = json.loads(raw).get("results", [])
+    except Exception as e:
+        print(
+            f"[ingest] watermark commit {commit_hash[:12]} :date lookup failed "
+            f"({e}); preloads fall back to unbounded current-graph queries",
+            file=sys.stderr,
+        )
+        return None
+    if not results:
+        print(
+            f"[ingest] watermark commit {commit_hash[:12]} has no :date fact; "
+            f"preloads fall back to unbounded current-graph queries",
+            file=sys.stderr,
+        )
+        return None
+    return results[0][0]
+
+
+def _iso_to_epoch_ms(ts_iso: Optional[str]) -> Optional[int]:
+    """Convert an ingest ISO 8601 timestamp to minigraf's epoch-ms valid-time
+    scale, so it can be compared against the :db/valid-from/:db/valid-to
+    pseudo-attributes. Returns None if ts_iso is absent or unparseable."""
+    if not ts_iso:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return int(parsed.timestamp() * 1000)
+
+
 def _total_ingested_query(db: Any) -> int:
     """Return the :total-ingested watermark recorded by the last *completed* run, or 0.
 
@@ -5306,8 +5368,9 @@ def _entity_introduced_by_set_provisional(
     introduced. Forward walk cannot produce that shape, nothing in the graph
     or the audit detects it, and it persists.
 
-    Positions, never timestamps: committer dates are not monotonic in
-    topological order (clock skew, rebases), which is why
+    Positions, never timestamps: ingest :date values are AUTHOR dates
+    (_git_commits reads `%at`) and are not monotonic in topological order
+    (clock skew, rebases, cherry-picks), which is why
     build_linearization uses --topo-order at all, so comparing :date values
     would silently mis-order commits. Both parameters default to None, in
     which case the guard is skipped and behaviour is exactly as before --
@@ -5333,6 +5396,136 @@ def _entity_introduced_by_set_provisional(
         _retract(db, f"[[{entity_ident} :introduced-by {current}]]", index_con=index_con)
     _transact(db, f"[[{entity_ident} :introduced-by {commit_ident}]]", commit_ts_iso, index_con=index_con)
     _lineage_mark_provisional(db, entity_ident, commit_ts_iso, index_con=index_con)
+
+
+def _re_date_structural_facts(
+    db: Any,
+    structural_triples: List[str],
+    new_ts_iso: str,
+    index_con: Optional[Any] = None,
+) -> None:
+    """Retract and re-assert an entity's structural facts at new_ts_iso.
+
+    Used whenever a provisional :introduced-by guess moves to an earlier
+    commit -- by _reverse_apply when the reverse walk finds an even earlier
+    occurrence, and by _forward_reconcile_provisional when the forward walk
+    reaches the true introduction. In both cases the facts were written at
+    the timestamp of the commit where the entity was first SIGHTED, which is
+    later than the introduction now is, leaving a valid-time window where
+    :introduced-by is live for an entity with no type, name or file -- so
+    ":as-of the introduction" reports it as nonexistent.
+
+    _retract targets live rows regardless of their original valid_from, so
+    this is a straight re-assert at the earlier timestamp.
+
+    :contains is retracted and transacted ONE TRIPLE PER CALL, on both
+    sides. Minigraf's EAVT pending index omits value bytes, so facts sharing
+    (entity, attribute, valid_from) in one call collapse to the last -- see
+    #222 phase 2b1, where this cost five of six containment edges on an
+    ordinary multi-entity file, permanently.
+    """
+    contains = [t for t in structural_triples if ":contains" in t]
+    other = [t for t in structural_triples if ":contains" not in t]
+    if other:
+        _retract(db, "[" + " ".join(other) + "]", index_con=index_con)
+        _transact(db, "[" + " ".join(other) + "]", new_ts_iso, index_con=index_con)
+    for triple in contains:
+        _retract(db, "[" + triple + "]", index_con=index_con)
+        _transact(db, "[" + triple + "]", new_ts_iso, index_con=index_con)
+
+
+def _forward_reconcile_provisional(
+    db: Any,
+    entity_ident: str,
+    structural_triples: List[str],
+    true_commit_ts_iso: str,
+    ts_by_commit_ident: Dict[str, str],
+    commit_ident: str,
+    index_con: Optional[Any] = None,
+) -> Optional[str]:
+    """#222 phase 2d: the forward walk has reached entity_ident's TRUE
+    introduction and found a provisional guess left by Stream 2. Clear the
+    guess so the caller's normal authoritative emission is the only
+    :introduced-by fact that survives.
+
+    Returns the superseded guess's commit ident, or None if entity_ident was
+    not provisional (in which case nothing is written at all).
+
+    Deliberately does NOT write the authoritative :introduced-by itself --
+    the caller's ordinary _build_code_triples output does that, so there is
+    exactly one code path that mints an authoritative introduction and this
+    function cannot drift from it.
+
+    Mirrors the supersede path in _reverse_apply: the same re-dating of
+    structural facts (via _re_date_structural_facts), the same refusal to
+    back-date a :modified-in edge whose commit timestamp is unknown, and --
+    what commit_ident is for -- the same refusal to hand the entity a
+    :modified-in edge at its OWN introduction (_reverse_apply's
+    `superseded_ident != commit_ident` guard).
+    """
+    guess_ident = _entity_introduced_by_query(db, entity_ident)
+    if not _lineage_is_provisional(db, entity_ident):
+        return None
+
+    # 1. Drop the guess. The caller writes the real one immediately after.
+    if guess_ident is not None:
+        _retract(db, f"[[{entity_ident} :introduced-by {guess_ident}]]", index_con=index_con)
+
+    # 2. Re-date structural facts to the true (earlier) introduction.
+    _re_date_structural_facts(
+        db,
+        [t for t in structural_triples if ":introduced-by" not in t],
+        true_commit_ts_iso,
+        index_con=index_con,
+    )
+
+    # 3. The entity's lineage is authoritative from here on.
+    _lineage_confirm(db, entity_ident, index_con=index_con)
+
+    if guess_ident is None:
+        return None
+
+    # 4. The candidate-diff record is stale the moment the guess moves off it,
+    # and this is the cheapest place to drop it -- guess_ident is right here.
+    _candidate_diff_clear(db, guess_ident[len(":commit/"):], entity_ident, index_con=index_con)
+
+    # 5. The guess commit is now known to be a genuine modification rather
+    # than the introduction -- UNLESS it is this very commit, which is the
+    # introduction. Stream 2 can guess the right commit and still leave a
+    # provisional marker on it (it claims high-to-low, so the first sighting
+    # of an entity born inside its own region IS that entity's introduction);
+    # the marker then survives whenever the run is interrupted before Stage B
+    # confirms it, and a later run's forward walk re-walks the position after
+    # _frontier_load discards the unrepresentable high interval. Writing the
+    # edge here would assert that the entity was modified at the commit that
+    # created it -- the exact shape _correction_sweep_apply refuses to write
+    # via its own self-introduction guard, and one a forward-only ingest can
+    # never produce. It is also unreachable by the sweep once the position is
+    # forward territory, so it would be permanent.
+    if guess_ident == commit_ident:
+        return guess_ident
+
+    # Otherwise the guess commit earns the :modified-in edge Stream 2
+    # withheld from it. Dated at ITS OWN timestamp, not this commit's.
+    #
+    # This inherits 2b's documented over-assertion: #221's unchanged-body
+    # narrowing cannot be re-checked against the guess commit's own diff,
+    # because only that commit's own parse carries the data. That is already
+    # owned -- the guess commit lies inside frontier-high's territory, so the
+    # correction sweep visits it, finds exactly one :introduced-by (case 3),
+    # and retracts this edge if its own parse says the body was unchanged.
+    guess_ts = ts_by_commit_ident.get(guess_ident)
+    if guess_ts is None:
+        print(
+            f"[_forward_reconcile_provisional] skipping retroactive :modified-in "
+            f"for {entity_ident} at {guess_ident}: no timestamp in commit_metadata",
+            file=sys.stderr,
+        )
+        return guess_ident
+    _transact(
+        db, f"[[{entity_ident} :modified-in {guess_ident}]]", guess_ts, index_con=index_con,
+    )
+    return guess_ident
 
 
 _LAST_RUN_KEYWORD_ATTRS = frozenset({":entity-type"})
@@ -6636,10 +6829,66 @@ def _build_code_triples(
     return triples
 
 
-def _preload_known_entities(db: Any, repo_path: str) -> tuple:
+def _preload_known_entities(
+    db: Any, repo_path: str, valid_at: Optional[str] = None
+) -> tuple:
     """Load all existing module/function/class/external-dependency idents from
     the DB, and pre-seed file_entities with all currently tracked files in the
     repo.
+
+    valid_at (#222 phase 2d review, B1) bounds the entity queries to the graph
+    as it stood at the forward walk's RESUME POSITION -- i.e. at the
+    :ingestion/watermark commit's own timestamp -- instead of "now". Before the
+    two-stream ingest, the two were the same thing: the graph never held facts
+    for a commit above the watermark. The reverse stream breaks that. It writes
+    structural facts across the whole frontier-high region, and Stage B's
+    lifecycle pass then applies that region's deletions and renames, so a
+    CURRENT-graph preload hands the resuming forward walk a state describing
+    commits it has not reached yet. Both directions of that mismatch corrupt
+    the graph:
+
+      * an entity born in the reverse region is present in file_entities, is
+        absent from the parse of the (earlier) commit the forward walk is
+        replaying, and so is closed and _forget_closed_entity-purged as a
+        "removed" entity -- with an orig_ts LATER than the close's valid_to,
+        an inverted valid interval;
+      * an entity CLOSED in the reverse region is missing from the state
+        entirely, so replaying an earlier commit that still contains it takes
+        _build_code_triples' introduction branch and mints a second live
+        :introduced-by.
+
+    Passing None restores the pre-#222 behaviour exactly, which is what a
+    fresh graph (no watermark) wants.
+
+    Known residual, deliberately not papered over: valid-time is populated
+    from AUTHOR dates -- _git_commits reads `%at`, not `%ct` -- which are not
+    monotonic in topological order, and are MORE inversion-prone than
+    committer dates would be (a rebase, a cherry-pick or a long-lived branch
+    merged late all carry the original author date forward, while rewriting
+    the committer date). So this bound is looser than a committer-date bound,
+    and looser still than a position-indexed one.
+
+    The residual therefore runs in BOTH directions, not just one:
+
+      * a commit at or below the watermark dated LATER than the watermark
+        commit -- its entities drop out of this snapshot and are treated as
+        new, i.e. duplicate introduction (the second bullet above, rarer);
+      * a commit ABOVE the watermark dated EARLIER than the watermark commit
+        -- its entities stay in this snapshot, are absent from the parse of
+        the earlier commit being replayed, and are closed and
+        _forget_closed_entity-purged: B1's original DATA-LOSS mode, surviving
+        in narrow form.
+
+    Both are live on this repository: of 552 watermark positions, 6 (118-123)
+    have a strictly-earlier-dated LATER position, and those later positions
+    (124-128, a side branch authored 2026-04-26/27 landing topologically
+    after the 2026-05-02 merges) are confirmed descendants of 118-123 via
+    `git merge-base --is-ancestor`. Consequence for whoever closes this: the
+    eventual ancestry- or position-indexed filter must REPLACE this
+    valid-time bound, not be unioned with it as an "add-back" -- a union only
+    re-admits the benign duplicate-introduction direction and leaves the
+    data-loss direction wide open. (The linearization is not available on
+    this code path, which is why the bound is expressed in valid-time here.)
 
     external-dependency entities share the module ident namespace and use the
     same "path" attribute as modules, so folding them into this same query
@@ -6679,12 +6928,19 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
     except Exception:
         pass
 
+    # Every clause of the query below is bounded by this one keyword, the
+    # :introduced-by -> :date join included: a commit above the watermark has
+    # a :date fact whose own valid-from is later than valid_at, so the join
+    # simply finds nothing for it.
+    valid_at_clause = f':valid-at "{_edn_escape(valid_at)}" ' if valid_at else ""
+
     for entity_type in ("module", "function", "class", "variable", "field", "external-dependency"):
         path_attr = "path" if entity_type in ("module", "external-dependency") else "file"
         try:
             raw = _db_execute(
                 db,
                 f'(query [:find ?ident ?path ?desc ?date '
+                f'{valid_at_clause}'
                 f':where [?e :entity-type :type/{entity_type}] '
                 f'[?e :ident ?ident] '
                 f'[?e :{path_attr} ?path] '
@@ -6707,7 +6963,9 @@ def _preload_known_entities(db: Any, repo_path: str) -> tuple:
     return entity_valid_from, entity_descriptions, file_entities, submodule_paths
 
 
-def _preload_unresolved_dep_idents(db: Any, submodule_paths: Dict[str, str]) -> Dict[str, str]:
+def _preload_unresolved_dep_idents(
+    db: Any, submodule_paths: Dict[str, str], valid_at: Optional[str] = None
+) -> Dict[str, str]:
     """Reload ident -> import_name for every unresolved-import stub (#112).
 
     _preload_known_entities' external-dependency branch requires a :path fact,
@@ -6721,12 +6979,33 @@ def _preload_unresolved_dep_idents(db: Any, submodule_paths: Dict[str, str]) -> 
     find and link any stub created in an earlier run (see the gitlink "add"
     handling in _run_ingestion) — without this, only same-run stubs would
     ever get linked.
+
+    valid_at MUST be the same resume-position bound _preload_known_entities
+    was given (#222 phase 2d review, B1), because submodule_paths is that
+    function's OUTPUT: this query is a minuend and submodule_paths is its
+    subtrahend, so bounding one without the other breaks the subtraction. A
+    real submodule created above the watermark by a prior run's Stage B would
+    drop out of the (bounded) subtrahend while staying in an unbounded
+    minuend, and be misclassified as a stub — reaching
+    state.unresolved_dep_idents, where the replayed gitlink "add" handler's
+    _submodule_path_matches_import check can fire on it (a submodule's
+    :description is `name or path`) and mint a bogus
+    [:module/sub-b :resolves-to :module/sub-a].
+
+    Unlike _preload_field_class_idents, this set has no asymmetry arguing for
+    the unrestricted read: an EXTRA entry is the bogus edge above, while a
+    MISSING one (a stub the reverse stream created above the watermark) is
+    merely a link the forward-only oracle would not have made at that
+    position either.
     """
     unresolved: Dict[str, str] = {}
+    valid_at_clause = f':valid-at "{_edn_escape(valid_at)}" ' if valid_at else ""
     try:
         raw = _db_execute(
             db,
-            "(query [:find ?ident ?desc :where "
+            "(query [:find ?ident ?desc "
+            f"{valid_at_clause}"
+            ":where "
             "[?e :entity-type :type/external-dependency] "
             "[?e :ident ?ident] "
             "[?e :description ?desc]])",
@@ -6749,6 +7028,16 @@ def _preload_field_class_idents(db: Any) -> Dict[str, str]:
     silently leaked open when a later run closes the field (its module-contains
     edge would still close, but not the class one). Current-time query semantics
     naturally exclude already-closed fields' edges.
+
+    Deliberately NOT bounded to the resume position, unlike the preloads
+    around it (#222 phase 2d review, B1). This is a pure side-table read
+    through .get() at close sites, never a "what existed then" set: an extra
+    entry for a field the forward walk has not reached is inert (nothing
+    looks it up until that field is genuinely closed, at which point the
+    value is right), while a MISSING entry is the leaked-edge bug above. So
+    the failure modes are asymmetric here in the opposite direction, and the
+    unrestricted read is the safer one. _preload_field_static_idents is the
+    same shape and is left alone for the same reason.
     """
     field_class_ident: Dict[str, str] = {}
     try:
@@ -6795,10 +7084,42 @@ def _preload_field_static_idents(db: Any) -> Dict[str, bool]:
 _VALID_TIME_FOREVER_MS = (1 << 63) - 1  # minigraf's i64::MAX "still open" :valid-to sentinel
 
 
+def _valid_time_window_clauses(valid_at_ms: Optional[int]) -> str:
+    """Predicate clauses selecting the facts live at valid_at_ms, for the
+    :any-valid-time preloads that bind ?vf/?vt (#222 phase 2d review, B1).
+
+    valid_at_ms=None keeps the pre-existing "still open right now" test
+    (:valid-to still at the forever sentinel) unchanged. Otherwise the test
+    becomes half-open containment, [?vf, ?vt) ∋ valid_at_ms -- the same
+    boundary rule :valid-at itself uses (a fact starting exactly at the
+    instant is live, one ending exactly at it is not), verified against the
+    backend so the two preload styles cannot disagree at the watermark.
+    The forever sentinel satisfies [(> ?vt valid_at_ms)] for any real
+    timestamp, so still-open facts stay in.
+    """
+    if valid_at_ms is None:
+        return f"[(= ?vt {_VALID_TIME_FOREVER_MS})]"
+    return f"[(<= ?vf {valid_at_ms})] [(> ?vt {valid_at_ms})]"
+
+
 def _preload_known_deps(
-    db: Any, file_entities: Dict[str, List[str]]
+    db: Any, file_entities: Dict[str, List[str]], valid_at_ms: Optional[int] = None
 ) -> tuple:
     """Reload file_deps/dep_valid_from from durable :depends-on facts.
+
+    valid_at_ms is _preload_known_entities' valid_at on minigraf's epoch-ms
+    valid-time scale, and means the same thing: the graph as it stood at the
+    forward walk's resume position (#222 phase 2d review, B1). :depends-on is
+    never written by the reverse stream, but Stage B's lifecycle pass calls
+    _forward_apply(lifecycle_only=True), whose dep_add_triples are NOT gated
+    on that flag -- so a completed two-stream run does leave :depends-on edges
+    above the watermark, and a current-time reload would hand them to a
+    resuming forward walk that then closes them at an earlier commit. This
+    query cannot express the bound as :valid-at, because the
+    :db/valid-from/:db/valid-to pseudo-attributes it needs only bind under
+    :any-valid-time; the equivalent is stated directly as
+    [valid_from, valid_to) containing valid_at_ms, which is exactly
+    :valid-at's own half-open semantics.
 
     Mirrors _preload_known_entities, but :depends-on facts have no
     :introduced-by-style companion edge to a commit's :date, so the
@@ -6851,7 +7172,7 @@ def _preload_known_deps(
             "[?src :depends-on ?dep] "
             "[?src :db/valid-from ?vf] "
             "[?src :db/valid-to ?vt] "
-            f"[(= ?vt {_VALID_TIME_FOREVER_MS})]])"
+            f"{_valid_time_window_clauses(valid_at_ms)}])"
         )
         rows = json.loads(raw).get("results", [])
     except Exception:
@@ -6871,10 +7192,15 @@ def _preload_known_deps(
     return file_deps, dep_valid_from
 
 
-def _preload_pinned_commits(db: Any) -> Dict[str, tuple]:
+def _preload_pinned_commits(db: Any, valid_at_ms: Optional[int] = None) -> Dict[str, tuple]:
     """Reload each external-dependency entity's current :pinned-commit value
     and the timestamp it was set at, mirroring _preload_known_deps's per-fact
     :any-valid-time pattern for :depends-on.
+
+    valid_at_ms carries the same resume-position bound, for the same reason:
+    Stage B's lifecycle pass runs the gitlink handling over the reverse
+    region, so a completed two-stream run can leave a bump recorded above the
+    watermark (#222 phase 2d review, B1).
 
     Needed because :pinned-commit is bi-temporally closed and reopened on
     every bump (see _run_ingestion's gitlink handling) — without this, the
@@ -6900,7 +7226,7 @@ def _preload_pinned_commits(db: Any) -> Dict[str, tuple]:
             "[?e :pinned-commit ?sha] "
             "[?e :db/valid-from ?vf] "
             "[?e :db/valid-to ?vt] "
-            f"[(= ?vt {_VALID_TIME_FOREVER_MS})]])"
+            f"{_valid_time_window_clauses(valid_at_ms)}])"
         )
         rows = json.loads(raw).get("results", [])
     except Exception:
@@ -6912,6 +7238,30 @@ def _preload_pinned_commits(db: Any) -> Dict[str, tuple]:
         )
         pinned[ident] = (sha, vf_iso)
     return pinned
+
+
+def _preload_provisional_idents(db: Any) -> Set[str]:
+    """Every tracked ident that currently has a :type/lineage-marker
+    companion entity, i.e. whose :introduced-by is a provisional guess.
+
+    No :status clause is needed: the marker exists ONLY while the entity is
+    provisional -- _lineage_confirm retracts the whole companion entity
+    rather than flipping its :status -- so existence is the test, exactly as
+    _lineage_is_provisional does per-ident. Keeping the two queries the same
+    shape is deliberate: this set is consulted where a per-ident check is
+    too expensive, and the two must never disagree.
+
+    Deliberately NOT bounded to the resume position the way the mutable walk
+    state is (#222 phase 2d review, B1). This set is the reconciliation
+    AUTHORITY: its whole job is to name the entities the reverse stream
+    introduced above the watermark, so restricting it to the watermark's
+    valid-time would empty it of exactly the rows it exists to carry.
+    """
+    raw = _db_execute(
+        db,
+        f"(query [:find ?e :where [?m :entity-type {_LINEAGE_MARKER_ENTITY_TYPE}] [?m :entity ?e]])",
+    )
+    return {row[0] for row in json.loads(raw).get("results", [])}
 
 
 def _load_ingestion_preload_state(repo_path: str) -> tuple:
@@ -6932,17 +7282,43 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     """
     db = _db if _db is not None else _open_db_at_with_extended_retry(_graph_path or _get_graph_path())
     watermark = _watermark_query(db)
+    # #222 phase 2d review, B1: the MUTABLE walk state must describe the graph
+    # at the forward walk's resume position, not "now" -- see
+    # _preload_known_entities' valid_at docstring for what goes wrong
+    # otherwise. The resume position IS the watermark (both the forward walk
+    # and Stage B's lifecycle pass start there), so the bound is that
+    # commit's own :date, read back out of the graph. Wall-clock time would
+    # be wrong twice over: it is not the resume position, and ingest
+    # valid-time is denominated in AUTHOR dates (_git_commits reads `%at`,
+    # not `%ct`), not real time. Author dates invert more readily than
+    # committer dates -- see _preload_known_entities' docstring for the
+    # residual this leaves open in BOTH directions, and for why the eventual
+    # ancestry-indexed fix must replace this bound rather than union with it.
+    # No watermark means a fresh graph, where None degrades this to exactly
+    # the pre-#222 unrestricted queries rather than to an empty state.
+    resume_valid_at = _commit_date_query(db, watermark)
+    resume_valid_at_ms = _iso_to_epoch_ms(resume_valid_at)
     prior_ingested = _count_commit_entities(db)
-    entity_valid_from, entity_descriptions, file_entities, submodule_paths = _preload_known_entities(db, repo_path)
-    file_deps, dep_valid_from = _preload_known_deps(db, file_entities)
-    pinned_commit_state = _preload_pinned_commits(db)
+    entity_valid_from, entity_descriptions, file_entities, submodule_paths = _preload_known_entities(
+        db, repo_path, valid_at=resume_valid_at,
+    )
+    file_deps, dep_valid_from = _preload_known_deps(
+        db, file_entities, valid_at_ms=resume_valid_at_ms,
+    )
+    pinned_commit_state = _preload_pinned_commits(db, valid_at_ms=resume_valid_at_ms)
     field_class_ident = _preload_field_class_idents(db)
     field_static_ident = _preload_field_static_idents(db)
-    unresolved_dep_idents = _preload_unresolved_dep_idents(db, submodule_paths)
+    # Same bound as _preload_known_entities above, and not optional: this
+    # preload subtracts submodule_paths, which that call already bounded.
+    unresolved_dep_idents = _preload_unresolved_dep_idents(
+        db, submodule_paths, valid_at=resume_valid_at,
+    )
+    provisional_idents = _preload_provisional_idents(db)
     return (
         watermark, prior_ingested, entity_valid_from, entity_descriptions,
         file_entities, file_deps, dep_valid_from, pinned_commit_state,
         field_class_ident, field_static_ident, submodule_paths, unresolved_dep_idents,
+        provisional_idents,
     )
 
 
@@ -7320,36 +7696,43 @@ def _extract_commit(
     return results, gitlink_changes, gitmodules_map, renamed_pairs
 
 
-def _reverse_fill_claim_and_process(
+def _reverse_apply(
     db: Any,
     repo_path: str,
     linearization: List[str],
     commit_metadata: List[Tuple[str, str, str, str]],
-    allocator: "frontier_registry.FrontierAllocator",
-    ignore_patterns: Sequence[str] = (),
+    pos: int,
+    file_results: List[tuple],
     index_con: Optional[Any] = None,
-) -> Optional[str]:
-    """#222 phase 2b: claim exactly one position from the gap's high end
-    (allocator.claim_high()) and process that one commit -- structural
-    facts, :modified-in edges, provisional :introduced-by, and candidate-diff
-    records for every entity the commit's "A"/"M" files touch. "D"/"R"
-    files are skipped entirely (deletions and renames are out of scope for
-    this sub-phase -- see the design spec).
+) -> str:
+    """#222 phase 2b: apply one already-claimed, already-extracted commit --
+    structural facts, :modified-in edges, provisional :introduced-by, and
+    candidate-diff records for every entity the commit's "A"/"M" files
+    touch. "D"/"R" files are skipped entirely (deletions and renames are
+    out of scope for this sub-phase -- see the design spec).
 
-    Reuses _extract_commit/_build_code_triples unchanged for entity
-    discovery/parsing (direction-agnostic). BOTH :introduced-by and
-    :modified-in are filtered out of _build_code_triples's own output and
-    written by this function instead -- _build_code_triples's gate for
-    both attributes is entity_valid_from membership, which for forward
-    walk coincides with "is this the introduction commit" but for reverse
-    walk does not: the first commit reverse walk sees an entity at is the
-    newest touch (not the introduction), and the commit where reverse walk
-    finally stops finding an even-earlier occurrence (the true
-    introduction) is by then already "known" from later, already-visited
-    commits. Reusing _build_code_triples's :modified-in emission verbatim
-    would misclassify both ends. See the design spec's "Per-commit
-    algorithm" section (revised after the final whole-branch review found
-    this defect) for the full derivation.
+    Split out of _reverse_fill_claim_and_process's single body (#222 phase
+    2d): `pos` (from allocator.claim_high()) and `file_results` (from
+    _extract_commit) are now supplied by the caller instead of produced
+    here, so the CPU-bound tree-sitter parse and these DB-bound writes can
+    be scheduled onto separate executors. See
+    _reverse_fill_claim_and_process's own docstring for why that split
+    matters and who is responsible for driving each half.
+
+    Reuses _build_code_triples unchanged for entity discovery/parsing
+    (direction-agnostic). BOTH :introduced-by and :modified-in are filtered
+    out of _build_code_triples's own output and written by this function
+    instead -- _build_code_triples's gate for both attributes is
+    entity_valid_from membership, which for forward walk coincides with
+    "is this the introduction commit" but for reverse walk does not: the
+    first commit reverse walk sees an entity at is the newest touch (not
+    the introduction), and the commit where reverse walk finally stops
+    finding an even-earlier occurrence (the true introduction) is by then
+    already "known" from later, already-visited commits. Reusing
+    _build_code_triples's :modified-in emission verbatim would misclassify
+    both ends. See the design spec's "Per-commit algorithm" section
+    (revised after the final whole-branch review found this defect) for
+    the full derivation.
 
     :introduced-by: a newly-discovered entity's guess is asserted via
     _entity_introduced_by_set_provisional and gets no :modified-in yet
@@ -7381,12 +7764,11 @@ def _reverse_fill_claim_and_process(
     an intermediate draft of 2c's spec dropped the case entirely, leaving it
     briefly owned by nobody (see the 2b review).
 
-    Returns the claimed commit's hash, or None if the gap was already
-    empty (allocator.claim_high() returned None) -- caller's signal to
-    stop. Writes for one commit are followed by exactly one
-    _db_checkpoint(db) call, after _frontier_persist_claim records the
-    claim -- mirrors _run_ingestion's one-checkpoint-per-commit cadence
-    (see the design spec's "Resume-safety / atomicity boundary" section).
+    Returns the applied commit's hash. Writes for one commit are followed
+    by exactly one _db_checkpoint(db) call, after _frontier_persist_claim
+    records the claim -- mirrors _run_ingestion's one-checkpoint-per-commit
+    cadence (see the design spec's "Resume-safety / atomicity boundary"
+    section).
     """
     # commit_metadata is indexed POSITIONALLY against linearization below,
     # while _frontier_persist_claim persists linearization[pos] -- so a
@@ -7394,20 +7776,16 @@ def _reverse_fill_claim_and_process(
     # persist another: silent, systematic misattribution. _run_ingestion
     # builds a watermark-relative list for its own use
     # (_git_commits(repo, watermark, branch)), which is exactly the wrong
-    # thing to hand this function. Checked before claim_high() so a bad call
-    # does not consume a position. This raises rather than returning None
-    # (2c's mirror-image guard returns None) because 2c selects its own
-    # position and can decline, whereas this walk has been handed one.
+    # thing to hand this function. _reverse_fill_claim_and_process checks
+    # this before claim_high() so a bad call does not consume a position;
+    # this copy is duplicated here because 2d calls _reverse_apply directly,
+    # after already claiming pos itself.
     if len(commit_metadata) != len(linearization):
         raise ValueError(
             "commit_metadata must be full-history and positionally aligned with "
             f"linearization (got {len(commit_metadata)} entries vs {len(linearization)}); "
             "pass _git_commits(repo, watermark_hash=None)"
         )
-
-    pos = allocator.claim_high()
-    if pos is None:
-        return None
 
     commit_hash, commit_ts_iso, author, subject = commit_metadata[pos]
     if commit_hash != linearization[pos]:
@@ -7416,10 +7794,6 @@ def _reverse_fill_claim_and_process(
             f"{linearization[pos]}: the two must be positionally aligned"
         )
     commit_ident = f":commit/{commit_hash[:12]}"
-
-    file_results, _gitlink_changes, _gitmodules_map, _renamed_pairs = _extract_commit(
-        repo_path, commit_hash, ignore_patterns
-    )
 
     all_triples: List[str] = [
         f"[{commit_ident} :entity-type :type/commit]",
@@ -7540,7 +7914,7 @@ def _reverse_fill_claim_and_process(
         intro_pos = pos_by_commit_ident.get(intro_ident) if intro_ident is not None else None
         if intro_pos is not None and pos <= intro_pos:
             print(
-                f"[_reverse_fill_claim_and_process] skipping :modified-in for {ident} at "
+                f"[_reverse_apply] skipping :modified-in for {ident} at "
                 f"position {pos}: not later than its introduction {intro_ident} "
                 f"(position {intro_pos})",
                 file=sys.stderr,
@@ -7575,32 +7949,17 @@ def _reverse_fill_claim_and_process(
             superseded_pos = pos_by_commit_ident.get(superseded_ident)
             if superseded_pos is None or superseded_pos > pos:
                 # The move happened: this commit is genuinely earlier.
-                #
                 # Re-date the entity's structural facts to match (#222 phase
-                # 2b1). They were written at the timestamp of the commit
+                # 2b1) -- see _re_date_structural_facts's own docstring for
+                # why (they were written at the timestamp of the commit
                 # where the walk first SIGHTED the entity, which is later
-                # than the guess now is -- leaving a valid-time window where
-                # :introduced-by is live for an entity with no type, name or
-                # file, so ":as-of the introduction" says it did not exist.
-                # _retract targets live rows regardless of their original
-                # valid_from, so this is a straight re-assert at the earlier
-                # timestamp. :contains goes one per call for the same EAVT
-                # reason as above, on the retract side too (see
-                # _ingest_close's docstring).
-                structural = [
-                    t for t in candidate_triples_by_ident.get(ident, [])
-                    if ":introduced-by" not in t
-                ]
-                structural_contains = [t for t in structural if ":contains" in t]
-                structural_other = [t for t in structural if ":contains" not in t]
-                if structural_other:
-                    _retract(db, "[" + " ".join(structural_other) + "]", index_con=index_con)
-                    _transact(
-                        db, "[" + " ".join(structural_other) + "]", commit_ts_iso, index_con=index_con,
-                    )
-                for structural_triple in structural_contains:
-                    _retract(db, "[" + structural_triple + "]", index_con=index_con)
-                    _transact(db, "[" + structural_triple + "]", commit_ts_iso, index_con=index_con)
+                # than the guess now is).
+                _re_date_structural_facts(
+                    db,
+                    [t for t in candidate_triples_by_ident.get(ident, []) if ":introduced-by" not in t],
+                    commit_ts_iso,
+                    index_con=index_con,
+                )
 
                 # The superseded candidate-diff record is stale the moment
                 # the guess moves off it, and this is the cheapest place to
@@ -7623,7 +7982,7 @@ def _reverse_fill_claim_and_process(
                 # to before the modification it describes -- a fact asserted
                 # valid before it was true. Skip and say so instead.
                 print(
-                    f"[_reverse_fill_claim_and_process] skipping retroactive :modified-in "
+                    f"[_reverse_apply] skipping retroactive :modified-in "
                     f"for {ident} at {superseded_ident}: no timestamp in commit_metadata",
                     file=sys.stderr,
                 )
@@ -7635,6 +7994,45 @@ def _reverse_fill_claim_and_process(
     _frontier_persist_claim(db, linearization, pos, from_low=False, commit_ts_iso=commit_ts_iso, index_con=index_con)
     _db_checkpoint(db)
     return commit_hash
+
+
+def _reverse_fill_claim_and_process(
+    db: Any,
+    repo_path: str,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+    allocator: "frontier_registry.FrontierAllocator",
+    ignore_patterns: Sequence[str] = (),
+    index_con: Optional[Any] = None,
+) -> Optional[str]:
+    """Synchronous convenience wrapper: claim one position from the gap's
+    high end and process it. Kept for tests and _reverse_bulk_fill_walk.
+
+    **2d must not call this from async code** -- it fuses the CPU-bound
+    tree-sitter parse and the DB-bound writes into one function body, so it
+    can only be scheduled onto one executor as a unit. On write_executor (a
+    thread) that parse holds the GIL for its whole duration, which is
+    exactly the event-loop starvation #116 introduced the process pool to
+    fix. 2d awaits _extract_commit on the process pool and _reverse_apply on
+    write_executor instead. Same caveat 2c's own wrappers carry.
+
+    Returns the claimed commit's hash, or None if the gap was already empty.
+    """
+    if len(commit_metadata) != len(linearization):
+        raise ValueError(
+            "commit_metadata must be full-history and positionally aligned with "
+            f"linearization (got {len(commit_metadata)} entries vs {len(linearization)}); "
+            "pass _git_commits(repo, watermark_hash=None)"
+        )
+    pos = allocator.claim_high()
+    if pos is None:
+        return None
+    file_results, _gitlink_changes, _gitmodules_map, _renamed_pairs = _extract_commit(
+        repo_path, linearization[pos], ignore_patterns
+    )
+    return _reverse_apply(
+        db, repo_path, linearization, commit_metadata, pos, file_results, index_con=index_con,
+    )
 
 
 def _reverse_bulk_fill_walk(
@@ -7682,6 +8080,604 @@ def _reverse_bulk_fill_walk(
             break
         last_pos = pos
     return count
+
+
+def _forward_apply(
+    db: Any,
+    repo_path: str,
+    state: "_ForwardWalkState",
+    commit: Tuple[str, str, str, str],
+    extracted: Tuple[list, list, dict, list],
+    index_con: Optional[Any] = None,
+    linearization: Optional[List[str]] = None,
+    pos: Optional[int] = None,
+    lifecycle_only: bool = False,
+) -> None:
+    """Apply one commit's forward-walk writes.
+
+    Moved verbatim out of _run_ingestion's `while pending:` loop (issue #222
+    phase 2d) so a single commit's write section can be driven per-commit by
+    the two-stream interleave. Purely synchronous: the eight individual
+    `run_in_executor(write_executor, ...)` submissions the inline body used
+    became direct calls, and the caller submits this whole function to
+    write_executor once instead.
+
+    linearization/pos are the allocator's view of this commit. When both are
+    supplied (Stage A's forward stream always does), this also persists the
+    frontier-low claim and advances the lineage-confirmed-through watermark;
+    both default to None so the existing tests that call this function with a
+    bare commit tuple stay valid.
+
+    lifecycle_only (#222 phase 2d, Stage B) restricts this to the facts the
+    REVERSE stream never wrote for a commit in frontier-high's territory --
+    deletions, renames, dependency-edge churn and gitlink changes -- while
+    leaving that commit's "A"/"M" entity facts alone. It is not a re-run of
+    the forward body: nothing wrote D/R or gitlink facts for these commits,
+    so there is nothing to deduplicate against, whereas re-running the A/M
+    emission WOULD duplicate (minigraf mints a genuinely live duplicate when
+    the same (entity, attribute, value) is re-transacted at a different
+    valid-from -- issue #156). Concretely, when true:
+
+    * The commit's own :type/commit entity and its :parent edges are skipped
+      -- _reverse_apply already wrote both for every commit in this range
+      (the same reason _correction_sweep_apply gives for not writing them).
+    * "D" files, "R" files and gitlink changes are processed unchanged. "R"
+      keeps its _build_code_triples emission for the NEW path: the reverse
+      stream skipped renames entirely, so nothing ever wrote those entities.
+    * "A"/"M" files still CALL _build_code_triples, and its returned triples
+      are DISCARDED. This looks redundant and is not: state.entity_valid_from
+      after Stage A covers only positions 0..meeting_point, so an entity
+      introduced INSIDE the reverse region is absent from it and a later
+      deletion of that entity within the same region would close with
+      orig_ts falling back to the delete commit's own timestamp -- a wrong,
+      often zero-width valid interval. Calling the function and dropping its
+      output keeps entity_valid_from / entity_descriptions / file_entities /
+      field_class_ident / field_static_ident current at zero fact cost, and
+      the sweep's ascending order makes the recorded timestamp the correct
+      EARLIEST one (_build_code_triples only writes entity_valid_from[ident]
+      when the ident is not already present).
+    * Provisional-lineage reconciliation is skipped for "A"/"M" --
+      _correction_sweep_apply owns those entities' lineage and has already
+      run for this commit. It is still performed for an "R" file's new path,
+      where the reverse stream may hold a provisional guess at a LATER
+      commit that this rename supersedes; there the DB is consulted
+      directly, because state.provisional_idents is a run-start preload
+      snapshot and is empty on a fresh ingest.
+    * _watermark_update, _frontier_persist_claim and
+      _lineage_confirmed_through_update are skipped. Stage B tracks its own
+      progress through :ingestion/correction-sweep-through, and the forward
+      frontier must not appear to advance into the reverse region.
+    """
+    commit_hash, commit_ts_iso, author, subject = commit
+    extracted_files, gitlink_changes, gitmodules_map, renamed_pairs = extracted
+    commit_ident = f":commit/{commit_hash[:12]}"
+    reason = f"git:{commit_hash} {author}: {subject}"
+
+    add_triples: List[str] = [] if lifecycle_only else [
+        f"[{commit_ident} :entity-type :type/commit]",
+        f'[{commit_ident} :ident "{commit_ident}"]',
+        f'[{commit_ident} :description "{_edn_escape(subject[:120])}"]',
+        f'[{commit_ident} :hash "{commit_hash}"]',
+        f'[{commit_ident} :author "{_edn_escape(author)}"]',
+        f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
+        f'[{commit_ident} :date "{commit_ts_iso}"]',
+    ]
+    close_items: List[tuple] = []  # (triples, original_ts_iso)
+    dep_add_triples: List[str] = []  # :depends-on triples to transact individually
+    # Old paths of files renamed this commit (R status). Their
+    # unmatched child entities / dependency edges are closed in a
+    # final pass after renamed_pairs is consumed (see below).
+    renamed_old_paths: set = set()
+
+    for status, file_path, extracted, precomputed, old_path in extracted_files:
+        if status == "D":
+            # Close module and all known child entities for this file.
+            # Iterate a copy: _forget_closed_entity mutates
+            # state.file_entities[file_path] in place as it purges.
+            idents = list(state.file_entities.get(file_path, [_code_ident("module", file_path)]))
+            module_ident = _code_ident("module", file_path)
+            for ident in idents:
+                orig_ts = state.entity_valid_from.get(ident, commit_ts_iso)
+                desc = state.entity_descriptions.get(ident, "")
+                close_items.append(
+                    (_build_close_triples(
+                        ident, desc, module_ident,
+                        state.field_class_ident.get(ident),
+                        close_entity_type=True, file_value=file_path,
+                        is_static=state.field_static_ident.get(ident),
+                    ), orig_ts)
+                )
+                _forget_closed_entity(
+                    ident, file_path, state.entity_valid_from,
+                    state.entity_descriptions, state.field_class_ident, state.file_entities,
+                    state.field_static_ident,
+                )
+            # Whole file is gone: drop its (now-empty) state.file_entities key
+            # so nothing stale lingers under this path (matches state.file_deps).
+            state.file_entities.pop(file_path, None)
+            # Close all :depends-on edges for the deleted module
+            for dep_ident in state.file_deps.get(file_path, set()):
+                orig_ts = state.dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
+                close_items.append(
+                    ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
+                )
+            state.file_deps.pop(file_path, None)
+        else:  # A or M or R
+            if status == "R" and old_path:
+                renamed_old_paths.add(old_path)
+                old_module_ident = _code_ident("module", old_path)
+                new_module_ident = _code_ident("module", file_path)
+                add_triples.append(f"[{new_module_ident} :renamed-from {old_module_ident}]")
+                # :renamed-to is a brand-new fact that becomes
+                # true at the rename commit and stays true forever
+                # after — it must be transacted open-ended (like
+                # :renamed-from), NOT closed with the old entity's
+                # historical valid window via _ingest_close.
+                add_triples.append(f"[{old_module_ident} :renamed-to {new_module_ident}]")
+                old_desc = state.entity_descriptions.get(old_module_ident, old_path)
+                orig_ts = state.entity_valid_from.get(old_module_ident, commit_ts_iso)
+                close_items.append((
+                    _build_close_triples(
+                        old_module_ident, old_desc, old_module_ident,
+                        close_entity_type=True, file_value=old_path,
+                    ),
+                    orig_ts,
+                ))
+                # Purge the closed old module. Its remaining child
+                # entities under old_path are closed+purged by the
+                # renamed_old_paths pass below, which also pops the
+                # whole state.file_entities[old_path] key — so only the
+                # scalar dicts and the module's own list slot need
+                # dropping here.
+                _forget_closed_entity(
+                    old_module_ident, old_path, state.entity_valid_from,
+                    state.entity_descriptions, state.field_class_ident, state.file_entities,
+                    state.field_static_ident,
+                )
+            previous_idents = set(state.file_entities.get(file_path, []))
+            # #222 phase 2d: an entity Stream 2 already introduced
+            # provisionally is NOT authoritatively introduced, so the
+            # forward walk must treat it as new. Popping it out of
+            # entity_valid_from is what makes _build_code_triples's own
+            # gate (entity_valid_from membership) agree -- deliberately
+            # in preference to widening that function's signature, since
+            # its gate means "is this the introduction" for a forward
+            # walk and nothing else should depend on that meaning.
+            #
+            # It is also semantically right on its own terms: the
+            # valid_from Stream 2 recorded is a wrong guess, and must
+            # never be used as an orig_ts for a close.
+            #
+            # state.provisional_idents is a PRELOAD SNAPSHOT (see
+            # _preload_provisional_idents), not the authority -- by the
+            # time this commit is reached, the entity may already have
+            # been confirmed authoritative in the DB (reconciled earlier
+            # in this same forward pass, or by a previous run's
+            # correction sweep) without the in-memory set knowing.
+            # Trusting the set alone would still pop entity_valid_from and
+            # hand the ident to _build_code_triples as "new" even though
+            # _forward_reconcile_provisional no-ops on an already-
+            # authoritative entity (see its own provisional check) --
+            # minting a SECOND :introduced-by alongside the authoritative
+            # one already there. That is exactly the two-value ambiguity
+            # _correction_sweep_apply fails safe on and never resolves,
+            # reintroduced through this door. So the set is kept only as
+            # a cheap prefilter; the DB (_lineage_is_provisional) is the
+            # authority actually consulted before an ident is treated as
+            # reconcilable. Every candidate that was in the set is
+            # evicted below regardless of whether it survives that
+            # check -- a stale entry left in place would be retried, and
+            # fail the same way, on every later commit that touches the
+            # entity.
+            #
+            # lifecycle_only (Stage B): _correction_sweep_apply owns "A"/"M"
+            # lineage and has already run for this very commit, so
+            # reconciling here would mint a second :introduced-by behind its
+            # back. An "R" file's NEW path is the one case that still needs
+            # it -- nothing wrote those entities in Stage A, so the reverse
+            # stream's provisional guess (if any) sits at a LATER commit that
+            # this rename supersedes. state.provisional_idents cannot be the
+            # prefilter there: it is a run-start snapshot, empty on a fresh
+            # ingest, and the guess was made during this same run.
+            if lifecycle_only:
+                reconcilable = (
+                    [
+                        ident for ident in _forward_candidate_idents(precomputed)
+                        if _lineage_is_provisional(db, ident)
+                    ]
+                    if status == "R" else []
+                )
+                # The eviction invariant above still holds here, it just has a
+                # different source: the preload snapshot is not the prefilter in
+                # this mode, so what must leave the set is exactly what was
+                # reconciled. Leaving these behind (the eviction loop's `[]` in
+                # an earlier revision) meant an R-file ident reconciled during
+                # Stage B stayed in state.provisional_idents and would be
+                # retried by every later commit touching the entity.
+                candidate_in_set = list(reconcilable)
+            else:
+                candidate_in_set = [
+                    ident for ident in _forward_candidate_idents(precomputed)
+                    if ident in state.provisional_idents
+                ]
+                reconcilable = [
+                    ident for ident in candidate_in_set
+                    if _lineage_is_provisional(db, ident)
+                ]
+            # Built once per file rather than scanned per ident (matches
+            # _reverse_fill_claim_and_process's candidate_triples_by_ident
+            # precedent) -- a per-ident linear scan here is O(n^2) per file
+            # once there is more than one reconcilable entity.
+            structural_triples_by_ident = (
+                _forward_structural_triples_by_ident(precomputed) if reconcilable else {}
+            )
+            for ident in reconcilable:
+                state.entity_valid_from.pop(ident, None)
+                if ident not in structural_triples_by_ident:
+                    # Unreachable in normal operation: _forward_candidate_idents
+                    # and _forward_structural_triples_by_ident scan the same
+                    # five sources. If they ever desynchronize, failing loudly
+                    # beats a silent [] -- that would let
+                    # _forward_reconcile_provisional retract the guess and
+                    # confirm lineage while skipping the re-dating, stranding
+                    # structural facts at the wrong valid-time.
+                    raise RuntimeError(
+                        f"_forward_structural_triples_by_ident has no entry for "
+                        f"{ident!r}, but it came from _forward_candidate_idents, "
+                        "which scans the same five sources -- the two have "
+                        "desynchronized"
+                    )
+                _forward_reconcile_provisional(
+                    db, ident, structural_triples_by_ident[ident],
+                    commit_ts_iso, state.ts_by_commit_ident, commit_ident,
+                    index_con=index_con,
+                )
+            for ident in candidate_in_set:
+                state.provisional_idents.discard(ident)
+            triples = _build_code_triples(
+                file_path, extracted, commit_ts_iso, state.entity_valid_from,
+                state.entity_descriptions, state.file_entities, commit_ident, precomputed,
+                state.field_class_ident, state.field_static_ident,
+            )
+            # lifecycle_only: called for its dict side effects, output
+            # DISCARDED for "A"/"M" (see this function's docstring). "R" keeps
+            # it -- the reverse stream skipped renames entirely, so nothing
+            # ever wrote the new path's entities.
+            if not lifecycle_only or status == "R":
+                add_triples.extend(triples)
+            # Detect entities removed from a modified file.
+            # _build_code_triples only appends to state.file_entities, never removes.
+            # Compare previous idents against the idents derivable from the
+            # current extraction to find what was deleted.
+            if status == "M":
+                module_ident = _code_ident("module", file_path)
+                current_extracted_idents: set = {module_ident}
+                for fn_ident, _fn_name, _fn_triples in precomputed["function_entries"]:
+                    current_extracted_idents.add(fn_ident)
+                for cls_ident, _cls_name, _cls_triples in precomputed["class_entries"]:
+                    current_extracted_idents.add(cls_ident)
+                # Globals and fields are tracked in state.file_entities too
+                # (see _build_code_triples): omitting them here would
+                # make every still-present global/field look "removed"
+                # on any later edit and wrongly close it (#113).
+                for gvar_ident, _gvar_name, _gvar_triples in precomputed["global_entries"]:
+                    current_extracted_idents.add(gvar_ident)
+                for field_ident, _field_name, _field_triples in precomputed["field_entries"]:
+                    current_extracted_idents.add(field_ident)
+                removed_idents = previous_idents - current_extracted_idents
+                # An in-place rename (old->new in the same file) is
+                # closed with :renamed-to linkage by the renamed_pairs
+                # loop below; exclude those old idents here so they are
+                # not ALSO closed as a plain removal (double close).
+                same_file_renamed_old_idents = {
+                    _code_ident(cat, o_file, o_name)
+                    for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
+                    if o_file == file_path
+                }
+                removed_idents -= same_file_renamed_old_idents
+                for ident in removed_idents:
+                    orig_ts = state.entity_valid_from.get(ident, commit_ts_iso)
+                    desc = state.entity_descriptions.get(ident, "")
+                    close_items.append(
+                        (_build_close_triples(
+                            ident, desc, module_ident,
+                            state.field_class_ident.get(ident),
+                            close_entity_type=True, file_value=file_path,
+                            is_static=state.field_static_ident.get(ident),
+                        ), orig_ts)
+                    )
+                    # File survives (M), only this child was removed:
+                    # purge just this ident from the file's list.
+                    _forget_closed_entity(
+                        ident, file_path, state.entity_valid_from,
+                        state.entity_descriptions, state.field_class_ident, state.file_entities,
+                        state.field_static_ident,
+                    )
+            # Compute dep edges for this file and diff against previous.
+            # Resolution itself already happened in _extract_commit
+            # (precomputed["resolved_imports"]) against that commit's
+            # own git-ls-tree state — nothing left to resolve here.
+            module_ident = _code_ident("module", file_path)
+            current_deps: set = set()
+            for import_name, dep_ident, is_resolved in precomputed["resolved_imports"]:
+                if dep_ident != module_ident:
+                    current_deps.add(dep_ident)
+                    is_relative = import_name.startswith(".")
+                    if not is_resolved and not is_relative and dep_ident not in state.entity_valid_from:
+                        add_triples.extend([
+                            f"[{dep_ident} :entity-type :type/external-dependency]",
+                            f'[{dep_ident} :ident "{_edn_escape(dep_ident)}"]',
+                            f'[{dep_ident} :description "{_edn_escape(import_name)}"]',
+                        ])
+                        state.entity_valid_from[dep_ident] = commit_ts_iso
+                        state.entity_descriptions[dep_ident] = import_name
+                        state.unresolved_dep_idents[dep_ident] = import_name
+                        # #112: an already-known submodule may be the real
+                        # target this unresolvable import was reaching for
+                        # (submodule directories are never in state.file_entities,
+                        # so any import into one always falls through here).
+                        for sub_ident, sub_path in state.submodule_paths.items():
+                            if _submodule_path_matches_import(sub_path, import_name):
+                                add_triples.append(f"[{dep_ident} :resolves-to {sub_ident}]")
+            previous_deps = state.file_deps.get(file_path, set())
+            for dep_ident in current_deps - previous_deps:
+                dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")
+                state.dep_valid_from[(module_ident, dep_ident)] = commit_ts_iso
+            if status == "M":
+                for dep_ident in previous_deps - current_deps:
+                    orig_ts = state.dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
+                    close_items.append(
+                        ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
+                    )
+            state.file_deps[file_path] = current_deps
+
+    # Function/class rename linkage (Task 9's renamed_pairs).
+    # Module-level linkage is handled separately per-file
+    # above (Task 5) since it comes from git's own -M
+    # detection, not this commit-wide matcher.
+    for category, old_file, old_name, new_file, new_name in renamed_pairs:
+        old_ident = _code_ident(category, old_file, old_name)
+        new_ident = _code_ident(category, new_file, new_name)
+        add_triples.append(f"[{new_ident} :renamed-from {old_ident}]")
+        # :renamed-to becomes true at the rename commit and stays
+        # open-ended thereafter — transact it via the add path, do
+        # NOT fold it into the old entity's _ingest_close window.
+        add_triples.append(f"[{old_ident} :renamed-to {new_ident}]")
+        old_desc = state.entity_descriptions.get(old_ident, old_name)
+        old_module_ident = _code_ident("module", old_file)
+        orig_ts = state.entity_valid_from.get(old_ident, commit_ts_iso)
+        close_items.append((
+            _build_close_triples(
+                old_ident, old_desc, old_module_ident,
+                state.field_class_ident.get(old_ident),
+                close_entity_type=True, file_value=old_file,
+                is_static=state.field_static_ident.get(old_ident),
+            ),
+            orig_ts,
+        ))
+        _forget_closed_entity(
+            old_ident, old_file, state.entity_valid_from,
+            state.entity_descriptions, state.field_class_ident, state.file_entities,
+            state.field_static_ident,
+        )
+
+    # A file rename (R status) only closes the old MODULE above.
+    # Child entities and dependency edges under the old path are
+    # closed here as plain removals UNLESS the matcher established
+    # a rename continuity edge for them (handled with :renamed-to
+    # by the loop above). This runs after renamed_pairs is fully
+    # consumed so those confirmed renames can be excluded; without
+    # it, unmatched old children/deps leak open forever under the
+    # old path while new ones open under the new path.
+    if renamed_old_paths:
+        renamed_covered_idents = {
+            _code_ident(cat, o_file, o_name)
+            for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
+        }
+        for r_old_path in renamed_old_paths:
+            r_old_module_ident = _code_ident("module", r_old_path)
+            # Iterate a copy: _forget_closed_entity mutates
+            # state.file_entities[r_old_path] in place as it purges.
+            for ident in list(state.file_entities.get(r_old_path, [])):
+                if ident == r_old_module_ident:
+                    continue  # already closed+purged by the R block above
+                if ident in renamed_covered_idents:
+                    continue  # already closed+purged with :renamed-to linkage
+                orig_ts = state.entity_valid_from.get(ident, commit_ts_iso)
+                desc = state.entity_descriptions.get(ident, "")
+                close_items.append(
+                    (_build_close_triples(
+                        ident, desc, r_old_module_ident,
+                        state.field_class_ident.get(ident),
+                        close_entity_type=True, file_value=r_old_path,
+                        is_static=state.field_static_ident.get(ident),
+                    ), orig_ts)
+                )
+                _forget_closed_entity(
+                    ident, r_old_path, state.entity_valid_from,
+                    state.entity_descriptions, state.field_class_ident, state.file_entities,
+                    state.field_static_ident,
+                )
+            # Whole old path is gone (renamed away): drop the key so
+            # no stale ident lingers to be re-discovered by a later
+            # commit that reuses this path (e.g. a shim at old_path).
+            state.file_entities.pop(r_old_path, None)
+            for dep_ident in state.file_deps.get(r_old_path, set()):
+                orig_ts = state.dep_valid_from.get((r_old_module_ident, dep_ident), commit_ts_iso)
+                close_items.append(
+                    ([f"[{r_old_module_ident} :depends-on {dep_ident}]"], orig_ts)
+                )
+            state.file_deps.pop(r_old_path, None)
+
+    # Process gitlink changes (submodule add/bump/remove).
+    # The "remove" case's interaction with the ordinary per-file module-open
+    # logic (elsewhere in this loop) is only sound because real submodule paths
+    # are extensionless (no tree-sitter parser matches them, so no module is
+    # ever opened for a bare gitlink path) — a gitlink path that happened to
+    # carry a recognized source extension is an untested, unreachable-in-practice edge case.
+    for kind, sha, path in gitlink_changes:
+        ext_ident = _code_ident("module", path)
+        if kind == "add":
+            info = gitmodules_map.get(path, {})
+            name = info.get("name", "")
+            url = info.get("url", "")
+            description = name or path
+            ext_triples = [
+                f"[{ext_ident} :entity-type :type/external-dependency]",
+                f'[{ext_ident} :ident "{_edn_escape(ext_ident)}"]',
+                f'[{ext_ident} :description "{_edn_escape(description)}"]',
+                f'[{ext_ident} :path "{_edn_escape(path)}"]',
+                f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]',
+                f"[{ext_ident} :introduced-by {commit_ident}]",
+            ]
+            if name:
+                ext_triples.append(f'[{ext_ident} :submodule-name "{_edn_escape(name)}"]')
+            if url:
+                ext_triples.append(f'[{ext_ident} :submodule-url "{_edn_escape(url)}"]')
+            add_triples.extend(ext_triples)
+            state.entity_valid_from[ext_ident] = commit_ts_iso
+            state.entity_descriptions[ext_ident] = description
+            state.pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
+            state.submodule_paths[ext_ident] = path
+            # #112: link any pre-existing unresolved-import stub whose
+            # import path reaches into this submodule — the ordering in
+            # the issue's own repro (stub created before the submodule
+            # was ever added), which the per-import check above can't
+            # catch since the submodule wasn't known yet at that time.
+            for stub_ident, import_name in state.unresolved_dep_idents.items():
+                if _submodule_path_matches_import(path, import_name):
+                    add_triples.append(f"[{stub_ident} :resolves-to {ext_ident}]")
+        elif kind == "bump":
+            old_sha, orig_ts = state.pinned_commit_state.get(ext_ident, (None, commit_ts_iso))
+            if old_sha is not None:
+                close_items.append(
+                    ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], orig_ts)
+                )
+            add_triples.append(f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]')
+            add_triples.append(f"[{ext_ident} :modified-in {commit_ident}]")
+            state.pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
+        else:  # "remove"
+            orig_ts = state.entity_valid_from.get(ext_ident, commit_ts_iso)
+            desc = state.entity_descriptions.get(ext_ident, "")
+            close_items.append(
+                (_build_close_triples(
+                    ext_ident, desc, ext_ident,
+                    entity_type_kw=":type/external-dependency",
+                    file_value=path,
+                ), orig_ts)
+            )
+            # Submodule removed: purge lifecycle state so a later
+            # re-add at the same path is treated as genuinely new.
+            # (Submodule paths aren't tracked in state.file_entities, so the
+            # path arg is a no-op there, but pass it for consistency.)
+            _forget_closed_entity(
+                ext_ident, path, state.entity_valid_from,
+                state.entity_descriptions, state.field_class_ident, state.file_entities,
+            )
+            old_sha, pin_orig_ts = state.pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
+            if old_sha is not None:
+                close_items.append(
+                    ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], pin_orig_ts)
+                )
+
+    # Split :contains triples out before batching.  Minigraf's EAVT
+    # pending index lacks value bytes in the key, so batching multiple
+    # [module :contains fn] facts in one transact silently drops all
+    # but the last.  Each :contains triple gets its own transact so
+    # they receive distinct tx_counts and avoid the index collision.
+    contains_triples = [t for t in add_triples if ":contains" in t]
+    other_triples = [t for t in add_triples if ":contains" not in t]
+    _ingest_transact(db, other_triples, commit_ts_iso, reason, index_con)
+    for ct in contains_triples:
+        _ingest_transact(db, [ct], commit_ts_iso, reason, index_con)
+    # :depends-on triples transacted individually — same EAVT collision risk
+    # as :contains when multiple deps share the same source module
+    for dt in dep_add_triples:
+        _ingest_transact(db, [dt], commit_ts_iso, reason, index_con)
+    for close_triples, orig_ts in close_items:
+        _ingest_close(db, close_triples, orig_ts, commit_ts_iso, reason, index_con)
+
+    # Ingest :parent edges — one transact per parent to avoid EAVT
+    # collision for merge commits (which have two parent hashes).
+    # Routed through _transact (not a raw _db_execute call) so the
+    # edge also lands in the persisted fact index -- see #118 review
+    # finding: this call site used to build its own raw (transact
+    # ...) string and bypass the index choke point entirely.
+    # lifecycle_only: _reverse_apply already wrote this commit's :parent
+    # edges (and its :type/commit entity, skipped at the top of this
+    # function) for every commit in frontier-high's territory.
+    if not lifecycle_only:
+        try:
+            for parent_hash in _git_parent_hashes(repo_path, commit_hash):
+                parent_ident = f":commit/{parent_hash[:12]}"
+                _transact(
+                    db,
+                    f'[[{commit_ident} :parent {parent_ident}]]',
+                    commit_ts_iso,
+                    None,
+                    None,
+                    index_con,
+                )
+        except Exception:
+            pass  # non-fatal; parent edges are best-effort
+
+    # lifecycle_only: Stage B tracks its own progress through
+    # :ingestion/correction-sweep-through (written by _correction_sweep_apply),
+    # and none of these three watermarks may advance into the reverse region --
+    # :ingestion/watermark and :ingestion/lineage-confirmed-through both mean
+    # "contiguous from C0", and frontier-low belongs to the forward stream.
+    if not lifecycle_only:
+        _watermark_update(db, commit_hash, commit_ts_iso, reason, index_con)
+        if linearization is not None and pos is not None:
+            _frontier_persist_claim(
+                db, linearization, pos, from_low=True,
+                commit_ts_iso=commit_ts_iso, index_con=index_con,
+            )
+        # The virgin positions this walk claims are authoritative on first write,
+        # so lineage is confirmed contiguously from C0 through here. The sweep
+        # folds its own region in later (Task 9); this watermark must not be
+        # advanced past the forward frontier before that happens.
+        _lineage_confirmed_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
+    _db_checkpoint(db)
+    _commit_index_writer_safe(index_con)
+
+
+def _forward_candidate_idents(precomputed: Dict[str, Any]) -> List[str]:
+    """Every entity ident a parsed file contributes -- module plus all four
+    child categories. Mirrors the identical collection kept inline in
+    _reverse_apply (its own local `candidate_idents`, moved verbatim out of
+    _reverse_fill_claim_and_process by #222 phase 2d Task 6) and in
+    _correction_sweep_apply (same name, same construction) -- those two are
+    NOT wired to call this helper (considered and declined, #222 phase 2d
+    Task 5 review), so all three must be kept in sync by hand."""
+    return (
+        [precomputed["module_ident"]]
+        + [ident for ident, _name, _t in precomputed["function_entries"]]
+        + [ident for ident, _name, _t in precomputed["class_entries"]]
+        + [ident for ident, _name, _t in precomputed["global_entries"]]
+        + [ident for ident, _name, _t in precomputed["field_entries"]]
+    )
+
+
+def _forward_structural_triples_by_ident(precomputed: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Every candidate ident's own structural triples, for re-dating, built
+    once per file instead of scanned per ident (#222 phase 2d Task 5 fix --
+    the previous per-ident linear scan was O(n^2) per file once more than one
+    entity needed reconciling). Matches the existing precedent in
+    _reverse_apply's candidate_triples_by_ident (moved verbatim out of
+    _reverse_fill_claim_and_process by #222 phase 2d Task 6), which builds
+    the same shape of dict from the same five sources.
+
+    A child's own list carries its [parent :contains child] edge, so
+    re-dating a child re-dates its containment edge with it (#222 phase
+    2b1)."""
+    by_ident: Dict[str, List[str]] = {
+        precomputed["module_ident"]: list(precomputed["module_candidate_triples"]),
+    }
+    for entries_key in ("function_entries", "class_entries", "global_entries", "field_entries"):
+        for entry_ident, _entry_name, entry_triples in precomputed[entries_key]:
+            by_ident[entry_ident] = list(entry_triples)
+    return by_ident
 
 
 _CORRECTION_SWEEP_THROUGH_IDENT = ":ingestion/correction-sweep-through"
@@ -7828,6 +8824,7 @@ def _correction_sweep_apply(
     file_results: List[tuple],
     index_con: Optional[Any] = None,
     skipped_so_far: int = 0,
+    update_watermark: bool = True,
 ) -> int:
     """Reconciles every candidate entity file_results describes for
     commit_hash, then records progress via _correction_sweep_through_update
@@ -7854,6 +8851,22 @@ def _correction_sweep_apply(
 
     Never calls _frontier_persist_claim -- frontier-low is not touched by
     this sweep.
+
+    update_watermark=False suppresses BOTH the trailing
+    _correction_sweep_through_update and the _db_checkpoint that follows it,
+    handing both back to the caller. Only a caller that does MORE per-commit
+    work after this returns should pass False -- 2d's Stage B, which follows
+    every call with _forward_apply(..., lifecycle_only=True) to write the
+    D/R/gitlink facts the reverse stream skipped. If the watermark advanced
+    here, a failure in that lifecycle pass would leave
+    :ingestion/correction-sweep-through naming a commit whose deletions,
+    renames and gitlink changes were never written, and the next run's
+    _correction_sweep_select_position would resume at through + 1 and skip
+    it permanently. Deferring the watermark (and the checkpoint that
+    durably records it) to after the lifecycle pass makes the whole
+    per-commit unit atomic with respect to resume, and keeps the
+    one-checkpoint-per-commit cadence intact. The default True preserves the
+    2c behaviour for every caller that does nothing after this returns.
     """
     commit_ident = f":commit/{commit_hash[:12]}"
     skipped_events = 0
@@ -7921,8 +8934,9 @@ def _correction_sweep_apply(
                             file=sys.stderr,
                         )
 
-    _correction_sweep_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
-    _db_checkpoint(db)
+    if update_watermark:
+        _correction_sweep_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
+        _db_checkpoint(db)
     return skipped_events
 
 
@@ -8023,6 +9037,135 @@ def _correction_sweep_walk(
     return commits_processed, skipped_events
 
 
+def _should_fold_lineage_watermark(db: Any, linearization: List[str]) -> bool:
+    """True iff the correction sweep genuinely reached frontier-high's own
+    :hi-hash, so :ingestion/lineage-confirmed-through may be folded forward
+    to it.
+
+    Stage B's loop exit alone must NOT trigger the fold.
+    _correction_sweep_select_position returns None for six different
+    reasons, only one of which is "reached the ceiling": it also returns
+    None when frontier-high is absent, when either boundary hash is stale
+    (rewritten history), when the gap is still open, and when
+    commit_metadata violates its contract. Folding on any None would report
+    lineage as confirmed through HEAD in exactly the situations where the
+    sweep did no work at all.
+    """
+    high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
+    if high_bounds is None:
+        return False
+    through_hash = _correction_sweep_through_query(db)
+    if through_hash is None:
+        return False
+    return through_hash == high_bounds[1] and through_hash in set(linearization)
+
+
+_DEFAULT_STREAM_RATIO = (1, 1)
+
+
+def _parse_stream_ratio(raw: Optional[str]) -> Tuple[int, int]:
+    """Parse MINIGRAF_INGEST_STREAM_RATIO ("F:R") into (forward_per_round,
+    reverse_per_round), falling back to 1:1 on anything malformed.
+
+    Never raises. This is read inside the background ingestion coroutine,
+    where a bad env var must degrade to the default rather than become the
+    reason a repository never ingests at all.
+
+    The ratio trades total work against how fast recent history becomes
+    usable: a commit the forward stream claims is parsed once and is
+    authoritative immediately, while a commit the reverse stream claims is
+    parsed twice (reverse walk, then the correction sweep's own
+    _extract_commit call). Total parse cost is N * (1 + reverse_fraction).
+    """
+    if raw is None:
+        return _DEFAULT_STREAM_RATIO
+    try:
+        forward_str, reverse_str = raw.split(":")
+        forward, reverse = int(forward_str.strip()), int(reverse_str.strip())
+        if forward < 1 or reverse < 1:
+            raise ValueError("both sides must be >= 1")
+        return forward, reverse
+    except Exception as e:
+        print(
+            f"[_run_ingestion] ignoring malformed MINIGRAF_INGEST_STREAM_RATIO "
+            f"{raw!r} ({e}); using {_DEFAULT_STREAM_RATIO[0]}:{_DEFAULT_STREAM_RATIO[1]}",
+            file=sys.stderr,
+        )
+        return _DEFAULT_STREAM_RATIO
+
+
+class _RoundRobinClaimer:
+    """#222 phase 2d: hands out positions from the shared gap, alternating
+    forward and reverse by a fixed ratio.
+
+    This IS the fairness mechanism. Because claims are handed out in one
+    deterministic sequence rather than raced between two tasks, starvation
+    is not expressible and the interleave is directly assertable in a test.
+    """
+
+    def __init__(
+        self,
+        allocator: "frontier_registry.FrontierAllocator",
+        forward_per_round: int,
+        reverse_per_round: int,
+    ):
+        self._allocator = allocator
+        self._forward_per_round = forward_per_round
+        self._reverse_per_round = reverse_per_round
+        self._taken_in_phase = 0
+        self._forward_phase = True
+
+    def next_claim(self) -> Optional[Tuple[str, int]]:
+        """('fwd', pos) or ('rev', pos), or None once the gap is empty.
+
+        There is deliberately no "the other side might still have work"
+        fallback: claim_low() and claim_high() both return None on exactly
+        the same condition, is_gap_empty(), so they can only ever return
+        None together. A fallthrough would be dead code reading as if the
+        two frontiers could exhaust independently -- they cannot; they share
+        one gap.
+        """
+        if self._forward_phase:
+            pos = self._allocator.claim_low()
+            tag = "fwd"
+            limit = self._forward_per_round
+        else:
+            pos = self._allocator.claim_high()
+            tag = "rev"
+            limit = self._reverse_per_round
+        if pos is None:
+            return None
+
+        self._taken_in_phase += 1
+        if self._taken_in_phase >= limit:
+            self._taken_in_phase = 0
+            self._forward_phase = not self._forward_phase
+        return tag, pos
+
+
+@dataclass
+class _ForwardWalkState:
+    """The forward walk's ten mutable preload dicts, threaded as one object.
+
+    Held by reference, not by value: _forward_apply mutates these in place
+    exactly as the inline loop body it was extracted from did (issue #222
+    phase 2d).
+    """
+
+    entity_valid_from: Dict[str, str]
+    entity_descriptions: Dict[str, str]
+    file_entities: Dict[str, list]
+    file_deps: Dict[str, set]
+    dep_valid_from: Dict[tuple, str]
+    pinned_commit_state: Dict[str, tuple]
+    field_class_ident: Dict[str, str]
+    field_static_ident: Dict[str, bool]
+    submodule_paths: Dict[str, str]
+    unresolved_dep_idents: Dict[str, str]
+    provisional_idents: Set[str] = field(default_factory=set)
+    ts_by_commit_ident: Dict[str, str] = field(default_factory=dict)
+
+
 async def _run_ingestion(repo_path: str, branch: str) -> None:
     """Background coroutine: walk git history and ingest code structure.
 
@@ -8062,6 +9205,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 watermark, prior_ingested, entity_valid_from, entity_descriptions,
                 file_entities, file_deps, dep_valid_from, pinned_commit_state,
                 field_class_ident, field_static_ident, submodule_paths, unresolved_dep_idents,
+                provisional_idents,  # consumed by _forward_apply (Task 5)
             ) = await loop.run_in_executor(preload_executor, _load_ingestion_preload_state, repo_path)
         # minigraf exposes no explicit close(): the file lock is only released once
         # every reference to the handle is gone — the worker thread's own `db`
@@ -8069,15 +9213,39 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # the global here is enough to release the lock.
         _db = None  # release file lock while enumerating commits
 
-        commits = _git_commits(repo_path, watermark, branch)
+        linearization = frontier_registry.build_linearization(repo_path, branch)
+        # FULL history, positionally aligned with linearization. Both
+        # _reverse_apply and _correction_sweep_select_position index it
+        # positionally, and _reverse_apply raises ValueError on a length
+        # mismatch -- a watermark-relative list is exactly the wrong thing
+        # to hand them.
+        commit_metadata = _git_commits(repo_path, None, branch)
         ignore_patterns = _load_ignore_patterns(repo_path)
+        state = _ForwardWalkState(
+            entity_valid_from=entity_valid_from,
+            entity_descriptions=entity_descriptions,
+            file_entities=file_entities,
+            file_deps=file_deps,
+            dep_valid_from=dep_valid_from,
+            pinned_commit_state=pinned_commit_state,
+            field_class_ident=field_class_ident,
+            field_static_ident=field_static_ident,
+            submodule_paths=submodule_paths,
+            unresolved_dep_idents=unresolved_dep_idents,
+            provisional_idents=provisional_idents,
+            # Full-history, so a resumed run's retroactive :modified-in for a
+            # guess commit at or below the watermark still finds a timestamp
+            # (a post-watermark-only map would silently skip it).
+            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
+        )
         repo_total_result = _subprocess.run(
             ["git", "rev-list", "--count", "HEAD"],
             cwd=repo_path, capture_output=True, text=True,
         )
-        repo_total = int(repo_total_result.stdout.strip()) if repo_total_result.returncode == 0 else len(commits)
+        repo_total = int(repo_total_result.stdout.strip()) if repo_total_result.returncode == 0 else len(commit_metadata)
         _ingest_progress["total"] = repo_total
         _ingest_progress["status"] = "running"
+        _ingest_progress["phase"] = "converging"
         _ingest_progress["processed"] = prior_ingested
         _ingest_progress["prior_ingested"] = prior_ingested
 
@@ -8125,6 +9293,23 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         index_path = fact_index.index_path_for(_graph_path or _get_graph_path())
         index_con = await loop.run_in_executor(write_executor, _open_index_writer_safe, index_path)
 
+        # #222 phase 2d: the two streams share one gap. _frontier_load WRITES
+        # (one-time watermark->interval migration, plus the lineage-marker
+        # migration), so it needs a live db and index_con and must run on
+        # write_executor rather than inline on the event-loop thread.
+        run_ts_iso = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.%f"
+        )[:-3] + "Z"
+        db = await _ensure_db_async()
+        allocator = await loop.run_in_executor(
+            write_executor, _frontier_load, db, linearization, run_ts_iso, index_con,
+        )
+        db = None
+        _db = None
+        claimer = _RoundRobinClaimer(
+            allocator, *_parse_stream_ratio(os.environ.get("MINIGRAF_INGEST_STREAM_RATIO"))
+        )
+
         try:
             # Extraction (git show + tree-sitter parse + triple construction) runs
             # in real OS processes, not threads (#116): tree-sitter's C parse holds
@@ -8147,18 +9332,30 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 max_workers=max_workers, mp_context=mp_context
             )
             try:
-                commits_iter = iter(commits)
                 pending: Any = deque()
 
+                # #222 phase 2d: positions come from the shared-gap claimer,
+                # not a plain commit iterator, and each pipeline entry carries
+                # the tag of the stream that claimed it. Extraction is stream-
+                # agnostic (every position goes to the same process pool); only
+                # the write half below dispatches on the tag.
+                #
+                # The pipeline is FIFO, and that is what preserves the ordering
+                # each stream requires: claims are handed out in one
+                # deterministic sequence, appended in that sequence and popped
+                # in it, so "fwd" positions reach _forward_apply strictly
+                # ascending (its state machine's precondition) and "rev"
+                # positions reach _reverse_apply strictly descending (its
+                # monotonicity and progress guards' precondition).
                 def submit_next() -> bool:
-                    try:
-                        commit = next(commits_iter)
-                    except StopIteration:
+                    claim = claimer.next_claim()
+                    if claim is None:
                         return False
+                    tag, pos = claim
                     fut = loop.run_in_executor(
-                        executor, _extract_commit, repo_path, commit[0], ignore_patterns
+                        executor, _extract_commit, repo_path, linearization[pos], ignore_patterns
                     )
-                    pending.append((commit, fut))
+                    pending.append((tag, pos, fut))
                     return True
 
                 for _ in range(pipeline_depth):
@@ -8170,7 +9367,8 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         completed_all = False
                         break
 
-                    (commit_hash, commit_ts_iso, author, subject), fut = pending.popleft()
+                    tag, pos, fut = pending.popleft()
+                    commit_hash, commit_ts_iso, author, subject = commit_metadata[pos]
                     # renamed_pairs (Task 9's 4th _extract_commit return element) is
                     # unpacked here but not yet consumed — Task 10 wires it into
                     # :renamed-from/:renamed-to triple emission for functions/classes.
@@ -8209,387 +9407,22 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
                     last_hash = commit_hash
                     _ingest_progress["current_commit"] = commit_hash
-                    reason = f"git:{commit_hash} {author}: {subject}"
-
-                    # Build commit entity ident from first 12 chars of hash
-                    commit_ident = f":commit/{commit_hash[:12]}"
 
                     # Acquire DB fresh each commit — never hold across yield
                     db = await _ensure_db_async()
                     try:
-                        add_triples: List[str] = [
-                            f"[{commit_ident} :entity-type :type/commit]",
-                            f'[{commit_ident} :ident "{commit_ident}"]',
-                            f'[{commit_ident} :description "{_edn_escape(subject[:120])}"]',
-                            f'[{commit_ident} :hash "{commit_hash}"]',
-                            f'[{commit_ident} :author "{_edn_escape(author)}"]',
-                            f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
-                            f'[{commit_ident} :date "{commit_ts_iso}"]',
-                        ]
-                        close_items: List[tuple] = []  # (triples, original_ts_iso)
-                        dep_add_triples: List[str] = []  # :depends-on triples to transact individually
-                        # Old paths of files renamed this commit (R status). Their
-                        # unmatched child entities / dependency edges are closed in a
-                        # final pass after renamed_pairs is consumed (see below).
-                        renamed_old_paths: set = set()
-
-                        for status, file_path, extracted, precomputed, old_path in extracted_files:
-                            if status == "D":
-                                # Close module and all known child entities for this file.
-                                # Iterate a copy: _forget_closed_entity mutates
-                                # file_entities[file_path] in place as it purges.
-                                idents = list(file_entities.get(file_path, [_code_ident("module", file_path)]))
-                                module_ident = _code_ident("module", file_path)
-                                for ident in idents:
-                                    orig_ts = entity_valid_from.get(ident, commit_ts_iso)
-                                    desc = entity_descriptions.get(ident, "")
-                                    close_items.append(
-                                        (_build_close_triples(
-                                            ident, desc, module_ident,
-                                            field_class_ident.get(ident),
-                                            close_entity_type=True, file_value=file_path,
-                                            is_static=field_static_ident.get(ident),
-                                        ), orig_ts)
-                                    )
-                                    _forget_closed_entity(
-                                        ident, file_path, entity_valid_from,
-                                        entity_descriptions, field_class_ident, file_entities,
-                                        field_static_ident,
-                                    )
-                                # Whole file is gone: drop its (now-empty) file_entities key
-                                # so nothing stale lingers under this path (matches file_deps).
-                                file_entities.pop(file_path, None)
-                                # Close all :depends-on edges for the deleted module
-                                for dep_ident in file_deps.get(file_path, set()):
-                                    orig_ts = dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
-                                    close_items.append(
-                                        ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
-                                    )
-                                file_deps.pop(file_path, None)
-                            else:  # A or M or R
-                                if status == "R" and old_path:
-                                    renamed_old_paths.add(old_path)
-                                    old_module_ident = _code_ident("module", old_path)
-                                    new_module_ident = _code_ident("module", file_path)
-                                    add_triples.append(f"[{new_module_ident} :renamed-from {old_module_ident}]")
-                                    # :renamed-to is a brand-new fact that becomes
-                                    # true at the rename commit and stays true forever
-                                    # after — it must be transacted open-ended (like
-                                    # :renamed-from), NOT closed with the old entity's
-                                    # historical valid window via _ingest_close.
-                                    add_triples.append(f"[{old_module_ident} :renamed-to {new_module_ident}]")
-                                    old_desc = entity_descriptions.get(old_module_ident, old_path)
-                                    orig_ts = entity_valid_from.get(old_module_ident, commit_ts_iso)
-                                    close_items.append((
-                                        _build_close_triples(
-                                            old_module_ident, old_desc, old_module_ident,
-                                            close_entity_type=True, file_value=old_path,
-                                        ),
-                                        orig_ts,
-                                    ))
-                                    # Purge the closed old module. Its remaining child
-                                    # entities under old_path are closed+purged by the
-                                    # renamed_old_paths pass below, which also pops the
-                                    # whole file_entities[old_path] key — so only the
-                                    # scalar dicts and the module's own list slot need
-                                    # dropping here.
-                                    _forget_closed_entity(
-                                        old_module_ident, old_path, entity_valid_from,
-                                        entity_descriptions, field_class_ident, file_entities,
-                                        field_static_ident,
-                                    )
-                                previous_idents = set(file_entities.get(file_path, []))
-                                triples = _build_code_triples(
-                                    file_path, extracted, commit_ts_iso, entity_valid_from,
-                                    entity_descriptions, file_entities, commit_ident, precomputed,
-                                    field_class_ident, field_static_ident,
-                                )
-                                add_triples.extend(triples)
-                                # Detect entities removed from a modified file.
-                                # _build_code_triples only appends to file_entities, never removes.
-                                # Compare previous idents against the idents derivable from the
-                                # current extraction to find what was deleted.
-                                if status == "M":
-                                    module_ident = _code_ident("module", file_path)
-                                    current_extracted_idents: set = {module_ident}
-                                    for fn_ident, _fn_name, _fn_triples in precomputed["function_entries"]:
-                                        current_extracted_idents.add(fn_ident)
-                                    for cls_ident, _cls_name, _cls_triples in precomputed["class_entries"]:
-                                        current_extracted_idents.add(cls_ident)
-                                    # Globals and fields are tracked in file_entities too
-                                    # (see _build_code_triples): omitting them here would
-                                    # make every still-present global/field look "removed"
-                                    # on any later edit and wrongly close it (#113).
-                                    for gvar_ident, _gvar_name, _gvar_triples in precomputed["global_entries"]:
-                                        current_extracted_idents.add(gvar_ident)
-                                    for field_ident, _field_name, _field_triples in precomputed["field_entries"]:
-                                        current_extracted_idents.add(field_ident)
-                                    removed_idents = previous_idents - current_extracted_idents
-                                    # An in-place rename (old->new in the same file) is
-                                    # closed with :renamed-to linkage by the renamed_pairs
-                                    # loop below; exclude those old idents here so they are
-                                    # not ALSO closed as a plain removal (double close).
-                                    same_file_renamed_old_idents = {
-                                        _code_ident(cat, o_file, o_name)
-                                        for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
-                                        if o_file == file_path
-                                    }
-                                    removed_idents -= same_file_renamed_old_idents
-                                    for ident in removed_idents:
-                                        orig_ts = entity_valid_from.get(ident, commit_ts_iso)
-                                        desc = entity_descriptions.get(ident, "")
-                                        close_items.append(
-                                            (_build_close_triples(
-                                                ident, desc, module_ident,
-                                                field_class_ident.get(ident),
-                                                close_entity_type=True, file_value=file_path,
-                                                is_static=field_static_ident.get(ident),
-                                            ), orig_ts)
-                                        )
-                                        # File survives (M), only this child was removed:
-                                        # purge just this ident from the file's list.
-                                        _forget_closed_entity(
-                                            ident, file_path, entity_valid_from,
-                                            entity_descriptions, field_class_ident, file_entities,
-                                            field_static_ident,
-                                        )
-                                # Compute dep edges for this file and diff against previous.
-                                # Resolution itself already happened in _extract_commit
-                                # (precomputed["resolved_imports"]) against that commit's
-                                # own git-ls-tree state — nothing left to resolve here.
-                                module_ident = _code_ident("module", file_path)
-                                current_deps: set = set()
-                                for import_name, dep_ident, is_resolved in precomputed["resolved_imports"]:
-                                    if dep_ident != module_ident:
-                                        current_deps.add(dep_ident)
-                                        is_relative = import_name.startswith(".")
-                                        if not is_resolved and not is_relative and dep_ident not in entity_valid_from:
-                                            add_triples.extend([
-                                                f"[{dep_ident} :entity-type :type/external-dependency]",
-                                                f'[{dep_ident} :ident "{_edn_escape(dep_ident)}"]',
-                                                f'[{dep_ident} :description "{_edn_escape(import_name)}"]',
-                                            ])
-                                            entity_valid_from[dep_ident] = commit_ts_iso
-                                            entity_descriptions[dep_ident] = import_name
-                                            unresolved_dep_idents[dep_ident] = import_name
-                                            # #112: an already-known submodule may be the real
-                                            # target this unresolvable import was reaching for
-                                            # (submodule directories are never in file_entities,
-                                            # so any import into one always falls through here).
-                                            for sub_ident, sub_path in submodule_paths.items():
-                                                if _submodule_path_matches_import(sub_path, import_name):
-                                                    add_triples.append(f"[{dep_ident} :resolves-to {sub_ident}]")
-                                previous_deps = file_deps.get(file_path, set())
-                                for dep_ident in current_deps - previous_deps:
-                                    dep_add_triples.append(f"[{module_ident} :depends-on {dep_ident}]")
-                                    dep_valid_from[(module_ident, dep_ident)] = commit_ts_iso
-                                if status == "M":
-                                    for dep_ident in previous_deps - current_deps:
-                                        orig_ts = dep_valid_from.get((module_ident, dep_ident), commit_ts_iso)
-                                        close_items.append(
-                                            ([f"[{module_ident} :depends-on {dep_ident}]"], orig_ts)
-                                        )
-                                file_deps[file_path] = current_deps
-
-                        # Function/class rename linkage (Task 9's renamed_pairs).
-                        # Module-level linkage is handled separately per-file
-                        # above (Task 5) since it comes from git's own -M
-                        # detection, not this commit-wide matcher.
-                        for category, old_file, old_name, new_file, new_name in renamed_pairs:
-                            old_ident = _code_ident(category, old_file, old_name)
-                            new_ident = _code_ident(category, new_file, new_name)
-                            add_triples.append(f"[{new_ident} :renamed-from {old_ident}]")
-                            # :renamed-to becomes true at the rename commit and stays
-                            # open-ended thereafter — transact it via the add path, do
-                            # NOT fold it into the old entity's _ingest_close window.
-                            add_triples.append(f"[{old_ident} :renamed-to {new_ident}]")
-                            old_desc = entity_descriptions.get(old_ident, old_name)
-                            old_module_ident = _code_ident("module", old_file)
-                            orig_ts = entity_valid_from.get(old_ident, commit_ts_iso)
-                            close_items.append((
-                                _build_close_triples(
-                                    old_ident, old_desc, old_module_ident,
-                                    field_class_ident.get(old_ident),
-                                    close_entity_type=True, file_value=old_file,
-                                    is_static=field_static_ident.get(old_ident),
-                                ),
-                                orig_ts,
-                            ))
-                            _forget_closed_entity(
-                                old_ident, old_file, entity_valid_from,
-                                entity_descriptions, field_class_ident, file_entities,
-                                field_static_ident,
-                            )
-
-                        # A file rename (R status) only closes the old MODULE above.
-                        # Child entities and dependency edges under the old path are
-                        # closed here as plain removals UNLESS the matcher established
-                        # a rename continuity edge for them (handled with :renamed-to
-                        # by the loop above). This runs after renamed_pairs is fully
-                        # consumed so those confirmed renames can be excluded; without
-                        # it, unmatched old children/deps leak open forever under the
-                        # old path while new ones open under the new path.
-                        if renamed_old_paths:
-                            renamed_covered_idents = {
-                                _code_ident(cat, o_file, o_name)
-                                for cat, o_file, o_name, _n_file, _n_name in renamed_pairs
-                            }
-                            for r_old_path in renamed_old_paths:
-                                r_old_module_ident = _code_ident("module", r_old_path)
-                                # Iterate a copy: _forget_closed_entity mutates
-                                # file_entities[r_old_path] in place as it purges.
-                                for ident in list(file_entities.get(r_old_path, [])):
-                                    if ident == r_old_module_ident:
-                                        continue  # already closed+purged by the R block above
-                                    if ident in renamed_covered_idents:
-                                        continue  # already closed+purged with :renamed-to linkage
-                                    orig_ts = entity_valid_from.get(ident, commit_ts_iso)
-                                    desc = entity_descriptions.get(ident, "")
-                                    close_items.append(
-                                        (_build_close_triples(
-                                            ident, desc, r_old_module_ident,
-                                            field_class_ident.get(ident),
-                                            close_entity_type=True, file_value=r_old_path,
-                                            is_static=field_static_ident.get(ident),
-                                        ), orig_ts)
-                                    )
-                                    _forget_closed_entity(
-                                        ident, r_old_path, entity_valid_from,
-                                        entity_descriptions, field_class_ident, file_entities,
-                                        field_static_ident,
-                                    )
-                                # Whole old path is gone (renamed away): drop the key so
-                                # no stale ident lingers to be re-discovered by a later
-                                # commit that reuses this path (e.g. a shim at old_path).
-                                file_entities.pop(r_old_path, None)
-                                for dep_ident in file_deps.get(r_old_path, set()):
-                                    orig_ts = dep_valid_from.get((r_old_module_ident, dep_ident), commit_ts_iso)
-                                    close_items.append(
-                                        ([f"[{r_old_module_ident} :depends-on {dep_ident}]"], orig_ts)
-                                    )
-                                file_deps.pop(r_old_path, None)
-
-                        # Process gitlink changes (submodule add/bump/remove).
-                        # The "remove" case's interaction with the ordinary per-file module-open
-                        # logic (elsewhere in this loop) is only sound because real submodule paths
-                        # are extensionless (no tree-sitter parser matches them, so no module is
-                        # ever opened for a bare gitlink path) — a gitlink path that happened to
-                        # carry a recognized source extension is an untested, unreachable-in-practice edge case.
-                        for kind, sha, path in gitlink_changes:
-                            ext_ident = _code_ident("module", path)
-                            if kind == "add":
-                                info = gitmodules_map.get(path, {})
-                                name = info.get("name", "")
-                                url = info.get("url", "")
-                                description = name or path
-                                ext_triples = [
-                                    f"[{ext_ident} :entity-type :type/external-dependency]",
-                                    f'[{ext_ident} :ident "{_edn_escape(ext_ident)}"]',
-                                    f'[{ext_ident} :description "{_edn_escape(description)}"]',
-                                    f'[{ext_ident} :path "{_edn_escape(path)}"]',
-                                    f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]',
-                                    f"[{ext_ident} :introduced-by {commit_ident}]",
-                                ]
-                                if name:
-                                    ext_triples.append(f'[{ext_ident} :submodule-name "{_edn_escape(name)}"]')
-                                if url:
-                                    ext_triples.append(f'[{ext_ident} :submodule-url "{_edn_escape(url)}"]')
-                                add_triples.extend(ext_triples)
-                                entity_valid_from[ext_ident] = commit_ts_iso
-                                entity_descriptions[ext_ident] = description
-                                pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
-                                submodule_paths[ext_ident] = path
-                                # #112: link any pre-existing unresolved-import stub whose
-                                # import path reaches into this submodule — the ordering in
-                                # the issue's own repro (stub created before the submodule
-                                # was ever added), which the per-import check above can't
-                                # catch since the submodule wasn't known yet at that time.
-                                for stub_ident, import_name in unresolved_dep_idents.items():
-                                    if _submodule_path_matches_import(path, import_name):
-                                        add_triples.append(f"[{stub_ident} :resolves-to {ext_ident}]")
-                            elif kind == "bump":
-                                old_sha, orig_ts = pinned_commit_state.get(ext_ident, (None, commit_ts_iso))
-                                if old_sha is not None:
-                                    close_items.append(
-                                        ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], orig_ts)
-                                    )
-                                add_triples.append(f'[{ext_ident} :pinned-commit "{_edn_escape(sha)}"]')
-                                add_triples.append(f"[{ext_ident} :modified-in {commit_ident}]")
-                                pinned_commit_state[ext_ident] = (sha, commit_ts_iso)
-                            else:  # "remove"
-                                orig_ts = entity_valid_from.get(ext_ident, commit_ts_iso)
-                                desc = entity_descriptions.get(ext_ident, "")
-                                close_items.append(
-                                    (_build_close_triples(
-                                        ext_ident, desc, ext_ident,
-                                        entity_type_kw=":type/external-dependency",
-                                        file_value=path,
-                                    ), orig_ts)
-                                )
-                                # Submodule removed: purge lifecycle state so a later
-                                # re-add at the same path is treated as genuinely new.
-                                # (Submodule paths aren't tracked in file_entities, so the
-                                # path arg is a no-op there, but pass it for consistency.)
-                                _forget_closed_entity(
-                                    ext_ident, path, entity_valid_from,
-                                    entity_descriptions, field_class_ident, file_entities,
-                                )
-                                old_sha, pin_orig_ts = pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
-                                if old_sha is not None:
-                                    close_items.append(
-                                        ([f'[{ext_ident} :pinned-commit "{_edn_escape(old_sha)}"]'], pin_orig_ts)
-                                    )
-
-                        # Split :contains triples out before batching.  Minigraf's EAVT
-                        # pending index lacks value bytes in the key, so batching multiple
-                        # [module :contains fn] facts in one transact silently drops all
-                        # but the last.  Each :contains triple gets its own transact so
-                        # they receive distinct tx_counts and avoid the index collision.
-                        contains_triples = [t for t in add_triples if ":contains" in t]
-                        other_triples = [t for t in add_triples if ":contains" not in t]
-                        await loop.run_in_executor(
-                            write_executor, _ingest_transact, db, other_triples, commit_ts_iso, reason, index_con
-                        )
-                        for ct in contains_triples:
+                        if tag == "fwd":
                             await loop.run_in_executor(
-                                write_executor, _ingest_transact, db, [ct], commit_ts_iso, reason, index_con
+                                write_executor, _forward_apply, db, repo_path, state,
+                                commit_metadata[pos],
+                                (extracted_files, gitlink_changes, gitmodules_map, renamed_pairs),
+                                index_con, linearization, pos,
                             )
-                        # :depends-on triples transacted individually — same EAVT collision risk
-                        # as :contains when multiple deps share the same source module
-                        for dt in dep_add_triples:
+                        else:
                             await loop.run_in_executor(
-                                write_executor, _ingest_transact, db, [dt], commit_ts_iso, reason, index_con
+                                write_executor, _reverse_apply, db, repo_path, linearization,
+                                commit_metadata, pos, extracted_files, index_con,
                             )
-                        for close_triples, orig_ts in close_items:
-                            await loop.run_in_executor(
-                                write_executor, _ingest_close, db, close_triples, orig_ts, commit_ts_iso, reason, index_con
-                            )
-
-                        # Ingest :parent edges — one transact per parent to avoid EAVT
-                        # collision for merge commits (which have two parent hashes).
-                        # Routed through _transact (not a raw _db_execute call) so the
-                        # edge also lands in the persisted fact index -- see #118 review
-                        # finding: this call site used to build its own raw (transact
-                        # ...) string and bypass the index choke point entirely.
-                        try:
-                            for parent_hash in _git_parent_hashes(repo_path, commit_hash):
-                                parent_ident = f":commit/{parent_hash[:12]}"
-                                await loop.run_in_executor(
-                                    write_executor,
-                                    _transact,
-                                    db,
-                                    f'[[{commit_ident} :parent {parent_ident}]]',
-                                    commit_ts_iso,
-                                    None,
-                                    None,
-                                    index_con,
-                                )
-                        except Exception:
-                            pass  # non-fatal; parent edges are best-effort
-
-                        await loop.run_in_executor(write_executor, _watermark_update, db, commit_hash, commit_ts_iso, reason, index_con)
-                        await loop.run_in_executor(write_executor, _db_checkpoint, db)
-                        await loop.run_in_executor(write_executor, _commit_index_writer_safe, index_con)
 
                     except Exception as e:
                         # Ordinary per-commit write failure (malformed EDN, a
@@ -8613,6 +9446,103 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
 
                     _ingest_progress["processed"] += 1
                     await asyncio.sleep(0)  # yield to event loop
+
+                # Stage B: the correction sweep. A third, strictly
+                # SEQUENTIAL pass, not a third concurrent task -- claim_low()
+                # and claim_high() partition one shared gap, so no sequence of
+                # forward claims can reach territory the reverse stream
+                # already claimed, and the sweep's own precondition is that
+                # the gap is already closed.
+                #
+                # Drives 2c's three pieces directly on their correct
+                # executors. _correction_sweep_claim_and_process and
+                # _correction_sweep_walk must NOT be used here: both fuse the
+                # CPU-bound parse and the DB-bound writes into one body.
+                if completed_all:
+                    _ingest_progress["phase"] = "sweeping"
+                    hash_to_pos = {h: i for i, h in enumerate(linearization)}
+                    skipped = 0
+                    db = await _ensure_db_async()
+                    try:
+                        while not _shutdown_requested.is_set():
+                            selected = await loop.run_in_executor(
+                                write_executor, _correction_sweep_select_position,
+                                db, linearization, commit_metadata, hash_to_pos,
+                            )
+                            if selected is None:
+                                break
+                            sweep_hash, sweep_ts = selected
+                            try:
+                                sweep_extracted = await loop.run_in_executor(
+                                    executor, _extract_commit, repo_path, sweep_hash, ignore_patterns,
+                                )
+                                sweep_files = sweep_extracted[0]
+                                # update_watermark=False: this commit is only
+                                # half-processed until the lifecycle pass below
+                                # also lands, so the sweep watermark (and its
+                                # checkpoint) is deferred to after it -- see
+                                # _correction_sweep_apply's own docstring.
+                                skipped += await loop.run_in_executor(
+                                    write_executor, _correction_sweep_apply,
+                                    db, sweep_hash, sweep_ts, sweep_files, index_con, skipped,
+                                    False,
+                                )
+                                # Apply the lifecycle facts the reverse stream
+                                # skipped entirely (D/R closes, renames,
+                                # dependency-edge churn, gitlink changes).
+                                # Fresh writes, not re-application -- nothing
+                                # wrote them for these commits. Runs AFTER the
+                                # A/M reconciliation above so an entity's
+                                # lineage is already authoritative before a
+                                # close in the same commit reads its window.
+                                await loop.run_in_executor(
+                                    write_executor, _forward_apply, db, repo_path, state,
+                                    commit_metadata[hash_to_pos[sweep_hash]],
+                                    sweep_extracted, index_con, None, None, True,
+                                )
+                                # Both halves landed -- only now is this commit
+                                # genuinely swept, so only now may the watermark
+                                # name it. Same one-checkpoint-per-commit cadence
+                                # _correction_sweep_apply had when it owned this.
+                                await loop.run_in_executor(
+                                    write_executor, _correction_sweep_through_update,
+                                    db, sweep_hash, sweep_ts, index_con,
+                                )
+                                await loop.run_in_executor(write_executor, _db_checkpoint, db)
+                            except concurrent.futures.process.BrokenProcessPool:
+                                raise
+                            except Exception as e:
+                                # A sweep-step failure aborts Stage B only.
+                                # Stage A's work is already persisted, and this
+                                # commit's watermark was never advanced (see
+                                # update_watermark=False above), so the next
+                                # run's _correction_sweep_select_position
+                                # re-selects THIS commit and reprocesses it from
+                                # the start -- nothing is silently skipped.
+                                print(
+                                    f"[_run_ingestion] correction sweep aborted at {sweep_hash}: {e}",
+                                    file=sys.stderr,
+                                )
+                                completed_all = False
+                                break
+                            await asyncio.sleep(0)  # yield to event loop
+                        if _shutdown_requested.is_set():
+                            completed_all = False
+                        _correction_sweep_log_summary(skipped)
+                        # DB-bound like everything else here, so it runs on
+                        # write_executor rather than inline on the event loop.
+                        should_fold = completed_all and await loop.run_in_executor(
+                            write_executor, _should_fold_lineage_watermark, db, linearization,
+                        )
+                        if should_fold:
+                            await loop.run_in_executor(
+                                write_executor, _lineage_confirmed_through_update,
+                                db, linearization[-1], commit_metadata[-1][1], index_con,
+                            )
+                            await loop.run_in_executor(write_executor, _db_checkpoint, db)
+                    finally:
+                        _db = None
+                        db = None
 
                 # Call _ingest_tags and _last_run_write before closing index_con
                 # so they use the batched connection instead of opening new ones
@@ -8639,6 +9569,12 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 await loop.run_in_executor(write_executor, _close_index_writer_safe, index_con)
                 await loop.run_in_executor(write_executor, executor.shutdown)
 
+            # "phase" describes what a RUNNING ingest is currently doing, so
+            # it must not outlive the run: leaving Stage B's "sweeping" in
+            # place made a finished run report {"status": "complete", "phase":
+            # "sweeping"} forever. Cleared on every terminal path below, not
+            # just this one.
+            _ingest_progress["phase"] = None
             if completed_all:
                 _ingest_progress["status"] = "complete"
             else:
@@ -8650,6 +9586,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # write_executor is already shut down by the inner finally above by the
         # time we get here (it runs on any exit from that try, including this
         # exception propagating through it) — nothing left to clean up.
+        _ingest_progress["phase"] = None
         _ingest_progress["status"] = "error"
         _ingest_progress["error"] = str(e)
         _ingest_progress["error_at"] = _now_utc_ms()
@@ -8669,6 +9606,7 @@ async def handle_minigraf_ingest_git(
     # and losing (#108).
     holder_pid = _live_lock_holder_pid(_graph_path or _get_graph_path())
     if holder_pid is not None:
+        _ingest_progress["phase"] = None
         _ingest_progress["status"] = "skipped"
         _ingest_progress["owner_pid"] = holder_pid
         return {
@@ -8693,6 +9631,7 @@ async def handle_minigraf_ingest_git(
     _ingest_progress = {
         "status": "starting", "processed": 0, "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        "phase": None,
     }
     _ingest_task = asyncio.create_task(_run_ingestion(repo, branch or _default_git_branch(repo)))
     return {"ok": True, "job_id": "git-ingest", "message": f"Ingestion started for {repo}"}
@@ -9089,6 +10028,7 @@ async def main() -> None:
     _ingest_progress = {
         "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        "phase": None,
     }
     if not os.environ.get("MINIGRAF_NO_AUTO_INGEST"):
         # Proactive check-before-attempt: if another live process already
