@@ -482,9 +482,36 @@ git fixture repos, no mocks.
   (confirmed with the user). Today's behaviour stands: `_frontier_load`
   discards and retracts an unrepresentable high interval and that region is
   re-walked. Correct and terminating, just slower than it needs to be.
-- **`"D"`/`"R"` file handling in the reverse and sweep paths** — 2b's existing
-  scope cut, unchanged. The forward stream handles deletions and renames as it
-  always has.
+- ~~**`"D"`/`"R"` file handling in the reverse and sweep paths** — 2b's existing
+  scope cut, unchanged.~~ **AMENDED 2026-07-27 — this was wrong, and is now in
+  scope.** Treating it as an unchanged scope cut held only while every stream
+  was inert. Stage A makes them live, and the Task 8 review measured the
+  result: at the 1:1 default, roughly the top half of history loses its
+  deletions, renames and submodule changes — closed entities stay open,
+  `:renamed-to` is never emitted, removed fields keep satisfying
+  `[?e :static true]`, closed `:depends-on` edges stay live — with no pass to
+  repair them. For a graph whose primary use is "what does this codebase look
+  like now", shipping that as the default is not an acceptable scope cut.
+
+  **The correction sweep now applies them** (`_forward_apply(...,
+  lifecycle_only=True)`, called per swept commit after
+  `_correction_sweep_apply`). The sweep is the right home: it already walks the
+  entire reverse region ascending, re-parsing every commit — the direction
+  lifecycle attribution requires, and exactly why D/R was intractable for the
+  reverse walk — and at convergence `state` already holds the live-entity
+  picture at the meeting point.
+
+  These facts are applied **fresh, not re-applied**: the reverse stream never
+  wrote D/R or gitlink facts for those commits, so there is nothing to
+  deduplicate against. The A/M emission stays owned by `_correction_sweep_apply`
+  precisely because re-running it *would* duplicate — minigraf creates a
+  genuinely live duplicate when the same `(entity, attribute, value)` is
+  re-transacted under a different valid-from (#156). In `lifecycle_only` mode
+  `_build_code_triples` is still called for A/M files, but purely for its dict
+  side effects, with its triples discarded: an entity introduced *inside* the
+  reverse region is absent from Stage A's `entity_valid_from`, and without that
+  bookkeeping a later deletion of it closes against the delete commit's own
+  timestamp, yielding a wrong valid interval.
 - **Pipelining Stage B's extraction** ahead of its apply — permitted by 2c but
   requires predicting positions rather than selecting them.
 - **Force-push / rebase detection, DAG diamonds, octopus merges, multiple

@@ -1520,10 +1520,56 @@ class TestStageBCorrectionSweep:
         assert mcp_server._should_fold_lineage_watermark(real_db, linearization) is True
 ```
 
+- [ ] **Step 1b: Write the lifecycle-repair tests (AMENDMENT)**
+
+These are the regression tests for the gap Step 3b closes. Each builds a repo where the *newest* commits — the ones the reverse stream claims at a 1:1 ratio — perform a deletion, a rename, and a submodule change, then runs a full `_run_ingestion` and asserts the graph matches what a forward-only ingest produces.
+
+```python
+class TestStageBRepairsLifecycleFacts:
+    """#222 phase 2d: the reverse stream skips D/R files and gitlink changes
+    entirely, so at the default 1:1 ratio the newest half of history loses
+    its deletions, renames and submodule bumps. Stage B applies them."""
+
+    @pytest.mark.asyncio
+    async def test_deletion_in_the_reverse_region_is_closed(self, tmp_path, monkeypatch):
+        """A function deleted in a recent commit must not still read as live
+        at HEAD. Without Stage B's lifecycle pass it stays open forever."""
+
+    @pytest.mark.asyncio
+    async def test_rename_in_the_reverse_region_emits_both_edges(self, tmp_path, monkeypatch):
+        """:renamed-from AND :renamed-to, and the old module closed."""
+
+    @pytest.mark.asyncio
+    async def test_submodule_bump_in_the_reverse_region_updates_pinned_commit(self, tmp_path, monkeypatch):
+        """Gitlink changes are discarded for reverse-claimed commits in
+        Stage A; the sweep must apply them."""
+
+    @pytest.mark.asyncio
+    async def test_entity_born_and_deleted_inside_the_reverse_region(self, tmp_path, monkeypatch):
+        """The case that motivates calling _build_code_triples for its dict
+        side effects on A/M files: the entity is absent from the Stage-A
+        entity_valid_from, so without that bookkeeping its close falls back
+        to the DELETE commit's own timestamp and yields a wrong (often
+        zero-width) valid interval. Assert the entity is live :valid-at a
+        point between its introduction and its deletion."""
+
+    @pytest.mark.asyncio
+    async def test_am_facts_are_not_duplicated_by_the_lifecycle_pass(self, tmp_path, monkeypatch):
+        """lifecycle_only must DISCARD _build_code_triples' output for A/M.
+        Re-transacting the same (entity, attribute, value) under a different
+        valid-from creates a genuinely live duplicate rather than a no-op
+        (#156), so assert exactly one :introduced-by and one :entity-type
+        per entity after a full run."""
+```
+
+Write each test body following the fixture idiom already used by `TestStageAInterleave` and the existing submodule tests (search for `:pinned-commit` for a worked gitlink example). Every one must build a real git repo, run the real `_run_ingestion`, and assert on persisted facts read back from a file-backed `MiniGrafDb`.
+
+The strongest available oracle is differential, and Task 11 already establishes the idiom: ingest the same repo twice, once at the `1:1` default and once forward-only via `MINIGRAF_INGEST_STREAM_RATIO=1000000:1`, and assert the two graphs agree. Prefer that over hand-enumerating expected facts wherever it fits — it is what makes these tests durable against unrelated changes in fact shape.
+
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestStageBCorrectionSweep -q`
-Expected: FAIL — `_should_fold_lineage_watermark` undefined, and the completed-run assertions fail because no sweep runs yet
+Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestStageBCorrectionSweep tests/test_mcp_server.py::TestStageBRepairsLifecycleFacts -q`
+Expected: FAIL — `_should_fold_lineage_watermark` undefined, `_forward_apply` has no `lifecycle_only` parameter, and the completed-run assertions fail because no sweep runs yet
 
 - [ ] **Step 3: Write the fold guard**
 
@@ -1550,6 +1596,24 @@ def _should_fold_lineage_watermark(db: Any, linearization: List[str]) -> bool:
         return False
     return through_hash == high_bounds[1] and through_hash in set(linearization)
 ```
+
+- [ ] **Step 3b: Add `lifecycle_only` to `_forward_apply` (AMENDMENT — see below)**
+
+**Why this exists.** The Task 8 review confirmed a live regression: `_reverse_apply` and `_correction_sweep_apply` both skip non-`A`/`M` files, and Stage A discards gitlink data for reverse-claimed commits. At the 1:1 default that loses roughly the top half of history's deletions, renames and submodule changes — closed entities stay open, `:renamed-to` is never emitted, removed fields keep satisfying `[?e :static true]`, closed `:depends-on` edges stay live. The original spec out-scoped this as "2b's existing scope cut, unchanged", which was true while every stream was inert and wrong once Stage A made them live. The human's decision: **the correction sweep applies them.**
+
+The sweep is the right home. It already walks the entire reverse region *ascending*, re-parsing each commit — the direction lifecycle attribution requires, and precisely why D/R was intractable for the reverse walk. And at convergence `state` already holds the live-entity picture at the meeting point, because Stage A's forward applies built it.
+
+Apply these facts **fresh**, do not re-run the whole forward body: the reverse stream never wrote D/R or gitlink facts for those commits, so there is nothing to deduplicate against. Re-running the A/M emission instead *would* duplicate — minigraf creates a genuinely live duplicate when the same `(entity, attribute, value)` is re-transacted under a different valid-from (issue #156), so that path must stay owned by `_correction_sweep_apply`.
+
+Widen `_forward_apply` with `lifecycle_only: bool = False`. When true:
+
+- **`"D"` and `"R"` files: process fully, unchanged.** `"R"` includes its `_build_code_triples` emission for the new path — the reverse stream skipped renames entirely, so the new path's entities were never written by anything.
+- **Gitlink changes: process fully, unchanged.**
+- **`"A"` and `"M"` files: call `_build_code_triples` for its dict side effects and DISCARD the returned triples.** Do not transact them. `_correction_sweep_apply` owns those entities' facts.
+
+That last rule is load-bearing and is the part most likely to be dropped as redundant. `state.entity_valid_from` after Stage A covers only positions `0..meeting_point`. An entity *introduced* inside the reverse region is absent from it, so a later deletion of that entity within the same region would close with `orig_ts = entity_valid_from.get(ident, commit_ts_iso)` — falling back to the delete commit's own timestamp and producing a wrong (often zero-width) valid interval. Calling `_build_code_triples` and dropping its output keeps `entity_valid_from`, `entity_descriptions`, `file_entities`, `field_class_ident` and `field_static_ident` current at zero fact cost. Ascending sweep order makes the recorded timestamp the correct earliest one, because `_build_code_triples` only writes `entity_valid_from[ident]` when the ident is not already present.
+
+Also skip `_watermark_update`, `_frontier_persist_claim` and `_lineage_confirmed_through_update` in this mode — Stage B tracks its own progress through `:ingestion/correction-sweep-through`, and the forward frontier must not appear to advance into the reverse region.
 
 - [ ] **Step 4: Write the Stage B driver**
 
@@ -1582,12 +1646,26 @@ In `_run_ingestion`, immediately after the `while pending:` loop ends and before
                                 break
                             sweep_hash, sweep_ts = selected
                             try:
-                                sweep_files, _g, _m, _r = await loop.run_in_executor(
+                                sweep_extracted = await loop.run_in_executor(
                                     executor, _extract_commit, repo_path, sweep_hash, ignore_patterns,
                                 )
+                                sweep_files = sweep_extracted[0]
                                 skipped += await loop.run_in_executor(
                                     write_executor, _correction_sweep_apply,
                                     db, sweep_hash, sweep_ts, sweep_files, index_con, skipped,
+                                )
+                                # Apply the lifecycle facts the reverse stream
+                                # skipped entirely (D/R closes, renames,
+                                # gitlink changes). Fresh writes, not
+                                # re-application -- nothing wrote them for
+                                # these commits. Runs AFTER the A/M
+                                # reconciliation above so an entity's lineage
+                                # is already authoritative before a close in
+                                # the same commit reads its window.
+                                await loop.run_in_executor(
+                                    write_executor, _forward_apply, db, repo_path, state,
+                                    commit_metadata[hash_to_pos[sweep_hash]],
+                                    sweep_extracted, index_con, None, None, True,
                                 )
                             except concurrent.futures.process.BrokenProcessPool:
                                 raise
