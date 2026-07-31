@@ -5385,14 +5385,18 @@ def _re_date_structural_facts(
 ) -> None:
     """Retract and re-assert an entity's structural facts at new_ts_iso.
 
-    Used whenever a provisional :introduced-by guess moves to an earlier
-    commit -- by _reverse_apply when the reverse walk finds an even earlier
-    occurrence, and by _forward_reconcile_provisional when the forward walk
-    reaches the true introduction. In both cases the facts were written at
-    the timestamp of the commit where the entity was first SIGHTED, which is
-    later than the introduction now is, leaving a valid-time window where
-    :introduced-by is live for an entity with no type, name or file -- so
-    ":as-of the introduction" reports it as nonexistent.
+    Used whenever a provisional :introduced-by guess is resolved to an
+    earlier commit -- by _correction_sweep_apply when the sweep confirms an
+    entity at its introduction, and by _forward_reconcile_provisional when
+    the forward walk reaches the true introduction. In both cases the facts
+    were written at the timestamp of the commit where the entity was first
+    SIGHTED, which is later than the introduction now is, leaving a valid
+    time window where :introduced-by is live for an entity with no type,
+    name or file -- so ":as-of the introduction" reports it as nonexistent.
+
+    _reverse_apply deliberately does NOT call this (#233): it used to, on
+    every provisional move, which re-dated a long-lived entity once per
+    touch instead of once. Both callers above fire once per entity.
 
     _retract targets live rows regardless of their original valid_from, so
     this is a straight re-assert at the earlier timestamp.
@@ -7663,10 +7667,10 @@ def _reverse_apply(
     index_con: Optional[Any] = None,
 ) -> str:
     """#222 phase 2b: apply one already-claimed, already-extracted commit --
-    structural facts, :modified-in edges, provisional :introduced-by, and
-    candidate-diff records for every entity the commit's "A"/"M" files
-    touch. "D"/"R" files are skipped entirely (deletions and renames are
-    out of scope for this sub-phase -- see the design spec).
+    structural facts, :modified-in edges, and provisional :introduced-by for
+    every entity the commit's "A"/"M" files touch. "D"/"R" files are skipped
+    entirely (deletions and renames are out of scope for this sub-phase --
+    see the design spec).
 
     Split out of _reverse_fill_claim_and_process's single body (#222 phase
     2d): `pos` (from allocator.claim_high()) and `file_results` (from
@@ -7703,6 +7707,17 @@ def _reverse_apply(
     Already-authoritative entities are never touched, but a genuine later
     touch always gets :modified-in (unless #221's unchanged-body check
     says the body is provably unchanged this commit).
+
+    Does NOT re-date structural facts as a guess moves earlier (#233). They
+    stay at the timestamp of the commit where this walk first SIGHTED the
+    entity, which is later than the provisional :introduced-by, so ":as-of
+    the provisional introduction" reports the entity as nonexistent for as
+    long as it stays provisional. The correction sweep closes that window
+    when it confirms. This is the same "temporarily dangling, and
+    convergent" shape as the :parent edges below, and the region is already
+    excluded from 2a's trust predicate -- but note that an INTERRUPTED run
+    now leaves a wider inconsistent window than it did before #233, closed
+    by the next run's sweep.
 
     Known, documented limitation, and who fixes it: the retroactive
     :modified-in for a superseded commit does not re-check #221's
@@ -7761,7 +7776,6 @@ def _reverse_apply(
         f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
         f'[{commit_ident} :date "{commit_ts_iso}"]',
     ]
-    candidate_triples_by_ident: Dict[str, List[str]] = {}
     pos_by_commit_ident = {f":commit/{h[:12]}": i for i, (h, _t, _a, _s) in enumerate(commit_metadata)}
     ts_by_commit_ident = {f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata}
     new_candidates: List[str] = []
@@ -7799,17 +7813,6 @@ def _reverse_apply(
         unchanged_idents = precomputed.get("unchanged_idents", set())
         for ident in candidate_idents:
             unchanged_by_ident[ident] = ident in unchanged_idents
-
-        # Keep each entity's candidate triples so a provisional move can
-        # re-date them (#222 phase 2b1). A child's own list carries its
-        # [parent :contains child] edge, so re-dating a child re-dates its
-        # containment edge with it.
-        candidate_triples_by_ident[precomputed["module_ident"]] = list(
-            precomputed["module_candidate_triples"]
-        )
-        for entries_key in ("function_entries", "class_entries", "global_entries", "field_entries"):
-            for entry_ident, _entry_name, entry_triples in precomputed[entries_key]:
-                candidate_triples_by_ident[entry_ident] = list(entry_triples)
 
         new_candidates.extend(set(known_before.keys()) - known_before_snapshot)
         for ident in set(candidate_idents) & known_before_snapshot:
@@ -7893,19 +7896,6 @@ def _reverse_apply(
         )
         if superseded_ident is not None and superseded_ident != commit_ident:
             superseded_pos = pos_by_commit_ident.get(superseded_ident)
-            if superseded_pos is None or superseded_pos > pos:
-                # The move happened: this commit is genuinely earlier.
-                # Re-date the entity's structural facts to match (#222 phase
-                # 2b1) -- see _re_date_structural_facts's own docstring for
-                # why (they were written at the timestamp of the commit
-                # where the walk first SIGHTED the entity, which is later
-                # than the guess now is).
-                _re_date_structural_facts(
-                    db,
-                    [t for t in candidate_triples_by_ident.get(ident, []) if ":introduced-by" not in t],
-                    commit_ts_iso,
-                    index_con=index_con,
-                )
             if superseded_pos is not None and superseded_pos <= pos:
                 # The move was refused (or would be): the "superseded" guess
                 # is not actually later than this commit, so asserting it as
@@ -8775,6 +8765,12 @@ def _correction_sweep_apply(
     never writes commit_hash's own :type/commit entity (2b already wrote
     it for every commit in this sweep's range). DB-bound, parse-free.
 
+    Re-dates each confirmed entity's structural facts to the introduction
+    commit (#233), which _reverse_apply used to do eagerly on every
+    provisional move. Sound here and only here: the gap-closed precondition
+    means Stream 2's guess is final, so an entity reaching case 1 is at its
+    introduction, and this pass visits each commit exactly once ascending.
+
     skipped_so_far is the driving loop's running total of skipped_events
     from every previous call this run -- it exists solely to make the
     stderr log cap (_CORRECTION_SWEEP_LOG_CAP) work across calls without
@@ -8819,6 +8815,22 @@ def _correction_sweep_apply(
         )
         unchanged_idents = precomputed.get("unchanged_idents", set())
 
+        # #233: the sweep re-dates structural facts, which _reverse_apply
+        # used to do eagerly on every provisional move (48% of Stage A's
+        # wall time -- 17,250 retracts over 12 real commits). This pass
+        # already visits every commit in the reverse region exactly once,
+        # ascending, and its gap-closed precondition means Stream 2's guess
+        # is final -- so the commit at which an entity reaches case 1 IS its
+        # introduction, and re-dating there is once per entity for the whole
+        # region. precomputed already carried these triples; only the idents
+        # were being read out of it.
+        candidate_triples_by_ident: Dict[str, List[str]] = {
+            precomputed["module_ident"]: list(precomputed["module_candidate_triples"])
+        }
+        for entries_key in ("function_entries", "class_entries", "global_entries", "field_entries"):
+            for entry_ident, _entry_name, entry_triples in precomputed[entries_key]:
+                candidate_triples_by_ident[entry_ident] = list(entry_triples)
+
         for ident in candidate_idents:
             raw = _db_execute(db, f"(query [:find ?c :where [{ident} :introduced-by ?c]])")
             introduced_by_values = {row[0] for row in json.loads(raw).get("results", [])}
@@ -8828,6 +8840,13 @@ def _correction_sweep_apply(
                     # Case 1: the provisional guess matches this commit --
                     # confirm. The :introduced-by fact itself is untouched,
                     # since its value was already correct.
+                    _re_date_structural_facts(
+                        db,
+                        [t for t in candidate_triples_by_ident.get(ident, [])
+                         if ":introduced-by" not in t],
+                        commit_ts_iso,
+                        index_con=index_con,
+                    )
                     _lineage_confirm(db, ident, index_con=index_con)
                 else:
                     # Case 2: guess points elsewhere, or an ambiguous
