@@ -5025,6 +5025,7 @@ def _frontier_load(
     ):
         _frontier_seed_from_watermark(db, linearization, run_ts_iso, index_con=index_con)
     _lineage_confirmed_through_migrate(db, run_ts_iso, index_con=index_con)
+    _candidate_diff_purge_legacy(db, index_con=index_con)
 
     hash_to_pos = {h: i for i, h in enumerate(linearization)}
     intervals: List[frontier_registry.Interval] = []
@@ -5256,78 +5257,56 @@ def _lineage_confirmed_through_migrate(
     _lineage_confirmed_through_update(db, hi_hash, run_ts_iso, index_con=index_con)
 
 
-def _candidate_diff_ident(commit_hash: str, entity_ident: str) -> str:
-    """Deterministic ident for a candidate-diff record. Not a public schema
-    type -- see the #222 phase 2a design spec's "Schema/audit status of new
-    entity types" section.
-    """
-    return f":candidate/{commit_hash[:12]}-{entity_ident.lstrip(':').replace('/', '-')}"
+def _candidate_diff_purge_legacy(db: Any, index_con: Optional[Any] = None) -> int:
+    """One-time cleanup for graphs written by #222 phase 2d, which persisted
+    a :type/candidate-diff record per (claimed commit, candidate entity)
+    pair. #233 deleted that path outright -- 2a specced the records so 2c
+    could confirm a candidate by hash comparison instead of re-parsing, but
+    2c as built re-parses on the process pool and reads
+    precomputed["unchanged_idents"], so nothing ever read them.
 
+    Without this, the records a 2d graph already holds are orphaned: the
+    writer AND the clearer are both gone. They are not inert -- fact_index
+    filters nothing by prefix (_MEMORY_PREFIXES affects scoring, not
+    inclusion), so they stay retrievable scratch noise indefinitely.
 
-def _candidate_diff_persist(
-    db: Any,
-    commit_hash: str,
-    entity_ident: str,
-    body_hash: str,
-    commit_ts_iso: str,
-    index_con: Optional[Any] = None,
-) -> None:
-    """Mint/update one candidate-diff record for (commit_hash, entity_ident).
-    Query-before-write -- no-ops if the persisted body_hash already
-    matches, retracts+reasserts only the :body-hash if it genuinely
-    changed (the other attributes are all derived from commit_hash/
-    entity_ident, which never change for a given record's ident). Uses
-    internal _transact/_retract directly, never handle_minigraf_transact:
-    :type/candidate-diff is deliberately unregistered in MINIGRAF_SCHEMA.
+    Called unconditionally from _frontier_load rather than gated on a
+    watermark: it is one query per load, cheap when there is nothing to
+    purge, and gating it would need a new watermark whose only job is to
+    record that a one-time deletion happened.
+
+    Returns the number of records purged. Records for distinct :candidate/
+    entities do not share (entity, attribute, valid_from), so the whole
+    purge is one collision-free _retract.
+
+    Note: minigraf resolves ?e in a query result to its internal entity id,
+    not the :candidate/... keyword the fact was minted with, and that
+    internal id is not accepted as an entity token in a retract pattern
+    (no :ident back-reference is populated for these records the way it is
+    for e.g. commits -- see _entity_introduced_by_query's ident_map). The
+    keyword ident is deterministic from (commit_ident, entity_ident) --
+    the same formula the deleted _candidate_diff_ident used -- so it is
+    rebuilt here instead of relying on ?e.
     """
-    ident = _candidate_diff_ident(commit_hash, entity_ident)
-    existing = _candidate_diff_read(db, commit_hash, entity_ident)
-    if existing == body_hash:
-        return
-    if existing is None:
-        commit_ident = f":commit/{commit_hash[:12]}"
-        facts = [
+    raw = _db_execute(
+        db, "(query [:find ?c ?ent ?h :where "
+            "[?e :entity-type :type/candidate-diff] [?e :commit ?c] "
+            "[?e :entity ?ent] [?e :body-hash ?h]])"
+    )
+    rows = json.loads(raw).get("results", [])
+    if not rows:
+        return 0
+    facts = []
+    for commit_ident, entity_ident, body_hash in rows:
+        ident = f":candidate/{commit_ident[len(':commit/'):]}-{entity_ident.lstrip(':').replace('/', '-')}"
+        facts.extend([
             f"[{ident} :entity-type :type/candidate-diff]",
             f"[{ident} :commit {commit_ident}]",
             f"[{ident} :entity {entity_ident}]",
             f'[{ident} :body-hash "{_edn_escape(body_hash)}"]',
-        ]
-        _transact(db, "[" + " ".join(facts) + "]", commit_ts_iso, index_con=index_con)
-    else:
-        _retract(db, f'[[{ident} :body-hash "{_edn_escape(existing)}"]]', index_con=index_con)
-        _transact(
-            db, f'[[{ident} :body-hash "{_edn_escape(body_hash)}"]]', commit_ts_iso, index_con=index_con
-        )
-
-
-def _candidate_diff_read(db: Any, commit_hash: str, entity_ident: str) -> Optional[str]:
-    """Return the persisted body_hash for (commit_hash, entity_ident), or
-    None if no candidate record exists for that pair."""
-    ident = _candidate_diff_ident(commit_hash, entity_ident)
-    raw = _db_execute(db, f"(query [:find ?h :where [{ident} :body-hash ?h]])")
-    results = json.loads(raw).get("results", [])
-    return results[0][0] if results else None
-
-
-def _candidate_diff_clear(
-    db: Any, commit_hash: str, entity_ident: str, index_con: Optional[Any] = None
-) -> None:
-    """Retract the candidate record once consumed (2c calls this after
-    confirming/rejecting), so these scratch facts don't accumulate
-    unbounded across a full ingest. No-op if no record exists.
-    """
-    existing = _candidate_diff_read(db, commit_hash, entity_ident)
-    if existing is None:
-        return
-    ident = _candidate_diff_ident(commit_hash, entity_ident)
-    commit_ident = f":commit/{commit_hash[:12]}"
-    facts = [
-        f"[{ident} :entity-type :type/candidate-diff]",
-        f"[{ident} :commit {commit_ident}]",
-        f"[{ident} :entity {entity_ident}]",
-        f'[{ident} :body-hash "{_edn_escape(existing)}"]',
-    ]
+        ])
     _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
+    return len(rows)
 
 
 def _entity_introduced_by_query(db: Any, entity_ident: str) -> Optional[str]:
@@ -5485,11 +5464,7 @@ def _forward_reconcile_provisional(
     if guess_ident is None:
         return None
 
-    # 4. The candidate-diff record is stale the moment the guess moves off it,
-    # and this is the cheapest place to drop it -- guess_ident is right here.
-    _candidate_diff_clear(db, guess_ident[len(":commit/"):], entity_ident, index_con=index_con)
-
-    # 5. The guess commit is now known to be a genuine modification rather
+    # 4. The guess commit is now known to be a genuine modification rather
     # than the introduction -- UNLESS it is this very commit, which is the
     # introduction. Stream 2 can guess the right commit and still leave a
     # provisional marker on it (it claims high-to-low, so the first sighting
@@ -6685,23 +6660,6 @@ def _precompute_file_triples(
     except Exception:
         unchanged_idents = set()
 
-    # #222 phase 2b: per-entity body hash for every entity present on the
-    # NEW side, keyed the same way unchanged_idents is above -- lets the
-    # reverse-bulk-fill walk persist a candidate-diff record (body hash)
-    # for an entity without needing the raw tree-sitter node itself.
-    # Module-level entries are deliberately excluded: there is no
-    # tree-sitter node to hash for a whole file, and candidate-diff
-    # persistence is function/class/variable/field-only (matching
-    # unchanged_idents' own category scope).
-    body_hashes: Dict[str, str] = {}
-    try:
-        new_nodes_for_hash = new_entity_nodes or {}
-        for category in ("function", "class", "variable", "field"):
-            for name, node in new_nodes_for_hash.get(category, {}).items():
-                body_hashes[_code_ident(category, file_path, name)] = _normalized_body_hash(node)
-    except Exception:
-        body_hashes = {}
-
     return {
         "module_ident": module_ident,
         "module_candidate_triples": module_candidate_triples,
@@ -6713,7 +6671,6 @@ def _precompute_file_triples(
         "field_static_map": field_static_map,
         "resolved_imports": resolved_imports,
         "unchanged_idents": unchanged_idents,
-        "body_hashes": body_hashes,
     }
 
 
@@ -7810,7 +7767,6 @@ def _reverse_apply(
     new_candidates: List[str] = []
     provisional_moves: List[Tuple[str, str]] = []  # (ident, superseded_commit_ident)
     already_authoritative_touched: List[Tuple[str, Optional[str]]] = []
-    body_hash_by_ident: Dict[str, str] = {}
     unchanged_by_ident: Dict[str, bool] = {}
 
     for status, file_path, extracted, precomputed, _old_path in file_results:
@@ -7864,8 +7820,6 @@ def _reverse_apply(
                 already_authoritative_touched.append(
                     (ident, _entity_introduced_by_query(db, ident))
                 )
-
-        body_hash_by_ident.update(precomputed.get("body_hashes", {}))
 
     # Split :contains out before batching (#222 phase 2b1). Minigraf's EAVT
     # pending index lacks value bytes in the key, so batching multiple
@@ -7931,20 +7885,12 @@ def _reverse_apply(
             db, ident, commit_ident, commit_ts_iso, index_con=index_con,
             pos=pos, pos_by_commit_ident=pos_by_commit_ident,
         )
-        if ident in body_hash_by_ident:
-            _candidate_diff_persist(
-                db, commit_hash, ident, body_hash_by_ident[ident], commit_ts_iso, index_con=index_con,
-            )
 
     for ident, superseded_ident in provisional_moves:
         _entity_introduced_by_set_provisional(
             db, ident, commit_ident, commit_ts_iso, index_con=index_con,
             pos=pos, pos_by_commit_ident=pos_by_commit_ident,
         )
-        if ident in body_hash_by_ident:
-            _candidate_diff_persist(
-                db, commit_hash, ident, body_hash_by_ident[ident], commit_ts_iso, index_con=index_con,
-            )
         if superseded_ident is not None and superseded_ident != commit_ident:
             superseded_pos = pos_by_commit_ident.get(superseded_ident)
             if superseded_pos is None or superseded_pos > pos:
@@ -7959,16 +7905,6 @@ def _reverse_apply(
                     [t for t in candidate_triples_by_ident.get(ident, []) if ":introduced-by" not in t],
                     commit_ts_iso,
                     index_con=index_con,
-                )
-
-                # The superseded candidate-diff record is stale the moment
-                # the guess moves off it, and this is the cheapest place to
-                # drop it -- superseded_ident is right here. Without it these
-                # scratch facts accumulate as O(entity touches) rather than
-                # O(entities), which is exactly what _candidate_diff_clear's
-                # own docstring says must not happen.
-                _candidate_diff_clear(
-                    db, superseded_ident[len(":commit/"):], ident, index_con=index_con,
                 )
             if superseded_pos is not None and superseded_pos <= pos:
                 # The move was refused (or would be): the "superseded" guess
@@ -8893,7 +8829,6 @@ def _correction_sweep_apply(
                     # confirm. The :introduced-by fact itself is untouched,
                     # since its value was already correct.
                     _lineage_confirm(db, ident, index_con=index_con)
-                    _candidate_diff_clear(db, commit_hash, ident, index_con=index_con)
                 else:
                     # Case 2: guess points elsewhere, or an ambiguous
                     # (zero/2+) value count -- fail safe, leave untouched.
@@ -8921,7 +8856,6 @@ def _correction_sweep_apply(
                             _transact(
                                 db, f"[[{ident} :modified-in {commit_ident}]]", commit_ts_iso, index_con=index_con,
                             )
-                    _candidate_diff_clear(db, commit_hash, ident, index_con=index_con)
                 else:
                     # Zero or 2+ distinct values -- same duplicate-fact
                     # risk as case 2 -- skip, left alone rather than

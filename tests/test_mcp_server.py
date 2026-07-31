@@ -6303,82 +6303,75 @@ class TestLineageConfirmedThroughMigration:
         assert mcp_server._lineage_confirmed_through_query(db) == "h2"
 
 
-class TestCandidateDiff:
-    def test_read_absent_record_returns_none(self, real_db):
+class TestCandidateDiffLegacyPurge:
+    """#233: the :type/candidate-diff record path is deleted, so nothing
+    clears the records a phase-2d graph already holds -- and they ARE
+    indexed (fact_index filters nothing by prefix; _MEMORY_PREFIXES affects
+    scoring only), so they would stay retrievable scratch noise forever.
+    _frontier_load is already the one-time-migration site."""
+
+    def _seed_legacy_record(self, db, commit_hash, entity_ident, body_hash):
+        """Write a candidate-diff record the way the deleted
+        _candidate_diff_persist used to, so the purge has something real to
+        find on a graph written by phase 2d."""
         import mcp_server
-        assert mcp_server._candidate_diff_read(real_db, "a" * 40, ":function/foo") is None
+        ident = f":candidate/{commit_hash[:12]}-{entity_ident.lstrip(':').replace('/', '-')}"
+        commit_ident = f":commit/{commit_hash[:12]}"
+        mcp_server._transact(
+            db,
+            "[" + " ".join([
+                f"[{ident} :entity-type :type/candidate-diff]",
+                f"[{ident} :commit {commit_ident}]",
+                f"[{ident} :entity {entity_ident}]",
+                f'[{ident} :body-hash "{body_hash}"]',
+            ]) + "]",
+            "2026-01-01T00:00:00Z",
+        )
+        return ident
 
-    def test_persist_then_read_round_trip(self, real_db):
+    def _live_record_count(self, db):
         import mcp_server
-        db = real_db
-        commit_hash = "a" * 40
-        entity_ident = ":function/src-auth-py-login"
+        raw = mcp_server._db_execute(
+            db, "(query [:find (count ?e) :where [?e :entity-type :type/candidate-diff]])"
+        )
+        results = json.loads(raw)["results"]
+        return results[0][0] if results else 0
 
-        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
-
-        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) == "hash1"
-        # A different (commit, entity) pair must not resolve to this record.
-        assert mcp_server._candidate_diff_read(db, "b" * 40, entity_ident) is None
-        assert mcp_server._candidate_diff_read(db, commit_hash, ":function/other") is None
-
-    def test_persist_same_hash_twice_does_not_duplicate(self, real_db):
+    def test_purges_pre_existing_records(self, real_db):
         import mcp_server
-        db = real_db
-        commit_hash = "a" * 40
-        entity_ident = ":function/src-auth-py-login"
+        self._seed_legacy_record(real_db, "a" * 40, ":function/src-auth-py-login", "h1")
+        self._seed_legacy_record(real_db, "b" * 40, ":function/src-auth-py-login", "h2")
+        assert self._live_record_count(real_db) == 2
 
-        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
-        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:01Z")
+        purged = mcp_server._candidate_diff_purge_legacy(real_db)
 
-        ident = mcp_server._candidate_diff_ident(commit_hash, entity_ident)
-        raw = mcp_server._db_execute(db, f"(query [:find (count ?h) :where [{ident} :body-hash ?h]])")
-        assert json.loads(raw)["results"] == [[1]]
+        assert purged == 2
+        assert self._live_record_count(real_db) == 0
 
-    def test_persist_different_hash_updates_without_duplicating(self, real_db):
+    def test_noop_on_a_graph_with_no_records(self, real_db):
         import mcp_server
-        db = real_db
-        commit_hash = "a" * 40
-        entity_ident = ":function/src-auth-py-login"
+        assert mcp_server._candidate_diff_purge_legacy(real_db) == 0
 
-        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
-        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash2", "2026-01-01T00:00:01Z")
-
-        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) == "hash2"
-        ident = mcp_server._candidate_diff_ident(commit_hash, entity_ident)
-        raw = mcp_server._db_execute(db, f"(query [:find (count ?h) :where [{ident} :body-hash ?h]])")
-        assert json.loads(raw)["results"] == [[1]]
-
-    def test_clear_removes_the_record(self, real_db):
+    def test_frontier_load_purges_on_an_existing_graph(self, real_db, tmp_path):
+        """The purge has to run from _frontier_load, not just exist -- an
+        already-migrated graph is loaded by every subsequent run and is
+        exactly where these orphans live."""
         import mcp_server
-        db = real_db
-        commit_hash = "a" * 40
-        entity_ident = ":function/src-auth-py-login"
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "c0"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        self._seed_legacy_record(real_db, "a" * 40, ":function/src-auth-py-login", "h1")
 
-        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
-        mcp_server._candidate_diff_clear(db, commit_hash, entity_ident)
+        mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
 
-        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) is None
-        ident = mcp_server._candidate_diff_ident(commit_hash, entity_ident)
-        raw = mcp_server._db_execute(db, f"(query [:find (count ?e) :where [{ident} :entity ?e]])")
-        assert json.loads(raw)["results"] == [[0]]
-
-    def test_clear_absent_record_is_a_noop(self, real_db):
-        import mcp_server
-        db = real_db
-        # Must not raise.
-        mcp_server._candidate_diff_clear(db, "a" * 40, ":function/never-persisted")
-
-    def test_candidate_diff_survives_audit(self, real_db):
-        import mcp_server
-        db = real_db
-        commit_hash = "a" * 40
-        entity_ident = ":function/src-auth-py-login"
-
-        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
-        result = mcp_server.handle_minigraf_audit()
-
-        assert result["retracted"] == 0
-        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) == "hash1"
+        assert self._live_record_count(real_db) == 0
 
 
 class TestEntityIntroducedBySetProvisional:
@@ -8667,50 +8660,6 @@ class TestPrecomputeFileTriplesBodyDiff:
         )
         field_ident = mcp_server._code_ident("field", "models.py", "Foo.bar")
         assert field_ident in result["unchanged_idents"]
-
-    def test_body_hashes_populated_for_every_new_side_function(self):
-        import mcp_server
-        parser = self._python_parser()
-        new_nodes = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
-        extracted = {"functions": ["login"], "classes": [], "imports": []}
-        result = mcp_server._precompute_file_triples(
-            "auth.py", extracted, ":commit/c1", {}, new_entity_nodes=new_nodes,
-        )
-        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
-        assert result["body_hashes"][fn_ident] == mcp_server._normalized_body_hash(new_nodes["function"]["login"])
-
-    def test_body_hashes_match_across_textually_identical_bodies(self):
-        import mcp_server
-        parser = self._python_parser()
-        nodes_a = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
-        nodes_b = self._all_nodes(parser, b"def login(user):\n\n    return   user.ok\n")
-        extracted = {"functions": ["login"], "classes": [], "imports": []}
-        result_a = mcp_server._precompute_file_triples(
-            "auth.py", extracted, ":commit/c1", {}, new_entity_nodes=nodes_a,
-        )
-        result_b = mcp_server._precompute_file_triples(
-            "auth.py", extracted, ":commit/c2", {}, new_entity_nodes=nodes_b,
-        )
-        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
-        assert result_a["body_hashes"][fn_ident] == result_b["body_hashes"][fn_ident]
-
-    def test_body_hashes_absent_without_new_entity_nodes(self):
-        import mcp_server
-        extracted = {"functions": ["login"], "classes": [], "imports": []}
-        result = mcp_server._precompute_file_triples("auth.py", extracted, ":commit/c1", {})
-        assert result["body_hashes"] == {}
-
-    def test_module_ident_never_appears_in_body_hashes(self):
-        import mcp_server
-        parser = self._python_parser()
-        new_nodes = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
-        extracted = {"functions": ["login"], "classes": [], "imports": []}
-        result = mcp_server._precompute_file_triples(
-            "auth.py", extracted, ":commit/c1", {}, new_entity_nodes=new_nodes,
-        )
-        module_ident = mcp_server._code_ident("module", "auth.py")
-        assert module_ident not in result["body_hashes"]
-
 
 class TestFieldClassContainment:
     """Fields owned by a real (extracted) class get BOTH module- and
@@ -14251,7 +14200,6 @@ class TestReverseFillClaimAndProcess:
         commit_ident = f":commit/{claimed_hash[:12]}"
         assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == commit_ident
         assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
-        assert mcp_server._candidate_diff_read(real_db, claimed_hash, fn_ident) is not None
 
     def test_walking_backward_moves_introduced_by_to_the_oldest_commit(self, real_db, tmp_path):
         import mcp_server
@@ -14271,7 +14219,6 @@ class TestReverseFillClaimAndProcess:
             real_db, f"(query [:find (count ?c) :where [{fn_ident} :introduced-by ?c]])"
         )
         assert json.loads(raw)["results"] == [[1]]
-        assert mcp_server._candidate_diff_read(real_db, oldest_hash, fn_ident) is not None
 
         # The converged :modified-in set must match what forward walk would
         # have produced: every later touch except the true introduction
@@ -14521,46 +14468,6 @@ class TestEntityIntroducedBySetProvisionalMonotonicity:
             pos=0, pos_by_commit_ident=pos_by,
         )
         assert mcp_server._entity_introduced_by_query(real_db, ident) == ":commit/c0"
-
-
-class TestReverseFillCandidateDiffLifecycle:
-    def test_superseded_candidate_diff_records_are_cleared_at_move_time(self, real_db, tmp_path):
-        """2b persisted a candidate-diff record for every (claimed commit,
-        entity) pair, on first sighting and on every move -- so storage grew
-        as O(entity touches), not O(entities), for scratch facts whose own
-        helper docstring says they must not "accumulate unbounded across a
-        full ingest". Only the final, lowest guess is a correct record; the
-        superseded one is stale the moment the guess moves, and 2b has
-        superseded_ident right there in hand."""
-        import mcp_server
-        import frontier_registry
-        repo = tmp_path / "repo"
-        repo.mkdir()
-        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
-        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
-        for i in range(6):
-            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
-            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
-        linearization = frontier_registry.build_linearization(str(repo))
-        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
-        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
-
-        mcp_server._reverse_bulk_fill_walk(
-            real_db, str(repo), linearization, commit_metadata, allocator,
-        )
-
-        login = mcp_server._code_ident("function", "auth.py", "login")
-        raw = mcp_server._db_execute(
-            real_db,
-            f"(query [:find ?rec :where [?rec :entity-type :type/candidate-diff] "
-            f"[?rec :entity {login}]])",
-        )
-        live_records = json.loads(raw)["results"]
-        assert len(live_records) == 1, (
-            f"one record per live guess, not one per touch; got {len(live_records)}"
-        )
 
 
 class TestReverseFillValidTimeParity:
@@ -15253,7 +15160,6 @@ class TestCorrectionSweepApply:
         assert skipped == 0
         assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
         assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{h0_hash[:12]}"
-        assert mcp_server._candidate_diff_read(real_db, h0_hash, fn_ident) is None
 
     def test_does_not_duplicate_commit_metadata(self, real_db, tmp_path):
         import mcp_server
@@ -15449,23 +15355,6 @@ class TestCorrectionSweepApply:
         )
         modified_in_values = {row[0] for row in json.loads(raw)["results"]}
         assert h2_ident not in modified_in_values
-
-    def test_opportunistic_stale_candidate_diff_cleanup(self, real_db, tmp_path):
-        import mcp_server
-        repo = self._repo_with_evolving_function(tmp_path)
-        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
-        h0_hash = commit_metadata[0][0]
-        h1_hash, h1_ts = commit_metadata[1][0], commit_metadata[1][1]
-        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
-        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by :commit/{h0_hash[:12]}]]", "2025-01-01T00:00:00Z")
-        # An orphaned candidate-diff record from a since-superseded guess.
-        mcp_server._candidate_diff_persist(real_db, h1_hash, fn_ident, "stale-hash", "2025-01-01T00:00:00Z")
-        assert mcp_server._candidate_diff_read(real_db, h1_hash, fn_ident) is not None
-
-        file_results = self._extract(repo, h1_hash)
-        mcp_server._correction_sweep_apply(real_db, h1_hash, h1_ts, file_results)
-
-        assert mcp_server._candidate_diff_read(real_db, h1_hash, fn_ident) is None
 
     def test_skipped_events_counts_events_not_entities(self, real_db, tmp_path):
         import mcp_server
@@ -15851,9 +15740,6 @@ class TestForwardReconcileProvisional:
             real_db, f"[[:code/fn-login :introduced-by {guess_ident}]]", "2026-06-01T00:00:00Z",
         )
         mcp_server._lineage_mark_provisional(real_db, ":code/fn-login", "2026-06-01T00:00:00Z")
-        mcp_server._candidate_diff_persist(
-            real_db, "bbbbbbbbbbbb" + "0" * 28, ":code/fn-login", "hash-b", "2026-06-01T00:00:00Z",
-        )
         return guess_ident, structural_triples
 
     def test_returns_none_and_writes_nothing_when_not_provisional(self, real_db):
@@ -15878,7 +15764,7 @@ class TestForwardReconcileProvisional:
         # one immediately after, via the normal forward emission path.
         assert mcp_server._entity_introduced_by_query(real_db, ":code/fn-login") is None
 
-    def test_confirms_the_marker_and_clears_the_candidate_diff(self, real_db):
+    def test_confirms_the_marker(self, real_db):
         import mcp_server
         guess_ident, structural = self._seed_provisional(real_db)
         returned = mcp_server._forward_reconcile_provisional(
@@ -15887,9 +15773,6 @@ class TestForwardReconcileProvisional:
         )
         assert returned == guess_ident
         assert mcp_server._lineage_is_provisional(real_db, ":code/fn-login") is False
-        assert mcp_server._candidate_diff_read(
-            real_db, "bbbbbbbbbbbb" + "0" * 28, ":code/fn-login",
-        ) is None
 
     def test_writes_modified_in_at_the_guess_commits_own_timestamp(self, real_db):
         """The guess commit is now known to be a genuine modification rather
