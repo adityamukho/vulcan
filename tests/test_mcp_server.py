@@ -14511,6 +14511,8 @@ class TestReverseApplySplit:
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
         bodies = "\n\n".join(f"def f{i}():\n    return 0" for i in range(12))
         for rev in range(2):
+            if rev > 0:
+                time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
             (repo / "wide.py").write_text(bodies.replace("return 0", f"return {rev}") + "\n")
             _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
             _subprocess.run(["git", "commit", "-m", f"c{rev}"], cwd=repo, check=True, capture_output=True)
@@ -14551,6 +14553,8 @@ class TestReverseApplySplit:
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
         bodies = "\n\n".join(f"def f{i}():\n    return 0" for i in range(6))
         for rev in range(2):
+            if rev > 0:
+                time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
             (repo / "wide.py").write_text(bodies.replace("return 0", f"return {rev}") + "\n")
             _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
             _subprocess.run(["git", "commit", "-m", f"c{rev}"], cwd=repo, check=True, capture_output=True)
@@ -14572,6 +14576,140 @@ class TestReverseApplySplit:
             assert tip_ident in modified_in, (
                 f"{ident} lost its retroactive edge; got {sorted(modified_in)}"
             )
+
+    def test_retroactive_gate_and_valid_time_survive_a_shared_superseded_timestamp(
+        self, real_db, tmp_path
+    ):
+        """#233 review: all three per-ident gates are pure functions of
+        superseded_ident (plus the fixed pos/commit_ident), and the group
+        key superseded_ts is ALSO a pure function of superseded_ident -- so
+        a group-wide implementation can only diverge from the per-ident one
+        when two DISTINCT superseded commits share a timestamp SECOND. This
+        pins two things at once against that exact fixture shape:
+
+        (a) the superseded_pos <= pos refusal stays per-ident across a group
+            boundary -- one ident's superseded guess (fake_before, position
+            0) is refused, the other's (fake_after, position 2) is allowed,
+            despite both sharing shared_ts, with the real commit processed
+            at position 1 in between;
+        (b) the allowed edge's valid-time is pinned to its OWN
+            superseded_ts, not this commit's commit_ts_iso, checked via
+            :valid-at against the real backend rather than by inspecting
+            transact call arguments.
+
+        commit_metadata/linearization are hand-extended with two fabricated
+        commit idents around one real commit -- the same "no real git
+        history, hand-built pos_by_commit_ident" shape
+        test_monotonicity_refusal_is_per_ident_not_per_batch already uses
+        for the sibling per-ident gate in
+        _entity_introduced_by_set_provisional_batch, because the refusal
+        branch guards a state (a "later" guess that turns out not to be
+        later) normal monotonic reverse-walk traversal can never produce on
+        its own.
+        """
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "a.py").write_text("def fa():\n    return 0\n")
+        (repo / "b.py").write_text("def fb():\n    return 0\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "root"], cwd=repo, check=True, capture_output=True)
+
+        real_linearization = frontier_registry.build_linearization(str(repo))
+        real_commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        root_hash, _real_root_ts, root_author, root_subject = real_commit_metadata[0]
+        assert real_linearization == [root_hash]
+
+        # All hand-picked, ordered SEED_TS < commit_ts_iso < shared_ts, and
+        # every one safely in minigraf's PAST relative to wall-clock "now"
+        # (unlike the real git-derived timestamp, which is effectively
+        # "now" and therefore too late to precede anything) -- because
+        # _reverse_apply's own "is this entity already known" check
+        # (_entity_introduced_by_query) is a PLAIN, now-relative query: a
+        # future-dated seed would be invisible to it and the whole
+        # provisional_moves path would never fire. See the #233 review
+        # discussion (this was the first, silently-empty version of this
+        # test) -- confirmed empirically against the real backend that a
+        # plain query hides a future-valid_from fact but :valid-at does not.
+        seed_ts = "2019-01-01T00:00:00Z"
+        commit_ts_iso = "2020-01-01T00:00:00Z"  # this call's fabricated "current commit" time
+        shared_ts = "2021-01-01T00:00:00Z"      # both fakes share this -- the collision under test
+
+        fake_before_hash = "a" * 40  # position 0 -- superseded_pos (0) <= pos (1): refused
+        fake_after_hash = "b" * 40   # position 2 -- superseded_pos (2) >  pos (1): allowed
+
+        linearization = [fake_before_hash, root_hash, fake_after_hash]
+        commit_metadata = [
+            (fake_before_hash, shared_ts, "fake", "fake before"),
+            (root_hash, commit_ts_iso, root_author, root_subject),
+            (fake_after_hash, shared_ts, "fake", "fake after"),
+        ]
+        pos = 1
+
+        fa_ident = mcp_server._code_ident("function", "a.py", "fa")
+        fb_ident = mcp_server._code_ident("function", "b.py", "fb")
+        fake_before_ident = f":commit/{fake_before_hash[:12]}"
+        fake_after_ident = f":commit/{fake_after_hash[:12]}"
+
+        # Seed both as already-provisional, guessed-introduced at the two
+        # fabricated commits -- real writes through the real batch helper,
+        # not a mock, mirroring test_monotonicity_refusal_is_per_ident_not_per_batch.
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [fa_ident], fake_before_ident, seed_ts,
+        )
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [fb_ident], fake_after_ident, seed_ts,
+        )
+
+        file_results, _g, _m, _r = mcp_server._extract_commit(str(repo), root_hash, ())
+        mcp_server._reverse_apply(
+            real_db, str(repo), linearization, commit_metadata, pos, file_results,
+        )
+
+        # (a) fa's guess (fake_before, position 0) is refused: no
+        # :modified-in fact at all, checked :valid-at shared_ts -- where a
+        # wrongly-admitted one (grouped under shared_ts by a buggy
+        # group-wide gate) would show.
+        raw = mcp_server._db_execute(
+            real_db,
+            f'(query [:find ?c :valid-at "{shared_ts}" :where [{fa_ident} :modified-in ?c]])',
+        )
+        assert json.loads(raw)["results"] == [], (
+            f"fa's refused superseded guess must not get a retroactive edge; "
+            f"got {json.loads(raw)['results']}"
+        )
+
+        # fb's guess (fake_after, position 2) is allowed: exactly the one
+        # retroactive edge, to fake_after_ident -- checked the same way, so
+        # a buggy group-wide gate that drops the WHOLE group (because fa,
+        # iterated first, was refused) is caught here too.
+        raw = mcp_server._db_execute(
+            real_db,
+            f'(query [:find ?c :valid-at "{shared_ts}" :where [{fb_ident} :modified-in ?c]])',
+        )
+        modified_in = {row[0] for row in json.loads(raw)["results"]}
+        assert modified_in == {fake_after_ident}, (
+            f"fb's allowed superseded guess must get its retroactive edge; got {modified_in}"
+        )
+
+        # (b) valid-time: fb's edge reads as [] :valid-at commit_ts_iso (this
+        # call's own commit) and live :valid-at shared_ts (fake_after's own
+        # commit) -- pinned to the SUPERSEDED commit's timestamp, not this
+        # commit's, exactly mirroring the real 4-commit/2-file reproduction
+        # from the #233 review ("a-py-f0 :modified-in reads [] as-of c0's ts
+        # and live as-of c1's").
+        raw = mcp_server._db_execute(
+            real_db,
+            f'(query [:find ?c :valid-at "{commit_ts_iso}" :where [{fb_ident} :modified-in ?c]])',
+        )
+        assert json.loads(raw)["results"] == [], (
+            "fb's retroactive edge must not be valid at commit_ts_iso "
+            f"({commit_ts_iso}); got {json.loads(raw)['results']}"
+        )
 
 
 class _NoProgressAllocator:
