@@ -321,6 +321,48 @@ The instrumented harness used to produce the profile above is retained under
 `evals/at_scale/` so the per-call-site attribution can be re-run rather than
 re-derived.
 
+## Post-implementation revision: the cost model above was wrong
+
+**Added 2026-08-02, after the fix landed and a full instrumented run attributed
+all 5,627 s of a complete ingestion.** Full tables:
+`.superpowers/sdd/2026-07-31-reverse-walk-write-amplification/stage-split-measurement.md`.
+
+Finding 1 of the Measurement section — "retract *count* is the actual cost
+driver" — **is not correct**, and the design leaned on it.
+
+Retract cost scales with the number of **facts inside the call**, not with the
+number of calls. Batching collapses call count and leaves wall clock roughly
+where it was. Three pieces of evidence from the completed run:
+
+- `_entity_introduced_by_set_provisional_batch` — the batch this spec's §3
+  introduced specifically to collapse per-ident retracts — is **204 calls
+  costing 2,181 s, averaging 10.7 seconds per call**: 38.8% of the entire run.
+  Python-side overhead cannot explain a 10-second call.
+- Inside `_re_date_structural_facts`, the *batched* non-`:contains` pair costs
+  **3.8x more** in aggregate than the per-triple `:contains` loop, despite being
+  one call instead of N.
+- Across the whole run, `_retract` averages **52.1 ms/call** against the ~13 ms
+  this spec quoted for the unbatched case — i.e. batched calls are individually
+  far more expensive, not amortised.
+
+Consequences for what this spec claimed:
+
+- **§3's batching delivered much less than predicted.** It is not harmful, and
+  the call-count reduction is real, but it is not where the wall clock went.
+- **§1's deferral did work.** `_re_date_structural_facts` was 48% of Stage A's
+  cost before; it is now **3.0% of the whole run**. That lever was real.
+- **§2's deletion did work** — the candidate-diff path is simply gone.
+- **The acceptance gate's 65x gap is dominated by minigraf's per-fact retract
+  cost**, which is outside this codebase. `_retract` is 73.5% of total run time
+  across call sites that are, at the hot ones, already batched.
+
+One codebase-side lever this spec missed entirely: `_correction_sweep_apply`'s
+case-3 `:modified-in` retract (`mcp_server.py`, the `already_has_modified_in`
+branch) is called **72,971 times individually**, costing **1,629 s — 29.0% of
+the run** — and is the one hot retract site never batched. Whether batching it
+recovers anything depends on minigraf's per-fact vs per-call cost split, which
+has not been measured.
+
 ## Explicitly not in scope
 
 - **Caching `_entity_introduced_by_query` in-run** (issue suggestion 3). The
@@ -329,6 +371,8 @@ re-derived.
   sweep also writes. Revisit only if it becomes visible after this fix lands.
 - **Why `_retract` costs 13x a `_transact`.** That is a minigraf-side question
   and may be worth its own issue; this spec routes around it by not issuing
-  34,473 retracts.
+  34,473 retracts. **Revised:** routing around it did not work, because the cost
+  follows facts rather than calls. See the revision section above — this is now
+  the single largest remaining lever, and it is minigraf-side.
 - **Phase 3 (tip-liveness), 4 (status/observability), 5 (hardening).**
   Unblocked by this work, not part of it.
