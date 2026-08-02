@@ -5166,7 +5166,7 @@ def _lineage_mark_provisional_batch(
     Collision-free: each marker is its own :lineage/... companion entity, so
     no two facts in the batch share (entity, attribute, valid_from).
     """
-    facts = []
+    facts: List[str] = []
     for entity_ident in entity_idents:
         if _lineage_is_provisional(db, entity_ident):
             continue
@@ -5368,6 +5368,21 @@ def _entity_introduced_by_set_provisional_batch(
       - value already equals commit_ident -- no write, but still marked
       - the monotonicity refusal (a guess may only move EARLIER), with its
         own stderr line per refused ident
+
+    Idempotent per ident: an ident whose value already equals commit_ident
+    contributes no fact write (but is still included in the marker batch).
+    Query-before-write, retract-then-reassert only for idents whose value
+    genuinely changed -- mirrors _watermark_update's pattern, since
+    re-transacting the same (entity, attribute, value) at a new valid_from
+    creates a duplicate live datom under minigraf's write semantics.
+
+    Positions, never timestamps: ingest :date values are AUTHOR dates
+    (_git_commits reads `%at`) and are not monotonic in topological order
+    (clock skew, rebases, cherry-picks), which is why build_linearization
+    uses --topo-order at all, so comparing :date values would silently
+    mis-order commits. pos and pos_by_commit_ident both default to None, in
+    which case the monotonicity guard is skipped for every ident in the
+    batch; _reverse_apply passes them always.
 
     Collision-free: within each batch the facts differ in entity, and only
     facts sharing (entity, attribute, valid_from) collapse in minigraf's

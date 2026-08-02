@@ -6180,6 +6180,35 @@ class TestLineageProvisionalMarker:
         raw = mcp_server._db_execute(db, f"(query [:find (count ?e) :where [{ident} :entity ?e]])")
         assert json.loads(raw)["results"] == [[1]]
 
+    def test_batch_marks_many_new_entities_in_one_transact(self, real_db):
+        """#233 review: test_batch_issues_a_constant_number_of_write_calls
+        (TestEntityIntroducedBySetProvisionalBatch) only ever counts a
+        SECOND call, by which point every ident is already marked and
+        _lineage_mark_provisional_batch short-circuits on the
+        _lineage_is_provisional gate before writing anything -- so it never
+        proves the marker batching itself. This test calls
+        _lineage_mark_provisional_batch directly on entities that have
+        never been marked, so the marker-transact path is genuinely
+        exercised, and asserts the write count is 1, not len(idents)."""
+        import mcp_server
+        idents = [f":function/src-auth-py-m{i}" for i in range(5)]
+        for ident in idents:
+            assert mcp_server._lineage_is_provisional(real_db, ident) is False
+
+        calls = []
+        real_transact = mcp_server._transact
+        mcp_server._transact = lambda *a, **k: (calls.append("t") or real_transact(*a, **k))
+        try:
+            mcp_server._lineage_mark_provisional_batch(
+                real_db, idents, "2026-01-03T00:00:00Z",
+            )
+        finally:
+            mcp_server._transact = real_transact
+
+        assert calls.count("t") == 1, f"one transact for all 5 new markers; got {calls}"
+        for ident in idents:
+            assert mcp_server._lineage_is_provisional(real_db, ident) is True
+
     def test_provisional_marker_survives_audit(self, real_db):
         import mcp_server
         db = real_db
