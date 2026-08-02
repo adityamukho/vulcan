@@ -352,9 +352,60 @@ Consequences for what this spec claimed:
 - **§1's deferral did work.** `_re_date_structural_facts` was 48% of Stage A's
   cost before; it is now **3.0% of the whole run**. That lever was real.
 - **§2's deletion did work** — the candidate-diff path is simply gone.
-- **The acceptance gate's 65x gap is dominated by minigraf's per-fact retract
-  cost**, which is outside this codebase. `_retract` is 73.5% of total run time
-  across call sites that are, at the hot ones, already batched.
+- **The acceptance gate's 65x gap is dominated by `_retract`**, which is 73.5%
+  of total run time across call sites that are, at the hot ones, already
+  batched. *(First attributed to minigraf; that was wrong — see the second
+  revision immediately below.)*
+
+## Second revision: it is our fact index, not minigraf
+
+**Added 2026-08-02, after two controlled microbenchmarks.** The revision above
+concluded the residual cost was "minigraf's per-fact retract cost, outside this
+codebase." That is **also wrong**, and in a more useful direction: the cost is
+in `fact_index.delete_facts`, which we own.
+
+**Minigraf's raw retract is free.** Retracting 1,000 facts from a 10,000-fact
+graph takes 0.06 s at one fact per call and 0.01 s batched — 0.06 ms/fact — with
+no measurable scaling in graph size (2k/10k/40k graphs all indistinguishable).
+
+The cost is the fact-index maintenance inside `mcp_server._retract`:
+
+```
+DELETE FROM facts_fts WHERE entity=? AND attribute=? AND value=? AND valid_to IS NULL
+```
+
+`facts_fts` is an **FTS5 virtual table** (`fact_index.py:23`). FTS5 has no
+B-tree over its columns, so an equality predicate cannot seek — every deleted
+triple costs a full scan of the index. Measured:
+
+| index rows | ms per deleted triple |
+|---:|---:|
+| 5,000 | 0.805 |
+| 20,000 | 2.887 (3.6x) |
+| 80,000 | 11.088 (3.8x) |
+
+Linear in index size. And **batching is irrelevant** — at a fixed 80,000-row
+index, deleting 200 triples costs 11.17 / 11.41 / 11.53 ms per triple whether
+issued as 200 calls, 20 calls, or 1. That is the direct explanation for why §3's
+batching did not move the needle.
+
+The *insert* path is flat at **0.006 ms/triple** regardless of index size —
+~1,800x faster — because `insert_facts` checks the B-tree-indexed `facts_dedup`
+companion table. `fact_index.py:31` states outright that scanning `facts_fts` is
+"an O(n) scan", which is why `facts_dedup` was introduced for inserts (#152).
+**The delete path never received the same treatment.**
+
+This also explains `_candidate_diff_purge_legacy`'s O(N^2) behaviour (500 records
+0.50 s, 8,000 records 126.71 s, chunking no help) found in this branch's final
+review — same root cause, not a separate defect.
+
+**Consequence:** the residual 65x is a fixable, in-codebase problem, not an
+upstream one. `facts_dedup` already carries the
+`(entity, attribute, value, valid_from, valid_to)` key a delete needs to seek
+on; giving it (or an equivalent mapping) the `facts_fts` rowid would let
+`delete_facts` issue `DELETE FROM facts_fts WHERE rowid = ?`, which FTS5 does
+support efficiently. That is a fact-index schema change with a version bump and
+migration — its own issue, not #233's.
 
 One codebase-side lever this spec missed entirely: `_correction_sweep_apply`'s
 case-3 `:modified-in` retract (`mcp_server.py`, the `already_has_modified_in`
