@@ -5156,6 +5156,30 @@ def _lineage_mark_provisional(
     _transact(db, "[" + " ".join(facts) + "]", commit_ts_iso, index_con=index_con)
 
 
+def _lineage_mark_provisional_batch(
+    db: Any, entity_idents: Sequence[str], commit_ts_iso: str, index_con: Optional[Any] = None
+) -> None:
+    """Batched _lineage_mark_provisional (#233). Same query-before-write
+    per ident -- an entity already marked is skipped, never duplicated --
+    but the facts for every genuinely-new marker go in ONE _transact.
+
+    Collision-free: each marker is its own :lineage/... companion entity, so
+    no two facts in the batch share (entity, attribute, valid_from).
+    """
+    facts = []
+    for entity_ident in entity_idents:
+        if _lineage_is_provisional(db, entity_ident):
+            continue
+        ident = _lineage_marker_ident(entity_ident)
+        facts.extend([
+            f"[{ident} :entity-type {_LINEAGE_MARKER_ENTITY_TYPE}]",
+            f"[{ident} :entity {entity_ident}]",
+            f"[{ident} :status :provisional]",
+        ])
+    if facts:
+        _transact(db, "[" + " ".join(facts) + "]", commit_ts_iso, index_con=index_con)
+
+
 def _lineage_confirm(db: Any, entity_ident: str, index_con: Optional[Any] = None) -> None:
     """Retract the :type/lineage-marker companion entity's facts for
     entity_ident if present; no-op if absent, so callers (2c) can call this
@@ -5317,6 +5341,75 @@ def _entity_introduced_by_query(db: Any, entity_ident: str) -> Optional[str]:
     return results[0][0] if results else None
 
 
+def _entity_introduced_by_set_provisional_batch(
+    db: Any,
+    entity_idents: Sequence[str],
+    commit_ident: str,
+    commit_ts_iso: str,
+    index_con: Optional[Any] = None,
+    pos: Optional[int] = None,
+    pos_by_commit_ident: Optional[Dict[str, int]] = None,
+) -> Set[str]:
+    """Assert or move a PROVISIONAL :introduced-by to commit_ident for many
+    entities at once (#233), in one _retract and at most two _transact
+    calls instead of two writes per ident. _reverse_apply's two loops were
+    the only production callers of the per-ident form, at ~1,265 idents per
+    commit on a real repository; retracts cost ~13ms against a transact's
+    ~1ms, so the retract batching is the load-bearing half.
+
+    Returns the set of idents whose guess was actually asserted or moved.
+
+    Every gate is per-ident and is applied in the same order the per-ident
+    function used, because batching must not turn one ident's refusal into
+    the whole batch being dropped, nor a refused ident into an included one:
+
+      - authoritative (a value exists and _lineage_is_provisional is False)
+        -- never touched; reverse walk must never clobber a confirmed fact
+      - value already equals commit_ident -- no write, but still marked
+      - the monotonicity refusal (a guess may only move EARLIER), with its
+        own stderr line per refused ident
+
+    Collision-free: within each batch the facts differ in entity, and only
+    facts sharing (entity, attribute, valid_from) collapse in minigraf's
+    EAVT pending index. :contains is the attribute where that bites, and it
+    is not written here.
+    """
+    to_retract: List[str] = []
+    to_transact: List[str] = []
+    to_mark: List[str] = []
+    moved: Set[str] = set()
+
+    for entity_ident in entity_idents:
+        current = _entity_introduced_by_query(db, entity_ident)
+        if current is not None and not _lineage_is_provisional(db, entity_ident):
+            continue  # authoritative -- never touch
+        if current == commit_ident:
+            to_mark.append(entity_ident)
+            continue
+        if current is not None and pos is not None and pos_by_commit_ident is not None:
+            current_pos = pos_by_commit_ident.get(current)
+            if current_pos is not None and pos >= current_pos:
+                print(
+                    f"[_entity_introduced_by_set_provisional] refusing to move "
+                    f"{entity_ident}'s guess from {current} (position {current_pos}) "
+                    f"to {commit_ident} (position {pos}): a guess may only move earlier",
+                    file=sys.stderr,
+                )
+                continue
+        if current is not None:
+            to_retract.append(f"[{entity_ident} :introduced-by {current}]")
+        to_transact.append(f"[{entity_ident} :introduced-by {commit_ident}]")
+        to_mark.append(entity_ident)
+        moved.add(entity_ident)
+
+    if to_retract:
+        _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+    if to_transact:
+        _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
+    _lineage_mark_provisional_batch(db, to_mark, commit_ts_iso, index_con=index_con)
+    return moved
+
+
 def _entity_introduced_by_set_provisional(
     db: Any,
     entity_ident: str,
@@ -5326,55 +5419,15 @@ def _entity_introduced_by_set_provisional(
     pos: Optional[int] = None,
     pos_by_commit_ident: Optional[Dict[str, int]] = None,
 ) -> None:
-    """Assert or move entity_ident's PROVISIONAL :introduced-by to
-    commit_ident. Never touches an entity whose :introduced-by is already
-    authoritative (a fact exists and _lineage_is_provisional is False) --
-    reverse walk (#222 phase 2b) must never clobber a fact Stream 1 has
-    already confirmed. Idempotent: no-ops the fact write (but still ensures
-    the marker is present) if the current value already equals
-    commit_ident. Query-before-write, retract-then-reassert only if the
-    value genuinely changed -- mirrors _watermark_update's pattern, since
-    re-transacting the same (entity, attribute, value) at a new valid_from
-    creates a duplicate live datom under minigraf's write semantics.
-
-    Monotonicity (#222 phase 2b1): when pos and pos_by_commit_ident are
-    supplied, a move is REFUSED unless commit_ident is strictly earlier than
-    the current guess. This docstring always claimed the contract ("reverse
-    walk has now reached an earlier commit") but nothing enforced it, so a
-    re-claim of a higher position -- routine on a resumed run -- dragged the
-    guess forward while the caller's retroactive :modified-in landed at the
-    older, lower commit, producing an entity modified before it was
-    introduced. Forward walk cannot produce that shape, nothing in the graph
-    or the audit detects it, and it persists.
-
-    Positions, never timestamps: ingest :date values are AUTHOR dates
-    (_git_commits reads `%at`) and are not monotonic in topological order
-    (clock skew, rebases, cherry-picks), which is why
-    build_linearization uses --topo-order at all, so comparing :date values
-    would silently mis-order commits. Both parameters default to None, in
-    which case the guard is skipped and behaviour is exactly as before --
-    2a's existing callers are unaffected; 2b passes them always.
+    """One-entity form of _entity_introduced_by_set_provisional_batch --
+    see that function for the gates. A delegating wrapper rather than a
+    parallel implementation (#233) so the batched and unbatched paths
+    cannot drift apart; the batch is the only production caller shape.
     """
-    current = _entity_introduced_by_query(db, entity_ident)
-    if current is not None and not _lineage_is_provisional(db, entity_ident):
-        return  # authoritative -- never touch
-    if current == commit_ident:
-        _lineage_mark_provisional(db, entity_ident, commit_ts_iso, index_con=index_con)
-        return
-    if current is not None and pos is not None and pos_by_commit_ident is not None:
-        current_pos = pos_by_commit_ident.get(current)
-        if current_pos is not None and pos >= current_pos:
-            print(
-                f"[_entity_introduced_by_set_provisional] refusing to move "
-                f"{entity_ident}'s guess from {current} (position {current_pos}) "
-                f"to {commit_ident} (position {pos}): a guess may only move earlier",
-                file=sys.stderr,
-            )
-            return
-    if current is not None:
-        _retract(db, f"[[{entity_ident} :introduced-by {current}]]", index_con=index_con)
-    _transact(db, f"[[{entity_ident} :introduced-by {commit_ident}]]", commit_ts_iso, index_con=index_con)
-    _lineage_mark_provisional(db, entity_ident, commit_ts_iso, index_con=index_con)
+    _entity_introduced_by_set_provisional_batch(
+        db, [entity_ident], commit_ident, commit_ts_iso,
+        index_con=index_con, pos=pos, pos_by_commit_ident=pos_by_commit_ident,
+    )
 
 
 def _re_date_structural_facts(
@@ -7890,17 +7943,17 @@ def _reverse_apply(
             db, "[" + " ".join(authoritative_modified_triples) + "]", commit_ts_iso, index_con=index_con,
         )
 
-    for ident in new_candidates:
-        _entity_introduced_by_set_provisional(
-            db, ident, commit_ident, commit_ts_iso, index_con=index_con,
-            pos=pos, pos_by_commit_ident=pos_by_commit_ident,
-        )
+    _entity_introduced_by_set_provisional_batch(
+        db, new_candidates, commit_ident, commit_ts_iso, index_con=index_con,
+        pos=pos, pos_by_commit_ident=pos_by_commit_ident,
+    )
+    _entity_introduced_by_set_provisional_batch(
+        db, [ident for ident, _superseded in provisional_moves], commit_ident,
+        commit_ts_iso, index_con=index_con,
+        pos=pos, pos_by_commit_ident=pos_by_commit_ident,
+    )
 
     for ident, superseded_ident in provisional_moves:
-        _entity_introduced_by_set_provisional(
-            db, ident, commit_ident, commit_ts_iso, index_con=index_con,
-            pos=pos, pos_by_commit_ident=pos_by_commit_ident,
-        )
         if superseded_ident is not None and superseded_ident != commit_ident:
             superseded_pos = pos_by_commit_ident.get(superseded_ident)
             if superseded_pos is not None and superseded_pos <= pos:

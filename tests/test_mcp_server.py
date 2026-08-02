@@ -6433,6 +6433,131 @@ class TestEntityIntroducedBySetProvisional:
         assert mcp_server._lineage_is_provisional(db, entity_ident) is False
 
 
+class TestEntityIntroducedBySetProvisionalBatch:
+    """#233: _reverse_apply's two loops were the only production callers of
+    the per-ident function, at one retract + one transact each -- 8,618
+    retracts over 12 commits of this repo, and retracts cost ~13ms against
+    a transact's ~1ms. The batch is the implementation now; the per-ident
+    function delegates to it so the gates cannot drift apart."""
+
+    def test_first_assert_batches_distinct_entities(self, real_db):
+        import mcp_server
+        idents = [f":function/src-auth-py-f{i}" for i in range(5)]
+
+        moved = mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, idents, ":commit/h2", "2026-01-03T00:00:00Z",
+        )
+
+        assert moved == set(idents)
+        for ident in idents:
+            assert mcp_server._entity_introduced_by_query(real_db, ident) == ":commit/h2"
+            assert mcp_server._lineage_is_provisional(real_db, ident) is True
+
+    def test_batch_issues_a_constant_number_of_write_calls(self, real_db):
+        """The whole point. Five entities must not cost five retracts."""
+        import mcp_server
+        idents = [f":function/src-auth-py-f{i}" for i in range(5)]
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, idents, ":commit/h2", "2026-01-03T00:00:00Z",
+        )
+
+        calls = []
+        real_transact, real_retract = mcp_server._transact, mcp_server._retract
+        mcp_server._transact = lambda *a, **k: (calls.append("t") or real_transact(*a, **k))
+        mcp_server._retract = lambda *a, **k: (calls.append("r") or real_retract(*a, **k))
+        try:
+            mcp_server._entity_introduced_by_set_provisional_batch(
+                real_db, idents, ":commit/h0", "2026-01-01T00:00:00Z",
+            )
+        finally:
+            mcp_server._transact, mcp_server._retract = real_transact, real_retract
+
+        assert calls.count("r") == 1, f"one retract for the whole batch; got {calls}"
+        assert calls.count("t") <= 2, f"at most guess + markers; got {calls}"
+
+    def test_moving_the_batch_earlier_leaves_one_value_each(self, real_db):
+        import mcp_server
+        idents = [f":function/src-auth-py-f{i}" for i in range(3)]
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, idents, ":commit/h2", "2026-01-03T00:00:00Z",
+        )
+
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, idents, ":commit/h0", "2026-01-01T00:00:00Z",
+        )
+
+        for ident in idents:
+            assert mcp_server._entity_introduced_by_query(real_db, ident) == ":commit/h0"
+            raw = mcp_server._db_execute(
+                real_db, f"(query [:find (count ?c) :where [{ident} :introduced-by ?c]])"
+            )
+            assert json.loads(raw)["results"] == [[1]]
+
+    def test_monotonicity_refusal_is_per_ident_not_per_batch(self, real_db):
+        """The gate that must not become batch-wide. One ident whose guess
+        would move LATER must be left alone while the rest of the batch
+        still applies -- batching must not turn a refusal into a dropped
+        batch, nor a refused ident into an included one."""
+        import mcp_server
+        pinned = ":function/src-auth-py-pinned"
+        movable = ":function/src-auth-py-movable"
+        pos_by_commit_ident = {":commit/h0": 0, ":commit/h1": 1, ":commit/h2": 2}
+        # pinned already sits at the EARLIEST commit; h1 would move it later.
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [pinned], ":commit/h0", "2026-01-01T00:00:00Z",
+            pos=0, pos_by_commit_ident=pos_by_commit_ident,
+        )
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [movable], ":commit/h2", "2026-01-03T00:00:00Z",
+            pos=2, pos_by_commit_ident=pos_by_commit_ident,
+        )
+
+        moved = mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [pinned, movable], ":commit/h1", "2026-01-02T00:00:00Z",
+            pos=1, pos_by_commit_ident=pos_by_commit_ident,
+        )
+
+        assert moved == {movable}
+        assert mcp_server._entity_introduced_by_query(real_db, pinned) == ":commit/h0"
+        assert mcp_server._entity_introduced_by_query(real_db, movable) == ":commit/h1"
+
+    def test_authoritative_entities_are_never_touched(self, real_db):
+        import mcp_server
+        authoritative = ":function/src-auth-py-authoritative"
+        provisional = ":function/src-auth-py-provisional"
+        mcp_server._transact(
+            real_db, f"[[{authoritative} :introduced-by :commit/h5]]", "2026-01-06T00:00:00Z",
+        )
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [provisional], ":commit/h2", "2026-01-03T00:00:00Z",
+        )
+
+        moved = mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [authoritative, provisional], ":commit/h0", "2026-01-01T00:00:00Z",
+        )
+
+        assert moved == {provisional}
+        assert mcp_server._entity_introduced_by_query(real_db, authoritative) == ":commit/h5"
+        assert mcp_server._lineage_is_provisional(real_db, authoritative) is False
+
+    def test_same_value_is_idempotent_but_still_marks(self, real_db):
+        import mcp_server
+        ident = ":function/src-auth-py-login"
+
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [ident], ":commit/h1", "2026-01-02T00:00:00Z",
+        )
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [ident], ":commit/h1", "2026-01-02T00:00:01Z",
+        )
+
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find (count ?c) :where [{ident} :introduced-by ?c]])"
+        )
+        assert json.loads(raw)["results"] == [[1]]
+        assert mcp_server._lineage_is_provisional(real_db, ident) is True
+
+
 class TestGitCommitsTopoOrder:
     def test_orders_by_topology_not_committer_date(self, git_repo_diamond_clock_skewed):
         import mcp_server
