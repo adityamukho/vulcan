@@ -5439,8 +5439,11 @@ def _forward_reconcile_provisional(
     exactly one code path that mints an authoritative introduction and this
     function cannot drift from it.
 
-    Mirrors the supersede path in _reverse_apply: the same re-dating of
-    structural facts (via _re_date_structural_facts), the same refusal to
+    Re-dates structural facts itself (via _re_date_structural_facts), same
+    as _correction_sweep_apply's case 1 does (#233) -- _reverse_apply's own
+    supersede path deliberately does NOT do this anymore (see its
+    docstring), so this function no longer mirrors it on that point.
+    Still mirrors _reverse_apply's supersede path for the refusal to
     back-date a :modified-in edge whose commit timestamp is unknown, and --
     what commit_ident is for -- the same refusal to hand the entity a
     :modified-in edge at its OWN introduction (_reverse_apply's
@@ -7713,11 +7716,15 @@ def _reverse_apply(
     entity, which is later than the provisional :introduced-by, so ":as-of
     the provisional introduction" reports the entity as nonexistent for as
     long as it stays provisional. The correction sweep closes that window
-    when it confirms. This is the same "temporarily dangling, and
-    convergent" shape as the :parent edges below, and the region is already
-    excluded from 2a's trust predicate -- but note that an INTERRUPTED run
-    now leaves a wider inconsistent window than it did before #233, closed
-    by the next run's sweep.
+    when it CONFIRMS the entity (case 1) -- but leaves it open for an entity
+    the sweep instead leaves provisional (case 2's fail-safe skip on an
+    ambiguous/wrong guess, already logged as skipped): that entity keeps its
+    stale-dated structural facts indefinitely, not just until the sweep
+    runs. This is the same "temporarily dangling, and convergent" shape as
+    the :parent edges below, and the region is already excluded from 2a's
+    trust predicate -- but note that an INTERRUPTED run now leaves a wider
+    inconsistent window than it did before #233, closed by the next run's
+    sweep (for entities that reach case 1, not case 2).
 
     Known, documented limitation, and who fixes it: the retroactive
     :modified-in for a superseded commit does not re-check #221's
@@ -8765,11 +8772,16 @@ def _correction_sweep_apply(
     never writes commit_hash's own :type/commit entity (2b already wrote
     it for every commit in this sweep's range). DB-bound, parse-free.
 
-    Re-dates each confirmed entity's structural facts to the introduction
-    commit (#233), which _reverse_apply used to do eagerly on every
-    provisional move. Sound here and only here: the gap-closed precondition
-    means Stream 2's guess is final, so an entity reaching case 1 is at its
-    introduction, and this pass visits each commit exactly once ascending.
+    Re-dates each confirmed (case 1) entity's structural facts to the
+    introduction commit (#233), which _reverse_apply used to do eagerly on
+    every provisional move. Sound here and only here: the gap-closed
+    precondition means Stream 2's guess is final, so an entity reaching
+    case 1 is at its introduction, and this pass visits each commit exactly
+    once ascending. An entity case 2 leaves provisional (ambiguous or wrong
+    guess, already logged as skipped) is NOT re-dated and keeps its
+    stale-dated structural facts -- the valid-time window _reverse_apply's
+    docstring describes closes only for entities this sweep confirms, not
+    for ones it skips.
 
     skipped_so_far is the driving loop's running total of skipped_events
     from every previous call this run -- it exists solely to make the

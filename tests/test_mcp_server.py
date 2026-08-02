@@ -15537,6 +15537,8 @@ class TestCorrectionSweepApply:
         _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
         for i in range(3):
+            if i > 0:
+                time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
             (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
             _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
             _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
@@ -15575,6 +15577,8 @@ class TestCorrectionSweepApply:
         _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
         for i in range(3):
+            if i > 0:
+                time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
             (repo / "auth.py").write_text(
                 f"def a():\n    return {i}\n\ndef b():\n    return {i}\n\ndef c():\n    return {i}\n"
             )
