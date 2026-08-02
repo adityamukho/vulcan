@@ -5180,20 +5180,37 @@ def _lineage_mark_provisional_batch(
         _transact(db, "[" + " ".join(facts) + "]", commit_ts_iso, index_con=index_con)
 
 
+def _lineage_confirm_batch(
+    db: Any, entity_idents: Sequence[str], index_con: Optional[Any] = None
+) -> None:
+    """Batched _lineage_confirm (#233). Retracts the :type/lineage-marker
+    companion entity's facts for every still-provisional ident in ONE
+    _retract; idents with no marker are skipped, so callers can pass a whole
+    commit's candidates unconditionally.
+
+    Collision-free: each marker is its own :lineage/... companion entity.
+    """
+    facts = []
+    for entity_ident in entity_idents:
+        if not _lineage_is_provisional(db, entity_ident):
+            continue
+        ident = _lineage_marker_ident(entity_ident)
+        facts.extend([
+            f"[{ident} :entity-type {_LINEAGE_MARKER_ENTITY_TYPE}]",
+            f"[{ident} :entity {entity_ident}]",
+            f"[{ident} :status :provisional]",
+        ])
+    if facts:
+        _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
+
+
 def _lineage_confirm(db: Any, entity_ident: str, index_con: Optional[Any] = None) -> None:
     """Retract the :type/lineage-marker companion entity's facts for
-    entity_ident if present; no-op if absent, so callers (2c) can call this
-    unconditionally without checking first.
+    entity_ident if present; no-op if absent, so callers can call this
+    unconditionally without checking first. One-entity form of
+    _lineage_confirm_batch, delegating so the two cannot drift (#233).
     """
-    if not _lineage_is_provisional(db, entity_ident):
-        return
-    ident = _lineage_marker_ident(entity_ident)
-    facts = [
-        f"[{ident} :entity-type {_LINEAGE_MARKER_ENTITY_TYPE}]",
-        f"[{ident} :entity {entity_ident}]",
-        f"[{ident} :status :provisional]",
-    ]
-    _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
+    _lineage_confirm_batch(db, [entity_ident], index_con=index_con)
 
 
 def _lineage_is_provisional(db: Any, entity_ident: str) -> bool:
@@ -7968,29 +7985,41 @@ def _reverse_apply(
         pos=pos, pos_by_commit_ident=pos_by_commit_ident,
     )
 
+    # #233: one transact per entity here was 10,161 calls over 12 commits of
+    # this repo. Each edge is asserted at the SUPERSEDED commit's own
+    # timestamp, not this commit's, so one batch is impossible -- but
+    # entities touched by one commit were almost always last sighted at the
+    # same commit, so grouping by that timestamp collapses to a handful.
+    # Every per-ident gate below stays per-ident and is evaluated during
+    # grouping. Facts differing in entity do not collide, so each group is
+    # one safe transact.
+    retroactive_by_ts: Dict[str, List[str]] = {}
     for ident, superseded_ident in provisional_moves:
-        if superseded_ident is not None and superseded_ident != commit_ident:
-            superseded_pos = pos_by_commit_ident.get(superseded_ident)
-            if superseded_pos is not None and superseded_pos <= pos:
-                # The move was refused (or would be): the "superseded" guess
-                # is not actually later than this commit, so asserting it as
-                # a modification would claim the entity changed at or before
-                # its own introduction.
-                continue
-            superseded_ts = ts_by_commit_ident.get(superseded_ident)
-            if superseded_ts is None:
-                # Falling back to THIS commit's timestamp back-dates the edge
-                # to before the modification it describes -- a fact asserted
-                # valid before it was true. Skip and say so instead.
-                print(
-                    f"[_reverse_apply] skipping retroactive :modified-in "
-                    f"for {ident} at {superseded_ident}: no timestamp in commit_metadata",
-                    file=sys.stderr,
-                )
-                continue
-            _transact(
-                db, f"[[{ident} :modified-in {superseded_ident}]]", superseded_ts, index_con=index_con,
+        if superseded_ident is None or superseded_ident == commit_ident:
+            continue
+        superseded_pos = pos_by_commit_ident.get(superseded_ident)
+        if superseded_pos is not None and superseded_pos <= pos:
+            # The move was refused (or would be): the "superseded" guess is
+            # not actually later than this commit, so asserting it as a
+            # modification would claim the entity changed at or before its
+            # own introduction.
+            continue
+        superseded_ts = ts_by_commit_ident.get(superseded_ident)
+        if superseded_ts is None:
+            # Falling back to THIS commit's timestamp back-dates the edge to
+            # before the modification it describes -- a fact asserted valid
+            # before it was true. Skip and say so instead.
+            print(
+                f"[_reverse_apply] skipping retroactive :modified-in "
+                f"for {ident} at {superseded_ident}: no timestamp in commit_metadata",
+                file=sys.stderr,
             )
+            continue
+        retroactive_by_ts.setdefault(superseded_ts, []).append(
+            f"[{ident} :modified-in {superseded_ident}]"
+        )
+    for superseded_ts, triples in retroactive_by_ts.items():
+        _transact(db, "[" + " ".join(triples) + "]", superseded_ts, index_con=index_con)
 
     _frontier_persist_claim(db, linearization, pos, from_low=False, commit_ts_iso=commit_ts_iso, index_con=index_con)
     _db_checkpoint(db)
@@ -8911,6 +8940,11 @@ def _correction_sweep_apply(
             for entry_ident, _entry_name, entry_triples in precomputed[entries_key]:
                 candidate_triples_by_ident[entry_ident] = list(entry_triples)
 
+        # #233: _lineage_confirm was one retract per confirmed entity here,
+        # and retracts cost ~13ms against a transact's ~1ms. Collected per
+        # file and flushed once at the bottom of this same iteration, so a
+        # file's confirms are one call.
+        to_confirm: List[str] = []
         for ident in candidate_idents:
             raw = _db_execute(db, f"(query [:find ?c :where [{ident} :introduced-by ?c]])")
             introduced_by_values = {row[0] for row in json.loads(raw).get("results", [])}
@@ -8927,7 +8961,7 @@ def _correction_sweep_apply(
                         commit_ts_iso,
                         index_con=index_con,
                     )
-                    _lineage_confirm(db, ident, index_con=index_con)
+                    to_confirm.append(ident)
                 else:
                     # Case 2: guess points elsewhere, or an ambiguous
                     # (zero/2+) value count -- fail safe, leave untouched.
@@ -8966,6 +9000,8 @@ def _correction_sweep_apply(
                             f"(ambiguous introduced-by values: {sorted(introduced_by_values)})",
                             file=sys.stderr,
                         )
+
+        _lineage_confirm_batch(db, to_confirm, index_con=index_con)
 
     if update_watermark:
         _correction_sweep_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)

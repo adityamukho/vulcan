@@ -14496,6 +14496,83 @@ class TestReverseApplySplit:
         assert applied == linearization[pos]
         assert snapshot(db_a) == snapshot(db_b)
 
+    def test_retroactive_modified_in_is_grouped_by_superseded_timestamp(self, real_db, tmp_path):
+        """#233: one transact per entity here was 10,161 calls over 12
+        commits of this repo. Each edge carries the SUPERSEDED commit's
+        timestamp, not this commit's, so one batch is impossible -- but
+        entities in one file were almost always last sighted at the same
+        commit, so grouping by timestamp collapses to a handful."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        bodies = "\n\n".join(f"def f{i}():\n    return 0" for i in range(12))
+        for rev in range(2):
+            (repo / "wide.py").write_text(bodies.replace("return 0", f"return {rev}") + "\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{rev}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        # Claim the tip first so the second claim is a genuine move.
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        transacts = []
+        real_transact = mcp_server._transact
+        mcp_server._transact = lambda db_, facts, *a, **k: (
+            transacts.append(facts) or real_transact(db_, facts, *a, **k)
+        )
+        try:
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+        finally:
+            mcp_server._transact = real_transact
+
+        retroactive = [f for f in transacts if ":modified-in" in f]
+        assert len(retroactive) <= 2, (
+            f"grouped by superseded timestamp, not one per entity; got {len(retroactive)}"
+        )
+
+    def test_grouped_retroactive_modified_in_keeps_every_edge(self, real_db, tmp_path):
+        """Grouping must not lose edges -- these facts differ in entity, so
+        they do not collide, but that is the assumption worth pinning."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        bodies = "\n\n".join(f"def f{i}():\n    return 0" for i in range(6))
+        for rev in range(2):
+            (repo / "wide.py").write_text(bodies.replace("return 0", f"return {rev}") + "\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{rev}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        tip_ident = f":commit/{linearization[1][:12]}"
+        for i in range(6):
+            ident = mcp_server._code_ident("function", "wide.py", f"f{i}")
+            raw = mcp_server._db_execute(
+                real_db, f"(query [:find ?c :where [{ident} :modified-in ?c]])"
+            )
+            modified_in = {row[0] for row in json.loads(raw)["results"]}
+            assert tip_ident in modified_in, (
+                f"{ident} lost its retroactive edge; got {sorted(modified_in)}"
+            )
+
 
 class _NoProgressAllocator:
     """Stand-in for a FrontierAllocator whose claim_high() stops making
@@ -15757,6 +15834,49 @@ class TestCorrectionSweepApply:
         )
         children = {row[0] for row in json.loads(raw)["results"]}
         assert len(children) == 3, f"all three containment edges must survive; got {sorted(children)}"
+
+    def test_confirm_is_batched_across_entities_at_one_commit(self, real_db, tmp_path):
+        """#233: _lineage_confirm was one retract per confirmed entity, and
+        retracts are the expensive op. The markers are distinct :lineage/...
+        companion entities, so one call covers them all."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        bodies = "\n\n".join(f"def f{i}():\n    return 0" for i in range(8))
+        (repo / "wide.py").write_text(bodies + "\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "c0"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        file_results, _g, _m, _r = mcp_server._extract_commit(str(repo), linearization[0], ())
+
+        retracts = []
+        real_retract = mcp_server._retract
+        mcp_server._retract = lambda db_, facts, *a, **k: (
+            retracts.append(facts) or real_retract(db_, facts, *a, **k)
+        )
+        try:
+            mcp_server._correction_sweep_apply(
+                real_db, linearization[0], commit_metadata[0][1], file_results,
+            )
+        finally:
+            mcp_server._retract = real_retract
+
+        marker_retracts = [f for f in retracts if ":type/lineage-marker" in f]
+        assert len(marker_retracts) == 1, (
+            f"one retract for every marker at this commit; got {len(marker_retracts)}"
+        )
+        for i in range(8):
+            ident = mcp_server._code_ident("function", "wide.py", f"f{i}")
+            assert mcp_server._lineage_is_provisional(real_db, ident) is False
 
 
 class TestCorrectionSweepClaimAndProcess:
