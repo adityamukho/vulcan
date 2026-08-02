@@ -15239,6 +15239,86 @@ class TestReverseBulkFillWalk:
         assert count == 0
 
 
+class TestReverseApplyWriteBudget:
+    """#233's regression test. The reverse walk was issuing ~6,970 write
+    calls per commit against the forward walk's 12, because every per-entity
+    write was per-entity-per-commit. Phase 2's fixtures were all 6-10
+    commits and varied COMMIT count, so none of them could see it -- this
+    varies ENTITY count at a fixed commit count, which is the axis the
+    defect lived on."""
+
+    def _repo_with_n_functions(self, tmp_path, n, name):
+        repo = tmp_path / name
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for rev in range(2):
+            body = "\n\n".join(f"def f{i}():\n    return {rev}" for i in range(n))
+            (repo / "wide.py").write_text(body + "\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{rev}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def _writes_for_the_second_claim(self, tmp_path, repo, graph_name):
+        """Claim the tip (every entity is new), then count write calls for
+        the claim below it (every entity is a provisional MOVE -- the path
+        that scaled with entity count).
+
+        Opens its own graph rather than reusing the real_db fixture's: this
+        test runs two repos in one test body, and both name their file
+        wide.py with functions f0.., so their idents would collide in a
+        shared graph (and the second _frontier_load would read the first
+        repo's now-stale bounds). The real_db fixture has already
+        monkeypatched MiniGrafDb.open to hand back a fresh in-memory db per
+        call, so open_db here is cheap and isolated."""
+        import mcp_server
+        import frontier_registry
+        real_db = mcp_server.open_db(str(tmp_path / graph_name)) or mcp_server.get_db()
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        calls = []
+        real_transact, real_retract = mcp_server._transact, mcp_server._retract
+        mcp_server._transact = lambda *a, **k: (calls.append("t") or real_transact(*a, **k))
+        mcp_server._retract = lambda *a, **k: (calls.append("r") or real_retract(*a, **k))
+        try:
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+        finally:
+            mcp_server._transact, mcp_server._retract = real_transact, real_retract
+        return len(calls)
+
+    def test_per_commit_writes_do_not_scale_with_entity_count(self, real_db, tmp_path):
+        small = self._writes_for_the_second_claim(
+            tmp_path, self._repo_with_n_functions(tmp_path, 5, "small"), "small.graph"
+        )
+        large = self._writes_for_the_second_claim(
+            tmp_path, self._repo_with_n_functions(tmp_path, 50, "large"), "large.graph"
+        )
+
+        assert large - small <= 5, (
+            f"a 10x entity count must not multiply per-commit writes: "
+            f"5 functions cost {small} write calls, 50 cost {large}. "
+            f"Before #233 this ratio was ~10x."
+        )
+
+    def test_per_commit_writes_stay_in_the_forward_walk_s_range(self, real_db, tmp_path):
+        """The absolute bar, not just the scaling one. The forward walk
+        sustains ~12 writes per commit: one batched transact, one per
+        :contains, one per :parent, watermark, checkpoint."""
+        writes = self._writes_for_the_second_claim(
+            tmp_path, self._repo_with_n_functions(tmp_path, 50, "wide"), "wide.graph"
+        )
+
+        assert writes <= 20, f"expected the forward walk's ~12 per commit; got {writes}"
+
+
 class TestCorrectionSweepThroughWatermark:
     def test_unset_reads_as_none(self, real_db):
         import mcp_server

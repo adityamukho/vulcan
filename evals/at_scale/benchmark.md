@@ -78,3 +78,48 @@ that was wrong and has been corrected here.
 | 4 | dependency-impact | PASS | 14.5ms | 5.3ms |
 | 5 | cross-layer | PASS | 568.4ms | 6.2ms |
 | 6 | cross-layer | PASS | 549.6ms | 2.9ms |
+
+## Ingestion Run — 20260802T082540Z
+
+- Repo: `.` @ `master`
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 553 |
+| Final status | complete |
+| Wall-clock | 5133.19s |
+| Throughput | 6.5 commits/min |
+| Peak RSS | 541132 KB |
+| Graph size | 174772224 bytes |
+| Fact-index size | 79183872 bytes |
+| Status-query latency (min/p50/p99/max) | 0.0ms / 0.0ms / 0.0ms / 0.8ms |
+| Graph-query latency (min/p50/p99/max) | 0.1ms / 12.2ms / 697.2ms / 956.8ms |
+
+This is the post-#233 acceptance-gate run (Task 5, issue #233; see
+`docs/superpowers/specs/2026-07-31-reverse-walk-write-amplification-design.md`).
+Compared to the pre-fix phase-2d run against master at `bbe7fee`, which was
+**killed incomplete after 62 minutes having reached ~100 of ~552 commits**
+(measured at 3,152 tx/commit average, 263x the 12 tx/commit forward-only
+baseline): this run **completes**, which the pre-fix run did not. That is
+the real, headline improvement.
+
+Against the 2026-07-19 forward-only baseline (498 commits, 78.87s, 378.9
+commits/min, 45,801,472 B) — not an apples-to-apples comparison, since this
+run does strictly more work (Stage A writes provisional lineage the baseline
+never wrote, and Stage B re-parses) and ingests 553 commits, not 498:
+
+- Wall-clock is 5,133.19s against 78.87s — **65x**. The design spec's stated
+  bar was "completes in a time of the same order as the baseline rather than
+  a different one." **That bar is not met.**
+- Graph size is 174,772,224 B against 45,801,472 B — **3.8x**, which does
+  fit the spec's "within a small multiple" bar.
+
+Neither number is dominated by per-entity-per-commit scaling of the kind
+#233 fixed — Task 5's `TestReverseApplyWriteBudget` isolates that axis
+directly and shows flat, O(1) per-commit write cost as entity count varies
+(see the commit message and the task-5 report for the counts). The
+remaining 65x gap against the baseline is a real, unresolved cost — most
+plausibly Stage B's re-parse and the two-stream interleaving overhead
+inherent to concurrent forward+reverse ingestion, rather than anything this
+task's regression test is positioned to catch. Left as a decision for a
+human, not addressed further in this task.
