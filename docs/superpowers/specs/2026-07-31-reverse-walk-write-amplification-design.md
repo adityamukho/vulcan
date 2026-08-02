@@ -189,8 +189,11 @@ The batch:
 4. Emits one `_transact` carrying the lineage-marker facts for every ident not
    already marked (three facts each, on distinct `:lineage/…` companion
    entities).
-5. Returns the set of idents that actually moved, so the caller knows which
-   supersede-side work applies.
+5. Returns the set of idents that actually moved. No caller consumes this
+   return value — the retroactive `:modified-in` loop re-derives which
+   idents moved independently rather than taking it as an input — so this
+   documents the batch's contract (and is asserted directly by tests)
+   rather than feeding any supersede-side work.
 
 All four batches are collision-free: within each, the facts differ in entity.
 The monotonicity refusal is per-ident and must stay per-ident — batching must
@@ -206,9 +209,17 @@ rather than one per entity. The `superseded_pos <= pos` refusal, the
 `superseded_ident != commit_ident` guard, and the missing-timestamp skip with
 its stderr line all stay per-ident, evaluated during grouping.
 
-**`_lineage_confirm` in the sweep is batched per commit.** One `_retract`
-carrying the marker facts for every entity confirming at that commit. The
-per-ident `_lineage_confirm` is retained for its other callers.
+**`_lineage_confirm` in the sweep is batched per file, not per commit.** One
+`_retract` carrying the marker facts for every entity confirming in one
+`file_results` entry (`_correction_sweep_apply`'s per-file loop collects
+`to_confirm` and flushes it at the bottom of each iteration) — so a commit
+touching *k* files pays *k* retracts, not one. The per-file flush is
+intentional, not a shortfall to fix: `candidate_idents` and the confirm
+decision are already computed per file, and merging across files within one
+commit would need to hold state across loop iterations for a savings that,
+per the real-repository measurements above, is dwarfed by the per-entity
+retract count this section already cut. The per-ident `_lineage_confirm` is
+retained for its other callers.
 
 **`:contains` re-dating stays one triple per `_retract`/`_transact` call.** The
 issue comment proposed batching these "when the facts differ in entity"; they

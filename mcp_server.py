@@ -5143,17 +5143,11 @@ def _lineage_mark_provisional(
     -- a marker already present is a no-op, never a duplicate write. Uses
     internal _transact directly, never handle_minigraf_transact: :type/
     lineage-marker is deliberately unregistered in MINIGRAF_SCHEMA, and the
-    public handler's schema gate would reject it outright.
+    public handler's schema gate would reject it outright. One-entity form
+    of _lineage_mark_provisional_batch, delegating so the two cannot drift
+    (#233, matching _lineage_confirm's own delegation rationale).
     """
-    if _lineage_is_provisional(db, entity_ident):
-        return
-    ident = _lineage_marker_ident(entity_ident)
-    facts = [
-        f"[{ident} :entity-type {_LINEAGE_MARKER_ENTITY_TYPE}]",
-        f"[{ident} :entity {entity_ident}]",
-        f"[{ident} :status :provisional]",
-    ]
-    _transact(db, "[" + " ".join(facts) + "]", commit_ts_iso, index_con=index_con)
+    _lineage_mark_provisional_batch(db, [entity_ident], commit_ts_iso, index_con=index_con)
 
 
 def _lineage_mark_provisional_batch(
@@ -5316,15 +5310,36 @@ def _candidate_diff_purge_legacy(db: Any, index_con: Optional[Any] = None) -> in
     purge, and gating it would need a new watermark whose only job is to
     record that a one-time deletion happened.
 
-    Returns the number of records purged. Records for distinct :candidate/
-    entities do not share (entity, attribute, valid_from), so the whole
-    purge is one collision-free _retract.
+    Returns the number of records purged (0 if there was nothing to purge,
+    or if the retract itself failed -- see below).
+
+    COST SHAPE: cheap when there is nothing to purge (one query, no
+    retract), but the retract itself is NOT cheap for a graph that actually
+    holds legacy records -- measured on the real backend at ~0.5s for 500
+    records, ~7.2s for 2,000, and ~127s for 8,000 (roughly O(N^2); chunking
+    the retract does not help, since the cost is in minigraf's retract
+    itself, not in call-count). A phase-2d graph can hold on the order of
+    10k+ live records, i.e. minutes of no output. This is still called
+    unconditionally (see above) because it is one-time per graph -- once
+    purged, later loads see zero rows and return immediately -- and gating
+    it behind a new watermark would add persistent state for a problem that
+    self-resolves after the first successful run. A row count is logged to
+    stderr before retracting so a multi-minute stall is legible rather than
+    looking like a hang, and the retract is best-effort: a failure is
+    logged and swallowed rather than propagated, because this is scratch
+    cleanup, not core ingestion, and _frontier_load's caller must not be
+    bricked for every future run by one bad retract here.
+
+    Records for distinct :candidate/ entities do not share (entity,
+    attribute, valid_from), so the whole purge is one collision-free
+    _retract call (cost above is backend-internal to that one call, not a
+    batching artifact).
 
     Note: minigraf resolves ?e in a query result to its internal entity id,
     not the :candidate/... keyword the fact was minted with, and that
     internal id is not accepted as an entity token in a retract pattern
     (no :ident back-reference is populated for these records the way it is
-    for e.g. commits -- see _entity_introduced_by_query's ident_map). The
+    for e.g. commits -- see _rebuild_index_from_graph's ident_map). The
     keyword ident is deterministic from (commit_ident, entity_ident) --
     the same formula the deleted _candidate_diff_ident used -- so it is
     rebuilt here instead of relying on ?e.
@@ -5337,6 +5352,12 @@ def _candidate_diff_purge_legacy(db: Any, index_con: Optional[Any] = None) -> in
     rows = json.loads(raw).get("results", [])
     if not rows:
         return 0
+    print(
+        f"[_candidate_diff_purge_legacy] purging {len(rows)} legacy "
+        ":type/candidate-diff record(s) -- this is O(n^2) in minigraf's "
+        "retract and may take a while (measured ~127s at 8,000 records)",
+        file=sys.stderr,
+    )
     facts = []
     for commit_ident, entity_ident, body_hash in rows:
         ident = f":candidate/{commit_ident[len(':commit/'):]}-{entity_ident.lstrip(':').replace('/', '-')}"
@@ -5346,7 +5367,11 @@ def _candidate_diff_purge_legacy(db: Any, index_con: Optional[Any] = None) -> in
             f"[{ident} :entity {entity_ident}]",
             f'[{ident} :body-hash "{_edn_escape(body_hash)}"]',
         ])
-    _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
+    try:
+        _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
+    except Exception as e:
+        print(f"[_candidate_diff_purge_legacy] retract failed, {len(rows)} record(s) left in place: {e}", file=sys.stderr)
+        return 0
     return len(rows)
 
 
@@ -8335,7 +8360,7 @@ def _forward_apply(
                     if _lineage_is_provisional(db, ident)
                 ]
             # Built once per file rather than scanned per ident (matches
-            # _reverse_fill_claim_and_process's candidate_triples_by_ident
+            # _correction_sweep_apply's candidate_triples_by_ident
             # precedent) -- a per-ident linear scan here is O(n^2) per file
             # once there is more than one reconcilable entity.
             structural_triples_by_ident = (
@@ -8693,10 +8718,9 @@ def _forward_structural_triples_by_ident(precomputed: Dict[str, Any]) -> Dict[st
     """Every candidate ident's own structural triples, for re-dating, built
     once per file instead of scanned per ident (#222 phase 2d Task 5 fix --
     the previous per-ident linear scan was O(n^2) per file once more than one
-    entity needed reconciling). Matches the existing precedent in
-    _reverse_apply's candidate_triples_by_ident (moved verbatim out of
-    _reverse_fill_claim_and_process by #222 phase 2d Task 6), which builds
-    the same shape of dict from the same five sources.
+    entity needed reconciling). Called by both _forward_apply and
+    _correction_sweep_apply, which need the same shape of dict built from
+    the same five sources for the same reason (#233).
 
     A child's own list carries its [parent :contains child] edge, so
     re-dating a child re-dates its containment edge with it (#222 phase
@@ -8933,12 +8957,7 @@ def _correction_sweep_apply(
         # introduction, and re-dating there is once per entity for the whole
         # region. precomputed already carried these triples; only the idents
         # were being read out of it.
-        candidate_triples_by_ident: Dict[str, List[str]] = {
-            precomputed["module_ident"]: list(precomputed["module_candidate_triples"])
-        }
-        for entries_key in ("function_entries", "class_entries", "global_entries", "field_entries"):
-            for entry_ident, _entry_name, entry_triples in precomputed[entries_key]:
-                candidate_triples_by_ident[entry_ident] = list(entry_triples)
+        candidate_triples_by_ident = _forward_structural_triples_by_ident(precomputed)
 
         # #233: _lineage_confirm was one retract per confirmed entity here,
         # and retracts cost ~13ms against a transact's ~1ms. Collected per
@@ -8956,7 +8975,7 @@ def _correction_sweep_apply(
                     # since its value was already correct.
                     _re_date_structural_facts(
                         db,
-                        [t for t in candidate_triples_by_ident.get(ident, [])
+                        [t for t in candidate_triples_by_ident[ident]
                          if ":introduced-by" not in t],
                         commit_ts_iso,
                         index_con=index_con,

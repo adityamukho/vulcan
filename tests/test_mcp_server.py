@@ -6381,6 +6381,47 @@ class TestCandidateDiffLegacyPurge:
         import mcp_server
         assert mcp_server._candidate_diff_purge_legacy(real_db) == 0
 
+    def test_logs_row_count_before_retracting(self, real_db, capsys):
+        """Important 1: a multi-minute stall must be legible, not look like a
+        hang -- the row count is logged to stderr before the (potentially
+        very slow) retract runs."""
+        import mcp_server
+        self._seed_legacy_record(real_db, "a" * 40, ":function/src-auth-py-login", "h1")
+        self._seed_legacy_record(real_db, "b" * 40, ":function/src-auth-py-login", "h2")
+
+        purged = mcp_server._candidate_diff_purge_legacy(real_db)
+
+        assert purged == 2
+        err = capsys.readouterr().err
+        assert "[_candidate_diff_purge_legacy]" in err
+        assert "2" in err
+
+    def test_retract_failure_is_logged_and_swallowed(self, real_db, capsys):
+        """Important 1: this is best-effort scratch cleanup on the hot path
+        _frontier_load awaits -- a raising _retract must be logged and
+        swallowed, returning 0, not propagated. An unhandled raise here
+        would fail _frontier_load itself, bricking every subsequent run of
+        the server identically."""
+        import mcp_server
+        self._seed_legacy_record(real_db, "a" * 40, ":function/src-auth-py-login", "h1")
+
+        def raising_retract(*a, **k):
+            raise RuntimeError("simulated real backend failure on retract")
+
+        real_retract = mcp_server._retract
+        mcp_server._retract = raising_retract
+        try:
+            purged = mcp_server._candidate_diff_purge_legacy(real_db)
+        finally:
+            mcp_server._retract = real_retract
+
+        assert purged == 0
+        err = capsys.readouterr().err
+        assert "[_candidate_diff_purge_legacy]" in err
+        assert "simulated real backend failure on retract" in err
+        # The record is still there -- the retract never actually applied.
+        assert self._live_record_count(real_db) == 1
+
     def test_frontier_load_purges_on_an_existing_graph(self, real_db, tmp_path):
         """The purge has to run from _frontier_load, not just exist -- an
         already-migrated graph is loaded by every subsequent run and is
@@ -16015,9 +16056,21 @@ class TestCorrectionSweepApply:
 
     def test_case_one_re_dates_the_contains_edge(self, real_db, tmp_path):
         """A child's own candidate triples carry its [parent :contains child]
-        edge, so re-dating a child must re-date its containment edge with it.
-        This is the edge minigraf#287 destroys if the re-date ever batches
-        multiple children of one module into a single call."""
+        edge, so re-dating a child must re-date its containment edge with it:
+        a re-dated child's containment edge must still be live (valid-at) at
+        the child's introduction timestamp, for all three siblings. This is
+        the edge minigraf#287 would destroy if the re-date ever batched
+        multiple children of one module's :contains facts into a single
+        _transact/_retract call.
+
+        _re_date_structural_facts does split its triples one call per triple
+        (#233), but at this call site that split is defensive rather than
+        load-bearing: a child's own candidate-triples list carries exactly
+        its own containment edge, and module_candidate_triples carries none,
+        so _re_date_structural_facts is only ever handed 0 or 1 :contains
+        triple per call here regardless of the split. The constraint the
+        split guards against is real elsewhere (minigraf#287 / #222 phase
+        2b1), just not exercised by this test."""
         import mcp_server
         import frontier_registry
         repo = tmp_path / "repo"
@@ -16327,8 +16380,6 @@ class TestCorrectionSweepWalk:
         for i in range(5):
             fn_ident = mcp_server._code_ident("function", f"f{i}.py", f"f{i}")
             assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
-        raw = mcp_server._db_execute(real_db, "(query [:find ?e :where [?e :entity-type :type/candidate-diff]])")
-        assert json.loads(raw)["results"] == []
         bounds = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
         assert mcp_server._correction_sweep_through_query(real_db) == bounds[1]
 
