@@ -6180,6 +6180,35 @@ class TestLineageProvisionalMarker:
         raw = mcp_server._db_execute(db, f"(query [:find (count ?e) :where [{ident} :entity ?e]])")
         assert json.loads(raw)["results"] == [[1]]
 
+    def test_batch_marks_many_new_entities_in_one_transact(self, real_db):
+        """#233 review: test_batch_issues_a_constant_number_of_write_calls
+        (TestEntityIntroducedBySetProvisionalBatch) only ever counts a
+        SECOND call, by which point every ident is already marked and
+        _lineage_mark_provisional_batch short-circuits on the
+        _lineage_is_provisional gate before writing anything -- so it never
+        proves the marker batching itself. This test calls
+        _lineage_mark_provisional_batch directly on entities that have
+        never been marked, so the marker-transact path is genuinely
+        exercised, and asserts the write count is 1, not len(idents)."""
+        import mcp_server
+        idents = [f":function/src-auth-py-m{i}" for i in range(5)]
+        for ident in idents:
+            assert mcp_server._lineage_is_provisional(real_db, ident) is False
+
+        calls = []
+        real_transact = mcp_server._transact
+        mcp_server._transact = lambda *a, **k: (calls.append("t") or real_transact(*a, **k))
+        try:
+            mcp_server._lineage_mark_provisional_batch(
+                real_db, idents, "2026-01-03T00:00:00Z",
+            )
+        finally:
+            mcp_server._transact = real_transact
+
+        assert calls.count("t") == 1, f"one transact for all 5 new markers; got {calls}"
+        for ident in idents:
+            assert mcp_server._lineage_is_provisional(real_db, ident) is True
+
     def test_provisional_marker_survives_audit(self, real_db):
         import mcp_server
         db = real_db
@@ -6303,82 +6332,116 @@ class TestLineageConfirmedThroughMigration:
         assert mcp_server._lineage_confirmed_through_query(db) == "h2"
 
 
-class TestCandidateDiff:
-    def test_read_absent_record_returns_none(self, real_db):
+class TestCandidateDiffLegacyPurge:
+    """#233: the :type/candidate-diff record path is deleted, so nothing
+    clears the records a phase-2d graph already holds -- and they ARE
+    indexed (fact_index filters nothing by prefix; _MEMORY_PREFIXES affects
+    scoring only), so they would stay retrievable scratch noise forever.
+    _frontier_load is already the one-time-migration site."""
+
+    def _seed_legacy_record(self, db, commit_hash, entity_ident, body_hash):
+        """Write a candidate-diff record the way the deleted
+        _candidate_diff_persist used to, so the purge has something real to
+        find on a graph written by phase 2d."""
         import mcp_server
-        assert mcp_server._candidate_diff_read(real_db, "a" * 40, ":function/foo") is None
+        ident = f":candidate/{commit_hash[:12]}-{entity_ident.lstrip(':').replace('/', '-')}"
+        commit_ident = f":commit/{commit_hash[:12]}"
+        mcp_server._transact(
+            db,
+            "[" + " ".join([
+                f"[{ident} :entity-type :type/candidate-diff]",
+                f"[{ident} :commit {commit_ident}]",
+                f"[{ident} :entity {entity_ident}]",
+                f'[{ident} :body-hash "{body_hash}"]',
+            ]) + "]",
+            "2026-01-01T00:00:00Z",
+        )
+        return ident
 
-    def test_persist_then_read_round_trip(self, real_db):
+    def _live_record_count(self, db):
         import mcp_server
-        db = real_db
-        commit_hash = "a" * 40
-        entity_ident = ":function/src-auth-py-login"
+        raw = mcp_server._db_execute(
+            db, "(query [:find (count ?e) :where [?e :entity-type :type/candidate-diff]])"
+        )
+        results = json.loads(raw)["results"]
+        return results[0][0] if results else 0
 
-        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
-
-        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) == "hash1"
-        # A different (commit, entity) pair must not resolve to this record.
-        assert mcp_server._candidate_diff_read(db, "b" * 40, entity_ident) is None
-        assert mcp_server._candidate_diff_read(db, commit_hash, ":function/other") is None
-
-    def test_persist_same_hash_twice_does_not_duplicate(self, real_db):
+    def test_purges_pre_existing_records(self, real_db):
         import mcp_server
-        db = real_db
-        commit_hash = "a" * 40
-        entity_ident = ":function/src-auth-py-login"
+        self._seed_legacy_record(real_db, "a" * 40, ":function/src-auth-py-login", "h1")
+        self._seed_legacy_record(real_db, "b" * 40, ":function/src-auth-py-login", "h2")
+        assert self._live_record_count(real_db) == 2
 
-        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
-        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:01Z")
+        purged = mcp_server._candidate_diff_purge_legacy(real_db)
 
-        ident = mcp_server._candidate_diff_ident(commit_hash, entity_ident)
-        raw = mcp_server._db_execute(db, f"(query [:find (count ?h) :where [{ident} :body-hash ?h]])")
-        assert json.loads(raw)["results"] == [[1]]
+        assert purged == 2
+        assert self._live_record_count(real_db) == 0
 
-    def test_persist_different_hash_updates_without_duplicating(self, real_db):
+    def test_noop_on_a_graph_with_no_records(self, real_db):
         import mcp_server
-        db = real_db
-        commit_hash = "a" * 40
-        entity_ident = ":function/src-auth-py-login"
+        assert mcp_server._candidate_diff_purge_legacy(real_db) == 0
 
-        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
-        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash2", "2026-01-01T00:00:01Z")
-
-        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) == "hash2"
-        ident = mcp_server._candidate_diff_ident(commit_hash, entity_ident)
-        raw = mcp_server._db_execute(db, f"(query [:find (count ?h) :where [{ident} :body-hash ?h]])")
-        assert json.loads(raw)["results"] == [[1]]
-
-    def test_clear_removes_the_record(self, real_db):
+    def test_logs_row_count_before_retracting(self, real_db, capsys):
+        """Important 1: a multi-minute stall must be legible, not look like a
+        hang -- the row count is logged to stderr before the (potentially
+        very slow) retract runs."""
         import mcp_server
-        db = real_db
-        commit_hash = "a" * 40
-        entity_ident = ":function/src-auth-py-login"
+        self._seed_legacy_record(real_db, "a" * 40, ":function/src-auth-py-login", "h1")
+        self._seed_legacy_record(real_db, "b" * 40, ":function/src-auth-py-login", "h2")
 
-        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
-        mcp_server._candidate_diff_clear(db, commit_hash, entity_ident)
+        purged = mcp_server._candidate_diff_purge_legacy(real_db)
 
-        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) is None
-        ident = mcp_server._candidate_diff_ident(commit_hash, entity_ident)
-        raw = mcp_server._db_execute(db, f"(query [:find (count ?e) :where [{ident} :entity ?e]])")
-        assert json.loads(raw)["results"] == [[0]]
+        assert purged == 2
+        err = capsys.readouterr().err
+        assert "[_candidate_diff_purge_legacy]" in err
+        assert "2" in err
 
-    def test_clear_absent_record_is_a_noop(self, real_db):
+    def test_retract_failure_is_logged_and_swallowed(self, real_db, capsys):
+        """Important 1: this is best-effort scratch cleanup on the hot path
+        _frontier_load awaits -- a raising _retract must be logged and
+        swallowed, returning 0, not propagated. An unhandled raise here
+        would fail _frontier_load itself, bricking every subsequent run of
+        the server identically."""
         import mcp_server
-        db = real_db
-        # Must not raise.
-        mcp_server._candidate_diff_clear(db, "a" * 40, ":function/never-persisted")
+        self._seed_legacy_record(real_db, "a" * 40, ":function/src-auth-py-login", "h1")
 
-    def test_candidate_diff_survives_audit(self, real_db):
+        def raising_retract(*a, **k):
+            raise RuntimeError("simulated real backend failure on retract")
+
+        real_retract = mcp_server._retract
+        mcp_server._retract = raising_retract
+        try:
+            purged = mcp_server._candidate_diff_purge_legacy(real_db)
+        finally:
+            mcp_server._retract = real_retract
+
+        assert purged == 0
+        err = capsys.readouterr().err
+        assert "[_candidate_diff_purge_legacy]" in err
+        assert "simulated real backend failure on retract" in err
+        # The record is still there -- the retract never actually applied.
+        assert self._live_record_count(real_db) == 1
+
+    def test_frontier_load_purges_on_an_existing_graph(self, real_db, tmp_path):
+        """The purge has to run from _frontier_load, not just exist -- an
+        already-migrated graph is loaded by every subsequent run and is
+        exactly where these orphans live."""
         import mcp_server
-        db = real_db
-        commit_hash = "a" * 40
-        entity_ident = ":function/src-auth-py-login"
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "c0"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        self._seed_legacy_record(real_db, "a" * 40, ":function/src-auth-py-login", "h1")
 
-        mcp_server._candidate_diff_persist(db, commit_hash, entity_ident, "hash1", "2026-01-01T00:00:00Z")
-        result = mcp_server.handle_minigraf_audit()
+        mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
 
-        assert result["retracted"] == 0
-        assert mcp_server._candidate_diff_read(db, commit_hash, entity_ident) == "hash1"
+        assert self._live_record_count(real_db) == 0
 
 
 class TestEntityIntroducedBySetProvisional:
@@ -6438,6 +6501,131 @@ class TestEntityIntroducedBySetProvisional:
 
         assert mcp_server._entity_introduced_by_query(db, entity_ident) == ":commit/original"
         assert mcp_server._lineage_is_provisional(db, entity_ident) is False
+
+
+class TestEntityIntroducedBySetProvisionalBatch:
+    """#233: _reverse_apply's two loops were the only production callers of
+    the per-ident function, at one retract + one transact each -- 8,618
+    retracts over 12 commits of this repo, and retracts cost ~13ms against
+    a transact's ~1ms. The batch is the implementation now; the per-ident
+    function delegates to it so the gates cannot drift apart."""
+
+    def test_first_assert_batches_distinct_entities(self, real_db):
+        import mcp_server
+        idents = [f":function/src-auth-py-f{i}" for i in range(5)]
+
+        moved = mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, idents, ":commit/h2", "2026-01-03T00:00:00Z",
+        )
+
+        assert moved == set(idents)
+        for ident in idents:
+            assert mcp_server._entity_introduced_by_query(real_db, ident) == ":commit/h2"
+            assert mcp_server._lineage_is_provisional(real_db, ident) is True
+
+    def test_batch_issues_a_constant_number_of_write_calls(self, real_db):
+        """The whole point. Five entities must not cost five retracts."""
+        import mcp_server
+        idents = [f":function/src-auth-py-f{i}" for i in range(5)]
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, idents, ":commit/h2", "2026-01-03T00:00:00Z",
+        )
+
+        calls = []
+        real_transact, real_retract = mcp_server._transact, mcp_server._retract
+        mcp_server._transact = lambda *a, **k: (calls.append("t") or real_transact(*a, **k))
+        mcp_server._retract = lambda *a, **k: (calls.append("r") or real_retract(*a, **k))
+        try:
+            mcp_server._entity_introduced_by_set_provisional_batch(
+                real_db, idents, ":commit/h0", "2026-01-01T00:00:00Z",
+            )
+        finally:
+            mcp_server._transact, mcp_server._retract = real_transact, real_retract
+
+        assert calls.count("r") == 1, f"one retract for the whole batch; got {calls}"
+        assert calls.count("t") <= 2, f"at most guess + markers; got {calls}"
+
+    def test_moving_the_batch_earlier_leaves_one_value_each(self, real_db):
+        import mcp_server
+        idents = [f":function/src-auth-py-f{i}" for i in range(3)]
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, idents, ":commit/h2", "2026-01-03T00:00:00Z",
+        )
+
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, idents, ":commit/h0", "2026-01-01T00:00:00Z",
+        )
+
+        for ident in idents:
+            assert mcp_server._entity_introduced_by_query(real_db, ident) == ":commit/h0"
+            raw = mcp_server._db_execute(
+                real_db, f"(query [:find (count ?c) :where [{ident} :introduced-by ?c]])"
+            )
+            assert json.loads(raw)["results"] == [[1]]
+
+    def test_monotonicity_refusal_is_per_ident_not_per_batch(self, real_db):
+        """The gate that must not become batch-wide. One ident whose guess
+        would move LATER must be left alone while the rest of the batch
+        still applies -- batching must not turn a refusal into a dropped
+        batch, nor a refused ident into an included one."""
+        import mcp_server
+        pinned = ":function/src-auth-py-pinned"
+        movable = ":function/src-auth-py-movable"
+        pos_by_commit_ident = {":commit/h0": 0, ":commit/h1": 1, ":commit/h2": 2}
+        # pinned already sits at the EARLIEST commit; h1 would move it later.
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [pinned], ":commit/h0", "2026-01-01T00:00:00Z",
+            pos=0, pos_by_commit_ident=pos_by_commit_ident,
+        )
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [movable], ":commit/h2", "2026-01-03T00:00:00Z",
+            pos=2, pos_by_commit_ident=pos_by_commit_ident,
+        )
+
+        moved = mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [pinned, movable], ":commit/h1", "2026-01-02T00:00:00Z",
+            pos=1, pos_by_commit_ident=pos_by_commit_ident,
+        )
+
+        assert moved == {movable}
+        assert mcp_server._entity_introduced_by_query(real_db, pinned) == ":commit/h0"
+        assert mcp_server._entity_introduced_by_query(real_db, movable) == ":commit/h1"
+
+    def test_authoritative_entities_are_never_touched(self, real_db):
+        import mcp_server
+        authoritative = ":function/src-auth-py-authoritative"
+        provisional = ":function/src-auth-py-provisional"
+        mcp_server._transact(
+            real_db, f"[[{authoritative} :introduced-by :commit/h5]]", "2026-01-06T00:00:00Z",
+        )
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [provisional], ":commit/h2", "2026-01-03T00:00:00Z",
+        )
+
+        moved = mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [authoritative, provisional], ":commit/h0", "2026-01-01T00:00:00Z",
+        )
+
+        assert moved == {provisional}
+        assert mcp_server._entity_introduced_by_query(real_db, authoritative) == ":commit/h5"
+        assert mcp_server._lineage_is_provisional(real_db, authoritative) is False
+
+    def test_same_value_is_idempotent_but_still_marks(self, real_db):
+        import mcp_server
+        ident = ":function/src-auth-py-login"
+
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [ident], ":commit/h1", "2026-01-02T00:00:00Z",
+        )
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [ident], ":commit/h1", "2026-01-02T00:00:01Z",
+        )
+
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find (count ?c) :where [{ident} :introduced-by ?c]])"
+        )
+        assert json.loads(raw)["results"] == [[1]]
+        assert mcp_server._lineage_is_provisional(real_db, ident) is True
 
 
 class TestGitCommitsTopoOrder:
@@ -8667,50 +8855,6 @@ class TestPrecomputeFileTriplesBodyDiff:
         )
         field_ident = mcp_server._code_ident("field", "models.py", "Foo.bar")
         assert field_ident in result["unchanged_idents"]
-
-    def test_body_hashes_populated_for_every_new_side_function(self):
-        import mcp_server
-        parser = self._python_parser()
-        new_nodes = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
-        extracted = {"functions": ["login"], "classes": [], "imports": []}
-        result = mcp_server._precompute_file_triples(
-            "auth.py", extracted, ":commit/c1", {}, new_entity_nodes=new_nodes,
-        )
-        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
-        assert result["body_hashes"][fn_ident] == mcp_server._normalized_body_hash(new_nodes["function"]["login"])
-
-    def test_body_hashes_match_across_textually_identical_bodies(self):
-        import mcp_server
-        parser = self._python_parser()
-        nodes_a = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
-        nodes_b = self._all_nodes(parser, b"def login(user):\n\n    return   user.ok\n")
-        extracted = {"functions": ["login"], "classes": [], "imports": []}
-        result_a = mcp_server._precompute_file_triples(
-            "auth.py", extracted, ":commit/c1", {}, new_entity_nodes=nodes_a,
-        )
-        result_b = mcp_server._precompute_file_triples(
-            "auth.py", extracted, ":commit/c2", {}, new_entity_nodes=nodes_b,
-        )
-        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
-        assert result_a["body_hashes"][fn_ident] == result_b["body_hashes"][fn_ident]
-
-    def test_body_hashes_absent_without_new_entity_nodes(self):
-        import mcp_server
-        extracted = {"functions": ["login"], "classes": [], "imports": []}
-        result = mcp_server._precompute_file_triples("auth.py", extracted, ":commit/c1", {})
-        assert result["body_hashes"] == {}
-
-    def test_module_ident_never_appears_in_body_hashes(self):
-        import mcp_server
-        parser = self._python_parser()
-        new_nodes = self._all_nodes(parser, b"def login(user):\n    return user.ok\n")
-        extracted = {"functions": ["login"], "classes": [], "imports": []}
-        result = mcp_server._precompute_file_triples(
-            "auth.py", extracted, ":commit/c1", {}, new_entity_nodes=new_nodes,
-        )
-        module_ident = mcp_server._code_ident("module", "auth.py")
-        assert module_ident not in result["body_hashes"]
-
 
 class TestFieldClassContainment:
     """Fields owned by a real (extracted) class get BOTH module- and
@@ -14251,7 +14395,6 @@ class TestReverseFillClaimAndProcess:
         commit_ident = f":commit/{claimed_hash[:12]}"
         assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == commit_ident
         assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
-        assert mcp_server._candidate_diff_read(real_db, claimed_hash, fn_ident) is not None
 
     def test_walking_backward_moves_introduced_by_to_the_oldest_commit(self, real_db, tmp_path):
         import mcp_server
@@ -14271,7 +14414,6 @@ class TestReverseFillClaimAndProcess:
             real_db, f"(query [:find (count ?c) :where [{fn_ident} :introduced-by ?c]])"
         )
         assert json.loads(raw)["results"] == [[1]]
-        assert mcp_server._candidate_diff_read(real_db, oldest_hash, fn_ident) is not None
 
         # The converged :modified-in set must match what forward walk would
         # have produced: every later touch except the true introduction
@@ -14394,6 +14536,221 @@ class TestReverseApplySplit:
         )
         assert applied == linearization[pos]
         assert snapshot(db_a) == snapshot(db_b)
+
+    def test_retroactive_modified_in_is_grouped_by_superseded_timestamp(self, real_db, tmp_path):
+        """#233: one transact per entity here was 10,161 calls over 12
+        commits of this repo. Each edge carries the SUPERSEDED commit's
+        timestamp, not this commit's, so one batch is impossible -- but
+        entities in one file were almost always last sighted at the same
+        commit, so grouping by timestamp collapses to a handful."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        bodies = "\n\n".join(f"def f{i}():\n    return 0" for i in range(12))
+        for rev in range(2):
+            if rev > 0:
+                time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
+            (repo / "wide.py").write_text(bodies.replace("return 0", f"return {rev}") + "\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{rev}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        # Claim the tip first so the second claim is a genuine move.
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        transacts = []
+        real_transact = mcp_server._transact
+        mcp_server._transact = lambda db_, facts, *a, **k: (
+            transacts.append(facts) or real_transact(db_, facts, *a, **k)
+        )
+        try:
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+        finally:
+            mcp_server._transact = real_transact
+
+        retroactive = [f for f in transacts if ":modified-in" in f]
+        assert len(retroactive) <= 2, (
+            f"grouped by superseded timestamp, not one per entity; got {len(retroactive)}"
+        )
+
+    def test_grouped_retroactive_modified_in_keeps_every_edge(self, real_db, tmp_path):
+        """Grouping must not lose edges -- these facts differ in entity, so
+        they do not collide, but that is the assumption worth pinning."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        bodies = "\n\n".join(f"def f{i}():\n    return 0" for i in range(6))
+        for rev in range(2):
+            if rev > 0:
+                time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
+            (repo / "wide.py").write_text(bodies.replace("return 0", f"return {rev}") + "\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{rev}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        tip_ident = f":commit/{linearization[1][:12]}"
+        for i in range(6):
+            ident = mcp_server._code_ident("function", "wide.py", f"f{i}")
+            raw = mcp_server._db_execute(
+                real_db, f"(query [:find ?c :where [{ident} :modified-in ?c]])"
+            )
+            modified_in = {row[0] for row in json.loads(raw)["results"]}
+            assert tip_ident in modified_in, (
+                f"{ident} lost its retroactive edge; got {sorted(modified_in)}"
+            )
+
+    def test_retroactive_gate_and_valid_time_survive_a_shared_superseded_timestamp(
+        self, real_db, tmp_path
+    ):
+        """#233 review: all three per-ident gates are pure functions of
+        superseded_ident (plus the fixed pos/commit_ident), and the group
+        key superseded_ts is ALSO a pure function of superseded_ident -- so
+        a group-wide implementation can only diverge from the per-ident one
+        when two DISTINCT superseded commits share a timestamp SECOND. This
+        pins two things at once against that exact fixture shape:
+
+        (a) the superseded_pos <= pos refusal stays per-ident across a group
+            boundary -- one ident's superseded guess (fake_before, position
+            0) is refused, the other's (fake_after, position 2) is allowed,
+            despite both sharing shared_ts, with the real commit processed
+            at position 1 in between;
+        (b) the allowed edge's valid-time is pinned to its OWN
+            superseded_ts, not this commit's commit_ts_iso, checked via
+            :valid-at against the real backend rather than by inspecting
+            transact call arguments.
+
+        commit_metadata/linearization are hand-extended with two fabricated
+        commit idents around one real commit -- the same "no real git
+        history, hand-built pos_by_commit_ident" shape
+        test_monotonicity_refusal_is_per_ident_not_per_batch already uses
+        for the sibling per-ident gate in
+        _entity_introduced_by_set_provisional_batch, because the refusal
+        branch guards a state (a "later" guess that turns out not to be
+        later) normal monotonic reverse-walk traversal can never produce on
+        its own.
+        """
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "a.py").write_text("def fa():\n    return 0\n")
+        (repo / "b.py").write_text("def fb():\n    return 0\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "root"], cwd=repo, check=True, capture_output=True)
+
+        real_linearization = frontier_registry.build_linearization(str(repo))
+        real_commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        root_hash, _real_root_ts, root_author, root_subject = real_commit_metadata[0]
+        assert real_linearization == [root_hash]
+
+        # All hand-picked, ordered SEED_TS < commit_ts_iso < shared_ts, and
+        # every one safely in minigraf's PAST relative to wall-clock "now"
+        # (unlike the real git-derived timestamp, which is effectively
+        # "now" and therefore too late to precede anything) -- because
+        # _reverse_apply's own "is this entity already known" check
+        # (_entity_introduced_by_query) is a PLAIN, now-relative query: a
+        # future-dated seed would be invisible to it and the whole
+        # provisional_moves path would never fire. See the #233 review
+        # discussion (this was the first, silently-empty version of this
+        # test) -- confirmed empirically against the real backend that a
+        # plain query hides a future-valid_from fact but :valid-at does not.
+        seed_ts = "2019-01-01T00:00:00Z"
+        commit_ts_iso = "2020-01-01T00:00:00Z"  # this call's fabricated "current commit" time
+        shared_ts = "2021-01-01T00:00:00Z"      # both fakes share this -- the collision under test
+
+        fake_before_hash = "a" * 40  # position 0 -- superseded_pos (0) <= pos (1): refused
+        fake_after_hash = "b" * 40   # position 2 -- superseded_pos (2) >  pos (1): allowed
+
+        linearization = [fake_before_hash, root_hash, fake_after_hash]
+        commit_metadata = [
+            (fake_before_hash, shared_ts, "fake", "fake before"),
+            (root_hash, commit_ts_iso, root_author, root_subject),
+            (fake_after_hash, shared_ts, "fake", "fake after"),
+        ]
+        pos = 1
+
+        fa_ident = mcp_server._code_ident("function", "a.py", "fa")
+        fb_ident = mcp_server._code_ident("function", "b.py", "fb")
+        fake_before_ident = f":commit/{fake_before_hash[:12]}"
+        fake_after_ident = f":commit/{fake_after_hash[:12]}"
+
+        # Seed both as already-provisional, guessed-introduced at the two
+        # fabricated commits -- real writes through the real batch helper,
+        # not a mock, mirroring test_monotonicity_refusal_is_per_ident_not_per_batch.
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [fa_ident], fake_before_ident, seed_ts,
+        )
+        mcp_server._entity_introduced_by_set_provisional_batch(
+            real_db, [fb_ident], fake_after_ident, seed_ts,
+        )
+
+        file_results, _g, _m, _r = mcp_server._extract_commit(str(repo), root_hash, ())
+        mcp_server._reverse_apply(
+            real_db, str(repo), linearization, commit_metadata, pos, file_results,
+        )
+
+        # (a) fa's guess (fake_before, position 0) is refused: no
+        # :modified-in fact at all, checked :valid-at shared_ts -- where a
+        # wrongly-admitted one (grouped under shared_ts by a buggy
+        # group-wide gate) would show.
+        raw = mcp_server._db_execute(
+            real_db,
+            f'(query [:find ?c :valid-at "{shared_ts}" :where [{fa_ident} :modified-in ?c]])',
+        )
+        assert json.loads(raw)["results"] == [], (
+            f"fa's refused superseded guess must not get a retroactive edge; "
+            f"got {json.loads(raw)['results']}"
+        )
+
+        # fb's guess (fake_after, position 2) is allowed: exactly the one
+        # retroactive edge, to fake_after_ident -- checked the same way, so
+        # a buggy group-wide gate that drops the WHOLE group (because fa,
+        # iterated first, was refused) is caught here too.
+        raw = mcp_server._db_execute(
+            real_db,
+            f'(query [:find ?c :valid-at "{shared_ts}" :where [{fb_ident} :modified-in ?c]])',
+        )
+        modified_in = {row[0] for row in json.loads(raw)["results"]}
+        assert modified_in == {fake_after_ident}, (
+            f"fb's allowed superseded guess must get its retroactive edge; got {modified_in}"
+        )
+
+        # (b) valid-time: fb's edge reads as [] :valid-at commit_ts_iso (this
+        # call's own commit) and live :valid-at shared_ts (fake_after's own
+        # commit) -- pinned to the SUPERSEDED commit's timestamp, not this
+        # commit's, exactly mirroring the real 4-commit/2-file reproduction
+        # from the #233 review ("a-py-f0 :modified-in reads [] as-of c0's ts
+        # and live as-of c1's").
+        raw = mcp_server._db_execute(
+            real_db,
+            f'(query [:find ?c :valid-at "{commit_ts_iso}" :where [{fb_ident} :modified-in ?c]])',
+        )
+        assert json.loads(raw)["results"] == [], (
+            "fb's retroactive edge must not be valid at commit_ts_iso "
+            f"({commit_ts_iso}); got {json.loads(raw)['results']}"
+        )
 
 
 class _NoProgressAllocator:
@@ -14523,65 +14880,78 @@ class TestEntityIntroducedBySetProvisionalMonotonicity:
         assert mcp_server._entity_introduced_by_query(real_db, ident) == ":commit/c0"
 
 
-class TestReverseFillCandidateDiffLifecycle:
-    def test_superseded_candidate_diff_records_are_cleared_at_move_time(self, real_db, tmp_path):
-        """2b persisted a candidate-diff record for every (claimed commit,
-        entity) pair, on first sighting and on every move -- so storage grew
-        as O(entity touches), not O(entities), for scratch facts whose own
-        helper docstring says they must not "accumulate unbounded across a
-        full ingest". Only the final, lowest guess is a correct record; the
-        superseded one is stale the moment the guess moves, and 2b has
-        superseded_ident right there in hand."""
-        import mcp_server
-        import frontier_registry
-        repo = tmp_path / "repo"
-        repo.mkdir()
-        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
-        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
-        for i in range(6):
-            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
-            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
-            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
-        linearization = frontier_registry.build_linearization(str(repo))
-        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
-        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
-
-        mcp_server._reverse_bulk_fill_walk(
-            real_db, str(repo), linearization, commit_metadata, allocator,
-        )
-
-        login = mcp_server._code_ident("function", "auth.py", "login")
-        raw = mcp_server._db_execute(
-            real_db,
-            f"(query [:find ?rec :where [?rec :entity-type :type/candidate-diff] "
-            f"[?rec :entity {login}]])",
-        )
-        live_records = json.loads(raw)["results"]
-        assert len(live_records) == 1, (
-            f"one record per live guess, not one per touch; got {len(live_records)}"
-        )
-
-
 class TestReverseFillValidTimeParity:
-    def test_structural_facts_are_re_dated_when_the_guess_moves_earlier(self, real_db, tmp_path):
-        """2b wrote an entity's structural facts once, at the timestamp of
-        the commit where the walk first SIGHTED it, and never re-dated them
-        as the guess moved earlier. That leaves a valid-time window where
-        :introduced-by is live for an entity with no type, name or file --
-        so ":as-of the introduction" answers "this entity did not exist",
-        while ":when was it introduced" answers with that very commit."""
-        import mcp_server
-        import frontier_registry
+    def _repo_with_three_commits(self, tmp_path):
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
         for i in range(3):
+            if i > 0:
+                # ensure distinct commit-timestamp seconds; see
+                # git_repo_with_deletion -- test_stage_a_alone_leaves_the_window_open
+                # below distinguishes "structural facts valid from the newest
+                # sighting" from "valid from the introduction", which collapses
+                # to a false pass if all three commits land in the same second.
+                time.sleep(1.1)
             (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
             _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
             _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def _attrs_at(self, real_db, entity_ident, ts_iso):
+        import mcp_server
+        raw = mcp_server._db_execute(
+            real_db, f'(query [:find ?a :valid-at "{ts_iso}" :where [{entity_ident} ?a ?v]])'
+        )
+        return {row[0] for row in json.loads(raw)["results"]}
+
+    def test_structural_facts_are_re_dated_by_the_correction_sweep(self, real_db, tmp_path):
+        """2b wrote an entity's structural facts once, at the timestamp of
+        the commit where the walk first SIGHTED it. That leaves a valid-time
+        window where :introduced-by is live for an entity with no type, name
+        or file -- so ":as-of the introduction" answers "this entity did not
+        exist", while ":when was it introduced" answers with that very
+        commit.
+
+        #233 moved the repair from _reverse_apply (which did it on every
+        provisional move: 48% of Stage A's wall time) to the correction
+        sweep's confirm branch, which visits each entity's introduction
+        exactly once. So the invariant now holds after Stage B, not after
+        Stage A -- this test asserts the end state, and its negative
+        counterpart below pins the Stage A window deliberately."""
+        import mcp_server
+        import frontier_registry
+        repo = self._repo_with_three_commits(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        mcp_server._correction_sweep_walk(
+            real_db, str(repo), linearization, commit_metadata,
+        )
+
+        login = mcp_server._code_ident("function", "auth.py", "login")
+        attrs = self._attrs_at(real_db, login, commit_metadata[0][1])
+        assert ":introduced-by" in attrs
+        assert ":entity-type" in attrs, (
+            "an entity live at its own introduction must carry its structure there too; "
+            f"got only {sorted(attrs)}"
+        )
+        assert ":file" in attrs
+
+    def test_stage_a_alone_leaves_the_window_open(self, real_db, tmp_path):
+        """The other half of the moved invariant. Deferring the re-date is a
+        real behaviour change and the window it opens is deliberate, so pin
+        it in both directions -- otherwise a future change could re-introduce
+        eager re-dating (and its 48% cost) with the suite still green."""
+        import mcp_server
+        import frontier_registry
+        repo = self._repo_with_three_commits(tmp_path)
         linearization = frontier_registry.build_linearization(str(repo))
         commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
         allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
@@ -14591,17 +14961,39 @@ class TestReverseFillValidTimeParity:
         )
 
         login = mcp_server._code_ident("function", "auth.py", "login")
-        intro_ts = commit_metadata[0][1]
-        raw = mcp_server._db_execute(
-            real_db, f'(query [:find ?a :valid-at "{intro_ts}" :where [{login} ?a ?v]])'
+        assert mcp_server._entity_introduced_by_query(real_db, login) == \
+            f":commit/{linearization[0][:12]}"
+        assert mcp_server._lineage_is_provisional(real_db, login) is True
+        attrs = self._attrs_at(real_db, login, commit_metadata[0][1])
+        assert ":entity-type" not in attrs, (
+            "Stage A must NOT re-date -- that is the amplification #233 removed"
         )
-        attrs_at_introduction = {row[0] for row in json.loads(raw)["results"]}
-        assert ":introduced-by" in attrs_at_introduction  # 2b already gets this right
-        assert ":entity-type" in attrs_at_introduction, (
-            "an entity live at its own introduction must carry its structure there too; "
-            f"got only {sorted(attrs_at_introduction)}"
+
+    def test_reverse_walk_issues_no_re_dating_writes(self, real_db, tmp_path):
+        """The cost assertion behind the behaviour assertions above:
+        _re_date_structural_facts must not be reached at all during Stage A.
+        At 17,250 retracts over 12 real commits (~13ms each) this was the
+        single largest line in the profile."""
+        import mcp_server
+        import frontier_registry
+        repo = self._repo_with_three_commits(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        calls = []
+        real_re_date = mcp_server._re_date_structural_facts
+        mcp_server._re_date_structural_facts = lambda *a, **k: (
+            calls.append(a) or real_re_date(*a, **k)
         )
-        assert ":file" in attrs_at_introduction
+        try:
+            mcp_server._reverse_bulk_fill_walk(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+        finally:
+            mcp_server._re_date_structural_facts = real_re_date
+
+        assert calls == []
 
 
 class TestReverseFillParentEdges:
@@ -14886,6 +15278,86 @@ class TestReverseBulkFillWalk:
             real_db, str(repo), linearization, commit_metadata, allocator,
         )
         assert count == 0
+
+
+class TestReverseApplyWriteBudget:
+    """#233's regression test. The reverse walk was issuing ~6,970 write
+    calls per commit against the forward walk's 12, because every per-entity
+    write was per-entity-per-commit. Phase 2's fixtures were all 6-10
+    commits and varied COMMIT count, so none of them could see it -- this
+    varies ENTITY count at a fixed commit count, which is the axis the
+    defect lived on."""
+
+    def _repo_with_n_functions(self, tmp_path, n, name):
+        repo = tmp_path / name
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for rev in range(2):
+            body = "\n\n".join(f"def f{i}():\n    return {rev}" for i in range(n))
+            (repo / "wide.py").write_text(body + "\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{rev}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    def _writes_for_the_second_claim(self, tmp_path, repo, graph_name):
+        """Claim the tip (every entity is new), then count write calls for
+        the claim below it (every entity is a provisional MOVE -- the path
+        that scaled with entity count).
+
+        Opens its own graph rather than reusing the real_db fixture's: this
+        test runs two repos in one test body, and both name their file
+        wide.py with functions f0.., so their idents would collide in a
+        shared graph (and the second _frontier_load would read the first
+        repo's now-stale bounds). The real_db fixture has already
+        monkeypatched MiniGrafDb.open to hand back a fresh in-memory db per
+        call, so open_db here is cheap and isolated."""
+        import mcp_server
+        import frontier_registry
+        real_db = mcp_server.open_db(str(tmp_path / graph_name)) or mcp_server.get_db()
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        calls = []
+        real_transact, real_retract = mcp_server._transact, mcp_server._retract
+        mcp_server._transact = lambda *a, **k: (calls.append("t") or real_transact(*a, **k))
+        mcp_server._retract = lambda *a, **k: (calls.append("r") or real_retract(*a, **k))
+        try:
+            mcp_server._reverse_fill_claim_and_process(
+                real_db, str(repo), linearization, commit_metadata, allocator,
+            )
+        finally:
+            mcp_server._transact, mcp_server._retract = real_transact, real_retract
+        return len(calls)
+
+    def test_per_commit_writes_do_not_scale_with_entity_count(self, real_db, tmp_path):
+        small = self._writes_for_the_second_claim(
+            tmp_path, self._repo_with_n_functions(tmp_path, 5, "small"), "small.graph"
+        )
+        large = self._writes_for_the_second_claim(
+            tmp_path, self._repo_with_n_functions(tmp_path, 50, "large"), "large.graph"
+        )
+
+        assert large - small <= 5, (
+            f"a 10x entity count must not multiply per-commit writes: "
+            f"5 functions cost {small} write calls, 50 cost {large}. "
+            f"Before #233 this ratio was ~10x."
+        )
+
+    def test_per_commit_writes_stay_in_the_forward_walk_s_range(self, real_db, tmp_path):
+        """The absolute bar, not just the scaling one. The forward walk
+        sustains ~12 writes per commit: one batched transact, one per
+        :contains, one per :parent, watermark, checkpoint."""
+        writes = self._writes_for_the_second_claim(
+            tmp_path, self._repo_with_n_functions(tmp_path, 50, "wide"), "wide.graph"
+        )
+
+        assert writes <= 20, f"expected the forward walk's ~12 per commit; got {writes}"
 
 
 class TestCorrectionSweepThroughWatermark:
@@ -15253,7 +15725,6 @@ class TestCorrectionSweepApply:
         assert skipped == 0
         assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
         assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{h0_hash[:12]}"
-        assert mcp_server._candidate_diff_read(real_db, h0_hash, fn_ident) is None
 
     def test_does_not_duplicate_commit_metadata(self, real_db, tmp_path):
         import mcp_server
@@ -15450,23 +15921,6 @@ class TestCorrectionSweepApply:
         modified_in_values = {row[0] for row in json.loads(raw)["results"]}
         assert h2_ident not in modified_in_values
 
-    def test_opportunistic_stale_candidate_diff_cleanup(self, real_db, tmp_path):
-        import mcp_server
-        repo = self._repo_with_evolving_function(tmp_path)
-        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
-        h0_hash = commit_metadata[0][0]
-        h1_hash, h1_ts = commit_metadata[1][0], commit_metadata[1][1]
-        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
-        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by :commit/{h0_hash[:12]}]]", "2025-01-01T00:00:00Z")
-        # An orphaned candidate-diff record from a since-superseded guess.
-        mcp_server._candidate_diff_persist(real_db, h1_hash, fn_ident, "stale-hash", "2025-01-01T00:00:00Z")
-        assert mcp_server._candidate_diff_read(real_db, h1_hash, fn_ident) is not None
-
-        file_results = self._extract(repo, h1_hash)
-        mcp_server._correction_sweep_apply(real_db, h1_hash, h1_ts, file_results)
-
-        assert mcp_server._candidate_diff_read(real_db, h1_hash, fn_ident) is None
-
     def test_skipped_events_counts_events_not_entities(self, real_db, tmp_path):
         import mcp_server
         repo = self._repo_with_evolving_function(tmp_path)
@@ -15514,6 +15968,7 @@ class TestCorrectionSweepApply:
         mcp_server._transact(real_db, "[[:module/synthetic :introduced-by :commit/preexisting]]", "2025-01-01T00:00:00Z")
         precomputed = {
             "module_ident": ":module/synthetic",
+            "module_candidate_triples": [],
             "function_entries": [(ident, ident, []) for ident in idents],
             "class_entries": [],
             "global_entries": [],
@@ -15558,6 +16013,141 @@ class TestCorrectionSweepApply:
         err = capsys.readouterr().err
         assert err.strip() != ""
         assert "3" in err
+
+    def test_case_one_re_dates_structural_facts(self, real_db, tmp_path):
+        """#233: the sweep's confirm branch is where re-dating now happens.
+        It already has the triples -- precomputed carries
+        module_candidate_triples and (ident, name, triples) per entries key
+        -- and previously read only the idents out of it."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(3):
+            if i > 0:
+                time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        login = mcp_server._code_ident("function", "auth.py", "login")
+
+        file_results, _g, _m, _r = mcp_server._extract_commit(str(repo), linearization[0], ())
+        mcp_server._correction_sweep_apply(
+            real_db, linearization[0], commit_metadata[0][1], file_results,
+        )
+
+        assert mcp_server._lineage_is_provisional(real_db, login) is False
+        raw = mcp_server._db_execute(
+            real_db,
+            f'(query [:find ?a :valid-at "{commit_metadata[0][1]}" :where [{login} ?a ?v]])',
+        )
+        attrs = {row[0] for row in json.loads(raw)["results"]}
+        assert ":entity-type" in attrs
+        assert ":file" in attrs
+
+    def test_case_one_re_dates_the_contains_edge(self, real_db, tmp_path):
+        """A child's own candidate triples carry its [parent :contains child]
+        edge, so re-dating a child must re-date its containment edge with it:
+        a re-dated child's containment edge must still be live (valid-at) at
+        the child's introduction timestamp, for all three siblings. This is
+        the edge minigraf#287 would destroy if the re-date ever batched
+        multiple children of one module's :contains facts into a single
+        _transact/_retract call.
+
+        _re_date_structural_facts does split its triples one call per triple
+        (#233), but at this call site that split is defensive rather than
+        load-bearing: a child's own candidate-triples list carries exactly
+        its own containment edge, and module_candidate_triples carries none,
+        so _re_date_structural_facts is only ever handed 0 or 1 :contains
+        triple per call here regardless of the split. The constraint the
+        split guards against is real elsewhere (minigraf#287 / #222 phase
+        2b1), just not exercised by this test."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(3):
+            if i > 0:
+                time.sleep(1.1)  # ensure distinct commit-timestamp seconds; see git_repo_with_deletion
+            (repo / "auth.py").write_text(
+                f"def a():\n    return {i}\n\ndef b():\n    return {i}\n\ndef c():\n    return {i}\n"
+            )
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+
+        mcp_server._correction_sweep_walk(
+            real_db, str(repo), linearization, commit_metadata,
+        )
+
+        module = mcp_server._code_ident("module", "auth.py")
+        raw = mcp_server._db_execute(
+            real_db,
+            f'(query [:find ?child :valid-at "{commit_metadata[0][1]}" '
+            f'  :where [{module} :contains ?child]])',
+        )
+        children = {row[0] for row in json.loads(raw)["results"]}
+        assert len(children) == 3, f"all three containment edges must survive; got {sorted(children)}"
+
+    def test_confirm_is_batched_across_entities_at_one_commit(self, real_db, tmp_path):
+        """#233: _lineage_confirm was one retract per confirmed entity, and
+        retracts are the expensive op. The markers are distinct :lineage/...
+        companion entities, so one call covers them all."""
+        import mcp_server
+        import frontier_registry
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        bodies = "\n\n".join(f"def f{i}():\n    return 0" for i in range(8))
+        (repo / "wide.py").write_text(bodies + "\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "c0"], cwd=repo, check=True, capture_output=True)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+        mcp_server._reverse_bulk_fill_walk(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        file_results, _g, _m, _r = mcp_server._extract_commit(str(repo), linearization[0], ())
+
+        retracts = []
+        real_retract = mcp_server._retract
+        mcp_server._retract = lambda db_, facts, *a, **k: (
+            retracts.append(facts) or real_retract(db_, facts, *a, **k)
+        )
+        try:
+            mcp_server._correction_sweep_apply(
+                real_db, linearization[0], commit_metadata[0][1], file_results,
+            )
+        finally:
+            mcp_server._retract = real_retract
+
+        marker_retracts = [f for f in retracts if ":type/lineage-marker" in f]
+        assert len(marker_retracts) == 1, (
+            f"one retract for every marker at this commit; got {len(marker_retracts)}"
+        )
+        for i in range(8):
+            ident = mcp_server._code_ident("function", "wide.py", f"f{i}")
+            assert mcp_server._lineage_is_provisional(real_db, ident) is False
 
 
 class TestCorrectionSweepClaimAndProcess:
@@ -15790,8 +16380,6 @@ class TestCorrectionSweepWalk:
         for i in range(5):
             fn_ident = mcp_server._code_ident("function", f"f{i}.py", f"f{i}")
             assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
-        raw = mcp_server._db_execute(real_db, "(query [:find ?e :where [?e :entity-type :type/candidate-diff]])")
-        assert json.loads(raw)["results"] == []
         bounds = mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT)
         assert mcp_server._correction_sweep_through_query(real_db) == bounds[1]
 
@@ -15851,9 +16439,6 @@ class TestForwardReconcileProvisional:
             real_db, f"[[:code/fn-login :introduced-by {guess_ident}]]", "2026-06-01T00:00:00Z",
         )
         mcp_server._lineage_mark_provisional(real_db, ":code/fn-login", "2026-06-01T00:00:00Z")
-        mcp_server._candidate_diff_persist(
-            real_db, "bbbbbbbbbbbb" + "0" * 28, ":code/fn-login", "hash-b", "2026-06-01T00:00:00Z",
-        )
         return guess_ident, structural_triples
 
     def test_returns_none_and_writes_nothing_when_not_provisional(self, real_db):
@@ -15878,7 +16463,7 @@ class TestForwardReconcileProvisional:
         # one immediately after, via the normal forward emission path.
         assert mcp_server._entity_introduced_by_query(real_db, ":code/fn-login") is None
 
-    def test_confirms_the_marker_and_clears_the_candidate_diff(self, real_db):
+    def test_confirms_the_marker(self, real_db):
         import mcp_server
         guess_ident, structural = self._seed_provisional(real_db)
         returned = mcp_server._forward_reconcile_provisional(
@@ -15887,9 +16472,6 @@ class TestForwardReconcileProvisional:
         )
         assert returned == guess_ident
         assert mcp_server._lineage_is_provisional(real_db, ":code/fn-login") is False
-        assert mcp_server._candidate_diff_read(
-            real_db, "bbbbbbbbbbbb" + "0" * 28, ":code/fn-login",
-        ) is None
 
     def test_writes_modified_in_at_the_guess_commits_own_timestamp(self, real_db):
         """The guess commit is now known to be a genuine modification rather

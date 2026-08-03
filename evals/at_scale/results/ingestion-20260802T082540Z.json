@@ -1,0 +1,23 @@
+{
+  "repo_path": ".",
+  "branch": "master",
+  "commits_ingested": 553,
+  "wall_clock_seconds": 5133.189456358028,
+  "throughput_per_minute": 6.463817531399093,
+  "peak_rss_kb": 541132,
+  "graph_size_bytes": 174772224,
+  "index_size_bytes": 79183872,
+  "status_latency": {
+    "min": 4.129018634557724e-06,
+    "p50": 7.518974598497152e-06,
+    "p99": 2.0295032300055027e-05,
+    "max": 0.0008073740173131227
+  },
+  "query_latency": {
+    "min": 5.1179027650505304e-05,
+    "p50": 0.012188596010673791,
+    "p99": 0.6972144250175916,
+    "max": 0.9568492589751258
+  },
+  "final_status": "complete"
+}

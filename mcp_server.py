@@ -5025,6 +5025,7 @@ def _frontier_load(
     ):
         _frontier_seed_from_watermark(db, linearization, run_ts_iso, index_con=index_con)
     _lineage_confirmed_through_migrate(db, run_ts_iso, index_con=index_con)
+    _candidate_diff_purge_legacy(db, index_con=index_con)
 
     hash_to_pos = {h: i for i, h in enumerate(linearization)}
     intervals: List[frontier_registry.Interval] = []
@@ -5142,33 +5143,68 @@ def _lineage_mark_provisional(
     -- a marker already present is a no-op, never a duplicate write. Uses
     internal _transact directly, never handle_minigraf_transact: :type/
     lineage-marker is deliberately unregistered in MINIGRAF_SCHEMA, and the
-    public handler's schema gate would reject it outright.
+    public handler's schema gate would reject it outright. One-entity form
+    of _lineage_mark_provisional_batch, delegating so the two cannot drift
+    (#233, matching _lineage_confirm's own delegation rationale).
     """
-    if _lineage_is_provisional(db, entity_ident):
-        return
-    ident = _lineage_marker_ident(entity_ident)
-    facts = [
-        f"[{ident} :entity-type {_LINEAGE_MARKER_ENTITY_TYPE}]",
-        f"[{ident} :entity {entity_ident}]",
-        f"[{ident} :status :provisional]",
-    ]
-    _transact(db, "[" + " ".join(facts) + "]", commit_ts_iso, index_con=index_con)
+    _lineage_mark_provisional_batch(db, [entity_ident], commit_ts_iso, index_con=index_con)
+
+
+def _lineage_mark_provisional_batch(
+    db: Any, entity_idents: Sequence[str], commit_ts_iso: str, index_con: Optional[Any] = None
+) -> None:
+    """Batched _lineage_mark_provisional (#233). Same query-before-write
+    per ident -- an entity already marked is skipped, never duplicated --
+    but the facts for every genuinely-new marker go in ONE _transact.
+
+    Collision-free: each marker is its own :lineage/... companion entity, so
+    no two facts in the batch share (entity, attribute, valid_from).
+    """
+    facts: List[str] = []
+    for entity_ident in entity_idents:
+        if _lineage_is_provisional(db, entity_ident):
+            continue
+        ident = _lineage_marker_ident(entity_ident)
+        facts.extend([
+            f"[{ident} :entity-type {_LINEAGE_MARKER_ENTITY_TYPE}]",
+            f"[{ident} :entity {entity_ident}]",
+            f"[{ident} :status :provisional]",
+        ])
+    if facts:
+        _transact(db, "[" + " ".join(facts) + "]", commit_ts_iso, index_con=index_con)
+
+
+def _lineage_confirm_batch(
+    db: Any, entity_idents: Sequence[str], index_con: Optional[Any] = None
+) -> None:
+    """Batched _lineage_confirm (#233). Retracts the :type/lineage-marker
+    companion entity's facts for every still-provisional ident in ONE
+    _retract; idents with no marker are skipped, so callers can pass a whole
+    commit's candidates unconditionally.
+
+    Collision-free: each marker is its own :lineage/... companion entity.
+    """
+    facts = []
+    for entity_ident in entity_idents:
+        if not _lineage_is_provisional(db, entity_ident):
+            continue
+        ident = _lineage_marker_ident(entity_ident)
+        facts.extend([
+            f"[{ident} :entity-type {_LINEAGE_MARKER_ENTITY_TYPE}]",
+            f"[{ident} :entity {entity_ident}]",
+            f"[{ident} :status :provisional]",
+        ])
+    if facts:
+        _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
 
 
 def _lineage_confirm(db: Any, entity_ident: str, index_con: Optional[Any] = None) -> None:
     """Retract the :type/lineage-marker companion entity's facts for
-    entity_ident if present; no-op if absent, so callers (2c) can call this
-    unconditionally without checking first.
+    entity_ident if present; no-op if absent, so callers can call this
+    unconditionally without checking first. One-entity form of
+    _lineage_confirm_batch, delegating so the two cannot drift (#233).
     """
-    if not _lineage_is_provisional(db, entity_ident):
-        return
-    ident = _lineage_marker_ident(entity_ident)
-    facts = [
-        f"[{ident} :entity-type {_LINEAGE_MARKER_ENTITY_TYPE}]",
-        f"[{ident} :entity {entity_ident}]",
-        f"[{ident} :status :provisional]",
-    ]
-    _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
+    _lineage_confirm_batch(db, [entity_ident], index_con=index_con)
 
 
 def _lineage_is_provisional(db: Any, entity_ident: str) -> bool:
@@ -5256,78 +5292,87 @@ def _lineage_confirmed_through_migrate(
     _lineage_confirmed_through_update(db, hi_hash, run_ts_iso, index_con=index_con)
 
 
-def _candidate_diff_ident(commit_hash: str, entity_ident: str) -> str:
-    """Deterministic ident for a candidate-diff record. Not a public schema
-    type -- see the #222 phase 2a design spec's "Schema/audit status of new
-    entity types" section.
-    """
-    return f":candidate/{commit_hash[:12]}-{entity_ident.lstrip(':').replace('/', '-')}"
+def _candidate_diff_purge_legacy(db: Any, index_con: Optional[Any] = None) -> int:
+    """One-time cleanup for graphs written by #222 phase 2d, which persisted
+    a :type/candidate-diff record per (claimed commit, candidate entity)
+    pair. #233 deleted that path outright -- 2a specced the records so 2c
+    could confirm a candidate by hash comparison instead of re-parsing, but
+    2c as built re-parses on the process pool and reads
+    precomputed["unchanged_idents"], so nothing ever read them.
 
+    Without this, the records a 2d graph already holds are orphaned: the
+    writer AND the clearer are both gone. They are not inert -- fact_index
+    filters nothing by prefix (_MEMORY_PREFIXES affects scoring, not
+    inclusion), so they stay retrievable scratch noise indefinitely.
 
-def _candidate_diff_persist(
-    db: Any,
-    commit_hash: str,
-    entity_ident: str,
-    body_hash: str,
-    commit_ts_iso: str,
-    index_con: Optional[Any] = None,
-) -> None:
-    """Mint/update one candidate-diff record for (commit_hash, entity_ident).
-    Query-before-write -- no-ops if the persisted body_hash already
-    matches, retracts+reasserts only the :body-hash if it genuinely
-    changed (the other attributes are all derived from commit_hash/
-    entity_ident, which never change for a given record's ident). Uses
-    internal _transact/_retract directly, never handle_minigraf_transact:
-    :type/candidate-diff is deliberately unregistered in MINIGRAF_SCHEMA.
+    Called unconditionally from _frontier_load rather than gated on a
+    watermark: it is one query per load, cheap when there is nothing to
+    purge, and gating it would need a new watermark whose only job is to
+    record that a one-time deletion happened.
+
+    Returns the number of records purged (0 if there was nothing to purge,
+    or if the retract itself failed -- see below).
+
+    COST SHAPE: cheap when there is nothing to purge (one query, no
+    retract), but the retract itself is NOT cheap for a graph that actually
+    holds legacy records -- measured on the real backend at ~0.5s for 500
+    records, ~7.2s for 2,000, and ~127s for 8,000 (roughly O(N^2); chunking
+    the retract does not help, since the cost is in minigraf's retract
+    itself, not in call-count). A phase-2d graph can hold on the order of
+    10k+ live records, i.e. minutes of no output. This is still called
+    unconditionally (see above) because it is one-time per graph -- once
+    purged, later loads see zero rows and return immediately -- and gating
+    it behind a new watermark would add persistent state for a problem that
+    self-resolves after the first successful run. A row count is logged to
+    stderr before retracting so a multi-minute stall is legible rather than
+    looking like a hang, and the retract is best-effort: a failure is
+    logged and swallowed rather than propagated, because this is scratch
+    cleanup, not core ingestion, and _frontier_load's caller must not be
+    bricked for every future run by one bad retract here.
+
+    Records for distinct :candidate/ entities do not share (entity,
+    attribute, valid_from), so the whole purge is one collision-free
+    _retract call (cost above is backend-internal to that one call, not a
+    batching artifact).
+
+    Note: minigraf resolves ?e in a query result to its internal entity id,
+    not the :candidate/... keyword the fact was minted with, and that
+    internal id is not accepted as an entity token in a retract pattern
+    (no :ident back-reference is populated for these records the way it is
+    for e.g. commits -- see _rebuild_index_from_graph's ident_map). The
+    keyword ident is deterministic from (commit_ident, entity_ident) --
+    the same formula the deleted _candidate_diff_ident used -- so it is
+    rebuilt here instead of relying on ?e.
     """
-    ident = _candidate_diff_ident(commit_hash, entity_ident)
-    existing = _candidate_diff_read(db, commit_hash, entity_ident)
-    if existing == body_hash:
-        return
-    if existing is None:
-        commit_ident = f":commit/{commit_hash[:12]}"
-        facts = [
+    raw = _db_execute(
+        db, "(query [:find ?c ?ent ?h :where "
+            "[?e :entity-type :type/candidate-diff] [?e :commit ?c] "
+            "[?e :entity ?ent] [?e :body-hash ?h]])"
+    )
+    rows = json.loads(raw).get("results", [])
+    if not rows:
+        return 0
+    print(
+        f"[_candidate_diff_purge_legacy] purging {len(rows)} legacy "
+        ":type/candidate-diff record(s) -- this is O(n^2) in minigraf's "
+        "retract and may take a while (measured ~127s at 8,000 records)",
+        file=sys.stderr,
+    )
+    facts = []
+    for commit_ident, entity_ident, body_hash in rows:
+        ident = f":candidate/{commit_ident[len(':commit/'):]}-{entity_ident.lstrip(':').replace('/', '-')}"
+        facts.extend([
             f"[{ident} :entity-type :type/candidate-diff]",
             f"[{ident} :commit {commit_ident}]",
             f"[{ident} :entity {entity_ident}]",
             f'[{ident} :body-hash "{_edn_escape(body_hash)}"]',
-        ]
-        _transact(db, "[" + " ".join(facts) + "]", commit_ts_iso, index_con=index_con)
-    else:
-        _retract(db, f'[[{ident} :body-hash "{_edn_escape(existing)}"]]', index_con=index_con)
-        _transact(
-            db, f'[[{ident} :body-hash "{_edn_escape(body_hash)}"]]', commit_ts_iso, index_con=index_con
-        )
-
-
-def _candidate_diff_read(db: Any, commit_hash: str, entity_ident: str) -> Optional[str]:
-    """Return the persisted body_hash for (commit_hash, entity_ident), or
-    None if no candidate record exists for that pair."""
-    ident = _candidate_diff_ident(commit_hash, entity_ident)
-    raw = _db_execute(db, f"(query [:find ?h :where [{ident} :body-hash ?h]])")
-    results = json.loads(raw).get("results", [])
-    return results[0][0] if results else None
-
-
-def _candidate_diff_clear(
-    db: Any, commit_hash: str, entity_ident: str, index_con: Optional[Any] = None
-) -> None:
-    """Retract the candidate record once consumed (2c calls this after
-    confirming/rejecting), so these scratch facts don't accumulate
-    unbounded across a full ingest. No-op if no record exists.
-    """
-    existing = _candidate_diff_read(db, commit_hash, entity_ident)
-    if existing is None:
-        return
-    ident = _candidate_diff_ident(commit_hash, entity_ident)
-    commit_ident = f":commit/{commit_hash[:12]}"
-    facts = [
-        f"[{ident} :entity-type :type/candidate-diff]",
-        f"[{ident} :commit {commit_ident}]",
-        f"[{ident} :entity {entity_ident}]",
-        f'[{ident} :body-hash "{_edn_escape(existing)}"]',
-    ]
-    _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
+        ])
+    try:
+        _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
+    except Exception as e:
+        print(f"[_candidate_diff_purge_legacy] retract failed, {len(rows)} record(s) left in place: {e}", file=sys.stderr)
+        return 0
+    return len(rows)
 
 
 def _entity_introduced_by_query(db: Any, entity_ident: str) -> Optional[str]:
@@ -5336,6 +5381,90 @@ def _entity_introduced_by_query(db: Any, entity_ident: str) -> Optional[str]:
     raw = _db_execute(db, f"(query [:find ?c :where [{entity_ident} :introduced-by ?c]])")
     results = json.loads(raw).get("results", [])
     return results[0][0] if results else None
+
+
+def _entity_introduced_by_set_provisional_batch(
+    db: Any,
+    entity_idents: Sequence[str],
+    commit_ident: str,
+    commit_ts_iso: str,
+    index_con: Optional[Any] = None,
+    pos: Optional[int] = None,
+    pos_by_commit_ident: Optional[Dict[str, int]] = None,
+) -> Set[str]:
+    """Assert or move a PROVISIONAL :introduced-by to commit_ident for many
+    entities at once (#233), in one _retract and at most two _transact
+    calls instead of two writes per ident. _reverse_apply's two loops were
+    the only production callers of the per-ident form, at ~1,265 idents per
+    commit on a real repository; retracts cost ~13ms against a transact's
+    ~1ms, so the retract batching is the load-bearing half.
+
+    Returns the set of idents whose guess was actually asserted or moved.
+
+    Every gate is per-ident and is applied in the same order the per-ident
+    function used, because batching must not turn one ident's refusal into
+    the whole batch being dropped, nor a refused ident into an included one:
+
+      - authoritative (a value exists and _lineage_is_provisional is False)
+        -- never touched; reverse walk must never clobber a confirmed fact
+      - value already equals commit_ident -- no write, but still marked
+      - the monotonicity refusal (a guess may only move EARLIER), with its
+        own stderr line per refused ident
+
+    Idempotent per ident: an ident whose value already equals commit_ident
+    contributes no fact write (but is still included in the marker batch).
+    Query-before-write, retract-then-reassert only for idents whose value
+    genuinely changed -- mirrors _watermark_update's pattern, since
+    re-transacting the same (entity, attribute, value) at a new valid_from
+    creates a duplicate live datom under minigraf's write semantics.
+
+    Positions, never timestamps: ingest :date values are AUTHOR dates
+    (_git_commits reads `%at`) and are not monotonic in topological order
+    (clock skew, rebases, cherry-picks), which is why build_linearization
+    uses --topo-order at all, so comparing :date values would silently
+    mis-order commits. pos and pos_by_commit_ident both default to None, in
+    which case the monotonicity guard is skipped for every ident in the
+    batch; _reverse_apply passes them always.
+
+    Collision-free: within each batch the facts differ in entity, and only
+    facts sharing (entity, attribute, valid_from) collapse in minigraf's
+    EAVT pending index. :contains is the attribute where that bites, and it
+    is not written here.
+    """
+    to_retract: List[str] = []
+    to_transact: List[str] = []
+    to_mark: List[str] = []
+    moved: Set[str] = set()
+
+    for entity_ident in entity_idents:
+        current = _entity_introduced_by_query(db, entity_ident)
+        if current is not None and not _lineage_is_provisional(db, entity_ident):
+            continue  # authoritative -- never touch
+        if current == commit_ident:
+            to_mark.append(entity_ident)
+            continue
+        if current is not None and pos is not None and pos_by_commit_ident is not None:
+            current_pos = pos_by_commit_ident.get(current)
+            if current_pos is not None and pos >= current_pos:
+                print(
+                    f"[_entity_introduced_by_set_provisional] refusing to move "
+                    f"{entity_ident}'s guess from {current} (position {current_pos}) "
+                    f"to {commit_ident} (position {pos}): a guess may only move earlier",
+                    file=sys.stderr,
+                )
+                continue
+        if current is not None:
+            to_retract.append(f"[{entity_ident} :introduced-by {current}]")
+        to_transact.append(f"[{entity_ident} :introduced-by {commit_ident}]")
+        to_mark.append(entity_ident)
+        moved.add(entity_ident)
+
+    if to_retract:
+        _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+    if to_transact:
+        _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
+    _lineage_mark_provisional_batch(db, to_mark, commit_ts_iso, index_con=index_con)
+    return moved
 
 
 def _entity_introduced_by_set_provisional(
@@ -5347,55 +5476,15 @@ def _entity_introduced_by_set_provisional(
     pos: Optional[int] = None,
     pos_by_commit_ident: Optional[Dict[str, int]] = None,
 ) -> None:
-    """Assert or move entity_ident's PROVISIONAL :introduced-by to
-    commit_ident. Never touches an entity whose :introduced-by is already
-    authoritative (a fact exists and _lineage_is_provisional is False) --
-    reverse walk (#222 phase 2b) must never clobber a fact Stream 1 has
-    already confirmed. Idempotent: no-ops the fact write (but still ensures
-    the marker is present) if the current value already equals
-    commit_ident. Query-before-write, retract-then-reassert only if the
-    value genuinely changed -- mirrors _watermark_update's pattern, since
-    re-transacting the same (entity, attribute, value) at a new valid_from
-    creates a duplicate live datom under minigraf's write semantics.
-
-    Monotonicity (#222 phase 2b1): when pos and pos_by_commit_ident are
-    supplied, a move is REFUSED unless commit_ident is strictly earlier than
-    the current guess. This docstring always claimed the contract ("reverse
-    walk has now reached an earlier commit") but nothing enforced it, so a
-    re-claim of a higher position -- routine on a resumed run -- dragged the
-    guess forward while the caller's retroactive :modified-in landed at the
-    older, lower commit, producing an entity modified before it was
-    introduced. Forward walk cannot produce that shape, nothing in the graph
-    or the audit detects it, and it persists.
-
-    Positions, never timestamps: ingest :date values are AUTHOR dates
-    (_git_commits reads `%at`) and are not monotonic in topological order
-    (clock skew, rebases, cherry-picks), which is why
-    build_linearization uses --topo-order at all, so comparing :date values
-    would silently mis-order commits. Both parameters default to None, in
-    which case the guard is skipped and behaviour is exactly as before --
-    2a's existing callers are unaffected; 2b passes them always.
+    """One-entity form of _entity_introduced_by_set_provisional_batch --
+    see that function for the gates. A delegating wrapper rather than a
+    parallel implementation (#233) so the batched and unbatched paths
+    cannot drift apart; the batch is the only production caller shape.
     """
-    current = _entity_introduced_by_query(db, entity_ident)
-    if current is not None and not _lineage_is_provisional(db, entity_ident):
-        return  # authoritative -- never touch
-    if current == commit_ident:
-        _lineage_mark_provisional(db, entity_ident, commit_ts_iso, index_con=index_con)
-        return
-    if current is not None and pos is not None and pos_by_commit_ident is not None:
-        current_pos = pos_by_commit_ident.get(current)
-        if current_pos is not None and pos >= current_pos:
-            print(
-                f"[_entity_introduced_by_set_provisional] refusing to move "
-                f"{entity_ident}'s guess from {current} (position {current_pos}) "
-                f"to {commit_ident} (position {pos}): a guess may only move earlier",
-                file=sys.stderr,
-            )
-            return
-    if current is not None:
-        _retract(db, f"[[{entity_ident} :introduced-by {current}]]", index_con=index_con)
-    _transact(db, f"[[{entity_ident} :introduced-by {commit_ident}]]", commit_ts_iso, index_con=index_con)
-    _lineage_mark_provisional(db, entity_ident, commit_ts_iso, index_con=index_con)
+    _entity_introduced_by_set_provisional_batch(
+        db, [entity_ident], commit_ident, commit_ts_iso,
+        index_con=index_con, pos=pos, pos_by_commit_ident=pos_by_commit_ident,
+    )
 
 
 def _re_date_structural_facts(
@@ -5406,14 +5495,18 @@ def _re_date_structural_facts(
 ) -> None:
     """Retract and re-assert an entity's structural facts at new_ts_iso.
 
-    Used whenever a provisional :introduced-by guess moves to an earlier
-    commit -- by _reverse_apply when the reverse walk finds an even earlier
-    occurrence, and by _forward_reconcile_provisional when the forward walk
-    reaches the true introduction. In both cases the facts were written at
-    the timestamp of the commit where the entity was first SIGHTED, which is
-    later than the introduction now is, leaving a valid-time window where
-    :introduced-by is live for an entity with no type, name or file -- so
-    ":as-of the introduction" reports it as nonexistent.
+    Used whenever a provisional :introduced-by guess is resolved to an
+    earlier commit -- by _correction_sweep_apply when the sweep confirms an
+    entity at its introduction, and by _forward_reconcile_provisional when
+    the forward walk reaches the true introduction. In both cases the facts
+    were written at the timestamp of the commit where the entity was first
+    SIGHTED, which is later than the introduction now is, leaving a valid
+    time window where :introduced-by is live for an entity with no type,
+    name or file -- so ":as-of the introduction" reports it as nonexistent.
+
+    _reverse_apply deliberately does NOT call this (#233): it used to, on
+    every provisional move, which re-dated a long-lived entity once per
+    touch instead of once. Both callers above fire once per entity.
 
     _retract targets live rows regardless of their original valid_from, so
     this is a straight re-assert at the earlier timestamp.
@@ -5456,8 +5549,11 @@ def _forward_reconcile_provisional(
     exactly one code path that mints an authoritative introduction and this
     function cannot drift from it.
 
-    Mirrors the supersede path in _reverse_apply: the same re-dating of
-    structural facts (via _re_date_structural_facts), the same refusal to
+    Re-dates structural facts itself (via _re_date_structural_facts), same
+    as _correction_sweep_apply's case 1 does (#233) -- _reverse_apply's own
+    supersede path deliberately does NOT do this anymore (see its
+    docstring), so this function no longer mirrors it on that point.
+    Still mirrors _reverse_apply's supersede path for the refusal to
     back-date a :modified-in edge whose commit timestamp is unknown, and --
     what commit_ident is for -- the same refusal to hand the entity a
     :modified-in edge at its OWN introduction (_reverse_apply's
@@ -5485,11 +5581,7 @@ def _forward_reconcile_provisional(
     if guess_ident is None:
         return None
 
-    # 4. The candidate-diff record is stale the moment the guess moves off it,
-    # and this is the cheapest place to drop it -- guess_ident is right here.
-    _candidate_diff_clear(db, guess_ident[len(":commit/"):], entity_ident, index_con=index_con)
-
-    # 5. The guess commit is now known to be a genuine modification rather
+    # 4. The guess commit is now known to be a genuine modification rather
     # than the introduction -- UNLESS it is this very commit, which is the
     # introduction. Stream 2 can guess the right commit and still leave a
     # provisional marker on it (it claims high-to-low, so the first sighting
@@ -6685,23 +6777,6 @@ def _precompute_file_triples(
     except Exception:
         unchanged_idents = set()
 
-    # #222 phase 2b: per-entity body hash for every entity present on the
-    # NEW side, keyed the same way unchanged_idents is above -- lets the
-    # reverse-bulk-fill walk persist a candidate-diff record (body hash)
-    # for an entity without needing the raw tree-sitter node itself.
-    # Module-level entries are deliberately excluded: there is no
-    # tree-sitter node to hash for a whole file, and candidate-diff
-    # persistence is function/class/variable/field-only (matching
-    # unchanged_idents' own category scope).
-    body_hashes: Dict[str, str] = {}
-    try:
-        new_nodes_for_hash = new_entity_nodes or {}
-        for category in ("function", "class", "variable", "field"):
-            for name, node in new_nodes_for_hash.get(category, {}).items():
-                body_hashes[_code_ident(category, file_path, name)] = _normalized_body_hash(node)
-    except Exception:
-        body_hashes = {}
-
     return {
         "module_ident": module_ident,
         "module_candidate_triples": module_candidate_triples,
@@ -6713,7 +6788,6 @@ def _precompute_file_triples(
         "field_static_map": field_static_map,
         "resolved_imports": resolved_imports,
         "unchanged_idents": unchanged_idents,
-        "body_hashes": body_hashes,
     }
 
 
@@ -7706,10 +7780,10 @@ def _reverse_apply(
     index_con: Optional[Any] = None,
 ) -> str:
     """#222 phase 2b: apply one already-claimed, already-extracted commit --
-    structural facts, :modified-in edges, provisional :introduced-by, and
-    candidate-diff records for every entity the commit's "A"/"M" files
-    touch. "D"/"R" files are skipped entirely (deletions and renames are
-    out of scope for this sub-phase -- see the design spec).
+    structural facts, :modified-in edges, and provisional :introduced-by for
+    every entity the commit's "A"/"M" files touch. "D"/"R" files are skipped
+    entirely (deletions and renames are out of scope for this sub-phase --
+    see the design spec).
 
     Split out of _reverse_fill_claim_and_process's single body (#222 phase
     2d): `pos` (from allocator.claim_high()) and `file_results` (from
@@ -7746,6 +7820,21 @@ def _reverse_apply(
     Already-authoritative entities are never touched, but a genuine later
     touch always gets :modified-in (unless #221's unchanged-body check
     says the body is provably unchanged this commit).
+
+    Does NOT re-date structural facts as a guess moves earlier (#233). They
+    stay at the timestamp of the commit where this walk first SIGHTED the
+    entity, which is later than the provisional :introduced-by, so ":as-of
+    the provisional introduction" reports the entity as nonexistent for as
+    long as it stays provisional. The correction sweep closes that window
+    when it CONFIRMS the entity (case 1) -- but leaves it open for an entity
+    the sweep instead leaves provisional (case 2's fail-safe skip on an
+    ambiguous/wrong guess, already logged as skipped): that entity keeps its
+    stale-dated structural facts indefinitely, not just until the sweep
+    runs. This is the same "temporarily dangling, and convergent" shape as
+    the :parent edges below, and the region is already excluded from 2a's
+    trust predicate -- but note that an INTERRUPTED run now leaves a wider
+    inconsistent window than it did before #233, closed by the next run's
+    sweep (for entities that reach case 1, not case 2).
 
     Known, documented limitation, and who fixes it: the retroactive
     :modified-in for a superseded commit does not re-check #221's
@@ -7804,13 +7893,11 @@ def _reverse_apply(
         f'[{commit_ident} :subject "{_edn_escape(subject[:200])}"]',
         f'[{commit_ident} :date "{commit_ts_iso}"]',
     ]
-    candidate_triples_by_ident: Dict[str, List[str]] = {}
     pos_by_commit_ident = {f":commit/{h[:12]}": i for i, (h, _t, _a, _s) in enumerate(commit_metadata)}
     ts_by_commit_ident = {f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata}
     new_candidates: List[str] = []
     provisional_moves: List[Tuple[str, str]] = []  # (ident, superseded_commit_ident)
     already_authoritative_touched: List[Tuple[str, Optional[str]]] = []
-    body_hash_by_ident: Dict[str, str] = {}
     unchanged_by_ident: Dict[str, bool] = {}
 
     for status, file_path, extracted, precomputed, _old_path in file_results:
@@ -7844,17 +7931,6 @@ def _reverse_apply(
         for ident in candidate_idents:
             unchanged_by_ident[ident] = ident in unchanged_idents
 
-        # Keep each entity's candidate triples so a provisional move can
-        # re-date them (#222 phase 2b1). A child's own list carries its
-        # [parent :contains child] edge, so re-dating a child re-dates its
-        # containment edge with it.
-        candidate_triples_by_ident[precomputed["module_ident"]] = list(
-            precomputed["module_candidate_triples"]
-        )
-        for entries_key in ("function_entries", "class_entries", "global_entries", "field_entries"):
-            for entry_ident, _entry_name, entry_triples in precomputed[entries_key]:
-                candidate_triples_by_ident[entry_ident] = list(entry_triples)
-
         new_candidates.extend(set(known_before.keys()) - known_before_snapshot)
         for ident in set(candidate_idents) & known_before_snapshot:
             if _lineage_is_provisional(db, ident):
@@ -7864,8 +7940,6 @@ def _reverse_apply(
                 already_authoritative_touched.append(
                     (ident, _entity_introduced_by_query(db, ident))
                 )
-
-        body_hash_by_ident.update(precomputed.get("body_hashes", {}))
 
     # Split :contains out before batching (#222 phase 2b1). Minigraf's EAVT
     # pending index lacks value bytes in the key, so batching multiple
@@ -7926,70 +8000,51 @@ def _reverse_apply(
             db, "[" + " ".join(authoritative_modified_triples) + "]", commit_ts_iso, index_con=index_con,
         )
 
-    for ident in new_candidates:
-        _entity_introduced_by_set_provisional(
-            db, ident, commit_ident, commit_ts_iso, index_con=index_con,
-            pos=pos, pos_by_commit_ident=pos_by_commit_ident,
-        )
-        if ident in body_hash_by_ident:
-            _candidate_diff_persist(
-                db, commit_hash, ident, body_hash_by_ident[ident], commit_ts_iso, index_con=index_con,
-            )
+    _entity_introduced_by_set_provisional_batch(
+        db, new_candidates, commit_ident, commit_ts_iso, index_con=index_con,
+        pos=pos, pos_by_commit_ident=pos_by_commit_ident,
+    )
+    _entity_introduced_by_set_provisional_batch(
+        db, [ident for ident, _superseded in provisional_moves], commit_ident,
+        commit_ts_iso, index_con=index_con,
+        pos=pos, pos_by_commit_ident=pos_by_commit_ident,
+    )
 
+    # #233: one transact per entity here was 10,161 calls over 12 commits of
+    # this repo. Each edge is asserted at the SUPERSEDED commit's own
+    # timestamp, not this commit's, so one batch is impossible -- but
+    # entities touched by one commit were almost always last sighted at the
+    # same commit, so grouping by that timestamp collapses to a handful.
+    # Every per-ident gate below stays per-ident and is evaluated during
+    # grouping. Facts differing in entity do not collide, so each group is
+    # one safe transact.
+    retroactive_by_ts: Dict[str, List[str]] = {}
     for ident, superseded_ident in provisional_moves:
-        _entity_introduced_by_set_provisional(
-            db, ident, commit_ident, commit_ts_iso, index_con=index_con,
-            pos=pos, pos_by_commit_ident=pos_by_commit_ident,
+        if superseded_ident is None or superseded_ident == commit_ident:
+            continue
+        superseded_pos = pos_by_commit_ident.get(superseded_ident)
+        if superseded_pos is not None and superseded_pos <= pos:
+            # The move was refused (or would be): the "superseded" guess is
+            # not actually later than this commit, so asserting it as a
+            # modification would claim the entity changed at or before its
+            # own introduction.
+            continue
+        superseded_ts = ts_by_commit_ident.get(superseded_ident)
+        if superseded_ts is None:
+            # Falling back to THIS commit's timestamp back-dates the edge to
+            # before the modification it describes -- a fact asserted valid
+            # before it was true. Skip and say so instead.
+            print(
+                f"[_reverse_apply] skipping retroactive :modified-in "
+                f"for {ident} at {superseded_ident}: no timestamp in commit_metadata",
+                file=sys.stderr,
+            )
+            continue
+        retroactive_by_ts.setdefault(superseded_ts, []).append(
+            f"[{ident} :modified-in {superseded_ident}]"
         )
-        if ident in body_hash_by_ident:
-            _candidate_diff_persist(
-                db, commit_hash, ident, body_hash_by_ident[ident], commit_ts_iso, index_con=index_con,
-            )
-        if superseded_ident is not None and superseded_ident != commit_ident:
-            superseded_pos = pos_by_commit_ident.get(superseded_ident)
-            if superseded_pos is None or superseded_pos > pos:
-                # The move happened: this commit is genuinely earlier.
-                # Re-date the entity's structural facts to match (#222 phase
-                # 2b1) -- see _re_date_structural_facts's own docstring for
-                # why (they were written at the timestamp of the commit
-                # where the walk first SIGHTED the entity, which is later
-                # than the guess now is).
-                _re_date_structural_facts(
-                    db,
-                    [t for t in candidate_triples_by_ident.get(ident, []) if ":introduced-by" not in t],
-                    commit_ts_iso,
-                    index_con=index_con,
-                )
-
-                # The superseded candidate-diff record is stale the moment
-                # the guess moves off it, and this is the cheapest place to
-                # drop it -- superseded_ident is right here. Without it these
-                # scratch facts accumulate as O(entity touches) rather than
-                # O(entities), which is exactly what _candidate_diff_clear's
-                # own docstring says must not happen.
-                _candidate_diff_clear(
-                    db, superseded_ident[len(":commit/"):], ident, index_con=index_con,
-                )
-            if superseded_pos is not None and superseded_pos <= pos:
-                # The move was refused (or would be): the "superseded" guess
-                # is not actually later than this commit, so asserting it as
-                # a modification would claim the entity changed at or before
-                # its own introduction.
-                continue
-            superseded_ts = ts_by_commit_ident.get(superseded_ident)
-            if superseded_ts is None:
-                # Falling back to THIS commit's timestamp back-dates the edge
-                # to before the modification it describes -- a fact asserted
-                # valid before it was true. Skip and say so instead.
-                print(
-                    f"[_reverse_apply] skipping retroactive :modified-in "
-                    f"for {ident} at {superseded_ident}: no timestamp in commit_metadata",
-                    file=sys.stderr,
-                )
-                continue
-            _transact(
-                db, f"[[{ident} :modified-in {superseded_ident}]]", superseded_ts, index_con=index_con,
-            )
+    for superseded_ts, triples in retroactive_by_ts.items():
+        _transact(db, "[" + " ".join(triples) + "]", superseded_ts, index_con=index_con)
 
     _frontier_persist_claim(db, linearization, pos, from_low=False, commit_ts_iso=commit_ts_iso, index_con=index_con)
     _db_checkpoint(db)
@@ -8305,7 +8360,7 @@ def _forward_apply(
                     if _lineage_is_provisional(db, ident)
                 ]
             # Built once per file rather than scanned per ident (matches
-            # _reverse_fill_claim_and_process's candidate_triples_by_ident
+            # _correction_sweep_apply's candidate_triples_by_ident
             # precedent) -- a per-ident linear scan here is O(n^2) per file
             # once there is more than one reconcilable entity.
             structural_triples_by_ident = (
@@ -8663,10 +8718,9 @@ def _forward_structural_triples_by_ident(precomputed: Dict[str, Any]) -> Dict[st
     """Every candidate ident's own structural triples, for re-dating, built
     once per file instead of scanned per ident (#222 phase 2d Task 5 fix --
     the previous per-ident linear scan was O(n^2) per file once more than one
-    entity needed reconciling). Matches the existing precedent in
-    _reverse_apply's candidate_triples_by_ident (moved verbatim out of
-    _reverse_fill_claim_and_process by #222 phase 2d Task 6), which builds
-    the same shape of dict from the same five sources.
+    entity needed reconciling). Called by both _forward_apply and
+    _correction_sweep_apply, which need the same shape of dict built from
+    the same five sources for the same reason (#233).
 
     A child's own list carries its [parent :contains child] edge, so
     re-dating a child re-dates its containment edge with it (#222 phase
@@ -8839,6 +8893,17 @@ def _correction_sweep_apply(
     never writes commit_hash's own :type/commit entity (2b already wrote
     it for every commit in this sweep's range). DB-bound, parse-free.
 
+    Re-dates each confirmed (case 1) entity's structural facts to the
+    introduction commit (#233), which _reverse_apply used to do eagerly on
+    every provisional move. Sound here and only here: the gap-closed
+    precondition means Stream 2's guess is final, so an entity reaching
+    case 1 is at its introduction, and this pass visits each commit exactly
+    once ascending. An entity case 2 leaves provisional (ambiguous or wrong
+    guess, already logged as skipped) is NOT re-dated and keeps its
+    stale-dated structural facts -- the valid-time window _reverse_apply's
+    docstring describes closes only for entities this sweep confirms, not
+    for ones it skips.
+
     skipped_so_far is the driving loop's running total of skipped_events
     from every previous call this run -- it exists solely to make the
     stderr log cap (_CORRECTION_SWEEP_LOG_CAP) work across calls without
@@ -8883,6 +8948,22 @@ def _correction_sweep_apply(
         )
         unchanged_idents = precomputed.get("unchanged_idents", set())
 
+        # #233: the sweep re-dates structural facts, which _reverse_apply
+        # used to do eagerly on every provisional move (48% of Stage A's
+        # wall time -- 17,250 retracts over 12 real commits). This pass
+        # already visits every commit in the reverse region exactly once,
+        # ascending, and its gap-closed precondition means Stream 2's guess
+        # is final -- so the commit at which an entity reaches case 1 IS its
+        # introduction, and re-dating there is once per entity for the whole
+        # region. precomputed already carried these triples; only the idents
+        # were being read out of it.
+        candidate_triples_by_ident = _forward_structural_triples_by_ident(precomputed)
+
+        # #233: _lineage_confirm was one retract per confirmed entity here,
+        # and retracts cost ~13ms against a transact's ~1ms. Collected per
+        # file and flushed once at the bottom of this same iteration, so a
+        # file's confirms are one call.
+        to_confirm: List[str] = []
         for ident in candidate_idents:
             raw = _db_execute(db, f"(query [:find ?c :where [{ident} :introduced-by ?c]])")
             introduced_by_values = {row[0] for row in json.loads(raw).get("results", [])}
@@ -8892,8 +8973,14 @@ def _correction_sweep_apply(
                     # Case 1: the provisional guess matches this commit --
                     # confirm. The :introduced-by fact itself is untouched,
                     # since its value was already correct.
-                    _lineage_confirm(db, ident, index_con=index_con)
-                    _candidate_diff_clear(db, commit_hash, ident, index_con=index_con)
+                    _re_date_structural_facts(
+                        db,
+                        [t for t in candidate_triples_by_ident[ident]
+                         if ":introduced-by" not in t],
+                        commit_ts_iso,
+                        index_con=index_con,
+                    )
+                    to_confirm.append(ident)
                 else:
                     # Case 2: guess points elsewhere, or an ambiguous
                     # (zero/2+) value count -- fail safe, leave untouched.
@@ -8921,7 +9008,6 @@ def _correction_sweep_apply(
                             _transact(
                                 db, f"[[{ident} :modified-in {commit_ident}]]", commit_ts_iso, index_con=index_con,
                             )
-                    _candidate_diff_clear(db, commit_hash, ident, index_con=index_con)
                 else:
                     # Zero or 2+ distinct values -- same duplicate-fact
                     # risk as case 2 -- skip, left alone rather than
@@ -8933,6 +9019,8 @@ def _correction_sweep_apply(
                             f"(ambiguous introduced-by values: {sorted(introduced_by_values)})",
                             file=sys.stderr,
                         )
+
+        _lineage_confirm_batch(db, to_confirm, index_con=index_con)
 
     if update_watermark:
         _correction_sweep_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
