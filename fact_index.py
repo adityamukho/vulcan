@@ -34,6 +34,13 @@ _META_SCHEMA_SQL = "CREATE TABLE IF NOT EXISTS index_meta (key TEXT PRIMARY KEY,
 # COALESCEd to '' on write because SQL's default UNIQUE semantics treat NULL
 # as never equal to itself, which would otherwise let every current fact
 # (valid_to=None) dodge the constraint entirely.
+#
+# As of #236 this table also serves the DELETE path: its implicit rowid IS
+# the corresponding facts_fts rowid (assigned explicitly by insert_facts), so
+# delete_facts seeks here and then deletes from facts_fts by rowid rather
+# than scanning it. That is why _SCHEMA_VERSION moved to 4 -- in a v3 file
+# the facts_fts rowids were auto-assigned and unrelated to these, so the
+# identity does not hold and ensure_schema wipes such a file.
 _DEDUP_SCHEMA_SQL = (
     "CREATE TABLE IF NOT EXISTS facts_dedup ("
     "entity TEXT NOT NULL, attribute TEXT NOT NULL, value TEXT NOT NULL, "
@@ -220,7 +227,22 @@ def insert_facts(
     that exact row was new (executemany's rowcount is not per-row reliable
     across sqlite3 driver versions). A distinct valid_from for the same
     (entity, attribute, value) is deliberately NOT deduped -- it's a
-    genuinely distinct fact, mirroring minigraf's own graph semantics."""
+    genuinely distinct fact, mirroring minigraf's own graph semantics.
+
+    The dedup row's rowid is assigned explicitly as the facts_fts rowid
+    (#236), making the two tables' rowids the same number by construction --
+    that identity is what lets delete_facts seek facts_dedup's B-tree and
+    then delete from facts_fts by rowid, instead of scanning the FTS5 table.
+    Reading cur.lastrowid is only valid because of the rowcount guard above
+    it: on an ignored INSERT OR IGNORE, lastrowid holds the PREVIOUS
+    successful insert's rowid rather than being cleared.
+
+    Dedup is written first, so the only inconsistency this path can leave
+    behind is a dedup row whose fts insert failed -- costing one unindexed
+    fact. The reverse, an fts row with no dedup row, would be far worse (its
+    rowid could later be recycled by a new dedup row into a collision) and
+    is unreachable from here.
+    """
     if not triples:
         return
     for entity, attribute, value, valid_from, valid_to in triples:
@@ -236,9 +258,9 @@ def insert_facts(
         if cur.rowcount == 0:
             continue
         con.execute(
-            "INSERT INTO facts_fts (entity, attribute, value, valid_from, valid_to) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (entity, attribute, value, valid_from, valid_to),
+            "INSERT INTO facts_fts (rowid, entity, attribute, value, valid_from, valid_to) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (cur.lastrowid, entity, attribute, value, valid_from, valid_to),
         )
 
 
@@ -251,27 +273,54 @@ def delete_facts(
     (entity, attribute, value) from an earlier lifecycle are never touched
     by a retract -- only the live, open-ended assertion is removed.
 
-    Also clears the matching facts_dedup row(s) (valid_to = '', the same
-    normalized-NULL sentinel insert_facts writes) -- code-review finding on
-    #152: leaving a stale facts_dedup row after a retract would make a later
-    insert_facts call for the exact same (entity, attribute, value,
-    valid_from) silently no-op, since the dedup guard can't distinguish
-    "already indexed and still live" from "was indexed once, since
-    retracted." Deliberately not scoped to a specific valid_from, matching
-    facts_fts's own DELETE above -- delete_facts doesn't know which
-    valid_from the now-deleted current row had either."""
+    Seeks facts_dedup for the rowid and then deletes facts_fts BY that rowid
+    (#236). The obvious equality DELETE against facts_fts costs O(index size)
+    per triple: FTS5 maintains a full-text index, not a B-tree over column
+    values, so `WHERE entity = ?` cannot seek and scans the whole table.
+    Measured at an 80,000-row index, that was 11.088 ms per deleted triple
+    against 0.0127 ms for the rowid form, and it was 73.5% of a full at-scale
+    ingestion's wall clock. Batching does not help -- the cost follows facts,
+    not calls -- which is why this stayed a per-triple loop rather than one
+    big executemany.
+
+    The lookup is a seek on the (entity, attribute, value) prefix of
+    facts_dedup's UNIQUE(entity, attribute, value, valid_from, valid_to)
+    index. It deliberately does NOT constrain valid_from, matching the
+    equality DELETE it replaced -- delete_facts doesn't know which valid_from
+    the current row carries, and the same (entity, attribute, value) can hold
+    several current rows at distinct valid_from values, all of which go. The
+    valid_to = '' filter is the normalized-NULL sentinel insert_facts writes,
+    corresponding one-to-one with facts_fts's valid_to IS NULL.
+
+    facts_fts is deleted BEFORE facts_dedup, and the order is load-bearing. A
+    failure between the two leaves an orphan dedup row: harmless, invisible
+    to queries, and cleared by the next delete of that triple. The reverse
+    order would leave an orphan facts_fts row -- permanently stale in query
+    results, holding a rowid that a later dedup insert could recycle into an
+    IntegrityError.
+
+    Clearing facts_dedup is also required for correctness independent of the
+    rowid scheme -- code-review finding on #152: a stale dedup row left after
+    a retract would make a later insert_facts call for the same (entity,
+    attribute, value, valid_from) silently no-op, since the dedup guard can't
+    distinguish "already indexed and still live" from "was indexed once,
+    since retracted."
+    """
     if not triples:
         return
-    con.executemany(
-        "DELETE FROM facts_fts WHERE entity = ? AND attribute = ? AND value = ? "
-        "AND valid_to IS NULL",
-        [(e, a, v) for e, a, v, _vf, _vt in triples],
-    )
-    con.executemany(
-        "DELETE FROM facts_dedup WHERE entity = ? AND attribute = ? AND value = ? "
-        "AND valid_to = ''",
-        [(e, a, v) for e, a, v, _vf, _vt in triples],
-    )
+    for entity, attribute, value, _valid_from, _valid_to in triples:
+        rowids = [
+            row[0] for row in con.execute(
+                "SELECT rowid FROM facts_dedup WHERE entity = ? AND attribute = ? "
+                "AND value = ? AND valid_to = ''",
+                (entity, attribute, value),
+            )
+        ]
+        if not rowids:
+            continue
+        params = [(rowid,) for rowid in rowids]
+        con.executemany("DELETE FROM facts_fts WHERE rowid = ?", params)
+        con.executemany("DELETE FROM facts_dedup WHERE rowid = ?", params)
 
 
 _TOKEN_PATTERN = re.compile(r"[a-z0-9]+")

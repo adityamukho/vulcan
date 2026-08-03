@@ -502,6 +502,104 @@ def test_delete_only_removes_exact_match(tmp_path):
         fact_index.close_writer(con)
 
 
+def test_insert_facts_assigns_dedup_rowid_as_fts_rowid(tmp_path):
+    """#236: the whole fix rests on this identity. delete_facts seeks
+    facts_dedup's B-tree for a rowid and then deletes facts_fts by that
+    rowid -- if the two ever diverge, a retract silently removes an
+    unrelated fact from the index."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        fact_index.insert_facts(con, [
+            (":decision/a", ":description", "first", None, None),
+            (":decision/b", ":description", "second", None, None),
+            (":decision/c", ":description", "third", None, None),
+        ])
+        con.commit()
+        fts = dict(con.execute("SELECT entity, rowid FROM facts_fts").fetchall())
+        dedup = dict(con.execute("SELECT entity, rowid FROM facts_dedup").fetchall())
+        assert len(fts) == 3
+        assert fts == dedup
+    finally:
+        fact_index.close_writer(con)
+
+
+def test_rowid_identity_survives_delete_and_reinsert(tmp_path):
+    """SQLite recycles a b-tree rowid once it's freed. A delete/reinsert
+    cycle therefore reuses the rowid its own fts row just vacated -- which
+    is only safe because the two are deleted in lockstep. If a stale fts row
+    survived at that rowid, the reinsert would raise IntegrityError."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        triple = (":decision/x", ":description", "hello", "2026-01-01T00:00:00.000Z", None)
+        for _ in range(3):
+            fact_index.insert_facts(con, [triple])
+            con.commit()
+            fts = con.execute("SELECT rowid FROM facts_fts").fetchall()
+            dedup = con.execute("SELECT rowid FROM facts_dedup").fetchall()
+            assert len(fts) == 1
+            assert fts == dedup
+            fact_index.delete_facts(con, [triple])
+            con.commit()
+            assert con.execute("SELECT count(*) FROM facts_fts").fetchone() == (0,)
+            assert con.execute("SELECT count(*) FROM facts_dedup").fetchone() == (0,)
+    finally:
+        fact_index.close_writer(con)
+
+
+def test_delete_facts_removes_every_current_row_regardless_of_valid_from(tmp_path):
+    """insert_facts deliberately keeps the same (entity, attribute, value) at
+    two distinct valid_from values as two rows (see
+    test_insert_facts_keeps_distinct_valid_from_as_separate_rows), and
+    delete_facts is deliberately not scoped to a valid_from -- it doesn't
+    know which one the current row carries. So the rowid lookup must return
+    a list and clear all of them, not seek a single row."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        fact_index.insert_facts(
+            con, [(":tag/v1", ":name", "v1", "2026-01-01T00:00:00.000Z", None)])
+        fact_index.insert_facts(
+            con, [(":tag/v1", ":name", "v1", "2026-02-01T00:00:00.000Z", None)])
+        con.commit()
+        assert len(con.execute(
+            "SELECT * FROM facts_fts WHERE entity = ':tag/v1'").fetchall()) == 2
+
+        fact_index.delete_facts(con, [(":tag/v1", ":name", "v1", None, None)])
+        con.commit()
+        assert con.execute("SELECT * FROM facts_fts WHERE entity = ':tag/v1'").fetchall() == []
+        assert con.execute("SELECT * FROM facts_dedup WHERE entity = ':tag/v1'").fetchall() == []
+    finally:
+        fact_index.close_writer(con)
+
+
+def test_delete_facts_tolerates_an_orphan_dedup_row(tmp_path):
+    """Dedup-first insert ordering plus fts-first delete ordering means the
+    only inconsistency physically reachable is a dedup row whose fts row is
+    missing (an fts insert that failed after the dedup insert committed).
+    Deleting it must be a clean no-op on facts_fts and must still clear the
+    dedup row, so the rowid is freed rather than blocking a later reinsert."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        triple = (":decision/x", ":description", "hello", "2026-01-01T00:00:00.000Z", None)
+        fact_index.insert_facts(con, [triple])
+        con.commit()
+        con.execute("DELETE FROM facts_fts")
+        con.commit()
+
+        fact_index.delete_facts(con, [triple])
+        con.commit()
+        assert con.execute("SELECT count(*) FROM facts_dedup").fetchone() == (0,)
+
+        fact_index.insert_facts(con, [triple])
+        con.commit()
+        assert con.execute("SELECT count(*) FROM facts_fts").fetchone() == (1,)
+    finally:
+        fact_index.close_writer(con)
+
+
 def test_open_reader_sees_writer_commits(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
     writer = fact_index.open_writer(path)
