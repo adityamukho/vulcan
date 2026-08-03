@@ -124,6 +124,10 @@ inherent to concurrent forward+reverse ingestion, rather than anything this
 task's regression test is positioned to catch. Left as a decision for a
 human, not addressed further in this task.
 
+**Answered by the 20260803T095104Z entry below (#236):** the gap was neither
+Stage B's re-parse nor the interleaving overhead — it was the fact index's
+delete path. 65x → 20.3x.
+
 ## Ingestion Run — 20260803T095104Z
 
 - Repo: `/home/aditya/Work/AMC/Minigraf/temporal_reasoning` @ `master`
@@ -139,3 +143,47 @@ human, not addressed further in this task.
 | Fact-index size | 83906560 bytes |
 | Status-query latency (min/p50/p99/max) | 0.0ms / 0.0ms / 0.0ms / 0.2ms |
 | Graph-query latency (min/p50/p99/max) | 0.1ms / 17.5ms / 1000.3ms / 1154.5ms |
+
+This is the acceptance-gate run for issue #236 (fact-index delete by rowid;
+Task 4, see `.superpowers/sdd/2026-08-03-fact-index-delete-by-rowid/`). It is
+the direct answer to the open question the 20260802T082540Z entry above left
+for a human, and it closes it.
+
+- **Wall clock is 1,600.55s against the 78.87s forward-only baseline — 20.3x,
+  down from 65x.** Normalising for commit count (568 vs 498) it is 17.8x per
+  commit. Against the 5,133.19s pre-fix run on master it is 3.21x faster in
+  raw wall clock and 3.29x per commit (2.818 s/commit vs 9.282 s/commit),
+  while doing ~2.7% more work (master absorbed #233/PR #237 between the two
+  runs, growing 553 → 568 commits). The spec projected 1,500–1,700s and
+  "roughly 20x"; the measurement landed essentially at the band's midpoint,
+  with no adjustment to either the result or the expectation. Two further
+  instrumented runs of the same build corroborate it (1,622.50s and
+  1,558.61s — ±2% around ~1,594s, all three `status=complete`).
+- **The 65x gap was not Stage B's re-parse or two-stream interleaving.** The
+  prior entry named those as "most plausible" and it was wrong. The cost was
+  `fact_index.delete_facts` scanning the FTS5 table on every retracted
+  triple: **all `_retract` fell from 4,137.8s / 73.5% of wall clock to 32.7s
+  / 2.1%** (126x fewer aggregate seconds while making *more* calls — 88,917
+  vs 79,414), and the residual `fact_index.delete_facts` cost is 8.79s across
+  234,928 triples, 0.037 ms/triple.
+- **`_candidate_diff_purge_legacy`'s O(N²) is confirmed gone.** A same-harness
+  A/B (shipped rowid delete vs an in-process reimplementation of the pre-#236
+  equality DELETE) at 500 / 2,000 / 8,000 records: legacy 0.995 → 3.372 →
+  14.549 ms/record (14.6x growth across 16x N — super-linear), rowid 0.211 →
+  0.241 → 0.297 ms/record (1.4x — flat). The legacy leg reproduces master's
+  recorded 0.50 / 7.24 / 126.71s at 0.50 / 6.74 / 116.39s, so the harness is
+  recreating the original conditions rather than a different workload.
+- **The new dominant cost is graph reads, not writes.** `_db_execute`
+  `(query ...)` is **1,328,250 calls / 523.02s / 33.6% of the run**,
+  concentrated in `_correction_sweep_apply`'s inline `:introduced-by` /
+  `:modified-in` lookups (258,074 calls, 255.48s, 16.4%) and
+  `_entity_introduced_by_query` from `_reverse_apply` (464,377 calls,
+  215.44s, 13.8%) — the same structural mistake #236 fixed in a different
+  table, a per-item lookup issued in a loop where a set-at-a-time form
+  exists. **Now tracked as #239.** 28.3% of wall clock remains unattributed
+  (process-pool `_extract_commit`, orchestration, thread hops), which #233
+  measured at ~312s across both stages — ~20% here, still below 33.6%.
+
+The remaining 20.3x is therefore still above the design spec's "same order as
+the baseline" bar, but it is no longer an unexplained gap: it has a named,
+measured, filed successor (#239).
