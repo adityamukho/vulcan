@@ -123,3 +123,19 @@ plausibly Stage B's re-parse and the two-stream interleaving overhead
 inherent to concurrent forward+reverse ingestion, rather than anything this
 task's regression test is positioned to catch. Left as a decision for a
 human, not addressed further in this task.
+
+## Ingestion Run — 20260803T095104Z
+
+- Repo: `/home/aditya/Work/AMC/Minigraf/temporal_reasoning` @ `master`
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 568 |
+| Final status | complete |
+| Wall-clock | 1600.55s |
+| Throughput | 21.3 commits/min |
+| Peak RSS | 552432 KB |
+| Graph size | 188432384 bytes |
+| Fact-index size | 83906560 bytes |
+| Status-query latency (min/p50/p99/max) | 0.0ms / 0.0ms / 0.0ms / 0.2ms |
+| Graph-query latency (min/p50/p99/max) | 0.1ms / 17.5ms / 1000.3ms / 1154.5ms |
