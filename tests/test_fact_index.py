@@ -196,6 +196,109 @@ def test_open_writer_wipes_a_v2_file_and_stamps_current_version(tmp_path):
     assert fact_index.needs_backfill(path) is True
 
 
+def _open_writer_style_connection(path):
+    """A connection configured exactly the way open_writer configures its
+    own -- same PRAGMAs, same DEFAULT isolation_level -- but WITHOUT calling
+    ensure_schema, so a test can drive the schema functions by hand."""
+    con = sqlite3.connect(path, timeout=5.0)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA mmap_size=%d" % fact_index._MMAP_SIZE)
+    con.execute("PRAGMA busy_timeout=%d" % fact_index._BUSY_TIMEOUT_MS)
+    return con
+
+
+def test_migrate_schema_does_not_wipe_a_migration_a_racer_already_completed(tmp_path):
+    """#236 review: ensure_schema's version check is unlocked, and pysqlite
+    runs DROP/CREATE in autocommit, so two callers can both read the stale
+    version before either drops. The loser must not then wipe the winner's
+    completed work -- the concrete case is an ingestion thread that read '3'
+    being descheduled while _run_startup_backfill's rebuild_index finishes a
+    full rescan, then waking up and dropping it.
+
+    The interleave is simulated deterministically: con_b's stale read is
+    taken for real (it returns '3'), con_a then completes the migration and
+    a rebuild-like population, and only then does con_b proceed into the
+    branch its stale read selected -- which is exactly _migrate_schema, the
+    body of ensure_schema's mismatch branch. This exercises the re-read-
+    under-lock path, not the happy path: at the top of ensure_schema con_b
+    would now see '4' and never get here at all."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    _build_v3_index_file(path)
+
+    con_a = _open_writer_style_connection(path)
+    con_b = _open_writer_style_connection(path)
+    try:
+        # con_b's version check happens FIRST and genuinely reads the stale
+        # version -- this is the decision that sends it into the drop branch.
+        assert fact_index._stored_schema_version(con_b) == "3"
+
+        # con_a wins the race: it migrates, and then a rebuild completes and
+        # stamps 'backfilled' plus real rows -- the multi-minute work that
+        # must survive.
+        fact_index.ensure_schema(con_a)
+        fact_index.insert_facts(
+            con_a, [(":decision/rebuilt", ":description", "expensive", None, None)])
+        con_a.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('backfilled', '1')")
+        con_a.commit()
+
+        # con_b now acts on its stale read. The re-read under the write lock
+        # is the only thing standing between it and three DROP TABLEs.
+        fact_index._migrate_schema(con_b)
+
+        assert con_b.execute("SELECT entity FROM facts_fts").fetchall() == [
+            (":decision/rebuilt",)]
+        assert con_b.execute("SELECT count(*) FROM facts_dedup").fetchone() == (1,)
+        assert con_b.execute(
+            "SELECT value FROM index_meta WHERE key = 'backfilled'"
+        ).fetchone() == ("1",)
+        assert con_b.execute(
+            "SELECT value FROM index_meta WHERE key = 'schema_version'"
+        ).fetchone() == ("4",)
+        # The completed backfill is still recognized as complete.
+        assert fact_index.needs_backfill(path) is False
+
+        # And the branch is still live: against a file that really IS stale,
+        # the same call still wipes. (Without this the test above would pass
+        # for a _migrate_schema that had simply stopped dropping anything.)
+        con_b.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('schema_version', '3')")
+        con_b.commit()
+        fact_index._migrate_schema(con_b)
+        assert con_b.execute("SELECT count(*) FROM facts_fts").fetchone() == (0,)
+        assert con_b.execute(
+            "SELECT value FROM index_meta WHERE key = 'backfilled'"
+        ).fetchone() is None
+    finally:
+        con_a.close()
+        con_b.close()
+
+
+def test_migrate_schema_restores_the_connection_isolation_level(tmp_path):
+    """_migrate_schema forces isolation_level=None to keep its explicit
+    BEGIN IMMEDIATE clear of pysqlite's implicit transaction management. It
+    must hand the connection back unchanged: batched ingestion writes
+    (insert_facts/delete_facts never commit) depend on pysqlite opening an
+    implicit transaction that close_writer's commit() ends, and an autocommit
+    connection would silently commit each write on its own."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    _build_v3_index_file(path)
+    con = _open_writer_style_connection(path)
+    try:
+        default_isolation = con.isolation_level
+        fact_index.ensure_schema(con)  # takes the migration branch
+        assert con.isolation_level == default_isolation
+        # Behavioural proof, not just the attribute: an uncommitted write is
+        # still rollback-able, i.e. a real transaction is open.
+        fact_index.insert_facts(
+            con, [(":decision/x", ":description", "uncommitted", None, None)])
+        assert con.in_transaction is True
+        con.rollback()
+        assert con.execute("SELECT count(*) FROM facts_fts").fetchone() == (0,)
+    finally:
+        con.close()
+
+
 def test_needs_backfill_true_for_missing_file(tmp_path):
     path = str(tmp_path / "nonexistent.fts.sqlite3")
     assert fact_index.needs_backfill(path) is True

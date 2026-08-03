@@ -82,10 +82,99 @@ def _stored_schema_version(con: sqlite3.Connection) -> Optional[str]:
     return row[0] if row else None
 
 
+def _migrate_schema(con: sqlite3.Connection) -> None:
+    """Wipe and recreate all three tables for a schema_version mismatch,
+    atomically. Called by ensure_schema, and only when its unlocked read
+    said the file is stale.
+
+    Everything happens inside one BEGIN IMMEDIATE ... COMMIT, and the stored
+    version is re-read AFTER the write lock is held. That re-read is the
+    whole point: the version check ensure_schema made before calling here
+    was unlocked, so two callers can both have seen the old version. Under
+    pysqlite, DROP/CREATE run in autocommit (con.in_transaction stays False
+    -- only DML opens the implicit transaction), so without this the drops
+    would commit one at a time with nothing serializing them. The reachable
+    damage was not corruption but wasted work: mcp_server's _run_ingestion
+    and _run_startup_backfill start concurrently on the first run after an
+    upgrade, and an ingestion thread that read the old version before a
+    rebuild_index() completed would then drop the freshly-rebuilt tables,
+    discarding a multi-minute rescan (self-healing, since needs_backfill()
+    stays True -- but the repeat can land in the hook's 5s-bounded
+    subprocess, which is what the eager startup backfill of #147 exists to
+    keep it out of). With the re-read, the second racer sees the current
+    version, drops nothing, and its CREATE ... IF NOT EXISTS statements are
+    no-ops.
+
+    isolation_level is forced to None for the duration and restored
+    afterwards. rebuild_index's docstring documents the hazard this avoids:
+    mixing an explicit BEGIN IMMEDIATE with pysqlite's implicit transaction
+    management. Unlike rebuild_index -- which owns its connection and can
+    simply connect with isolation_level=None -- this function is handed
+    open_writer's connection, which must keep its DEFAULT isolation_level
+    once we return: insert_facts/delete_facts deliberately don't commit, and
+    batched ingestion writes rely on pysqlite opening an implicit
+    transaction for them that close_writer's commit() ends. Leaving the
+    connection in autocommit would silently turn every batched write into
+    its own transaction. Hence save/restore rather than a permanent change.
+    Safe because ensure_schema runs before any caller has issued DML on this
+    connection, so there is never a pending implicit transaction for the
+    isolation_level assignment to commit out from under.
+
+    No retry loop, unlike rebuild_index. That loop exists for a documented
+    SQLite quirk in which PRAGMA journal_mode=WAL alone does not honor
+    busy_timeout; BEGIN IMMEDIATE does honor it, so a racer here blocks for
+    up to _BUSY_TIMEOUT_MS and then proceeds rather than failing fast. The
+    journal_mode PRAGMA on this path is open_writer's, issued before this
+    function is reached and unchanged by #236. A genuine lock timeout that
+    does escape propagates out of open_writer, where the only production
+    caller that can race a long rebuild (_open_index_writer_safe) already
+    retries lock errors with exponential backoff and otherwise degrades to
+    per-triple index writes.
+    """
+    prior_isolation = con.isolation_level
+    con.isolation_level = None
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            if _stored_schema_version(con) != _SCHEMA_VERSION:
+                # A stale-version file must be emptied, not merely reshaped.
+                # The index is a derived cache, so this costs one rebuild and
+                # never data -- and dropping index_meta takes the 'backfilled'
+                # sentinel with it, so needs_backfill() stays True and the
+                # next caller that acts on it (handle_memory_prepare_turn, or
+                # _run_startup_backfill) repopulates from the graph's full
+                # history. A stale-version file thereby becomes exactly the
+                # already-working "index file missing" case. On a brand-new
+                # empty file these are no-ops.
+                con.execute("DROP TABLE IF EXISTS facts_fts")
+                con.execute("DROP TABLE IF EXISTS index_meta")
+                con.execute("DROP TABLE IF EXISTS facts_dedup")
+            con.execute(_SCHEMA_SQL)
+            con.execute(_META_SCHEMA_SQL)
+            con.execute(_DEDUP_SCHEMA_SQL)
+            con.execute(
+                "INSERT OR IGNORE INTO index_meta (key, value) VALUES ('schema_version', ?)",
+                (_SCHEMA_VERSION,),
+            )
+            con.execute("COMMIT")
+        except BaseException:
+            try:
+                con.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+    finally:
+        con.isolation_level = prior_isolation
+
+
 def ensure_schema(con: sqlite3.Connection) -> None:
-    """Create facts_fts and index_meta if they don't exist yet, and stamp
-    schema_version. Idempotent and safe under concurrent callers (IF NOT
-    EXISTS + busy_timeout serializes racers). Deliberately does NOT set the
+    """Create facts_fts, index_meta and facts_dedup if they don't exist yet,
+    and stamp schema_version. Idempotent and safe under concurrent callers:
+    the purely additive path below is CREATE ... IF NOT EXISTS plus INSERT OR
+    IGNORE, serialized by busy_timeout, while the destructive
+    version-mismatch path is delegated to _migrate_schema, which takes a
+    write lock and re-reads the stored version under it so a racer whose
+    unlocked read was stale drops nothing. Deliberately does NOT set the
     'backfilled' meta key -- only rebuild_index() does that, atomically,
     after a genuinely complete rescan. This is the whole fix for the
     write-races-ahead-of-read backfill bug: a file created by an incremental
@@ -99,8 +188,8 @@ def ensure_schema(con: sqlite3.Connection) -> None:
     statements instead (_SCHEMA_SQL, _META_SCHEMA_SQL).
 
     On a schema_version mismatch -- including a v1 file with no index_meta
-    at all -- all three tables are dropped and recreated empty before the
-    CREATE block below. This is what lets delete_facts trust that
+    at all -- all three tables are dropped and recreated empty, by
+    _migrate_schema. This is what lets delete_facts trust that
     facts_dedup.rowid IS facts_fts.rowid (#236): a v3 file's facts_fts
     rowids were auto-assigned and unrelated to its dedup rowids, so
     rowid-based deletes against one would remove unrelated rows.
@@ -112,17 +201,8 @@ def ensure_schema(con: sqlite3.Connection) -> None:
     some read happened to trigger a rebuild).
     """
     if _stored_schema_version(con) != _SCHEMA_VERSION:
-        # A stale-version file must be emptied, not merely reshaped. The
-        # index is a derived cache, so this costs one rebuild and never
-        # data -- and dropping index_meta takes the 'backfilled' sentinel
-        # with it, so needs_backfill() stays True and the next caller that
-        # acts on it (handle_memory_prepare_turn, or _run_startup_backfill)
-        # repopulates from the graph's full history. A stale-version file
-        # thereby becomes exactly the already-working "index file missing"
-        # case. On a brand-new empty file these are no-ops.
-        con.execute("DROP TABLE IF EXISTS facts_fts")
-        con.execute("DROP TABLE IF EXISTS index_meta")
-        con.execute("DROP TABLE IF EXISTS facts_dedup")
+        _migrate_schema(con)
+        return
     con.execute(_SCHEMA_SQL)
     con.execute(_META_SCHEMA_SQL)
     con.execute(_DEDUP_SCHEMA_SQL)
@@ -292,7 +372,14 @@ def delete_facts(
     the current row carries, and the same (entity, attribute, value) can hold
     several current rows at distinct valid_from values, all of which go. The
     valid_to = '' filter is the normalized-NULL sentinel insert_facts writes,
-    corresponding one-to-one with facts_fts's valid_to IS NULL.
+    corresponding one-to-one with facts_fts's valid_to IS NULL -- on the
+    precondition that no caller ever passes valid_to='' to insert_facts,
+    which would normalize to the same '' in dedup (looking current) while
+    landing in facts_fts as '' rather than NULL (not current). Every
+    production caller satisfies this: _transact (mcp_server.py) passes only
+    None or a real ISO timestamp, and _retract passes None, None. This is
+    documented as a precondition rather than enforced, since a runtime check
+    on the hot per-triple path would cost more than the unreachable case.
 
     facts_fts is deleted BEFORE facts_dedup, and the order is load-bearing. A
     failure between the two leaves an orphan dedup row: harmless, invisible
