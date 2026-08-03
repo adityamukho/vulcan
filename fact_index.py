@@ -40,7 +40,7 @@ _DEDUP_SCHEMA_SQL = (
     "valid_from TEXT NOT NULL, valid_to TEXT NOT NULL, "
     "UNIQUE(entity, attribute, value, valid_from, valid_to))"
 )
-_SCHEMA_VERSION = "3"
+_SCHEMA_VERSION = "4"
 
 
 def index_path_for(graph_path: str) -> str:
@@ -60,6 +60,21 @@ def _configure(con: sqlite3.Connection) -> None:
     con.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
 
 
+def _stored_schema_version(con: sqlite3.Connection) -> Optional[str]:
+    """Return the schema_version stamped in this index file, or None if
+    there isn't one readable -- a v1 file with no index_meta table at all,
+    a file whose index_meta exists but lacks the row, or anything that
+    raises. All three mean "not the current schema" to the only caller,
+    ensure_schema, which treats None exactly like a mismatched version."""
+    try:
+        row = con.execute(
+            "SELECT value FROM index_meta WHERE key = 'schema_version'"
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    return row[0] if row else None
+
+
 def ensure_schema(con: sqlite3.Connection) -> None:
     """Create facts_fts and index_meta if they don't exist yet, and stamp
     schema_version. Idempotent and safe under concurrent callers (IF NOT
@@ -76,18 +91,31 @@ def ensure_schema(con: sqlite3.Connection) -> None:
     retry loop exists to prevent. rebuild_index() inlines both schema
     statements instead (_SCHEMA_SQL, _META_SCHEMA_SQL).
 
-    Code-review note on #152's facts_dedup addition: against an existing v2
-    index file (pre-dating facts_dedup), this function creates facts_dedup
-    empty (IF NOT EXISTS) but does NOT bump schema_version (INSERT OR IGNORE
-    is a no-op once the key exists) and does NOT backfill facts_dedup from
-    facts_fts's existing rows. A write against such a file before its next
-    read-triggered rebuild_index() (see needs_backfill(), whose only caller
-    that acts on a True result is the read-path handle_memory_prepare_turn)
-    can therefore append one more duplicate for a key that was already
-    duplicated pre-fix -- bounded, not the original unbounded-growth bug,
-    and self-healing once a read path triggers a real rebuild, but not
-    something open_writer()/ensure_schema() close on their own.
+    On a schema_version mismatch -- including a v1 file with no index_meta
+    at all -- all three tables are dropped and recreated empty before the
+    CREATE block below. This is what lets delete_facts trust that
+    facts_dedup.rowid IS facts_fts.rowid (#236): a v3 file's facts_fts
+    rowids were auto-assigned and unrelated to its dedup rowids, so
+    rowid-based deletes against one would remove unrelated rows.
+    needs_backfill() already returned True for such a file, but only the
+    read path acts on that -- open_writer would otherwise write straight
+    into the stale file. Dropping here also supersedes the old #152 caveat
+    (a v2 file got facts_dedup created empty, never backfilled, with the
+    version never bumped, leaving the dedup guard under-protecting until
+    some read happened to trigger a rebuild).
     """
+    if _stored_schema_version(con) != _SCHEMA_VERSION:
+        # A stale-version file must be emptied, not merely reshaped. The
+        # index is a derived cache, so this costs one rebuild and never
+        # data -- and dropping index_meta takes the 'backfilled' sentinel
+        # with it, so needs_backfill() stays True and the next caller that
+        # acts on it (handle_memory_prepare_turn, or _run_startup_backfill)
+        # repopulates from the graph's full history. A stale-version file
+        # thereby becomes exactly the already-working "index file missing"
+        # case. On a brand-new empty file these are no-ops.
+        con.execute("DROP TABLE IF EXISTS facts_fts")
+        con.execute("DROP TABLE IF EXISTS index_meta")
+        con.execute("DROP TABLE IF EXISTS facts_dedup")
     con.execute(_SCHEMA_SQL)
     con.execute(_META_SCHEMA_SQL)
     con.execute(_DEDUP_SCHEMA_SQL)

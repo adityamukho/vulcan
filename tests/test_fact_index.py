@@ -51,13 +51,149 @@ def test_open_writer_stamps_schema_version_but_not_backfilled(tmp_path):
         version = con.execute(
             "SELECT value FROM index_meta WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("3",)
+        assert version == ("4",)
         backfilled = con.execute(
             "SELECT value FROM index_meta WHERE key = 'backfilled'"
         ).fetchone()
         assert backfilled is None
     finally:
         fact_index.close_writer(con)
+
+
+def _build_v3_index_file(path):
+    """Hand-build a schema-v3 file: the exact pre-#236 shape, including a
+    facts_fts row whose rowid was auto-assigned and therefore bears no
+    relation to its facts_dedup row's rowid. This is the file that would be
+    silently mis-deleted if v4 delete code ever ran against it."""
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE VIRTUAL TABLE facts_fts USING fts5(entity, attribute, value, "
+        "valid_from UNINDEXED, valid_to UNINDEXED, tokenize='unicode61')"
+    )
+    con.execute("CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute(
+        "CREATE TABLE facts_dedup ("
+        "entity TEXT NOT NULL, attribute TEXT NOT NULL, value TEXT NOT NULL, "
+        "valid_from TEXT NOT NULL, valid_to TEXT NOT NULL, "
+        "UNIQUE(entity, attribute, value, valid_from, valid_to))"
+    )
+    con.execute(
+        "INSERT INTO facts_fts (entity, attribute, value, valid_from, valid_to) "
+        "VALUES (':decision/old', ':description', 'stale', '2026-01-01T00:00:00.000Z', NULL)"
+    )
+    con.execute(
+        "INSERT INTO facts_dedup VALUES (':decision/old', ':description', 'stale', "
+        "'2026-01-01T00:00:00.000Z', '')"
+    )
+    con.execute("INSERT INTO index_meta (key, value) VALUES ('schema_version', '3')")
+    con.execute("INSERT INTO index_meta (key, value) VALUES ('backfilled', '1')")
+    con.commit()
+    con.close()
+
+
+def test_open_writer_wipes_a_stale_schema_version_file(tmp_path):
+    """#236: a v3 file's facts_fts rowids are auto-assigned and unrelated to
+    its facts_dedup rowids, so v4's rowid-based delete would remove wrong
+    rows. The version bump alone doesn't prevent that -- only the read path
+    acts on needs_backfill(), while open_writer would happily write to the
+    stale file. So ensure_schema must wipe it at writer-open time."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    _build_v3_index_file(path)
+    assert fact_index.needs_backfill(path) is True
+
+    con = fact_index.open_writer(path)
+    try:
+        assert con.execute("SELECT count(*) FROM facts_fts").fetchone() == (0,)
+        assert con.execute("SELECT count(*) FROM facts_dedup").fetchone() == (0,)
+        assert con.execute(
+            "SELECT value FROM index_meta WHERE key = 'schema_version'"
+        ).fetchone() == ("4",)
+        # The 'backfilled' sentinel went with index_meta, so a rebuild still
+        # follows -- the wipe must not look like a completed backfill.
+        assert con.execute(
+            "SELECT value FROM index_meta WHERE key = 'backfilled'"
+        ).fetchone() is None
+    finally:
+        fact_index.close_writer(con)
+    assert fact_index.needs_backfill(path) is True
+
+
+def test_open_writer_does_not_wipe_a_current_version_file(tmp_path):
+    """The wipe fires ONLY on a version mismatch. Every ingestion run after
+    the first reopens a current-version file and must keep its rows -- this
+    is the regression that would quietly destroy the index on every open."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con1 = fact_index.open_writer(path)
+    fact_index.insert_facts(con1, [(":decision/x", ":description", "hello", None, None)])
+    fact_index.close_writer(con1)
+
+    con2 = fact_index.open_writer(path)
+    try:
+        assert con2.execute("SELECT entity FROM facts_fts").fetchall() == [(":decision/x",)]
+    finally:
+        fact_index.close_writer(con2)
+
+
+def test_open_writer_wipes_a_v1_file_with_no_meta_table(tmp_path):
+    """A v1 file has a 3-column facts_fts and no index_meta at all. Reading
+    schema_version must not raise, and the drop must actually replace the
+    old table -- CREATE ... IF NOT EXISTS alone would leave the 3-column
+    shape in place, and every later insert would fail on column count."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE VIRTUAL TABLE facts_fts USING fts5(entity, attribute, value, "
+        "tokenize='unicode61')"
+    )
+    con.execute("INSERT INTO facts_fts VALUES (':decision/old', ':description', 'stale')")
+    con.commit()
+    con.close()
+
+    writer = fact_index.open_writer(path)
+    try:
+        cols = [r[1] for r in writer.execute("PRAGMA table_info(facts_fts)").fetchall()]
+        assert cols == ["entity", "attribute", "value", "valid_from", "valid_to"]
+        assert writer.execute("SELECT count(*) FROM facts_fts").fetchone() == (0,)
+        assert writer.execute(
+            "SELECT value FROM index_meta WHERE key = 'schema_version'"
+        ).fetchone() == ("4",)
+        # And the wiped file is immediately usable, not just well-shaped.
+        fact_index.insert_facts(
+            writer, [(":decision/new", ":description", "fresh", None, None)])
+        writer.commit()
+        assert writer.execute("SELECT entity FROM facts_fts").fetchall() == [(":decision/new",)]
+    finally:
+        fact_index.close_writer(writer)
+
+
+def test_open_writer_wipes_a_v2_file_and_stamps_current_version(tmp_path):
+    """A v2 file (backfilled, no facts_dedup). Before #236, ensure_schema
+    created facts_dedup empty here but left schema_version at '2' and left
+    'backfilled'='1' standing -- the gap ensure_schema's own docstring
+    documented. The wipe closes it."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE VIRTUAL TABLE facts_fts USING fts5(entity, attribute, value, "
+        "valid_from UNINDEXED, valid_to UNINDEXED, tokenize='unicode61')"
+    )
+    con.execute("CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute("INSERT INTO index_meta (key, value) VALUES ('schema_version', '2')")
+    con.execute("INSERT INTO index_meta (key, value) VALUES ('backfilled', '1')")
+    con.commit()
+    con.close()
+
+    writer = fact_index.open_writer(path)
+    try:
+        assert writer.execute(
+            "SELECT value FROM index_meta WHERE key = 'schema_version'"
+        ).fetchone() == ("4",)
+        assert writer.execute(
+            "SELECT value FROM index_meta WHERE key = 'backfilled'"
+        ).fetchone() is None
+    finally:
+        fact_index.close_writer(writer)
+    assert fact_index.needs_backfill(path) is True
 
 
 def test_needs_backfill_true_for_missing_file(tmp_path):
