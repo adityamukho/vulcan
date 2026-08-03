@@ -1,0 +1,23 @@
+{
+  "repo_path": "/home/aditya/Work/AMC/Minigraf/temporal_reasoning",
+  "branch": "master",
+  "commits_ingested": 568,
+  "wall_clock_seconds": 1600.5542564030038,
+  "throughput_per_minute": 21.292624016751226,
+  "peak_rss_kb": 552432,
+  "graph_size_bytes": 188432384,
+  "index_size_bytes": 83906560,
+  "status_latency": {
+    "min": 4.124944098293781e-06,
+    "p50": 6.992020644247532e-06,
+    "p99": 3.1554955057799816e-05,
+    "max": 0.0002492159837856889
+  },
+  "query_latency": {
+    "min": 5.479389801621437e-05,
+    "p50": 0.017531177029013634,
+    "p99": 1.00025147292763,
+    "max": 1.1544714610790834
+  },
+  "final_status": "complete"
+}
