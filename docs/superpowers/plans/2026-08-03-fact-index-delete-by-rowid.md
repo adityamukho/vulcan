@@ -740,7 +740,7 @@ Body must reference `#236` without a closing keyword (see Global Constraints) if
 
 ## Notes for the implementer
 
-**The one thing that can go badly wrong here** is the rowid identity silently not holding — a delete would then remove an unrelated fact from the index, and nothing would fail loudly. `test_insert_facts_assigns_dedup_rowid_as_fts_rowid` and `test_rowid_identity_survives_delete_and_reinsert` are the guards. Because they pass before the change as well as after (see File Structure), they are easy to mistake for redundant and delete during review. They are not: they are the only thing standing between a future edit and silent index corruption.
+**The one thing that can go badly wrong here** is the rowid identity silently not holding — a delete would then remove an unrelated fact from the index, and nothing would fail loudly. Code review corrected this section's original claim about which tests guard that. The four tests of Step 1 pin the identity but *not* the construction: in every scenario they build, both tables share the same `max(rowid)`, so auto-assignment and explicit assignment produce identical rowids and all four pass on either insert form (verified by reverting `insert_facts` and re-running them). The guard is `test_rowid_identity_holds_after_dedup_runs_ahead_of_fts`, which first desynchronises the two tables' rowid counters with an orphan dedup row and only then asserts the identity and a correct retract; it is the one test that fails on the auto-assigned form. Keep all five, but do not mistake the four for the discriminator.
 
 **Mechanics already verified** (do not re-derive; they were spiked before the spec was written):
 

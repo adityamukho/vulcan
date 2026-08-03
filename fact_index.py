@@ -277,11 +277,13 @@ def delete_facts(
     (#236). The obvious equality DELETE against facts_fts costs O(index size)
     per triple: FTS5 maintains a full-text index, not a B-tree over column
     values, so `WHERE entity = ?` cannot seek and scans the whole table.
-    Measured at an 80,000-row index, that was 11.088 ms per deleted triple
-    against 0.0127 ms for the rowid form, and it was 73.5% of a full at-scale
-    ingestion's wall clock. Batching does not help -- the cost follows facts,
-    not calls -- which is why this stayed a per-triple loop rather than one
-    big executemany.
+    At an 80,000-row index the spec measured 11.088 ms per deleted triple
+    against 0.0127 ms for the rowid form -- 73.5% of a full at-scale
+    ingestion's wall clock. Those absolutes are one machine's snapshot and
+    drift between runs (the landing run read 13.7531 vs 0.0134); the durable
+    claim is the shape, legacy linear in index size and the rowid form flat.
+    Batching does not help -- the cost follows facts, not calls -- which is
+    why this stayed a per-triple loop rather than one big executemany.
 
     The lookup is a seek on the (entity, attribute, value) prefix of
     facts_dedup's UNIQUE(entity, attribute, value, valid_from, valid_to)

@@ -600,6 +600,51 @@ def test_delete_facts_tolerates_an_orphan_dedup_row(tmp_path):
         fact_index.close_writer(con)
 
 
+def test_rowid_identity_holds_after_dedup_runs_ahead_of_fts(tmp_path):
+    """The discriminating test for #236's explicit rowid assignment.
+
+    The four tests above pin the identity but NOT the construction: in every
+    scenario they build, facts_fts and facts_dedup share the same
+    max(rowid), so the pre-#236 auto-assigned insert produces exactly the
+    same rowids as the explicit one and they pass either way (verified by
+    reverting insert_facts and re-running them -- all four still passed).
+    This test is the one that actually fails on the auto-assigned form.
+
+    It works by first making the two tables' rowid counters diverge: an
+    orphan dedup row whose fts insert failed after the dedup row committed,
+    which delete_facts' docstring identifies as the one inconsistency that
+    is physically reachable. From then on auto-assignment is off by one, so
+    a retract seeks the correct dedup rowid and deletes the WRONG fts row --
+    the silent index corruption this whole task exists to prevent. Do not
+    "simplify" this back into the coincidence case the others cover.
+    """
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        fact_index.insert_facts(con, [(":d/A", ":description", "a", None, None)])
+        con.execute(
+            "INSERT INTO facts_dedup (entity, attribute, value, valid_from, valid_to) "
+            "VALUES (':d/orphan', ':description', 'orphan', '', '')"
+        )
+        fact_index.insert_facts(con, [
+            (":d/C", ":description", "c", None, None),
+            (":d/D", ":description", "d", None, None),
+        ])
+        con.commit()
+
+        fts = dict(con.execute("SELECT entity, rowid FROM facts_fts").fetchall())
+        dedup = dict(con.execute("SELECT entity, rowid FROM facts_dedup").fetchall())
+        assert fts == {e: r for e, r in dedup.items() if e != ":d/orphan"}
+
+        fact_index.delete_facts(con, [(":d/C", ":description", "c", None, None)])
+        con.commit()
+        assert sorted(
+            row[0] for row in con.execute("SELECT entity FROM facts_fts")
+        ) == [":d/A", ":d/D"]
+    finally:
+        fact_index.close_writer(con)
+
+
 def test_open_reader_sees_writer_commits(tmp_path):
     path = str(tmp_path / "t.fts.sqlite3")
     writer = fact_index.open_writer(path)
