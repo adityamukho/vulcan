@@ -6503,6 +6503,72 @@ class TestEntityIntroducedBySetProvisional:
         assert mcp_server._lineage_is_provisional(db, entity_ident) is False
 
 
+class TestEntityIntroducedByValuesQuery:
+    """#235: an entity can hold two live :introduced-by facts. The
+    single-value query silently returned the first of them, so the
+    ambiguity was invisible; the all-values query is what the correction
+    sweep's repair path needs to collapse it."""
+
+    def test_values_query_returns_empty_for_unknown_entity(self, real_db):
+        import mcp_server
+        assert mcp_server._entity_introduced_by_values_query(real_db, ":function/nope") == []
+
+    def test_values_query_returns_single_value(self, real_db):
+        import mcp_server
+        entity_ident = ":function/src-auth-py-login"
+        mcp_server._transact(
+            real_db, f"[[{entity_ident} :introduced-by :commit/h0]]", "2026-01-01T00:00:00Z",
+        )
+        assert mcp_server._entity_introduced_by_values_query(real_db, entity_ident) == [":commit/h0"]
+
+    def test_values_query_returns_both_values_of_a_corrupted_entity(self, real_db):
+        import mcp_server
+        entity_ident = ":function/src-auth-py-login"
+        mcp_server._transact(
+            real_db, f"[[{entity_ident} :introduced-by :commit/h0]]", "2026-01-01T00:00:00Z",
+        )
+        mcp_server._transact(
+            real_db, f"[[{entity_ident} :introduced-by :commit/h5]]", "2026-01-05T00:00:00Z",
+        )
+        assert sorted(
+            mcp_server._entity_introduced_by_values_query(real_db, entity_ident)
+        ) == [":commit/h0", ":commit/h5"]
+
+    def test_single_value_query_warns_on_ambiguity_and_still_returns_a_value(
+        self, real_db, capsys,
+    ):
+        """Must NOT raise: both walks call this mid-run, before Stage B,
+        so raising would hard-fail ingestion on the very graphs the
+        sweep's repair exists to heal."""
+        import mcp_server
+        entity_ident = ":function/src-auth-py-login"
+        mcp_server._transact(
+            real_db, f"[[{entity_ident} :introduced-by :commit/h0]]", "2026-01-01T00:00:00Z",
+        )
+        mcp_server._transact(
+            real_db, f"[[{entity_ident} :introduced-by :commit/h5]]", "2026-01-05T00:00:00Z",
+        )
+        capsys.readouterr()  # discard anything the seeding wrote
+
+        result = mcp_server._entity_introduced_by_query(real_db, entity_ident)
+
+        assert result in (":commit/h0", ":commit/h5")
+        err = capsys.readouterr().err
+        assert entity_ident in err
+        assert ":commit/h0" in err and ":commit/h5" in err
+
+    def test_single_value_query_is_silent_for_one_value(self, real_db, capsys):
+        import mcp_server
+        entity_ident = ":function/src-auth-py-login"
+        mcp_server._transact(
+            real_db, f"[[{entity_ident} :introduced-by :commit/h0]]", "2026-01-01T00:00:00Z",
+        )
+        capsys.readouterr()
+
+        assert mcp_server._entity_introduced_by_query(real_db, entity_ident) == ":commit/h0"
+        assert "introduced-by" not in capsys.readouterr().err
+
+
 class TestEntityIntroducedBySetProvisionalBatch:
     """#233: _reverse_apply's two loops were the only production callers of
     the per-ident function, at one retract + one transact each -- 8,618

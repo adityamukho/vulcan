@@ -5375,12 +5375,42 @@ def _candidate_diff_purge_legacy(db: Any, index_con: Optional[Any] = None) -> in
     return len(rows)
 
 
+def _entity_introduced_by_values_query(db: Any, entity_ident: str) -> List[str]:
+    """Every live :introduced-by value for entity_ident, in the backend's
+    unspecified order; [] if it has none.
+
+    A list rather than a single value because an entity CAN hold more than
+    one (#235): the forward walk used to mint a second alongside the reverse
+    stream's provisional guess. _correction_sweep_apply's repair path needs
+    to see all of them to collapse them.
+    """
+    raw = _db_execute(db, f"(query [:find ?c :where [{entity_ident} :introduced-by ?c]])")
+    return [row[0] for row in json.loads(raw).get("results", [])]
+
+
 def _entity_introduced_by_query(db: Any, entity_ident: str) -> Optional[str]:
     """Return entity_ident's current :introduced-by value (a commit ident
-    string), or None if it has none yet."""
-    raw = _db_execute(db, f"(query [:find ?c :where [{entity_ident} :introduced-by ?c]])")
-    results = json.loads(raw).get("results", [])
-    return results[0][0] if results else None
+    string), or None if it has none yet.
+
+    An entity holding two values is corrupt (#235). Which of them is
+    returned here is UNSPECIFIED -- the backend imposes no ordering -- so
+    this warns and returns an arbitrary one rather than pretending the
+    graph is well-formed. It deliberately does NOT raise: both walks call
+    this during a run, long before Stage B's repair pass, so raising would
+    hard-fail ingestion on exactly the graphs that repair exists to heal.
+    Position-based selection of the survivor lives in
+    _correction_sweep_apply, which has the linearization positions this
+    function does not.
+    """
+    values = _entity_introduced_by_values_query(db, entity_ident)
+    if len(values) > 1:
+        print(
+            f"[_entity_introduced_by] {entity_ident} has {len(values)} live "
+            f":introduced-by values {sorted(values)} -- returning an arbitrary "
+            "one (#235); the correction sweep repairs this",
+            file=sys.stderr,
+        )
+    return values[0] if values else None
 
 
 def _entity_introduced_by_set_provisional_batch(
