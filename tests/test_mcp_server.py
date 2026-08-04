@@ -16215,6 +16215,113 @@ class TestCorrectionSweepApply:
             ident = mcp_server._code_ident("function", "wide.py", f"f{i}")
             assert mcp_server._lineage_is_provisional(real_db, ident) is False
 
+    def _pos_map(self, repo):
+        import mcp_server, frontier_registry
+        linearization = frontier_registry.build_linearization(str(repo))
+        return {f":commit/{h[:12]}": i for i, h in enumerate(linearization)}, linearization
+
+    def test_repair_keeps_the_lowest_position_introduced_by(self, real_db, tmp_path):
+        """#235: an entity carrying two live :introduced-by values is
+        collapsed to the one at the LOWEST linearization position. The
+        reverse stream's guess is a sighting at or above the true
+        introduction -- the same direction its own monotonicity rule
+        encodes -- so the earlier value is the introduction."""
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        pos_map, linearization = self._pos_map(repo)
+        h0, h2 = f":commit/{linearization[0][:12]}", f":commit/{linearization[2][:12]}"
+
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {h2}]]", "2026-01-03T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {h0}]]", "2026-01-01T00:00:00Z")
+        assert len(mcp_server._entity_introduced_by_values_query(real_db, fn_ident)) == 2
+
+        # The sweep meets the entity at h1 -- NEITHER of its two values.
+        # That is the real shape: the second mint happens in the forward
+        # region, which Stage B never sweeps, so a rule keyed on "is this
+        # commit one of the values" would never fire.
+        h1_hash, h1_ts = linearization[1], "2026-01-02T00:00:00Z"
+        mcp_server._correction_sweep_apply(
+            real_db, h1_hash, h1_ts, self._extract(repo, h1_hash),
+            pos_by_commit_ident=pos_map,
+        )
+
+        assert mcp_server._entity_introduced_by_values_query(real_db, fn_ident) == [h0]
+
+    def test_repair_is_inert_without_a_position_map(self, real_db, tmp_path):
+        """Gated: every existing caller and test keeps today's fail-safe
+        behaviour until it opts in."""
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        _pos_map, linearization = self._pos_map(repo)
+        h0, h2 = f":commit/{linearization[0][:12]}", f":commit/{linearization[2][:12]}"
+
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {h2}]]", "2026-01-03T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {h0}]]", "2026-01-01T00:00:00Z")
+
+        h1_hash = linearization[1]
+        mcp_server._correction_sweep_apply(
+            real_db, h1_hash, "2026-01-02T00:00:00Z", self._extract(repo, h1_hash),
+        )
+
+        assert sorted(mcp_server._entity_introduced_by_values_query(real_db, fn_ident)) == sorted([h0, h2])
+
+    def test_repair_sorts_an_unknown_commit_ident_last(self, real_db, tmp_path):
+        """A value absent from the map must never be chosen over a known
+        one, and must never raise."""
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        pos_map, linearization = self._pos_map(repo)
+        h0 = f":commit/{linearization[0][:12]}"
+
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by :commit/deadbeef0000]]", "2026-01-03T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {h0}]]", "2026-01-01T00:00:00Z")
+
+        h1_hash = linearization[1]
+        mcp_server._correction_sweep_apply(
+            real_db, h1_hash, "2026-01-02T00:00:00Z", self._extract(repo, h1_hash),
+            pos_by_commit_ident=pos_map,
+        )
+
+        assert mcp_server._entity_introduced_by_values_query(real_db, fn_ident) == [h0]
+
+    def test_repair_then_case_one_confirms_in_the_same_call(self, real_db, tmp_path):
+        """Repair collapses multiplicity only. If the survivor equals the
+        commit being swept and the entity is still provisional, case 1 runs
+        on the repaired value and confirms it -- without repair it would
+        have hit case 2's fail-safe skip."""
+        import mcp_server, frontier_registry
+        repo = self._repo_with_evolving_function(tmp_path)
+        pos_map, linearization = self._pos_map(repo)
+        h0, h2 = f":commit/{linearization[0][:12]}", f":commit/{linearization[2][:12]}"
+
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        # The module is a candidate at h0 too. Seed it authoritative at h0 so
+        # the returned skipped count speaks only about fn_ident: an unseeded
+        # module has zero :introduced-by values and takes case 3's ambiguous
+        # skip, which would mask whether repair-then-confirm skipped anything.
+        mcp_server._transact(
+            real_db,
+            f"[[{mcp_server._code_ident('module', 'auth.py')} :introduced-by {h0}]]",
+            "2026-01-01T00:00:00Z",
+        )
+        # Provisional at h0 (marker created), then a stray second value at h2.
+        mcp_server._entity_introduced_by_set_provisional(real_db, fn_ident, h0, "2026-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {h2}]]", "2026-01-03T00:00:00Z")
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+
+        h0_hash = linearization[0]
+        skipped = mcp_server._correction_sweep_apply(
+            real_db, h0_hash, "2026-01-01T00:00:00Z", self._extract(repo, h0_hash),
+            pos_by_commit_ident=pos_map,
+        )
+
+        assert mcp_server._entity_introduced_by_values_query(real_db, fn_ident) == [h0]
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+        assert skipped == 0, "repaired then confirmed -- nothing left provisional"
+
 
 class TestCorrectionSweepClaimAndProcess:
     def _init_repo(self, repo):
@@ -17741,14 +17848,121 @@ class TestNoDuplicateIntroducedByAfterFullIngest:
             )
         finally:
             db = None
+        rows = json.loads(raw)["results"]
+        # Non-vacuity floor: `ambiguous == []` also holds over an EMPTY result
+        # set, so an ingest that emitted no :introduced-by facts at all would
+        # pass this oracle silently. The fixture guarantees at least the five
+        # stay_* functions plus one born_* per commit, each introduced once.
+        assert len(rows) >= 5 + self.N_COMMITS, (
+            f"only {len(rows)} entities carry :introduced-by; expected at least "
+            f"{5 + self.N_COMMITS} (5 stay_* + {self.N_COMMITS} born_*) -- the "
+            "ambiguity assertion below would pass vacuously"
+        )
         ambiguous = sorted(
-            (row[0], row[1]) for row in json.loads(raw)["results"] if row[1] > 1
+            (row[0], row[1]) for row in rows if row[1] > 1
         )
         assert ambiguous == [], f"entities with multiple :introduced-by: {ambiguous}"
 
         err = capsys.readouterr().err
         assert "left provisional" not in err, err
         assert "left unreconciled" not in err, err
+
+    async def _ingest_interrupted(self, repo, graph_path, monkeypatch, stop_after):
+        """Ingest at the 1:1 default but request shutdown from inside the
+        stop_after'th _forward_apply, so Stage A stops with the reverse
+        stream's claims persisted and Stage B never reached. Same helper
+        TestMultiStreamParityWithForwardOnly uses; _run_ingestion clears
+        _shutdown_requested itself, so the resuming run needs no cleanup."""
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
+        mcp_server._db = None
+        self._reset_progress()
+
+        real_forward = mcp_server._forward_apply
+        calls = {"n": 0}
+
+        def stopping_forward(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == stop_after:
+                mcp_server._shutdown_requested.set()
+            return real_forward(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", stopping_forward)
+        try:
+            await mcp_server._run_ingestion(str(repo), "master")
+        finally:
+            monkeypatch.setattr(mcp_server, "_forward_apply", real_forward)
+        assert mcp_server._ingest_progress["status"] == "stopped", mcp_server._ingest_progress
+        mcp_server._db = None
+
+    @pytest.mark.asyncio
+    async def test_a_pre_corrupted_graph_is_repaired_by_the_next_ingest(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        """Fix-forward alone leaves graphs already in the field broken.
+        Corrupt an entity by hand, then let a run reach Stage B: the sweep
+        must collapse it to the lower-position value.
+
+        The corruption is injected after an INTERRUPTED Stage A rather than
+        after a completed ingest, and that is forced, not a preference. A
+        completed run drives the sweep watermark
+        (:ingestion/correction-sweep-through) all the way to frontier-high's
+        :hi-hash -- measured: position 13 of 13 on this 14-commit fixture --
+        so on a second _run_ingestion over the same history
+        _correction_sweep_select_position hits its `pos > ceiling_pos` guard,
+        returns None on its first call, and _correction_sweep_apply is never
+        invoked at all. Stopping inside Stage A instead leaves the watermark
+        unset with the reverse region already claimed, so the resuming run
+        actually sweeps.
+
+        stay_0 is the target because it is authoritative and single-valued at
+        the interruption point, its true introduction is position 0, and it
+        is a candidate in every commit the sweep visits."""
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph_path = tmp_path / "memory.graph"
+
+        await self._ingest_interrupted(repo, graph_path, monkeypatch, stop_after=4)
+
+        import frontier_registry
+        linearization = frontier_registry.build_linearization(str(repo))
+        fn_ident = mcp_server._code_ident("function", "mod.py", "stay_0")
+        late = f":commit/{linearization[-1][:12]}"
+
+        db = MiniGrafDb.open(str(graph_path))
+        try:
+            before = mcp_server._entity_introduced_by_values_query(db, fn_ident)
+            assert before == [f":commit/{linearization[0][:12]}"], before
+            assert mcp_server._correction_sweep_through_query(db) is None, (
+                "Stage B must not have run yet, or the resuming run has nothing to sweep"
+            )
+            mcp_server._transact(db, f"[[{fn_ident} :introduced-by {late}]]", "2026-01-09T00:00:00Z")
+            assert len(mcp_server._entity_introduced_by_values_query(db, fn_ident)) == 2
+        finally:
+            db = None
+        mcp_server._db = None
+        capsys.readouterr()  # drop the interrupted run's output
+
+        # Resume. Stage A completes, then Stage B sweeps and repairs.
+        self._reset_progress()
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+        mcp_server._db = None
+        err = capsys.readouterr().err
+
+        db = MiniGrafDb.open(str(graph_path))
+        try:
+            after = mcp_server._entity_introduced_by_values_query(db, fn_ident)
+        finally:
+            db = None
+        assert after == before, f"repair must keep the original value; got {after}"
+        # ...and it must be the SWEEP that repaired it, not some other reader
+        # incidentally collapsing the pair. This is the assertion that makes
+        # the test about Stage B.
+        assert f"[_correction_sweep] repaired {fn_ident}: kept {before[0]}" in err, err
 
 
 class TestMultiStreamParityWithForwardOnly:

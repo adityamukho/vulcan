@@ -8910,6 +8910,7 @@ def _correction_sweep_apply(
     index_con: Optional[Any] = None,
     skipped_so_far: int = 0,
     update_watermark: bool = True,
+    pos_by_commit_ident: Optional[Dict[str, int]] = None,
 ) -> int:
     """Reconciles every candidate entity file_results describes for
     commit_hash, then records progress via _correction_sweep_through_update
@@ -8947,6 +8948,30 @@ def _correction_sweep_apply(
 
     Never calls _frontier_persist_claim -- frontier-low is not touched by
     this sweep.
+
+    pos_by_commit_ident (#235) enables the repair of graphs that already
+    carry two live :introduced-by facts for one entity -- corruption an
+    earlier version of _forward_apply created and which nothing converges,
+    since every later reader sees one value, retracts it, and asserts a
+    fresh one. When supplied, an ident holding 2+ values is collapsed to
+    the one at the LOWEST linearization position before the case 1/2/3
+    branching below runs; the survivor is then handled exactly as a
+    single-valued entity would be. Repair collapses multiplicity only, it
+    never confirms.
+
+    Earliest-by-position is the right survivor because the reverse stream's
+    guess is a sighting at or above the true introduction --
+    _entity_introduced_by_set_provisional_batch's monotonicity rule already
+    encodes that direction -- while the spurious second mint landed at the
+    true introduction itself.
+
+    Positions are required rather than derivable from arrival order: the
+    second mint happens in the FORWARD region, which this sweep never
+    visits, so it meets these entities at commits that are neither of their
+    two values. A value absent from the map sorts last, so an unrecognised
+    commit ident can never win and can never raise. Left None (the default)
+    the repair is inert and every caller keeps the pre-#235 fail-safe.
+    Best-effort: an entity this sweep never visits is not repaired.
 
     update_watermark=False suppresses BOTH the trailing
     _correction_sweep_through_update and the _db_checkpoint that follows it,
@@ -8996,8 +9021,28 @@ def _correction_sweep_apply(
         # file's confirms are one call.
         to_confirm: List[str] = []
         for ident in candidate_idents:
-            raw = _db_execute(db, f"(query [:find ?c :where [{ident} :introduced-by ?c]])")
-            introduced_by_values = {row[0] for row in json.loads(raw).get("results", [])}
+            introduced_by_values = set(_entity_introduced_by_values_query(db, ident))
+
+            # #235 repair: collapse a corrupted multi-valued entity BEFORE the
+            # case branching below, so cases 1/2/3 always see a well-formed
+            # entity and need no multi-value handling of their own.
+            if pos_by_commit_ident is not None and len(introduced_by_values) > 1:
+                survivor = min(
+                    sorted(introduced_by_values),
+                    key=lambda c: pos_by_commit_ident.get(c, len(pos_by_commit_ident)),
+                )
+                doomed = sorted(introduced_by_values - {survivor})
+                _retract(
+                    db,
+                    "[" + " ".join(f"[{ident} :introduced-by {c}]" for c in doomed) + "]",
+                    index_con=index_con,
+                )
+                print(
+                    f"[_correction_sweep] repaired {ident}: kept {survivor}, "
+                    f"retracted {doomed} (#235)",
+                    file=sys.stderr,
+                )
+                introduced_by_values = {survivor}
 
             if _lineage_is_provisional(db, ident):
                 if introduced_by_values == {commit_ident}:
@@ -9083,6 +9128,7 @@ def _correction_sweep_claim_and_process(
     index_con: Optional[Any] = None,
     hash_to_pos: Optional[Dict[str, int]] = None,
     skipped_so_far: int = 0,
+    pos_by_commit_ident: Optional[Dict[str, int]] = None,
 ) -> Optional[Tuple[str, int]]:
     """Synchronous convenience wrapper composing
     _correction_sweep_select_position, _extract_commit, and
@@ -9109,6 +9155,7 @@ def _correction_sweep_claim_and_process(
     skipped_events = _correction_sweep_apply(
         db, commit_hash, commit_ts_iso, file_results,
         index_con=index_con, skipped_so_far=skipped_so_far,
+        pos_by_commit_ident=pos_by_commit_ident,
     )
     return commit_hash, skipped_events
 
@@ -9580,6 +9627,14 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 if completed_all:
                     _ingest_progress["phase"] = "sweeping"
                     hash_to_pos = {h: i for i, h in enumerate(linearization)}
+                    # #235: the sweep's repair path needs linearization
+                    # positions to pick which of a corrupted entity's
+                    # :introduced-by values survives. Same construction
+                    # _reverse_apply uses.
+                    sweep_pos_by_commit_ident = {
+                        f":commit/{h[:12]}": i
+                        for i, (h, _t, _a, _s) in enumerate(commit_metadata)
+                    }
                     skipped = 0
                     db = await _ensure_db_async()
                     try:
@@ -9604,7 +9659,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 skipped += await loop.run_in_executor(
                                     write_executor, _correction_sweep_apply,
                                     db, sweep_hash, sweep_ts, sweep_files, index_con, skipped,
-                                    False,
+                                    False, sweep_pos_by_commit_ident,
                                 )
                                 # Apply the lifecycle facts the reverse stream
                                 # skipped entirely (D/R closes, renames,
