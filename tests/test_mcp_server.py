@@ -39,13 +39,20 @@ def reset_mcp_server_db():
     gives each test an isolated graph path, and fact_index.index_path_for()
     derives the sidecar index path from it, so each test's index file lives
     in its own fresh temp directory with no cross-test state to leak.
+
+    _entity_introduced_by_query's stderr budget (#235) IS module-level and
+    does need resetting: production resets it once per ingestion run, and
+    without the equivalent here a test that exhausts it would silently
+    suppress the warnings a later test asserts on.
     """
     import mcp_server
     mcp_server._db = None
     mcp_server._grammar_cache.clear()
+    mcp_server._reset_introduced_by_ambiguity_log_budget()
     yield
     mcp_server._db = None
     mcp_server._grammar_cache.clear()
+    mcp_server._reset_introduced_by_ambiguity_log_budget()
 
 
 @pytest.fixture
@@ -6503,6 +6510,142 @@ class TestEntityIntroducedBySetProvisional:
         assert mcp_server._lineage_is_provisional(db, entity_ident) is False
 
 
+class TestEntityIntroducedByValuesQuery:
+    """#235: an entity can hold two live :introduced-by facts. The
+    single-value query silently returned the first of them, so the
+    ambiguity was invisible; the all-values query is what the correction
+    sweep's repair path needs to collapse it."""
+
+    def test_values_query_returns_empty_for_unknown_entity(self, real_db):
+        import mcp_server
+        assert mcp_server._entity_introduced_by_values_query(real_db, ":function/nope") == []
+
+    def test_values_query_returns_single_value(self, real_db):
+        import mcp_server
+        entity_ident = ":function/src-auth-py-login"
+        mcp_server._transact(
+            real_db, f"[[{entity_ident} :introduced-by :commit/h0]]", "2026-01-01T00:00:00Z",
+        )
+        assert mcp_server._entity_introduced_by_values_query(real_db, entity_ident) == [":commit/h0"]
+
+    def test_values_query_returns_both_values_of_a_corrupted_entity(self, real_db):
+        import mcp_server
+        entity_ident = ":function/src-auth-py-login"
+        mcp_server._transact(
+            real_db, f"[[{entity_ident} :introduced-by :commit/h0]]", "2026-01-01T00:00:00Z",
+        )
+        mcp_server._transact(
+            real_db, f"[[{entity_ident} :introduced-by :commit/h5]]", "2026-01-05T00:00:00Z",
+        )
+        assert sorted(
+            mcp_server._entity_introduced_by_values_query(real_db, entity_ident)
+        ) == [":commit/h0", ":commit/h5"]
+
+    def test_single_value_query_warns_on_ambiguity_and_still_returns_a_value(
+        self, real_db, capsys,
+    ):
+        """Must NOT raise: both walks call this mid-run, before Stage B,
+        so raising would hard-fail ingestion on the very graphs the
+        sweep's repair exists to heal."""
+        import mcp_server
+        entity_ident = ":function/src-auth-py-login"
+        mcp_server._transact(
+            real_db, f"[[{entity_ident} :introduced-by :commit/h0]]", "2026-01-01T00:00:00Z",
+        )
+        mcp_server._transact(
+            real_db, f"[[{entity_ident} :introduced-by :commit/h5]]", "2026-01-05T00:00:00Z",
+        )
+        capsys.readouterr()  # discard anything the seeding wrote
+
+        result = mcp_server._entity_introduced_by_query(real_db, entity_ident)
+
+        assert result in (":commit/h0", ":commit/h5")
+        err = capsys.readouterr().err
+        assert entity_ident in err
+        assert ":commit/h0" in err and ":commit/h5" in err
+
+    def test_single_value_query_is_silent_for_one_value(self, real_db, capsys):
+        import mcp_server
+        entity_ident = ":function/src-auth-py-login"
+        mcp_server._transact(
+            real_db, f"[[{entity_ident} :introduced-by :commit/h0]]", "2026-01-01T00:00:00Z",
+        )
+        capsys.readouterr()
+
+        assert mcp_server._entity_introduced_by_query(real_db, entity_ident) == ":commit/h0"
+        assert "introduced-by" not in capsys.readouterr().err
+
+    def _corrupt(self, db, n):
+        import mcp_server
+        idents = [f":function/ambiguous-{i}" for i in range(n)]
+        for ident in idents:
+            mcp_server._transact(db, f"[[{ident} :introduced-by :commit/h0]]", "2026-01-01T00:00:00Z")
+            mcp_server._transact(db, f"[[{ident} :introduced-by :commit/h5]]", "2026-01-05T00:00:00Z")
+        return idents
+
+    def test_ambiguity_warning_is_rate_capped_but_the_value_is_not(self, real_db, capsys):
+        """#235: _reverse_apply calls this up to 3x per ident per commit, so
+        on a corrupted at-scale graph an uncapped warning buries the rest of
+        the ingest log long before the repair pass can run. Only stderr is
+        capped -- every call must still return a value."""
+        import mcp_server
+        n = mcp_server._INTRODUCED_BY_AMBIGUITY_LOG_CAP + 5
+        idents = self._corrupt(real_db, n)
+        capsys.readouterr()
+
+        results = [mcp_server._entity_introduced_by_query(real_db, i) for i in idents]
+
+        assert all(r in (":commit/h0", ":commit/h5") for r in results), (
+            "the cap must never change what is returned"
+        )
+        err = capsys.readouterr().err
+        warned = [line for line in err.splitlines() if "ambiguous-" in line]
+        assert len(warned) == mcp_server._INTRODUCED_BY_AMBIGUITY_LOG_CAP
+        assert "further ambiguity warnings suppressed" in err
+
+    def test_budget_is_restored_per_run_not_burned_forever(self, real_db, capsys):
+        """The sweep's cap resets per run because its budget is a
+        caller-threaded local. This one is a module global (no caller here
+        carries a running total), so the reset is explicit -- _run_ingestion
+        calls it at the top of every run. Without that, a long-lived server
+        would log nothing after its first corrupted ingest."""
+        import mcp_server
+        idents = self._corrupt(real_db, mcp_server._INTRODUCED_BY_AMBIGUITY_LOG_CAP + 3)
+        for ident in idents:
+            mcp_server._entity_introduced_by_query(real_db, ident)
+        capsys.readouterr()
+
+        # Exhausted: a further call says nothing.
+        mcp_server._entity_introduced_by_query(real_db, idents[0])
+        assert "ambiguous-" not in capsys.readouterr().err
+
+        mcp_server._reset_introduced_by_ambiguity_log_budget()
+        mcp_server._entity_introduced_by_query(real_db, idents[0])
+        assert "ambiguous-0" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_run_ingestion_resets_the_budget(self, tmp_path, monkeypatch):
+        """The reset must be wired into the run, not merely available."""
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "a.py").write_text("def f(): pass\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h0"], cwd=repo, check=True, capture_output=True)
+
+        mcp_server._introduced_by_ambiguity_logged = 10**6
+        await mcp_server._run_ingestion(str(repo), "master")
+        mcp_server._db = None
+
+        assert mcp_server._introduced_by_ambiguity_logged < 10**6, (
+            "_run_ingestion must reset the per-run stderr budget"
+        )
+
+
 class TestEntityIntroducedBySetProvisionalBatch:
     """#233: _reverse_apply's two loops were the only production callers of
     the per-ident function, at one retract + one transact each -- 8,618
@@ -9298,15 +9441,25 @@ class TestPreloadProvisionalIdents:
         assert mcp_server._preload_provisional_idents(real_db) == {":code/fn-b"}
         assert mcp_server._lineage_is_provisional(real_db, ":code/fn-a") is False
 
-    def test_load_ingestion_preload_state_returns_it_last(self, real_db, tmp_path):
+    def test_load_ingestion_preload_state_does_not_preload_it(self, real_db, tmp_path):
+        """#235: the ingestion preload deliberately does NOT carry a
+        provisional-ident snapshot. _forward_apply asks
+        _lineage_is_provisional per ident instead, so a snapshot here would
+        be write-only state inviting a future prefilter -- exactly the shape
+        that minted a second :introduced-by. The function itself survives for
+        whole-graph assertions, which is what the tests above cover."""
         import mcp_server
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
         mcp_server._lineage_mark_provisional(real_db, ":code/fn-a", "2026-01-01T00:00:00Z")
+        assert mcp_server._preload_provisional_idents(real_db) == {":code/fn-a"}
+
         result = mcp_server._load_ingestion_preload_state(str(repo))
-        assert len(result) == 13
-        assert result[-1] == {":code/fn-a"}
+        assert len(result) == 12
+        assert {":code/fn-a"} not in result
+        assert not any(isinstance(element, set) and ":code/fn-a" in element
+                       for element in result)
 
 
 class TestIngestTransactFactIndex:
@@ -16149,6 +16302,123 @@ class TestCorrectionSweepApply:
             ident = mcp_server._code_ident("function", "wide.py", f"f{i}")
             assert mcp_server._lineage_is_provisional(real_db, ident) is False
 
+    def _pos_map(self, repo):
+        import mcp_server, frontier_registry
+        linearization = frontier_registry.build_linearization(str(repo))
+        return {f":commit/{h[:12]}": i for i, h in enumerate(linearization)}, linearization
+
+    def test_repair_keeps_the_lowest_position_introduced_by(self, real_db, tmp_path):
+        """#235: an entity carrying two live :introduced-by values is
+        collapsed to the one at the LOWEST linearization position. The
+        reverse stream's guess is a sighting at or above the true
+        introduction -- the same direction its own monotonicity rule
+        encodes -- so the earlier value is the introduction."""
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        pos_map, linearization = self._pos_map(repo)
+        h0, h2 = f":commit/{linearization[0][:12]}", f":commit/{linearization[2][:12]}"
+
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {h2}]]", "2026-01-03T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {h0}]]", "2026-01-01T00:00:00Z")
+        assert len(mcp_server._entity_introduced_by_values_query(real_db, fn_ident)) == 2
+
+        # The sweep meets the entity at h1 -- NEITHER of its two values.
+        # That is the real shape: the second mint happens in the forward
+        # region, which Stage B never sweeps, so a rule keyed on "is this
+        # commit one of the values" would never fire.
+        h1_hash, h1_ts = linearization[1], "2026-01-02T00:00:00Z"
+        mcp_server._correction_sweep_apply(
+            real_db, h1_hash, h1_ts, self._extract(repo, h1_hash),
+            pos_by_commit_ident=pos_map,
+        )
+
+        assert mcp_server._entity_introduced_by_values_query(real_db, fn_ident) == [h0]
+
+    def test_repair_is_inert_without_a_position_map(self, real_db, tmp_path):
+        """Gated: every existing caller and test keeps today's fail-safe
+        behaviour until it opts in. An EMPTY map is gated out too -- with no
+        positions to compare, every value scores the same len(map)==0
+        default and the collapse would degenerate to "lexicographically
+        smallest ident wins", contradicting "absent sorts last"."""
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        _pos_map, linearization = self._pos_map(repo)
+        h0, h2 = f":commit/{linearization[0][:12]}", f":commit/{linearization[2][:12]}"
+
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {h2}]]", "2026-01-03T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {h0}]]", "2026-01-01T00:00:00Z")
+
+        h1_hash = linearization[1]
+        mcp_server._correction_sweep_apply(
+            real_db, h1_hash, "2026-01-02T00:00:00Z", self._extract(repo, h1_hash),
+        )
+
+        assert sorted(mcp_server._entity_introduced_by_values_query(real_db, fn_ident)) == sorted([h0, h2])
+
+        mcp_server._correction_sweep_apply(
+            real_db, h1_hash, "2026-01-02T00:00:00Z", self._extract(repo, h1_hash),
+            pos_by_commit_ident={},
+        )
+
+        assert sorted(mcp_server._entity_introduced_by_values_query(real_db, fn_ident)) == sorted([h0, h2])
+
+    def test_repair_sorts_an_unknown_commit_ident_last(self, real_db, tmp_path):
+        """A value absent from the map must never be chosen over a known
+        one, and must never raise."""
+        import mcp_server
+        repo = self._repo_with_evolving_function(tmp_path)
+        pos_map, linearization = self._pos_map(repo)
+        h0 = f":commit/{linearization[0][:12]}"
+
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by :commit/deadbeef0000]]", "2026-01-03T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {h0}]]", "2026-01-01T00:00:00Z")
+
+        h1_hash = linearization[1]
+        mcp_server._correction_sweep_apply(
+            real_db, h1_hash, "2026-01-02T00:00:00Z", self._extract(repo, h1_hash),
+            pos_by_commit_ident=pos_map,
+        )
+
+        assert mcp_server._entity_introduced_by_values_query(real_db, fn_ident) == [h0]
+
+    def test_repair_then_case_one_confirms_in_the_same_call(self, real_db, tmp_path):
+        """Repair collapses multiplicity only. If the survivor equals the
+        commit being swept and the entity is still provisional, case 1 runs
+        on the repaired value and confirms it -- without repair it would
+        have hit case 2's fail-safe skip."""
+        import mcp_server, frontier_registry
+        repo = self._repo_with_evolving_function(tmp_path)
+        pos_map, linearization = self._pos_map(repo)
+        h0, h2 = f":commit/{linearization[0][:12]}", f":commit/{linearization[2][:12]}"
+
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        # The module is a candidate at h0 too. Seed it authoritative at h0 so
+        # the returned skipped count speaks only about fn_ident: an unseeded
+        # module has zero :introduced-by values and takes case 3's ambiguous
+        # skip, which would mask whether repair-then-confirm skipped anything.
+        mcp_server._transact(
+            real_db,
+            f"[[{mcp_server._code_ident('module', 'auth.py')} :introduced-by {h0}]]",
+            "2026-01-01T00:00:00Z",
+        )
+        # Provisional at h0 (marker created), then a stray second value at h2.
+        mcp_server._entity_introduced_by_set_provisional(real_db, fn_ident, h0, "2026-01-01T00:00:00Z")
+        mcp_server._transact(real_db, f"[[{fn_ident} :introduced-by {h2}]]", "2026-01-03T00:00:00Z")
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+
+        h0_hash = linearization[0]
+        skipped = mcp_server._correction_sweep_apply(
+            real_db, h0_hash, "2026-01-01T00:00:00Z", self._extract(repo, h0_hash),
+            pos_by_commit_ident=pos_map,
+        )
+
+        assert mcp_server._entity_introduced_by_values_query(real_db, fn_ident) == [h0]
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+        assert skipped == 0, "repaired then confirmed -- nothing left provisional"
+
 
 class TestCorrectionSweepClaimAndProcess:
     def _init_repo(self, repo):
@@ -16324,6 +16594,48 @@ class TestCorrectionSweepWalk:
         assert commits_processed == 3
         assert skipped_events == 0
         assert mcp_server._correction_sweep_through_query(real_db) == linearization[-1]
+
+    def _repo_with_one_evolving_file(self, tmp_path, n):
+        """n commits all touching a.py, so its entities are candidates at
+        every swept commit -- _repo_with_n_commits gives each commit its own
+        file, which the sweep only ever sees once."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        self._init_repo(repo)
+        for i in range(n):
+            self._commit(repo, "a.py", f"def login():\n    return {i}\n", f"h{i}")
+        return repo
+
+    def test_walk_arms_the_two_value_repair(self, real_db, tmp_path):
+        """#235: _correction_sweep_apply's repair is inert unless a caller
+        supplies pos_by_commit_ident, and _correction_sweep_walk is the
+        driving loop that has commit_metadata in scope. If it does not build
+        and pass the map, an entity holding two live :introduced-by values
+        is merely logged as ambiguous and survives the whole sweep."""
+        import mcp_server
+        repo = self._repo_with_one_evolving_file(tmp_path, 3)
+        linearization, commit_metadata = self._linearization_and_metadata(repo)
+        self._close_gap_at(repo, real_db, linearization, commit_metadata, split_pos=1)
+
+        fn_ident = mcp_server._code_ident("function", "a.py", "login")
+        h0 = f":commit/{linearization[0][:12]}"
+        h2 = f":commit/{linearization[2][:12]}"
+        # Force exactly the corruption the old _forward_apply produced: a
+        # second live value alongside whatever the reverse stream recorded.
+        for value in (h0, h2):
+            if value not in mcp_server._entity_introduced_by_values_query(real_db, fn_ident):
+                mcp_server._transact(
+                    real_db, f"[[{fn_ident} :introduced-by {value}]]", "2026-01-01T00:00:00Z",
+                )
+        before = mcp_server._entity_introduced_by_values_query(real_db, fn_ident)
+        assert len(before) >= 2, f"fixture must start corrupt; got {before}"
+
+        mcp_server._correction_sweep_walk(real_db, str(repo), linearization, commit_metadata)
+
+        after = mcp_server._entity_introduced_by_values_query(real_db, fn_ident)
+        assert after == [h0], (
+            f"the walk must collapse to the lowest-position value; got {sorted(after)}"
+        )
 
     def test_returns_zero_zero_when_gap_still_open(self, real_db, tmp_path):
         import mcp_server
@@ -16616,7 +16928,11 @@ class TestForwardApplyReconcilesProvisional:
             file_deps={}, dep_valid_from={}, pinned_commit_state={},
             field_class_ident={}, field_static_ident={}, submodule_paths={},
             unresolved_dep_idents={},
-            provisional_idents=mcp_server._preload_provisional_idents(real_db),
+            # #235: no provisional-ident snapshot is threaded at all -- the
+            # walk asks _lineage_is_provisional per ident. An earlier revision
+            # of this test seeded one from _preload_provisional_idents AFTER
+            # the reverse stream ran, which no real fresh run ever has, and
+            # that hid the second-mint bug entirely.
             ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
         )
         extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
@@ -16648,21 +16964,23 @@ class TestForwardApplyReconcilesProvisional:
         assert module_values == {f":commit/{linearization[0][:12]}"}, "exactly one, naming h0"
         assert mcp_server._lineage_is_provisional(real_db, module_ident) is False
 
-    def test_forward_apply_does_not_duplicate_for_a_stale_provisional_snapshot_entry(
+    def test_forward_apply_does_not_duplicate_for_an_already_confirmed_entity(
         self, real_db, tmp_path,
     ):
-        """FIX 1 regression (#222 phase 2d Task 5 review): state.provisional_idents
-        is a preload SNAPSHOT, not the authority. If something else (e.g. the
-        correction sweep) already confirmed an entity authoritative in the DB
-        after the snapshot was taken, the snapshot can still list it as
-        provisional. The forward walk must consult the DB
-        (_lineage_is_provisional) before treating the ident as reconcilable --
-        popping it out of entity_valid_from unconditionally would make
-        _build_code_triples mint a SECOND :introduced-by on top of the
-        existing authoritative one, while _forward_reconcile_provisional
-        (itself DB-backed) no-ops on an already-confirmed entity and never
-        retracts the duplicate. Without the fix this yields two
-        :introduced-by values; with it, exactly one survives."""
+        """FIX 1 regression (#222 phase 2d Task 5 review, kept live by #235):
+        an entity the reverse stream introduced provisionally and something
+        else (e.g. the correction sweep) has since confirmed authoritative
+        must NOT be treated as reconcilable. Popping it out of
+        entity_valid_from unconditionally would make _build_code_triples mint
+        a SECOND :introduced-by on top of the existing authoritative one,
+        while _forward_reconcile_provisional (itself DB-backed) no-ops on an
+        already-confirmed entity and never retracts the duplicate. Without
+        the per-ident _lineage_is_provisional check this yields two
+        :introduced-by values; with it, exactly one survives.
+
+        This is the stale-POSITIVE half of the argument in _forward_apply's
+        reconciliation comment: it is why the DB check cannot simply be
+        dropped in favour of any set, snapshot or otherwise."""
         import mcp_server, frontier_registry
         repo = self._repo(tmp_path)
         linearization = frontier_registry.build_linearization(str(repo))
@@ -16676,14 +16994,9 @@ class TestForwardApplyReconcilesProvisional:
         fn_ident = mcp_server._code_ident("function", "auth.py", "login")
         assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
 
-        # Take the preload snapshot while the entity is still genuinely
-        # provisional...
-        provisional_snapshot = mcp_server._preload_provisional_idents(real_db)
-        assert fn_ident in provisional_snapshot
-
-        # ...then simulate something else confirming it authoritative in the
-        # DB afterward (the snapshot is now stale for this ident, though the
-        # existing :introduced-by fact itself is untouched).
+        # Simulate something else confirming it authoritative in the DB
+        # before the forward walk arrives (the existing :introduced-by fact
+        # itself is untouched by that confirmation).
         mcp_server._lineage_confirm(real_db, fn_ident)
         assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
         existing_raw = mcp_server._db_execute(
@@ -16701,7 +17014,6 @@ class TestForwardApplyReconcilesProvisional:
             file_deps={}, dep_valid_from={}, pinned_commit_state={},
             field_class_ident={}, field_static_ident={}, submodule_paths={},
             unresolved_dep_idents={},
-            provisional_idents=provisional_snapshot,  # stale: still lists fn_ident
             ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
         )
         extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
@@ -16714,18 +17026,65 @@ class TestForwardApplyReconcilesProvisional:
         )
         values = {row[0] for row in json.loads(raw)["results"]}
         assert values == {f":commit/{linearization[1][:12]}"}, (
-            "exactly one :introduced-by must survive -- a stale snapshot "
-            "entry must not cause a second one to be minted"
+            "exactly one :introduced-by must survive -- an already-confirmed "
+            "entity must not have a second one minted on top of it"
         )
-        # The stale entry must be evicted, or it would be retried (and fail
-        # the same way) on every later commit that touches this entity.
-        assert fn_ident not in state.provisional_idents
+
+    def test_reconciles_a_guess_made_during_this_same_run(self, real_db, tmp_path):
+        """#235: the prefilter was a run-start snapshot, empty on a fresh
+        ingest. Stream 2's guesses are written during that same run, so the
+        prefilter dropped every one of them before the DB-authoritative
+        _lineage_is_provisional check could see it -- and
+        _build_code_triples then minted a SECOND :introduced-by alongside
+        the guess. The DB must be the sole authority."""
+        import mcp_server, frontier_registry
+        repo = self._repo(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        # The graph the forward walk starts against, exactly as _run_ingestion
+        # sees it: nothing is provisional yet.
+        assert mcp_server._preload_provisional_idents(real_db) == set(), (
+            "a fresh graph has no provisional idents yet"
+        )
+
+        # Only now does Stream 2 claim h1 and guess.
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={}, entity_descriptions={}, file_entities={},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
+        )
+        extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
+        mcp_server._forward_apply(real_db, str(repo), state, commit_metadata[0], extracted)
+
+        values = mcp_server._entity_introduced_by_values_query(real_db, fn_ident)
+        assert values == [f":commit/{linearization[0][:12]}"], (
+            f"exactly one :introduced-by, naming h0; got {sorted(values)}"
+        )
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
 
     def test_resumed_run_variant_is_not_suppressed_by_entity_valid_from(self, real_db, tmp_path):
         """The silent failure mode: on a RESUMED run, Stream 2's structural
         facts are already in the preloaded entity_valid_from, so
         _build_code_triples would suppress the introduction entirely and the
-        wrong provisional guess would survive forever."""
+        wrong provisional guess would survive forever.
+
+        #235: this used to have a sibling
+        (test_without_provisional_idents_the_resumed_case_still_reconciles)
+        that ran the identical setup with an EMPTY provisional-ident
+        snapshot, to prove the snapshot was not the gate. With the snapshot
+        deleted outright the two are the same test, so only this one
+        remains -- the outcome asserted below is now reachable by no other
+        input than the DB's own answer."""
         import mcp_server, frontier_registry
         repo = self._repo(tmp_path)
         linearization = frontier_registry.build_linearization(str(repo))
@@ -16744,7 +17103,6 @@ class TestForwardApplyReconcilesProvisional:
             file_deps={}, dep_valid_from={}, pinned_commit_state={},
             field_class_ident={}, field_static_ident={}, submodule_paths={},
             unresolved_dep_idents={},
-            provisional_idents={fn_ident},
             ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
         )
         extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
@@ -16757,35 +17115,6 @@ class TestForwardApplyReconcilesProvisional:
         )
         assert {row[0] for row in json.loads(raw)["results"]} == {f":commit/{linearization[0][:12]}"}
         assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
-
-    def test_without_provisional_idents_the_resumed_case_regresses(self, real_db, tmp_path):
-        """Pins that provisional_idents is actually consulted: with it empty,
-        the resumed-run case leaves the wrong guess in place. This is the
-        direct regression test for the silent failure mode."""
-        import mcp_server, frontier_registry
-        repo = self._repo(tmp_path)
-        linearization = frontier_registry.build_linearization(str(repo))
-        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
-        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
-        mcp_server._reverse_fill_claim_and_process(
-            real_db, str(repo), linearization, commit_metadata, allocator,
-        )
-        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
-        state = mcp_server._ForwardWalkState(
-            entity_valid_from={fn_ident: "2026-06-01T00:00:00Z"},
-            entity_descriptions={fn_ident: "login"}, file_entities={"auth.py": [fn_ident]},
-            file_deps={}, dep_valid_from={}, pinned_commit_state={},
-            field_class_ident={}, field_static_ident={}, submodule_paths={},
-            unresolved_dep_idents={},
-            provisional_idents=set(),   # the bug
-            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
-        )
-        extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
-        mcp_server._forward_apply(
-            real_db, str(repo), state, commit_metadata[0], extracted,
-        )
-        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
-        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{linearization[1][:12]}"
 
 
 class TestRoundRobinClaimer:
@@ -17512,6 +17841,195 @@ class TestStageBRepairsLifecycleFacts:
             assert len(subjects) == len(set(subjects)), \
                 f"duplicate live {attr} facts after the lifecycle pass: " \
                 f"{sorted(r for r in rows if subjects.count(r[0]) > 1)}"
+
+
+class TestNoDuplicateIntroducedByAfterFullIngest:
+    """#235's reproduction, as a standing oracle.
+
+    A full converging ingest -- both streams plus Stage B -- must leave no
+    entity holding two live :introduced-by facts. On master this yields six
+    such entities on a 14-commit history, and the pair never converges: every
+    later reader sees only one value, retracts that one, and asserts a fresh
+    one, so the corruption regenerates rather than healing.
+
+    The fixture matters. `born_N` functions accumulate one per commit, so
+    each is introduced at a different position and the reverse stream's
+    guesses land above the forward walk's true introductions; the five
+    long-lived functions are edited every commit so they stay candidates all
+    the way down. That combination is what produces same-run provisional
+    guesses for entities the forward walk later reaches.
+    """
+
+    N_COMMITS = 14
+
+    def _reset_progress(self):
+        import mcp_server
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        }
+
+    def _repo(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "master"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(self.N_COMMITS):
+            body = "".join(
+                f"def stay_{k}():\n    return {i}\n\n" for k in range(5)
+            ) + "".join(
+                f"def born_{b}():\n    return {b}\n\n" for b in range(i + 1)
+            )
+            (repo / "mod.py").write_text(body)
+            ts = f"2021-03-{i + 1:02d}T00:00:00Z"
+            env = {**os.environ, "GIT_AUTHOR_DATE": ts, "GIT_COMMITTER_DATE": ts}
+            _subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(
+                ["git", "commit", "-m", f"c{i}"], cwd=repo, check=True,
+                capture_output=True, env=env,
+            )
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_full_ingest_leaves_no_entity_with_two_introduced_by(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph_path = tmp_path / "memory.graph"
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
+        mcp_server._db = None
+        self._reset_progress()
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+        mcp_server._db = None  # release the file lock before reopening
+
+        db = MiniGrafDb.open(str(graph_path))
+        try:
+            raw = mcp_server._db_execute(
+                db, "(query [:find ?e (count ?c) :where [?e :introduced-by ?c]])",
+            )
+        finally:
+            db = None
+        rows = json.loads(raw)["results"]
+        # Non-vacuity floor: `ambiguous == []` also holds over an EMPTY result
+        # set, so an ingest that emitted no :introduced-by facts at all would
+        # pass this oracle silently. The fixture guarantees at least the five
+        # stay_* functions plus one born_* per commit, each introduced once.
+        assert len(rows) >= 5 + self.N_COMMITS, (
+            f"only {len(rows)} entities carry :introduced-by; expected at least "
+            f"{5 + self.N_COMMITS} (5 stay_* + {self.N_COMMITS} born_*) -- the "
+            "ambiguity assertion below would pass vacuously"
+        )
+        ambiguous = sorted(
+            (row[0], row[1]) for row in rows if row[1] > 1
+        )
+        assert ambiguous == [], f"entities with multiple :introduced-by: {ambiguous}"
+
+        err = capsys.readouterr().err
+        assert "left provisional" not in err, err
+        assert "left unreconciled" not in err, err
+
+    async def _ingest_interrupted(self, repo, graph_path, monkeypatch, stop_after):
+        """Ingest at the 1:1 default but request shutdown from inside the
+        stop_after'th _forward_apply, so Stage A stops with the reverse
+        stream's claims persisted and Stage B never reached. Same helper
+        TestMultiStreamParityWithForwardOnly uses; _run_ingestion clears
+        _shutdown_requested itself, so the resuming run needs no cleanup."""
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
+        mcp_server._db = None
+        self._reset_progress()
+
+        real_forward = mcp_server._forward_apply
+        calls = {"n": 0}
+
+        def stopping_forward(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == stop_after:
+                mcp_server._shutdown_requested.set()
+            return real_forward(*args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", stopping_forward)
+        try:
+            await mcp_server._run_ingestion(str(repo), "master")
+        finally:
+            monkeypatch.setattr(mcp_server, "_forward_apply", real_forward)
+        assert mcp_server._ingest_progress["status"] == "stopped", mcp_server._ingest_progress
+        mcp_server._db = None
+
+    @pytest.mark.asyncio
+    async def test_a_pre_corrupted_graph_is_repaired_by_the_next_ingest(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        """Fix-forward alone leaves graphs already in the field broken.
+        Corrupt an entity by hand, then let a run reach Stage B: the sweep
+        must collapse it to the lower-position value.
+
+        The corruption is injected after an INTERRUPTED Stage A rather than
+        after a completed ingest, and that is forced, not a preference. A
+        completed run drives the sweep watermark
+        (:ingestion/correction-sweep-through) all the way to frontier-high's
+        :hi-hash -- measured: position 13 of 13 on this 14-commit fixture --
+        so on a second _run_ingestion over the same history
+        _correction_sweep_select_position hits its `pos > ceiling_pos` guard,
+        returns None on its first call, and _correction_sweep_apply is never
+        invoked at all. Stopping inside Stage A instead leaves the watermark
+        unset with the reverse region already claimed, so the resuming run
+        actually sweeps.
+
+        stay_0 is the target because it is authoritative and single-valued at
+        the interruption point, its true introduction is position 0, and it
+        is a candidate in every commit the sweep visits."""
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph_path = tmp_path / "memory.graph"
+
+        await self._ingest_interrupted(repo, graph_path, monkeypatch, stop_after=4)
+
+        import frontier_registry
+        linearization = frontier_registry.build_linearization(str(repo))
+        fn_ident = mcp_server._code_ident("function", "mod.py", "stay_0")
+        late = f":commit/{linearization[-1][:12]}"
+
+        db = MiniGrafDb.open(str(graph_path))
+        try:
+            before = mcp_server._entity_introduced_by_values_query(db, fn_ident)
+            assert before == [f":commit/{linearization[0][:12]}"], before
+            assert mcp_server._correction_sweep_through_query(db) is None, (
+                "Stage B must not have run yet, or the resuming run has nothing to sweep"
+            )
+            mcp_server._transact(db, f"[[{fn_ident} :introduced-by {late}]]", "2026-01-09T00:00:00Z")
+            assert len(mcp_server._entity_introduced_by_values_query(db, fn_ident)) == 2
+        finally:
+            db = None
+        mcp_server._db = None
+        capsys.readouterr()  # drop the interrupted run's output
+
+        # Resume. Stage A completes, then Stage B sweeps and repairs.
+        self._reset_progress()
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+        mcp_server._db = None
+        err = capsys.readouterr().err
+
+        db = MiniGrafDb.open(str(graph_path))
+        try:
+            after = mcp_server._entity_introduced_by_values_query(db, fn_ident)
+        finally:
+            db = None
+        assert after == before, f"repair must keep the original value; got {after}"
+        # ...and it must be the SWEEP that repaired it, not some other reader
+        # incidentally collapsing the pair. This is the assertion that makes
+        # the test about Stage B.
+        assert f"[_correction_sweep] repaired {fn_ident}: kept {before[0]}" in err, err
 
 
 class TestMultiStreamParityWithForwardOnly:
