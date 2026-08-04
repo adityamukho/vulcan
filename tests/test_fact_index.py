@@ -51,13 +51,252 @@ def test_open_writer_stamps_schema_version_but_not_backfilled(tmp_path):
         version = con.execute(
             "SELECT value FROM index_meta WHERE key = 'schema_version'"
         ).fetchone()
-        assert version == ("3",)
+        assert version == ("4",)
         backfilled = con.execute(
             "SELECT value FROM index_meta WHERE key = 'backfilled'"
         ).fetchone()
         assert backfilled is None
     finally:
         fact_index.close_writer(con)
+
+
+def _build_v3_index_file(path):
+    """Hand-build a schema-v3 file: the exact pre-#236 shape, including a
+    facts_fts row whose rowid was auto-assigned and therefore bears no
+    relation to its facts_dedup row's rowid. This is the file that would be
+    silently mis-deleted if v4 delete code ever ran against it."""
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE VIRTUAL TABLE facts_fts USING fts5(entity, attribute, value, "
+        "valid_from UNINDEXED, valid_to UNINDEXED, tokenize='unicode61')"
+    )
+    con.execute("CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute(
+        "CREATE TABLE facts_dedup ("
+        "entity TEXT NOT NULL, attribute TEXT NOT NULL, value TEXT NOT NULL, "
+        "valid_from TEXT NOT NULL, valid_to TEXT NOT NULL, "
+        "UNIQUE(entity, attribute, value, valid_from, valid_to))"
+    )
+    con.execute(
+        "INSERT INTO facts_fts (entity, attribute, value, valid_from, valid_to) "
+        "VALUES (':decision/old', ':description', 'stale', '2026-01-01T00:00:00.000Z', NULL)"
+    )
+    con.execute(
+        "INSERT INTO facts_dedup VALUES (':decision/old', ':description', 'stale', "
+        "'2026-01-01T00:00:00.000Z', '')"
+    )
+    con.execute("INSERT INTO index_meta (key, value) VALUES ('schema_version', '3')")
+    con.execute("INSERT INTO index_meta (key, value) VALUES ('backfilled', '1')")
+    con.commit()
+    con.close()
+
+
+def test_open_writer_wipes_a_stale_schema_version_file(tmp_path):
+    """#236: a v3 file's facts_fts rowids are auto-assigned and unrelated to
+    its facts_dedup rowids, so v4's rowid-based delete would remove wrong
+    rows. The version bump alone doesn't prevent that -- only the read path
+    acts on needs_backfill(), while open_writer would happily write to the
+    stale file. So ensure_schema must wipe it at writer-open time."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    _build_v3_index_file(path)
+    assert fact_index.needs_backfill(path) is True
+
+    con = fact_index.open_writer(path)
+    try:
+        assert con.execute("SELECT count(*) FROM facts_fts").fetchone() == (0,)
+        assert con.execute("SELECT count(*) FROM facts_dedup").fetchone() == (0,)
+        assert con.execute(
+            "SELECT value FROM index_meta WHERE key = 'schema_version'"
+        ).fetchone() == ("4",)
+        # The 'backfilled' sentinel went with index_meta, so a rebuild still
+        # follows -- the wipe must not look like a completed backfill.
+        assert con.execute(
+            "SELECT value FROM index_meta WHERE key = 'backfilled'"
+        ).fetchone() is None
+    finally:
+        fact_index.close_writer(con)
+    assert fact_index.needs_backfill(path) is True
+
+
+def test_open_writer_does_not_wipe_a_current_version_file(tmp_path):
+    """The wipe fires ONLY on a version mismatch. Every ingestion run after
+    the first reopens a current-version file and must keep its rows -- this
+    is the regression that would quietly destroy the index on every open."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con1 = fact_index.open_writer(path)
+    fact_index.insert_facts(con1, [(":decision/x", ":description", "hello", None, None)])
+    fact_index.close_writer(con1)
+
+    con2 = fact_index.open_writer(path)
+    try:
+        assert con2.execute("SELECT entity FROM facts_fts").fetchall() == [(":decision/x",)]
+    finally:
+        fact_index.close_writer(con2)
+
+
+def test_open_writer_wipes_a_v1_file_with_no_meta_table(tmp_path):
+    """A v1 file has a 3-column facts_fts and no index_meta at all. Reading
+    schema_version must not raise, and the drop must actually replace the
+    old table -- CREATE ... IF NOT EXISTS alone would leave the 3-column
+    shape in place, and every later insert would fail on column count."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE VIRTUAL TABLE facts_fts USING fts5(entity, attribute, value, "
+        "tokenize='unicode61')"
+    )
+    con.execute("INSERT INTO facts_fts VALUES (':decision/old', ':description', 'stale')")
+    con.commit()
+    con.close()
+
+    writer = fact_index.open_writer(path)
+    try:
+        cols = [r[1] for r in writer.execute("PRAGMA table_info(facts_fts)").fetchall()]
+        assert cols == ["entity", "attribute", "value", "valid_from", "valid_to"]
+        assert writer.execute("SELECT count(*) FROM facts_fts").fetchone() == (0,)
+        assert writer.execute(
+            "SELECT value FROM index_meta WHERE key = 'schema_version'"
+        ).fetchone() == ("4",)
+        # And the wiped file is immediately usable, not just well-shaped.
+        fact_index.insert_facts(
+            writer, [(":decision/new", ":description", "fresh", None, None)])
+        writer.commit()
+        assert writer.execute("SELECT entity FROM facts_fts").fetchall() == [(":decision/new",)]
+    finally:
+        fact_index.close_writer(writer)
+
+
+def test_open_writer_wipes_a_v2_file_and_stamps_current_version(tmp_path):
+    """A v2 file (backfilled, no facts_dedup). Before #236, ensure_schema
+    created facts_dedup empty here but left schema_version at '2' and left
+    'backfilled'='1' standing -- the gap ensure_schema's own docstring
+    documented. The wipe closes it."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE VIRTUAL TABLE facts_fts USING fts5(entity, attribute, value, "
+        "valid_from UNINDEXED, valid_to UNINDEXED, tokenize='unicode61')"
+    )
+    con.execute("CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT)")
+    con.execute("INSERT INTO index_meta (key, value) VALUES ('schema_version', '2')")
+    con.execute("INSERT INTO index_meta (key, value) VALUES ('backfilled', '1')")
+    con.commit()
+    con.close()
+
+    writer = fact_index.open_writer(path)
+    try:
+        assert writer.execute(
+            "SELECT value FROM index_meta WHERE key = 'schema_version'"
+        ).fetchone() == ("4",)
+        assert writer.execute(
+            "SELECT value FROM index_meta WHERE key = 'backfilled'"
+        ).fetchone() is None
+    finally:
+        fact_index.close_writer(writer)
+    assert fact_index.needs_backfill(path) is True
+
+
+def _open_writer_style_connection(path):
+    """A connection configured exactly the way open_writer configures its
+    own -- same PRAGMAs, same DEFAULT isolation_level -- but WITHOUT calling
+    ensure_schema, so a test can drive the schema functions by hand."""
+    con = sqlite3.connect(path, timeout=5.0)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA mmap_size=%d" % fact_index._MMAP_SIZE)
+    con.execute("PRAGMA busy_timeout=%d" % fact_index._BUSY_TIMEOUT_MS)
+    return con
+
+
+def test_migrate_schema_does_not_wipe_a_migration_a_racer_already_completed(tmp_path):
+    """#236 review: ensure_schema's version check is unlocked, and pysqlite
+    runs DROP/CREATE in autocommit, so two callers can both read the stale
+    version before either drops. The loser must not then wipe the winner's
+    completed work -- the concrete case is an ingestion thread that read '3'
+    being descheduled while _run_startup_backfill's rebuild_index finishes a
+    full rescan, then waking up and dropping it.
+
+    The interleave is simulated deterministically: con_b's stale read is
+    taken for real (it returns '3'), con_a then completes the migration and
+    a rebuild-like population, and only then does con_b proceed into the
+    branch its stale read selected -- which is exactly _migrate_schema, the
+    body of ensure_schema's mismatch branch. This exercises the re-read-
+    under-lock path, not the happy path: at the top of ensure_schema con_b
+    would now see '4' and never get here at all."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    _build_v3_index_file(path)
+
+    con_a = _open_writer_style_connection(path)
+    con_b = _open_writer_style_connection(path)
+    try:
+        # con_b's version check happens FIRST and genuinely reads the stale
+        # version -- this is the decision that sends it into the drop branch.
+        assert fact_index._stored_schema_version(con_b) == "3"
+
+        # con_a wins the race: it migrates, and then a rebuild completes and
+        # stamps 'backfilled' plus real rows -- the multi-minute work that
+        # must survive.
+        fact_index.ensure_schema(con_a)
+        fact_index.insert_facts(
+            con_a, [(":decision/rebuilt", ":description", "expensive", None, None)])
+        con_a.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('backfilled', '1')")
+        con_a.commit()
+
+        # con_b now acts on its stale read. The re-read under the write lock
+        # is the only thing standing between it and three DROP TABLEs.
+        fact_index._migrate_schema(con_b)
+
+        assert con_b.execute("SELECT entity FROM facts_fts").fetchall() == [
+            (":decision/rebuilt",)]
+        assert con_b.execute("SELECT count(*) FROM facts_dedup").fetchone() == (1,)
+        assert con_b.execute(
+            "SELECT value FROM index_meta WHERE key = 'backfilled'"
+        ).fetchone() == ("1",)
+        assert con_b.execute(
+            "SELECT value FROM index_meta WHERE key = 'schema_version'"
+        ).fetchone() == ("4",)
+        # The completed backfill is still recognized as complete.
+        assert fact_index.needs_backfill(path) is False
+
+        # And the branch is still live: against a file that really IS stale,
+        # the same call still wipes. (Without this the test above would pass
+        # for a _migrate_schema that had simply stopped dropping anything.)
+        con_b.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('schema_version', '3')")
+        con_b.commit()
+        fact_index._migrate_schema(con_b)
+        assert con_b.execute("SELECT count(*) FROM facts_fts").fetchone() == (0,)
+        assert con_b.execute(
+            "SELECT value FROM index_meta WHERE key = 'backfilled'"
+        ).fetchone() is None
+    finally:
+        con_a.close()
+        con_b.close()
+
+
+def test_migrate_schema_restores_the_connection_isolation_level(tmp_path):
+    """_migrate_schema forces isolation_level=None to keep its explicit
+    BEGIN IMMEDIATE clear of pysqlite's implicit transaction management. It
+    must hand the connection back unchanged: batched ingestion writes
+    (insert_facts/delete_facts never commit) depend on pysqlite opening an
+    implicit transaction that close_writer's commit() ends, and an autocommit
+    connection would silently commit each write on its own."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    _build_v3_index_file(path)
+    con = _open_writer_style_connection(path)
+    try:
+        default_isolation = con.isolation_level
+        fact_index.ensure_schema(con)  # takes the migration branch
+        assert con.isolation_level == default_isolation
+        # Behavioural proof, not just the attribute: an uncommitted write is
+        # still rollback-able, i.e. a real transaction is open.
+        fact_index.insert_facts(
+            con, [(":decision/x", ":description", "uncommitted", None, None)])
+        assert con.in_transaction is True
+        con.rollback()
+        assert con.execute("SELECT count(*) FROM facts_fts").fetchone() == (0,)
+    finally:
+        con.close()
 
 
 def test_needs_backfill_true_for_missing_file(tmp_path):
@@ -362,6 +601,149 @@ def test_delete_only_removes_exact_match(tmp_path):
         con.commit()
         rows = con.execute("SELECT entity FROM facts_fts").fetchall()
         assert rows == [(":decision/a",)]
+    finally:
+        fact_index.close_writer(con)
+
+
+def test_insert_facts_assigns_dedup_rowid_as_fts_rowid(tmp_path):
+    """#236: the whole fix rests on this identity. delete_facts seeks
+    facts_dedup's B-tree for a rowid and then deletes facts_fts by that
+    rowid -- if the two ever diverge, a retract silently removes an
+    unrelated fact from the index."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        fact_index.insert_facts(con, [
+            (":decision/a", ":description", "first", None, None),
+            (":decision/b", ":description", "second", None, None),
+            (":decision/c", ":description", "third", None, None),
+        ])
+        con.commit()
+        fts = dict(con.execute("SELECT entity, rowid FROM facts_fts").fetchall())
+        dedup = dict(con.execute("SELECT entity, rowid FROM facts_dedup").fetchall())
+        assert len(fts) == 3
+        assert fts == dedup
+    finally:
+        fact_index.close_writer(con)
+
+
+def test_rowid_identity_survives_delete_and_reinsert(tmp_path):
+    """SQLite recycles a b-tree rowid once it's freed. A delete/reinsert
+    cycle therefore reuses the rowid its own fts row just vacated -- which
+    is only safe because the two are deleted in lockstep. If a stale fts row
+    survived at that rowid, the reinsert would raise IntegrityError."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        triple = (":decision/x", ":description", "hello", "2026-01-01T00:00:00.000Z", None)
+        for _ in range(3):
+            fact_index.insert_facts(con, [triple])
+            con.commit()
+            fts = con.execute("SELECT rowid FROM facts_fts").fetchall()
+            dedup = con.execute("SELECT rowid FROM facts_dedup").fetchall()
+            assert len(fts) == 1
+            assert fts == dedup
+            fact_index.delete_facts(con, [triple])
+            con.commit()
+            assert con.execute("SELECT count(*) FROM facts_fts").fetchone() == (0,)
+            assert con.execute("SELECT count(*) FROM facts_dedup").fetchone() == (0,)
+    finally:
+        fact_index.close_writer(con)
+
+
+def test_delete_facts_removes_every_current_row_regardless_of_valid_from(tmp_path):
+    """insert_facts deliberately keeps the same (entity, attribute, value) at
+    two distinct valid_from values as two rows (see
+    test_insert_facts_keeps_distinct_valid_from_as_separate_rows), and
+    delete_facts is deliberately not scoped to a valid_from -- it doesn't
+    know which one the current row carries. So the rowid lookup must return
+    a list and clear all of them, not seek a single row."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        fact_index.insert_facts(
+            con, [(":tag/v1", ":name", "v1", "2026-01-01T00:00:00.000Z", None)])
+        fact_index.insert_facts(
+            con, [(":tag/v1", ":name", "v1", "2026-02-01T00:00:00.000Z", None)])
+        con.commit()
+        assert len(con.execute(
+            "SELECT * FROM facts_fts WHERE entity = ':tag/v1'").fetchall()) == 2
+
+        fact_index.delete_facts(con, [(":tag/v1", ":name", "v1", None, None)])
+        con.commit()
+        assert con.execute("SELECT * FROM facts_fts WHERE entity = ':tag/v1'").fetchall() == []
+        assert con.execute("SELECT * FROM facts_dedup WHERE entity = ':tag/v1'").fetchall() == []
+    finally:
+        fact_index.close_writer(con)
+
+
+def test_delete_facts_tolerates_an_orphan_dedup_row(tmp_path):
+    """Dedup-first insert ordering plus fts-first delete ordering means the
+    only inconsistency physically reachable is a dedup row whose fts row is
+    missing (an fts insert that failed after the dedup insert committed).
+    Deleting it must be a clean no-op on facts_fts and must still clear the
+    dedup row, so the rowid is freed rather than blocking a later reinsert."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        triple = (":decision/x", ":description", "hello", "2026-01-01T00:00:00.000Z", None)
+        fact_index.insert_facts(con, [triple])
+        con.commit()
+        con.execute("DELETE FROM facts_fts")
+        con.commit()
+
+        fact_index.delete_facts(con, [triple])
+        con.commit()
+        assert con.execute("SELECT count(*) FROM facts_dedup").fetchone() == (0,)
+
+        fact_index.insert_facts(con, [triple])
+        con.commit()
+        assert con.execute("SELECT count(*) FROM facts_fts").fetchone() == (1,)
+    finally:
+        fact_index.close_writer(con)
+
+
+def test_rowid_identity_holds_after_dedup_runs_ahead_of_fts(tmp_path):
+    """The discriminating test for #236's explicit rowid assignment.
+
+    The four tests above pin the identity but NOT the construction: in every
+    scenario they build, facts_fts and facts_dedup share the same
+    max(rowid), so the pre-#236 auto-assigned insert produces exactly the
+    same rowids as the explicit one and they pass either way (verified by
+    reverting insert_facts and re-running them -- all four still passed).
+    This test is the one that actually fails on the auto-assigned form.
+
+    It works by first making the two tables' rowid counters diverge: an
+    orphan dedup row whose fts insert failed after the dedup row committed,
+    which delete_facts' docstring identifies as the one inconsistency that
+    is physically reachable. From then on auto-assignment is off by one, so
+    a retract seeks the correct dedup rowid and deletes the WRONG fts row --
+    the silent index corruption this whole task exists to prevent. Do not
+    "simplify" this back into the coincidence case the others cover.
+    """
+    path = str(tmp_path / "t.fts.sqlite3")
+    con = fact_index.open_writer(path)
+    try:
+        fact_index.insert_facts(con, [(":d/A", ":description", "a", None, None)])
+        con.execute(
+            "INSERT INTO facts_dedup (entity, attribute, value, valid_from, valid_to) "
+            "VALUES (':d/orphan', ':description', 'orphan', '', '')"
+        )
+        fact_index.insert_facts(con, [
+            (":d/C", ":description", "c", None, None),
+            (":d/D", ":description", "d", None, None),
+        ])
+        con.commit()
+
+        fts = dict(con.execute("SELECT entity, rowid FROM facts_fts").fetchall())
+        dedup = dict(con.execute("SELECT entity, rowid FROM facts_dedup").fetchall())
+        assert fts == {e: r for e, r in dedup.items() if e != ":d/orphan"}
+
+        fact_index.delete_facts(con, [(":d/C", ":description", "c", None, None)])
+        con.commit()
+        assert sorted(
+            row[0] for row in con.execute("SELECT entity FROM facts_fts")
+        ) == [":d/A", ":d/D"]
     finally:
         fact_index.close_writer(con)
 

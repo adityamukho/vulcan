@@ -20,11 +20,15 @@ index per deleted triple. fact_index.py:31 already says as much ("an O(n)
 scan over facts_fts"), which is exactly why facts_dedup was added for the
 INSERT path. The DELETE path never got the same treatment.
 
-Prediction if that is the cause: delete cost per triple grows linearly with
-the number of rows in facts_fts, and is unaffected by how many triples are
-batched into one delete_facts call.
+Confirmed: delete cost per triple grows linearly with the number of rows in
+facts_fts, and is unaffected by how many triples are batched into one
+delete_facts call. D1 below runs the legacy equality DELETE (inlined, so it
+stays measurable) against whatever delete_facts currently does, on freshly
+built indexes of the same size. Before #236's rowid fix the two columns
+agree, because they are the same statement; after it they diverge by orders
+of magnitude, and that divergence is the fix's evidence.
 
-    .venv/bin/python scratchpad/index_delete_bench.py
+    .venv/bin/python evals/at_scale/bench_index_delete_cost.py
 """
 import os
 import shutil
@@ -53,6 +57,29 @@ def build_index(tmpdir, name, n_rows):
     return con, path
 
 
+def bench_delete_legacy(con, n_delete, per_call):
+    """The pre-#236 delete: an equality DELETE straight against facts_fts.
+    Inlined here rather than called through fact_index so these numbers stay
+    reproducible once delete_facts switches to rowids -- run before that
+    switch, this is byte-for-byte what delete_facts itself does, so the two
+    columns in D1 below should agree."""
+    rows = [
+        (f":e/n{i}", ":attr", f"value number {i} with some text")
+        for i in range(n_delete)
+    ]
+    t0 = time.perf_counter()
+    for start in range(0, n_delete, per_call):
+        chunk = rows[start:start + per_call]
+        con.executemany(
+            "DELETE FROM facts_fts WHERE entity = ? AND attribute = ? AND value = ? "
+            "AND valid_to IS NULL", chunk)
+        con.executemany(
+            "DELETE FROM facts_dedup WHERE entity = ? AND attribute = ? AND value = ? "
+            "AND valid_to = ''", chunk)
+    con.commit()
+    return time.perf_counter() - t0
+
+
 def bench_delete(con, n_delete, per_call):
     rows = [
         (f":e/n{i}", ":attr", f"value number {i} with some text", TS, None)
@@ -67,16 +94,15 @@ def bench_delete(con, n_delete, per_call):
 
 def main(tmpdir):
     print("=== D1: delete 200 rows one call, vary index size ===")
-    print(f"{'index rows':>11} {'seconds':>9} {'ms/triple':>11}")
-    prev = None
+    print(f"{'index rows':>11} {'legacy ms/triple':>18} {'delete_facts ms/triple':>24} {'ratio':>8}")
     for n_rows in (5_000, 20_000, 80_000):
-        con, _ = build_index(tmpdir, f"d1_{n_rows}", n_rows)
-        secs = bench_delete(con, 200, 200)
-        per = secs / 200 * 1000
-        growth = f"  ({per / prev:.1f}x)" if prev else ""
-        print(f"{n_rows:>11} {secs:>9.3f} {per:>11.3f}{growth}")
-        prev = per
+        con, _ = build_index(tmpdir, f"d1_legacy_{n_rows}", n_rows)
+        legacy = bench_delete_legacy(con, 200, 200) / 200 * 1000
         con.close()
+        con, _ = build_index(tmpdir, f"d1_current_{n_rows}", n_rows)
+        current = bench_delete(con, 200, 200) / 200 * 1000
+        con.close()
+        print(f"{n_rows:>11} {legacy:>18.4f} {current:>24.4f} {legacy / current:>7.0f}x")
 
     print("\n=== D2: fixed 80,000-row index, delete 200, vary triples/call ===")
     print(f"{'triples/call':>13} {'calls':>7} {'seconds':>9} {'ms/triple':>11}")
