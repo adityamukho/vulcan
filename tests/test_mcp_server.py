@@ -16250,7 +16250,10 @@ class TestCorrectionSweepApply:
 
     def test_repair_is_inert_without_a_position_map(self, real_db, tmp_path):
         """Gated: every existing caller and test keeps today's fail-safe
-        behaviour until it opts in."""
+        behaviour until it opts in. An EMPTY map is gated out too -- with no
+        positions to compare, every value scores the same len(map)==0
+        default and the collapse would degenerate to "lexicographically
+        smallest ident wins", contradicting "absent sorts last"."""
         import mcp_server
         repo = self._repo_with_evolving_function(tmp_path)
         _pos_map, linearization = self._pos_map(repo)
@@ -16263,6 +16266,13 @@ class TestCorrectionSweepApply:
         h1_hash = linearization[1]
         mcp_server._correction_sweep_apply(
             real_db, h1_hash, "2026-01-02T00:00:00Z", self._extract(repo, h1_hash),
+        )
+
+        assert sorted(mcp_server._entity_introduced_by_values_query(real_db, fn_ident)) == sorted([h0, h2])
+
+        mcp_server._correction_sweep_apply(
+            real_db, h1_hash, "2026-01-02T00:00:00Z", self._extract(repo, h1_hash),
+            pos_by_commit_ident={},
         )
 
         assert sorted(mcp_server._entity_introduced_by_values_query(real_db, fn_ident)) == sorted([h0, h2])

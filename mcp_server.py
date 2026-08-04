@@ -8969,9 +8969,22 @@ def _correction_sweep_apply(
     second mint happens in the FORWARD region, which this sweep never
     visits, so it meets these entities at commits that are neither of their
     two values. A value absent from the map sorts last, so an unrecognised
-    commit ident can never win and can never raise. Left None (the default)
-    the repair is inert and every caller keeps the pre-#235 fail-safe.
-    Best-effort: an entity this sweep never visits is not repaired.
+    commit ident can never win and can never raise. Left None or empty (the
+    default) the repair is inert and every caller keeps the pre-#235
+    fail-safe -- empty is gated out too, since with no positions to compare
+    the "absent sorts last" rule degenerates to picking the
+    lexicographically smallest ident.
+
+    Reach, stated plainly: repair only touches entities this sweep visits,
+    and on an already-COMPLETED graph it visits none. A finished run leaves
+    :ingestion/correction-sweep-through at frontier-high's :hi-hash, so the
+    next run's _correction_sweep_select_position hits its pos > ceiling_pos
+    guard, returns None on its first call, and this function is never
+    invoked -- re-running ingestion on a corrupted graph repairs nothing.
+    Recovery requires new commits above the old ceiling (and then only for
+    entities that are candidates in those commits), a resumed run whose
+    watermark is still short of the ceiling, or an explicit repair pass /
+    watermark reset.
 
     update_watermark=False suppresses BOTH the trailing
     _correction_sweep_through_update and the _db_checkpoint that follows it,
@@ -9026,7 +9039,12 @@ def _correction_sweep_apply(
             # #235 repair: collapse a corrupted multi-valued entity BEFORE the
             # case branching below, so cases 1/2/3 always see a well-formed
             # entity and need no multi-value handling of their own.
-            if pos_by_commit_ident is not None and len(introduced_by_values) > 1:
+            # Truthiness, not `is not None`: an EMPTY map scores every value
+            # with the same len(map)==0 default, collapsing to "smallest
+            # ident wins" -- which contradicts "a value absent from the map
+            # sorts last" above. Unreachable in production (a run with no
+            # commits has nothing to sweep), gated so code and docstring agree.
+            if pos_by_commit_ident and len(introduced_by_values) > 1:
                 survivor = min(
                     sorted(introduced_by_values),
                     key=lambda c: pos_by_commit_ident.get(c, len(pos_by_commit_ident)),

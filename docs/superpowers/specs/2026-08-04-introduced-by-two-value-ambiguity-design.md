@@ -153,9 +153,22 @@ Callers holding `commit_metadata` — the 2d Stage B driver and
 sorts last rather than raising, so an unrecognised commit ident can never be
 chosen over a known one and can never crash the sweep.
 
-**Limitation, stated deliberately.** An entity whose values are all outside the
-map, or which the sweep never visits, is not repaired. Repair is best-effort
-healing for graphs already in the field, not a guarantee.
+**Limitation, stated deliberately.** Repair reaches only entities the sweep
+actually visits, and on an already-completed graph it visits none. A finished
+run leaves `:ingestion/correction-sweep-through` at frontier-high's `:hi-hash`,
+so the next run's `_correction_sweep_select_position` hits its `pos >
+ceiling_pos` guard (`mcp_server.py:8894`), returns None on its first call, and
+`_correction_sweep_apply` runs zero times — measured on the 14-commit fixture:
+watermark at position 13 of 13, one `select`, zero `apply`. Re-running ingestion
+therefore repairs nothing, and that is the modal state of a graph in the field.
+
+Recovery requires one of: new commits above the old ceiling (and then only for
+entities that are candidates in those commits), an interrupted run that resumes
+with the watermark still short of the ceiling, or an explicit repair pass /
+watermark reset. An entity whose values are all outside the map is likewise not
+repaired. This section buys convergence for graphs that keep being ingested; it
+is not a recovery path for a static corrupted graph, and closing #235 should not
+be read as providing one.
 
 ### 3. Observe — make ambiguity loud
 
