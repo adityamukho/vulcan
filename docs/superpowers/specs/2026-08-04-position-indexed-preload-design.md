@@ -220,9 +220,15 @@ without a position clause would make their data-loss direction *worse*, which
 is precisely the union #238 forbids. Leaving them at `ts(W)` is strictly no
 worse than today.
 
-Their docstrings gain a note recording this residual and its cause, and a
-follow-up issue is filed. #238's measured data loss is entity-level; this keeps
-the change focused on it.
+Their docstrings gain a note recording this residual and its cause, pointing at
+**#245**. #238's measured data loss is entity-level; this keeps the change
+focused on it.
+
+**#238 is not closed by this work.** It stays open, blocked on #245, so the
+issue is not closed until all four call sites are resolved. The PR body and
+every commit message must therefore use `Refs #238`, never a closing keyword —
+GitHub scans both, and on this project a *negated* "does not close #N" has
+still auto-closed an issue. #231 *is* closed by this work.
 
 ### Call-order change in `_run_ingestion`
 
@@ -311,8 +317,8 @@ calls the preload directly.
 - Recording the closing commit in the graph (`:closed-in` / `:position`), which
   would make the close end exactly filterable. Rejected: fact-model change with
   migration obligations, to close only the recoverable direction.
-- Position-filtering `:depends-on` and `:pinned-commit` — see above; follow-up
-  issue.
+- Position-filtering `:depends-on` and `:pinned-commit` — **#245**, which #238
+  is blocked on.
 - Cleaning up stale live `:introduced-by` on already-closed entities in
   existing graphs — #244.
 - `_db_checkpoint` cadence (#241) and the `:introduced-by` point-query volume
