@@ -16682,7 +16682,13 @@ class TestForwardApplyReconcilesProvisional:
             file_deps={}, dep_valid_from={}, pinned_commit_state={},
             field_class_ident={}, field_static_ident={}, submodule_paths={},
             unresolved_dep_idents={},
-            provisional_idents=mcp_server._preload_provisional_idents(real_db),
+            # #235: production preloads at RUN START, before Stream 2 has
+            # written anything, so on a fresh ingest this set is EMPTY. Calling
+            # _preload_provisional_idents here -- after the reverse stream ran --
+            # handed the forward walk a snapshot that already contained the
+            # guess, which no real fresh run ever has, and hid the second-mint
+            # bug entirely.
+            provisional_idents=set(),
             ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
         )
         extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
@@ -16787,6 +16793,83 @@ class TestForwardApplyReconcilesProvisional:
         # the same way) on every later commit that touches this entity.
         assert fn_ident not in state.provisional_idents
 
+    def test_reconciles_a_guess_made_during_this_same_run(self, real_db, tmp_path):
+        """#235: the prefilter was a run-start snapshot, empty on a fresh
+        ingest. Stream 2's guesses are written during that same run, so the
+        prefilter dropped every one of them before the DB-authoritative
+        _lineage_is_provisional check could see it -- and
+        _build_code_triples then minted a SECOND :introduced-by alongside
+        the guess. The DB must be the sole authority."""
+        import mcp_server, frontier_registry
+        repo = self._repo(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        # Snapshot taken FIRST, exactly as _run_ingestion does -- empty.
+        snapshot = mcp_server._preload_provisional_idents(real_db)
+        assert snapshot == set(), "a fresh graph has no provisional idents yet"
+
+        # Only now does Stream 2 claim h1 and guess.
+        mcp_server._reverse_fill_claim_and_process(
+            real_db, str(repo), linearization, commit_metadata, allocator,
+        )
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
+
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={}, entity_descriptions={}, file_entities={},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+            provisional_idents=snapshot,
+            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
+        )
+        extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
+        mcp_server._forward_apply(real_db, str(repo), state, commit_metadata[0], extracted)
+
+        values = mcp_server._entity_introduced_by_values_query(real_db, fn_ident)
+        assert values == [f":commit/{linearization[0][:12]}"], (
+            f"exactly one :introduced-by, naming h0; got {sorted(values)}"
+        )
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+
+    def test_evicts_a_stale_snapshot_entry_that_is_no_longer_provisional(
+        self, real_db, tmp_path,
+    ):
+        """The eviction invariant survives dropping the prefilter: every
+        candidate examined leaves state.provisional_idents, whether or not
+        the DB agreed it was provisional. A stale entry left behind is
+        retried, and fails the same way, on every later commit touching the
+        entity (see the comment at mcp_server.py:8345)."""
+        import mcp_server, frontier_registry
+        repo = self._repo(tmp_path)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        mcp_server._frontier_load(real_db, linearization, "2026-01-04T00:00:00Z")
+
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        # Authoritative in the DB (a plain transact, no lineage marker) but
+        # still listed by a stale snapshot -- what a resumed run sees after a
+        # previous run's sweep confirmed the entity.
+        mcp_server._transact(
+            real_db, f"[[{fn_ident} :introduced-by :commit/already]]", "2026-01-01T00:00:00Z",
+        )
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={}, entity_descriptions={}, file_entities={},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+            provisional_idents={fn_ident},
+            ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
+        )
+        extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
+        mcp_server._forward_apply(real_db, str(repo), state, commit_metadata[0], extracted)
+
+        assert fn_ident not in state.provisional_idents, "stale entry must be evicted"
+
     def test_resumed_run_variant_is_not_suppressed_by_entity_valid_from(self, real_db, tmp_path):
         """The silent failure mode: on a RESUMED run, Stream 2's structural
         facts are already in the preloaded entity_valid_from, so
@@ -16824,10 +16907,16 @@ class TestForwardApplyReconcilesProvisional:
         assert {row[0] for row in json.loads(raw)["results"]} == {f":commit/{linearization[0][:12]}"}
         assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
 
-    def test_without_provisional_idents_the_resumed_case_regresses(self, real_db, tmp_path):
-        """Pins that provisional_idents is actually consulted: with it empty,
-        the resumed-run case leaves the wrong guess in place. This is the
-        direct regression test for the silent failure mode."""
+    def test_without_provisional_idents_the_resumed_case_still_reconciles(self, real_db, tmp_path):
+        """#235: this pinned the OLD design, where an empty
+        state.provisional_idents left the resumed-run case unreconciled
+        because the set was consulted as a prefilter gate. That gate is
+        gone -- _lineage_is_provisional(db, ...) is the sole authority now,
+        so an empty (or entirely wrong) snapshot must no longer change the
+        outcome. Same setup as
+        test_resumed_run_variant_is_not_suppressed_by_entity_valid_from,
+        with provisional_idents=set() instead of {fn_ident}, and the same
+        result: exactly one :introduced-by, naming h0."""
         import mcp_server, frontier_registry
         repo = self._repo(tmp_path)
         linearization = frontier_registry.build_linearization(str(repo))
@@ -16843,15 +16932,15 @@ class TestForwardApplyReconcilesProvisional:
             file_deps={}, dep_valid_from={}, pinned_commit_state={},
             field_class_ident={}, field_static_ident={}, submodule_paths={},
             unresolved_dep_idents={},
-            provisional_idents=set(),   # the bug
+            provisional_idents=set(),   # no longer a gate -- must not matter
             ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
         )
         extracted = mcp_server._extract_commit(str(repo), linearization[0], ())
         mcp_server._forward_apply(
             real_db, str(repo), state, commit_metadata[0], extracted,
         )
-        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is True
-        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{linearization[1][:12]}"
+        assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+        assert mcp_server._entity_introduced_by_query(real_db, fn_ident) == f":commit/{linearization[0][:12]}"
 
 
 class TestRoundRobinClaimer:
@@ -17578,6 +17667,88 @@ class TestStageBRepairsLifecycleFacts:
             assert len(subjects) == len(set(subjects)), \
                 f"duplicate live {attr} facts after the lifecycle pass: " \
                 f"{sorted(r for r in rows if subjects.count(r[0]) > 1)}"
+
+
+class TestNoDuplicateIntroducedByAfterFullIngest:
+    """#235's reproduction, as a standing oracle.
+
+    A full converging ingest -- both streams plus Stage B -- must leave no
+    entity holding two live :introduced-by facts. On master this yields six
+    such entities on a 14-commit history, and the pair never converges: every
+    later reader sees only one value, retracts that one, and asserts a fresh
+    one, so the corruption regenerates rather than healing.
+
+    The fixture matters. `born_N` functions accumulate one per commit, so
+    each is introduced at a different position and the reverse stream's
+    guesses land above the forward walk's true introductions; the five
+    long-lived functions are edited every commit so they stay candidates all
+    the way down. That combination is what produces same-run provisional
+    guesses for entities the forward walk later reaches.
+    """
+
+    N_COMMITS = 14
+
+    def _reset_progress(self):
+        import mcp_server
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        }
+
+    def _repo(self, tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init", "-b", "master"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(self.N_COMMITS):
+            body = "".join(
+                f"def stay_{k}():\n    return {i}\n\n" for k in range(5)
+            ) + "".join(
+                f"def born_{b}():\n    return {b}\n\n" for b in range(i + 1)
+            )
+            (repo / "mod.py").write_text(body)
+            ts = f"2021-03-{i + 1:02d}T00:00:00Z"
+            env = {**os.environ, "GIT_AUTHOR_DATE": ts, "GIT_COMMITTER_DATE": ts}
+            _subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(
+                ["git", "commit", "-m", f"c{i}"], cwd=repo, check=True,
+                capture_output=True, env=env,
+            )
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_full_ingest_leaves_no_entity_with_two_introduced_by(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        import mcp_server
+        from minigraf import MiniGrafDb
+        repo = self._repo(tmp_path)
+        graph_path = tmp_path / "memory.graph"
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
+        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
+        mcp_server._db = None
+        self._reset_progress()
+        await mcp_server._run_ingestion(str(repo), "master")
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+        mcp_server._db = None  # release the file lock before reopening
+
+        db = MiniGrafDb.open(str(graph_path))
+        try:
+            raw = mcp_server._db_execute(
+                db, "(query [:find ?e (count ?c) :where [?e :introduced-by ?c]])",
+            )
+        finally:
+            db = None
+        ambiguous = sorted(
+            (row[0], row[1]) for row in json.loads(raw)["results"] if row[1] > 1
+        )
+        assert ambiguous == [], f"entities with multiple :introduced-by: {ambiguous}"
+
+        err = capsys.readouterr().err
+        assert "left provisional" not in err, err
+        assert "left unreconciled" not in err, err
 
 
 class TestMultiStreamParityWithForwardOnly:

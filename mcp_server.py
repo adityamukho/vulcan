@@ -8333,27 +8333,31 @@ def _forward_apply(
             # valid_from Stream 2 recorded is a wrong guess, and must
             # never be used as an orig_ts for a close.
             #
-            # state.provisional_idents is a PRELOAD SNAPSHOT (see
-            # _preload_provisional_idents), not the authority -- by the
-            # time this commit is reached, the entity may already have
-            # been confirmed authoritative in the DB (reconciled earlier
-            # in this same forward pass, or by a previous run's
-            # correction sweep) without the in-memory set knowing.
-            # Trusting the set alone would still pop entity_valid_from and
-            # hand the ident to _build_code_triples as "new" even though
-            # _forward_reconcile_provisional no-ops on an already-
-            # authoritative entity (see its own provisional check) --
-            # minting a SECOND :introduced-by alongside the authoritative
-            # one already there. That is exactly the two-value ambiguity
-            # _correction_sweep_apply fails safe on and never resolves,
-            # reintroduced through this door. So the set is kept only as
-            # a cheap prefilter; the DB (_lineage_is_provisional) is the
-            # authority actually consulted before an ident is treated as
-            # reconcilable. Every candidate that was in the set is
-            # evicted below regardless of whether it survives that
-            # check -- a stale entry left in place would be retried, and
-            # fail the same way, on every later commit that touches the
-            # entity.
+            # #235: state.provisional_idents is NOT consulted as a gate here.
+            # It is a PRELOAD SNAPSHOT (see _preload_provisional_idents) taken
+            # at run start, so on a fresh ingest it is EMPTY -- and Stream 2
+            # writes its guesses during that same run. Using it as a prefilter
+            # dropped every same-run guess before the DB-authoritative check
+            # below could see it, _forward_reconcile_provisional never fired,
+            # and _build_code_triples minted a SECOND :introduced-by alongside
+            # the guess. A prefilter's false negatives are unrecoverable
+            # precisely because the authority never runs.
+            #
+            # The snapshot is also stale-POSITIVE: by the time this commit is
+            # reached an ident it lists may already have been confirmed
+            # authoritative in the DB (reconciled earlier in this same forward
+            # pass, or by a previous run's correction sweep). That is why
+            # _lineage_is_provisional stays the authority rather than being
+            # dropped in favour of a set -- popping entity_valid_from for an
+            # already-authoritative ident hands it to _build_code_triples as
+            # "new" and mints the same second fact, while
+            # _forward_reconcile_provisional no-ops on it.
+            #
+            # The set survives only so a RESUMED run's genuinely-stale entries
+            # drain: every candidate examined is evicted below regardless of
+            # whether it survives the DB check, because an entry left in place
+            # would be retried, and fail the same way, on every later commit
+            # that touches the entity.
             #
             # lifecycle_only (Stage B): _correction_sweep_apply owns "A"/"M"
             # lineage and has already run for this very commit, so
@@ -8381,10 +8385,7 @@ def _forward_apply(
                 # retried by every later commit touching the entity.
                 candidate_in_set = list(reconcilable)
             else:
-                candidate_in_set = [
-                    ident for ident in _forward_candidate_idents(precomputed)
-                    if ident in state.provisional_idents
-                ]
+                candidate_in_set = _forward_candidate_idents(precomputed)
                 reconcilable = [
                     ident for ident in candidate_in_set
                     if _lineage_is_provisional(db, ident)
