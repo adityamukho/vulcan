@@ -187,3 +187,64 @@ for a human, and it closes it.
 The remaining 20.3x is therefore still above the design spec's "same order as
 the baseline" bar, but it is no longer an unexplained gap: it has a named,
 measured, filed successor (#239).
+
+## No Ingestion Run — fix-235-two-value-introduced-by
+
+**No acceptance-gate run was completed on this branch, and this entry is not
+one.** Two attempts at the full-history acceptance benchmark on
+`fix-235-two-value-introduced-by` were killed before completion — one at
+3h54m (~1/3 complete), one at 36m. Neither produced a result worth recording
+in the metrics-table format above, and no table is given here. The gate
+should be re-run once #242 (below) is fixed.
+
+- **The cause is the benchmark harness itself, filed as #242, not #235's
+  code.** `_poll_during_ingestion` issues a blocking graph query on the
+  event loop every 0.5 s, and `_STATUS_QUERY` counts every `:type/commit`
+  entity — so the poll's own cost grows across the run. Late in a run it
+  consumes most of the event loop and ingestion approaches a standstill.
+  The second killed attempt shows the collapse directly: graph growth fell
+  1.35 -> 0.405 -> 0.101 MB/min across three consecutive 15-minute windows,
+  with the main process pinned at 99% CPU while all 8 parse workers sat
+  idle at 0.5-1.1%. This implicates the two entries above this one, too: the
+  78.87s and 1600.55s figures carry the same polling overhead, so
+  entry-to-entry *comparisons* remain apples-to-apples (same harness bug,
+  present throughout), but the *absolute* numbers in this file overstate
+  real ingestion cost. **Hypothesis, not measured:** a feedback loop between
+  rising poll-query cost and lock contention against the ingestion writer
+  may explain why the two killed attempts on this branch diverged so
+  sharply in wall clock (3h54m vs 36m) rather than failing at a consistent
+  point.
+- **What replaces it here: a two-revision A/B**, not a single-revision gate
+  run, using `evals/at_scale/profile_forward_reconcile_attribution.py`
+  (committed `f830285`), which drives the same `_run_ingestion` across
+  Stage A and Stage B directly and does not poll. BEFORE = `20b9b38` (the
+  prefilter still in place), AFTER = `7b08db6`. Both legs ingest the same
+  root-anchored refs. On the 450-commit slice, the largest both revisions
+  ran to completion: **720.57s BEFORE vs 741.85s AFTER, a ratio of 1.03**
+  (1.01 at 150 commits, 1.03 at 300 commits). On the full 586-commit
+  history, both capped at 1500s, AFTER is *ahead*: Stage A done at 619.9s
+  vs BEFORE's 675.8s, and more Stage B work completed in the remaining
+  budget. The single largest attributed delta is `_correction_sweep_apply`,
+  +34.5s (131.8 -> 166.3s) over the same 225 calls, driven by `_retract`
+  rising 53,567 -> 79,175 calls (+48%) — the sweep doing repair work the bug
+  used to suppress — partly offset by `_reverse_apply` running 12.9s
+  faster, netting +21.3s overall.
+- **The hypothesis that motivated concern about #235 in the first place is
+  disproved.** `_lineage_is_provisional` was expected to dominate the cost,
+  since #235 makes it run per candidate ident instead of behind an
+  in-memory prefilter. Measured directly
+  (`evals/at_scale/bench_lineage_query_cost.py`, commit `7b08db6`): HIT
+  costs 0.0514 / 0.0600 / 0.0597 ms and MISS costs 0.0459 / 0.0542 / 0.0528
+  ms at 100k / 1M / 5M facts — a miss is *cheaper* than a hit, and neither
+  scales with graph size. In the A/B above it accounts for 29.0s of a
+  741.85s run. The follow-up hypothesis, `_forward_reconcile_provisional`,
+  fires 281 times for 0.73s total — confirming the behavioural claim (0
+  calls on BEFORE: the prefilter suppressed it entirely) while refuting the
+  cost claim.
+- **A separate finding, unrelated to #235, filed as #241:** `_db_checkpoint`
+  is the largest single call site on *both* revisions in the A/B —
+  371.0s vs 367.1s over the same 902 calls on the 450-commit slice, roughly
+  0.69s per checkpoint, once per commit against a graph that grows the
+  whole run. Likely missed by earlier per-call attributions because the
+  per-thread cProfile hook used for them was killing the `write_executor`
+  threads it was attached to.
