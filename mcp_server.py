@@ -5388,6 +5388,37 @@ def _entity_introduced_by_values_query(db: Any, entity_ident: str) -> List[str]:
     return [row[0] for row in json.loads(raw).get("results", [])]
 
 
+# Max two-value :introduced-by warnings _entity_introduced_by_query writes to
+# stderr per ingestion run (#235). Same budget and same intent as
+# _CORRECTION_SWEEP_LOG_CAP -- a corrupted at-scale graph must not drown the
+# log -- but it cannot use that cap's caller-threaded-total mechanism: this is
+# a leaf query called from four sites in two walks (_reverse_apply alone calls
+# it up to 3x per ident per commit), none of which carry, or should carry, a
+# running log total just to reach it.
+#
+# The budget therefore lives in a module global, with the per-run reset that
+# _CORRECTION_SWEEP_LOG_CAP gets for free from its caller's zero-initialized
+# local supplied explicitly instead: _run_ingestion calls
+# _reset_introduced_by_ambiguity_log_budget() at the top of every run. That
+# preserves the property the sweep's design note actually cares about -- this
+# server is long-lived and runs many ingests, and a never-reset counter would
+# burn its budget on the first one and log nothing ever after.
+_INTRODUCED_BY_AMBIGUITY_LOG_CAP = 10
+_introduced_by_ambiguity_logged = 0
+
+
+def _reset_introduced_by_ambiguity_log_budget() -> None:
+    """Restore _entity_introduced_by_query's full stderr budget.
+
+    Called once per ingestion run (see _run_ingestion). Not thread-safe in
+    any strict sense, and deliberately so: the counter guards log volume
+    only, never a decision, so a lost increment under concurrency costs at
+    most one extra or one missing warning line.
+    """
+    global _introduced_by_ambiguity_logged
+    _introduced_by_ambiguity_logged = 0
+
+
 def _entity_introduced_by_query(db: Any, entity_ident: str) -> Optional[str]:
     """Return entity_ident's current :introduced-by value (a commit ident
     string), or None if it has none yet.
@@ -5401,15 +5432,31 @@ def _entity_introduced_by_query(db: Any, entity_ident: str) -> Optional[str]:
     Position-based selection of the survivor lives in
     _correction_sweep_apply, which has the linearization positions this
     function does not.
+
+    The warning is rate-capped per run (_INTRODUCED_BY_AMBIGUITY_LOG_CAP);
+    the RETURN VALUE never is. A corrupt at-scale graph can hold thousands
+    of ambiguous entities and _reverse_apply calls this up to 3x per ident
+    per commit, so an uncapped line here buries the rest of the ingest log
+    long before the repair pass can run.
     """
+    global _introduced_by_ambiguity_logged
     values = _entity_introduced_by_values_query(db, entity_ident)
     if len(values) > 1:
-        print(
-            f"[_entity_introduced_by] {entity_ident} has {len(values)} live "
-            f":introduced-by values {sorted(values)} -- returning an arbitrary "
-            "one (#235); the correction sweep repairs this",
-            file=sys.stderr,
-        )
+        _introduced_by_ambiguity_logged += 1
+        if _introduced_by_ambiguity_logged <= _INTRODUCED_BY_AMBIGUITY_LOG_CAP:
+            print(
+                f"[_entity_introduced_by] {entity_ident} has {len(values)} live "
+                f":introduced-by values {sorted(values)} -- returning an arbitrary "
+                "one (#235); the correction sweep repairs this",
+                file=sys.stderr,
+            )
+            if _introduced_by_ambiguity_logged == _INTRODUCED_BY_AMBIGUITY_LOG_CAP:
+                print(
+                    f"[_entity_introduced_by] log cap "
+                    f"({_INTRODUCED_BY_AMBIGUITY_LOG_CAP}) reached -- further "
+                    "ambiguity warnings suppressed for this run",
+                    file=sys.stderr,
+                )
     return values[0] if values else None
 
 
@@ -7417,12 +7464,18 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     unresolved_dep_idents = _preload_unresolved_dep_idents(
         db, submodule_paths, valid_at=resume_valid_at,
     )
-    provisional_idents = _preload_provisional_idents(db)
+    # No provisional-ident preload (#235): the forward walk's reconciliation
+    # gate is _lineage_is_provisional(db, ident), queried per ident at the
+    # moment it matters. A run-start snapshot cannot serve that purpose -- it
+    # is empty on a fresh ingest, where Stream 2 writes its guesses during
+    # this same run -- so preloading one only invites a future maintainer to
+    # re-derive a gate from it. _preload_provisional_idents still exists for
+    # whole-graph assertions ("no markers left after a full ingest"); it is
+    # deliberately not part of the walk's state.
     return (
         watermark, prior_ingested, entity_valid_from, entity_descriptions,
         file_entities, file_deps, dep_valid_from, pinned_commit_state,
         field_class_ident, field_static_ident, submodule_paths, unresolved_dep_idents,
-        provisional_idents,
     )
 
 
@@ -8225,9 +8278,8 @@ def _forward_apply(
       _correction_sweep_apply owns those entities' lineage and has already
       run for this commit. It is still performed for an "R" file's new path,
       where the reverse stream may hold a provisional guess at a LATER
-      commit that this rename supersedes; there the DB is consulted
-      directly, because state.provisional_idents is a run-start preload
-      snapshot and is empty on a fresh ingest.
+      commit that this rename supersedes; there the DB
+      (_lineage_is_provisional) is consulted directly, per ident.
     * _watermark_update, _frontier_persist_claim and
       _lineage_confirmed_through_update are skipped. Stage B tracks its own
       progress through :ingestion/correction-sweep-through, and the forward
@@ -8333,31 +8385,26 @@ def _forward_apply(
             # valid_from Stream 2 recorded is a wrong guess, and must
             # never be used as an orig_ts for a close.
             #
-            # #235: state.provisional_idents is NOT consulted as a gate here.
-            # It is a PRELOAD SNAPSHOT (see _preload_provisional_idents) taken
-            # at run start, so on a fresh ingest it is EMPTY -- and Stream 2
-            # writes its guesses during that same run. Using it as a prefilter
-            # dropped every same-run guess before the DB-authoritative check
-            # below could see it, _forward_reconcile_provisional never fired,
-            # and _build_code_triples minted a SECOND :introduced-by alongside
-            # the guess. A prefilter's false negatives are unrecoverable
-            # precisely because the authority never runs.
+            # #235: _lineage_is_provisional(db, ident) is the SOLE authority
+            # for reconcilability, asked per ident, right here. There is no
+            # preloaded set, and none may be reintroduced as a prefilter --
+            # that is the bug this fix removed, in both directions:
             #
-            # The snapshot is also stale-POSITIVE: by the time this commit is
-            # reached an ident it lists may already have been confirmed
-            # authoritative in the DB (reconciled earlier in this same forward
-            # pass, or by a previous run's correction sweep). That is why
-            # _lineage_is_provisional stays the authority rather than being
-            # dropped in favour of a set -- popping entity_valid_from for an
-            # already-authoritative ident hands it to _build_code_triples as
-            # "new" and mints the same second fact, while
-            # _forward_reconcile_provisional no-ops on it.
-            #
-            # The set survives only so a RESUMED run's genuinely-stale entries
-            # drain: every candidate examined is evicted below regardless of
-            # whether it survives the DB check, because an entry left in place
-            # would be retried, and fail the same way, on every later commit
-            # that touches the entity.
+            #   * stale-NEGATIVE. A run-start snapshot is EMPTY on a fresh
+            #     ingest, and Stream 2 writes its guesses during that same
+            #     run. Prefiltering through it dropped every same-run guess
+            #     before the DB check could see it,
+            #     _forward_reconcile_provisional never fired, and
+            #     _build_code_triples minted a SECOND :introduced-by
+            #     alongside the guess. A prefilter's false negatives are
+            #     unrecoverable precisely because the authority never runs.
+            #   * stale-POSITIVE. By the time this commit is reached, an
+            #     ident such a snapshot listed may already be authoritative
+            #     in the DB (reconciled earlier in this same forward pass, or
+            #     by a previous run's correction sweep). Popping
+            #     entity_valid_from for it hands it to _build_code_triples as
+            #     "new" and mints the same second fact, while
+            #     _forward_reconcile_provisional no-ops and never retracts it.
             #
             # lifecycle_only (Stage B): _correction_sweep_apply owns "A"/"M"
             # lineage and has already run for this very commit, so
@@ -8365,31 +8412,14 @@ def _forward_apply(
             # back. An "R" file's NEW path is the one case that still needs
             # it -- nothing wrote those entities in Stage A, so the reverse
             # stream's provisional guess (if any) sits at a LATER commit that
-            # this rename supersedes. state.provisional_idents cannot be the
-            # prefilter there: it is a run-start snapshot, empty on a fresh
-            # ingest, and the guess was made during this same run.
-            if lifecycle_only:
-                reconcilable = (
-                    [
-                        ident for ident in _forward_candidate_idents(precomputed)
-                        if _lineage_is_provisional(db, ident)
-                    ]
-                    if status == "R" else []
-                )
-                # The eviction invariant above still holds here, it just has a
-                # different source: the preload snapshot is not the prefilter in
-                # this mode, so what must leave the set is exactly what was
-                # reconciled. Leaving these behind (the eviction loop's `[]` in
-                # an earlier revision) meant an R-file ident reconciled during
-                # Stage B stayed in state.provisional_idents and would be
-                # retried by every later commit touching the entity.
-                candidate_in_set = list(reconcilable)
-            else:
-                candidate_in_set = _forward_candidate_idents(precomputed)
-                reconcilable = [
-                    ident for ident in candidate_in_set
-                    if _lineage_is_provisional(db, ident)
-                ]
+            # this rename supersedes.
+            candidates = (
+                _forward_candidate_idents(precomputed)
+                if (not lifecycle_only or status == "R") else []
+            )
+            reconcilable = [
+                ident for ident in candidates if _lineage_is_provisional(db, ident)
+            ]
             # Built once per file rather than scanned per ident (matches
             # _correction_sweep_apply's candidate_triples_by_ident
             # precedent) -- a per-ident linear scan here is O(n^2) per file
@@ -8418,8 +8448,6 @@ def _forward_apply(
                     commit_ts_iso, state.ts_by_commit_ident, commit_ident,
                     index_con=index_con,
                 )
-            for ident in candidate_in_set:
-                state.provisional_idents.discard(ident)
             triples = _build_code_triples(
                 file_path, extracted, commit_ts_iso, state.entity_valid_from,
                 state.entity_descriptions, state.file_entities, commit_ident, precomputed,
@@ -9162,6 +9190,15 @@ def _correction_sweep_claim_and_process(
     _correction_sweep_select_position found nothing safe to do.
     skipped_so_far is forwarded to _correction_sweep_apply unchanged (see
     its docstring for why it exists).
+
+    pos_by_commit_ident (#235) is likewise forwarded unchanged: it enables
+    _correction_sweep_apply's two-value :introduced-by repair, which is
+    inert without it. Optional here only because the repair is optional --
+    but every driving loop should supply it, built exactly as _reverse_apply
+    and _correction_sweep_walk build it,
+    {f":commit/{h[:12]}": i for i, (h, ...) in enumerate(commit_metadata)},
+    which is positionally aligned with linearization by that argument's own
+    contract.
     """
     selected = _correction_sweep_select_position(db, linearization, commit_metadata, hash_to_pos)
     if selected is None:
@@ -9186,10 +9223,17 @@ def _correction_sweep_walk(
     ignore_patterns: Sequence[str] = (),
     index_con: Optional[Any] = None,
 ) -> Tuple[int, int]:
-    """Build hash_to_pos once and repeatedly call
-    _correction_sweep_claim_and_process (passing it down, along with the
+    """Build hash_to_pos and pos_by_commit_ident once and repeatedly call
+    _correction_sweep_claim_and_process (passing them down, along with the
     running skipped-events total as skipped_so_far) until that returns
     None, then call _correction_sweep_log_summary with the final total.
+
+    pos_by_commit_ident (#235) is what arms _correction_sweep_apply's
+    two-value :introduced-by repair; without it this walk would visit a
+    corrupt entity and merely log it as ambiguous. Built with the same
+    expression _reverse_apply uses, off commit_metadata, which
+    _correction_sweep_claim_and_process's own callees require to be
+    positionally aligned with linearization.
 
     Returns (commits_processed, skipped_events) -- summed across every
     call, both 0 when the gap-closed precondition isn't met yet (the
@@ -9204,6 +9248,7 @@ def _correction_sweep_walk(
     _correction_sweep_log_summary when its own loop ends.
     """
     hash_to_pos = {h: i for i, h in enumerate(linearization)}
+    pos_by_commit_ident = {f":commit/{h[:12]}": i for i, (h, _t, _a, _s) in enumerate(commit_metadata)}
     commits_processed = 0
     skipped_events = 0
     while True:
@@ -9211,6 +9256,7 @@ def _correction_sweep_walk(
             db, repo_path, linearization, commit_metadata,
             ignore_patterns=ignore_patterns, index_con=index_con,
             hash_to_pos=hash_to_pos, skipped_so_far=skipped_events,
+            pos_by_commit_ident=pos_by_commit_ident,
         )
         if result is None:
             break
@@ -9346,7 +9392,11 @@ class _ForwardWalkState:
     field_static_ident: Dict[str, bool]
     submodule_paths: Dict[str, str]
     unresolved_dep_idents: Dict[str, str]
-    provisional_idents: Set[str] = field(default_factory=set)
+    # No provisional-ident set here on purpose (#235) -- see _forward_apply's
+    # reconciliation block. Lineage provisionality is a DB question
+    # (_lineage_is_provisional), asked per ident at the moment it matters;
+    # a run-start snapshot of it is wrong on a fresh ingest in both
+    # directions and must not be reintroduced as a prefilter.
     ts_by_commit_ident: Dict[str, str] = field(default_factory=dict)
 
 
@@ -9378,6 +9428,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     # stomped on here; main()'s finally block re-sets the flag on exit regardless,
     # so a shutdown request arriving between runs is never silently lost.
     _shutdown_requested.clear()
+    # Per-run stderr budget for the two-value :introduced-by warning (#235).
+    # Reset HERE, not at module import, because this server is long-lived:
+    # see _reset_introduced_by_ambiguity_log_budget.
+    _reset_introduced_by_ambiguity_log_budget()
     try:
         # Read watermark and pre-load known entities/deps before releasing DB.
         # Off-loaded to a worker thread (see _load_ingestion_preload_state)
@@ -9389,7 +9443,6 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 watermark, prior_ingested, entity_valid_from, entity_descriptions,
                 file_entities, file_deps, dep_valid_from, pinned_commit_state,
                 field_class_ident, field_static_ident, submodule_paths, unresolved_dep_idents,
-                provisional_idents,  # consumed by _forward_apply (Task 5)
             ) = await loop.run_in_executor(preload_executor, _load_ingestion_preload_state, repo_path)
         # minigraf exposes no explicit close(): the file lock is only released once
         # every reference to the handle is gone — the worker thread's own `db`
@@ -9416,7 +9469,6 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             field_static_ident=field_static_ident,
             submodule_paths=submodule_paths,
             unresolved_dep_idents=unresolved_dep_idents,
-            provisional_idents=provisional_idents,
             # Full-history, so a resumed run's retroactive :modified-in for a
             # guess commit at or below the watermark still finds a timestamp
             # (a post-watermark-only map would silently skip it).
