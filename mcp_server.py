@@ -7233,42 +7233,54 @@ def _preload_known_entities(
 
 
 def _preload_unresolved_dep_idents(
-    db: Any, submodule_paths: Dict[str, str], valid_at: Optional[str] = None
+    db: Any, valid_at: Optional[str] = None
 ) -> Dict[str, str]:
     """Reload ident -> import_name for every unresolved-import stub (#112).
 
     _preload_known_entities' external-dependency branch requires a :path fact,
     which only real submodule entities have — unresolved-import stubs (see
-    _run_ingestion's dep-edge handling) never get one, so they're invisible to
+    _forward_apply's dep-edge handling) never get one, so they're invisible to
     that query. This runs the same :entity-type match WITHOUT the :path
-    requirement, then subtracts submodule_paths' idents (already known
-    submodules) to get exactly the stub idents, restart-safe.
+    requirement, then subtracts the idents that DO have a :path to get exactly
+    the stub idents, restart-safe.
 
     Needed so a submodule added in a later, separate ingestion run can still
     find and link any stub created in an earlier run (see the gitlink "add"
-    handling in _run_ingestion) — without this, only same-run stubs would
-    ever get linked.
+    handling in _forward_apply) — without this, only same-run stubs would ever
+    get linked.
 
-    valid_at MUST be the same resume-position bound _preload_known_entities
-    was given (#222 phase 2d review, B1), because submodule_paths is that
-    function's OUTPUT: this query is a minuend and submodule_paths is its
-    subtrahend, so bounding one without the other breaks the subtraction. A
-    real submodule created above the watermark by a prior run's Stage B would
-    drop out of the (bounded) subtrahend while staying in an unbounded
-    minuend, and be misclassified as a stub — reaching
+    The subtrahend is its OWN unbounded query, deliberately not
+    _preload_known_entities' submodule_paths (#238). Stub-ness is "has no
+    :path" — a property of the entity, not of the resume position — and once
+    submodule_paths became position-filtered, sharing it would drop a real
+    submodule born above the watermark out of the subtrahend while it stayed
+    in the minuend. That misclassifies it as a stub, reaching
     state.unresolved_dep_idents, where the replayed gitlink "add" handler's
     _submodule_path_matches_import check can fire on it (a submodule's
     :description is `name or path`) and mint a bogus
     [:module/sub-b :resolves-to :module/sub-a].
 
-    Unlike _preload_field_class_idents, this set has no asymmetry arguing for
-    the unrestricted read: an EXTRA entry is the bogus edge above, while a
-    MISSING one (a stub the reverse stream created above the watermark) is
-    merely a link the forward-only oracle would not have made at that
-    position either.
+    The MINUEND keeps the narrow ts(W) bound rather than #238's widened
+    envelope, because this set's asymmetry runs the other way from
+    _preload_known_entities': an EXTRA entry is the bogus edge above, while a
+    MISSING one is merely a link the forward-only oracle would not have made
+    at that position either. Narrower is safer here.
     """
     unresolved: Dict[str, str] = {}
     valid_at_clause = f':valid-at "{_edn_escape(valid_at)}" ' if valid_at else ""
+    path_bearing: set = set()
+    try:
+        raw = _db_execute(
+            db,
+            "(query [:find ?ident "
+            ":where "
+            "[?e :entity-type :type/external-dependency] "
+            "[?e :ident ?ident] "
+            "[?e :path ?path]])",
+        )
+        path_bearing = {row[0] for row in json.loads(raw).get("results", [])}
+    except Exception:
+        return unresolved
     try:
         raw = _db_execute(
             db,
@@ -7280,7 +7292,7 @@ def _preload_unresolved_dep_idents(
             "[?e :description ?desc]])",
         )
         for ident, desc in json.loads(raw).get("results", []):
-            if ident not in submodule_paths:
+            if ident not in path_bearing:
                 unresolved[ident] = desc
     except Exception:
         pass
@@ -7578,10 +7590,12 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     pinned_commit_state = _preload_pinned_commits(db, valid_at_ms=resume_valid_at_ms)
     field_class_ident = _preload_field_class_idents(db)
     field_static_ident = _preload_field_static_idents(db)
-    # Same bound as _preload_known_entities above, and not optional: this
-    # preload subtracts submodule_paths, which that call already bounded.
+    # Independent of _preload_known_entities' bound now (#238): the subtrahend
+    # is that function's own unbounded :path query, so stub classification no
+    # longer moves with the resume position. Keeps ts(W), not the envelope --
+    # see its docstring for why narrower is safer for this set.
     unresolved_dep_idents = _preload_unresolved_dep_idents(
-        db, submodule_paths, valid_at=resume_valid_at,
+        db, valid_at=resume_valid_at,
     )
     # No provisional-ident preload (#235): the forward walk's reconciliation
     # gate is _lineage_is_provisional(db, ident), queried per ident at the

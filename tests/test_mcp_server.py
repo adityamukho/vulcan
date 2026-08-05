@@ -9403,23 +9403,22 @@ class TestPreloadExternalDependencies:
 
         assert pinned[":module/vendor-lib"] == ("abc123", "2026-01-01T00:00:00.000Z")
 
-    def test_unresolved_stubs_share_the_resume_bound_with_submodule_paths(
+    def test_above_watermark_submodule_is_not_misclassified_as_a_stub(
         self, real_db, tmp_path,
     ):
-        """#222 phase 2d review, B1 follow-up: _preload_unresolved_dep_idents
-        is a minuend whose subtrahend (submodule_paths) is bounded to the
-        resume position, so it must carry the same bound.
+        """#238 follow-on: stub-ness is "has no :path", a property of the
+        ENTITY, not of the resume position.
 
-        Seeds two REAL submodules with prefix-related paths — one introduced
-        below the watermark, one above it (as a prior run's Stage B would
-        leave it) — plus one genuine unresolved-import stub. Bounded to the
-        watermark, the above-watermark submodule drops out of BOTH sides and
-        only the stub remains. Unbounded (the pre-fix shape, asserted below
-        so the misclassification is pinned and not merely described), it
-        drops out of the subtrahend only and is misclassified as a stub —
-        at which point the replayed gitlink "add" for vendor/lib mints
-        [:module/vendor-lib-extra :resolves-to :module/vendor-lib], since a
-        submodule's :description is `name or path`.
+        This function is a minuend whose subtrahend used to be
+        _preload_known_entities' submodule_paths. Once that output is
+        position-filtered (#238), a real submodule born above the watermark
+        drops out of the subtrahend while staying in the minuend, and is
+        misclassified as a stub -- reaching state.unresolved_dep_idents, where
+        the replayed gitlink "add" handler's _submodule_path_matches_import
+        check fires on it (a submodule's :description is `name or path`) and
+        mints a bogus [:module/vendor-lib-extra :resolves-to :module/vendor-lib].
+
+        The subtrahend is therefore its own UNBOUNDED :path query.
         """
         import mcp_server
 
@@ -9429,9 +9428,6 @@ class TestPreloadExternalDependencies:
             '[:module/vendor-lib :ident ":module/vendor-lib"] '
             '[:module/vendor-lib :path "vendor/lib"] '
             '[:module/vendor-lib :description "vendor/lib"] '
-            '[:module/vendor-lib :introduced-by :commit/c1] '
-            '[:commit/c1 :date "2026-01-01T00:00:00Z"] '
-            '[:commit/c1 :hash "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"] '
             # A genuine unresolved-import stub: no :path, ever.
             '[:module/pkg-missing :entity-type :type/external-dependency] '
             '[:module/pkg-missing :ident ":module/pkg-missing"] '
@@ -9443,32 +9439,33 @@ class TestPreloadExternalDependencies:
             '[[:module/vendor-lib-extra :entity-type :type/external-dependency] '
             '[:module/vendor-lib-extra :ident ":module/vendor-lib-extra"] '
             '[:module/vendor-lib-extra :path "vendor/lib/extra"] '
-            '[:module/vendor-lib-extra :description "vendor/lib/extra"] '
-            '[:module/vendor-lib-extra :introduced-by :commit/c2] '
-            '[:commit/c2 :date "2026-06-01T00:00:00Z"] '
-            '[:commit/c2 :hash "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"]])'
+            '[:module/vendor-lib-extra :description "vendor/lib/extra"]])'
         )
 
-        resume_valid_at = "2026-03-01T00:00:00Z"
-        *_, submodule_paths = mcp_server._preload_known_entities(
-            real_db, str(tmp_path), valid_at=resume_valid_at,
+        stubs = mcp_server._preload_unresolved_dep_idents(
+            real_db, valid_at="2026-03-01T00:00:00Z",
         )
-        assert submodule_paths == {":module/vendor-lib": "vendor/lib"}, (
-            "precondition: the above-watermark submodule must be out of the subtrahend"
+        assert stubs == {":module/pkg-missing": "pkg.missing"}, (
+            "a real (:path-bearing) submodule must never be classified as a stub, "
+            "regardless of which side of the watermark it was born on"
         )
 
-        bounded = mcp_server._preload_unresolved_dep_idents(
-            real_db, submodule_paths, valid_at=resume_valid_at,
+    def test_stub_above_the_watermark_is_excluded_by_the_bound(self, real_db, tmp_path):
+        """For stubs, MISSING is benign (a link the forward-only oracle would
+        not have made either) while EXTRA is harmful (a bogus :resolves-to), so
+        this minuend keeps the NARROWER ts(W) bound rather than #238's widened
+        envelope."""
+        import mcp_server
+        real_db.execute(
+            '(transact {:valid-from "2026-06-01T00:00:00Z"} '
+            '[[:module/pkg-late :entity-type :type/external-dependency] '
+            '[:module/pkg-late :ident ":module/pkg-late"] '
+            '[:module/pkg-late :description "pkg.late"]])'
         )
-        assert bounded == {":module/pkg-missing": "pkg.missing"}
-
-        unbounded = mcp_server._preload_unresolved_dep_idents(real_db, submodule_paths)
-        assert ":module/vendor-lib-extra" in unbounded, (
-            "the pre-fix shape must still misclassify, or this test proves nothing"
+        stubs = mcp_server._preload_unresolved_dep_idents(
+            real_db, valid_at="2026-03-01T00:00:00Z",
         )
-        assert mcp_server._submodule_path_matches_import(
-            "vendor/lib", unbounded[":module/vendor-lib-extra"]
-        ), "and the gitlink 'add' linking would then fire on it"
+        assert stubs == {}
 
     def test_preload_pinned_commits_returns_empty_on_query_failure(self, real_db, monkeypatch):
         """Same malformed-query technique as
