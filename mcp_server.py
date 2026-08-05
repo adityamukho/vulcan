@@ -4642,6 +4642,33 @@ def _git_tags(repo_path: str) -> List[tuple]:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_introduced_by(
+    db: Any, state: "_ForwardWalkState", ident: str
+) -> Optional[str]:
+    """The commit ident to retract for ident's :introduced-by at a close site.
+
+    Prefers the walk state, which the forward walk maintains for free at every
+    introduction. Falls back to a DB read for entities the state never saw --
+    principally entities Stream 2 introduced during THIS run, which Stage B's
+    _forward_apply(lifecycle_only=True) then closes. Without the fallback #231
+    would survive for exactly those.
+
+    The fallback is a per-CLOSE read, not per-ident-per-commit, so it does not
+    feed #239's hot path (1.33M :introduced-by point queries, 33.6% of at-scale
+    wall clock). Do not hoist it into a preloaded set: #235 removed a
+    provisional-ident prefilter for being wrong in both directions, and the
+    same argument applies to any run-start snapshot of lineage.
+
+    Returns None when the entity genuinely has no :introduced-by (an
+    unresolved-import stub), which _build_close_triples treats as "do not
+    retract".
+    """
+    known = state.entity_introduced_by.get(ident)
+    if known is not None:
+        return known
+    return _entity_introduced_by_query(db, ident)
+
+
 def _build_close_triples(
     ident: str,
     description: str,
@@ -4652,6 +4679,7 @@ def _build_close_triples(
     entity_type_kw: Optional[str] = None,
     file_value: Optional[str] = None,
     is_static: Optional[bool] = None,
+    introduced_by: Optional[str] = None,
 ) -> List[str]:
     """Return triple strings needed to bi-temporally close an entity.
 
@@ -4687,6 +4715,18 @@ def _build_close_triples(
     ident prefix, for callers whose ident prefix does NOT match their real
     :entity-type. Takes precedence over close_entity_type when both are given
     (they shouldn't be — pass one or the other).
+
+    introduced_by is the entity's :introduced-by commit ident, closed alongside
+    everything else (#231). Opt-in for the same reason close_entity_type is:
+    unresolved-import stubs reuse the module ident prefix but never have an
+    :introduced-by fact (see _forward_apply's dep-edge handling), so deriving
+    one here would retract a fact that was never asserted. Callers get the
+    value from _resolve_introduced_by, which prefers the walk state and falls
+    back to a DB read.
+
+    Leaving this fact open was the whole of #231: a closed-and-purged entity
+    still answered a bare [?e :introduced-by ?c] query, which made
+    _entity_introduced_by_query an unsound liveness test.
     """
     triples = [
         f'[{ident} :ident "{_edn_escape(ident)}"]',
@@ -4711,6 +4751,8 @@ def _build_close_triples(
         triples.append(f'[{ident} {attr} "{_edn_escape(file_value)}"]')
     if is_static is not None:
         triples.append(f"[{ident} :static {'true' if is_static else 'false'}]")
+    if introduced_by is not None:
+        triples.append(f"[{ident} :introduced-by {introduced_by}]")
     return triples
 
 
@@ -4722,6 +4764,7 @@ def _forget_closed_entity(
     field_class_ident: Dict[str, str],
     file_entities: Dict[str, List[str]],
     field_static_ident: Optional[Dict[str, bool]] = None,
+    entity_introduced_by: Optional[Dict[str, str]] = None,
 ) -> None:
     """Purge a just-closed ident from all in-memory lifecycle bookkeeping.
 
@@ -4743,6 +4786,10 @@ def _forget_closed_entity(
     - entity_descriptions / field_class_ident / field_static_ident: purged for
       consistency so no stale description, class-containment parent, or
       :static value is read for a future re-introduction of the same ident.
+    - entity_introduced_by: holds the ident's introducing commit for #231's
+      close-time retract. A stale entry would make a re-introduction at the
+      same ident retract the OLD introduction's :introduced-by on its next
+      close -- a fact that no longer exists at that value.
 
     Call this at EVERY entity close site, AFTER that site has read whatever it
     needs (description, orig_ts, class ident) to build its close triples — never
@@ -4759,6 +4806,8 @@ def _forget_closed_entity(
     field_class_ident.pop(ident, None)
     if field_static_ident is not None:
         field_static_ident.pop(ident, None)
+    if entity_introduced_by is not None:
+        entity_introduced_by.pop(ident, None)
     if file_path is not None:
         idents = file_entities.get(file_path)
         if idents is not None:
@@ -5373,6 +5422,32 @@ def _candidate_diff_purge_legacy(db: Any, index_con: Optional[Any] = None) -> in
         print(f"[_candidate_diff_purge_legacy] retract failed, {len(rows)} record(s) left in place: {e}", file=sys.stderr)
         return 0
     return len(rows)
+
+
+def _entity_ident_is_live(db: Any, entity_ident: str) -> bool:
+    """True iff entity_ident currently has a live :ident fact.
+
+    The reverse walk's "do I already know this entity?" gate (#231). It used
+    to ask _entity_introduced_by_query(db, ident) is not None, which was
+    unsound: _build_close_triples never retracted :introduced-by, so a
+    closed-and-purged entity kept that fact forever and the gate answered
+    "known" for it. _build_code_triples then took its "already known" branch
+    and emitted only :modified-in -- the entity was resurrected with lineage
+    but no identity, invisible to nearly every query, and
+    _correction_sweep_apply could not repair it either (it reconciles lineage
+    only and never emits structural facts).
+
+    Task 4 of this change does make close sites retract :introduced-by, which
+    would make the old gate correct too. This gate stays on :ident anyway: the
+    question it asks IS liveness, and coupling it to a lineage attribute is
+    what made #231 possible. It also stays correct if a future close site
+    forgets :introduced-by.
+
+    Current-time query by design -- an entity live in a CLOSED window is
+    exactly the resurrection case this must answer False for.
+    """
+    raw = _db_execute(db, f"(query [:find ?i :where [{entity_ident} :ident ?i]])")
+    return bool(json.loads(raw).get("results", []))
 
 
 def _entity_introduced_by_values_query(db: Any, entity_ident: str) -> List[str]:
@@ -6879,6 +6954,7 @@ def _build_code_triples(
     precomputed: Dict[str, Any],
     field_class_ident: Optional[Dict[str, str]] = None,
     field_static_ident: Optional[Dict[str, bool]] = None,
+    entity_introduced_by: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """Return Datalog triple strings for a file's extracted code entities.
 
@@ -6898,6 +6974,15 @@ def _build_code_triples(
 
     :depends-on edges are written in the commit loop by _run_ingestion as the
     file's imports change, giving them proper bi-temporal bounds.
+
+    entity_introduced_by, when supplied, records ident -> commit_ident at every
+    introduction branch -- the same five places entity_valid_from is written,
+    and written once for the same reason. Close sites need the commit IDENT to
+    retract [ident :introduced-by commit] (#231); entity_valid_from only has
+    the timestamp. Optional and defaulting to None because _reverse_apply
+    filters this function's :introduced-by output out entirely and owns that
+    attribute's write timing itself, so a forward-biased guess must never
+    reach its state.
     """
     triples: List[str] = []
     module_ident = precomputed["module_ident"]
@@ -6917,6 +7002,8 @@ def _build_code_triples(
         if module_ident not in idents_for_file:
             idents_for_file.append(module_ident)
         entity_valid_from[module_ident] = commit_ts_iso
+        if entity_introduced_by is not None:
+            entity_introduced_by[module_ident] = commit_ident
         entity_descriptions[module_ident] = file_path
     else:
         # Existing module: only record that this commit modified it. NOT
@@ -6930,6 +7017,8 @@ def _build_code_triples(
             if fn_ident not in idents_for_file:
                 idents_for_file.append(fn_ident)
             entity_valid_from[fn_ident] = commit_ts_iso
+            if entity_introduced_by is not None:
+                entity_introduced_by[fn_ident] = commit_ident
             entity_descriptions[fn_ident] = fn_name
         elif fn_ident not in unchanged_idents:
             # Pre-existing function whose body actually changed (#221):
@@ -6942,6 +7031,8 @@ def _build_code_triples(
             if cls_ident not in idents_for_file:
                 idents_for_file.append(cls_ident)
             entity_valid_from[cls_ident] = commit_ts_iso
+            if entity_introduced_by is not None:
+                entity_introduced_by[cls_ident] = commit_ident
             entity_descriptions[cls_ident] = cls_name
         elif cls_ident not in unchanged_idents:
             # Pre-existing class whose body actually changed (#221): record
@@ -6954,6 +7045,8 @@ def _build_code_triples(
             if gvar_ident not in idents_for_file:
                 idents_for_file.append(gvar_ident)
             entity_valid_from[gvar_ident] = commit_ts_iso
+            if entity_introduced_by is not None:
+                entity_introduced_by[gvar_ident] = commit_ident
             entity_descriptions[gvar_ident] = gvar_name
         elif gvar_ident not in unchanged_idents:
             triples.append(f"[{gvar_ident} :modified-in {commit_ident}]")
@@ -6964,6 +7057,8 @@ def _build_code_triples(
             if field_ident not in idents_for_file:
                 idents_for_file.append(field_ident)
             entity_valid_from[field_ident] = commit_ts_iso
+            if entity_introduced_by is not None:
+                entity_introduced_by[field_ident] = commit_ident
             entity_descriptions[field_ident] = field_name
             # Record the field's real owning-class parent so every close path
             # can retract the [class :contains field] edge alongside the module
@@ -6981,65 +7076,66 @@ def _build_code_triples(
 
 
 def _preload_known_entities(
-    db: Any, repo_path: str, valid_at: Optional[str] = None
+    db: Any,
+    repo_path: str,
+    valid_at: Optional[str] = None,
+    hash_to_pos: Optional[Dict[str, int]] = None,
+    watermark_pos: Optional[int] = None,
 ) -> tuple:
     """Load all existing module/function/class/external-dependency idents from
     the DB, and pre-seed file_entities with all currently tracked files in the
     repo.
 
-    valid_at (#222 phase 2d review, B1) bounds the entity queries to the graph
-    as it stood at the forward walk's RESUME POSITION -- i.e. at the
-    :ingestion/watermark commit's own timestamp -- instead of "now". Before the
-    two-stream ingest, the two were the same thing: the graph never held facts
-    for a commit above the watermark. The reverse stream breaks that. It writes
-    structural facts across the whole frontier-high region, and Stage B's
-    lifecycle pass then applies that region's deletions and renames, so a
-    CURRENT-graph preload hands the resuming forward walk a state describing
-    commits it has not reached yet. Both directions of that mismatch corrupt
-    the graph:
+    valid_at + hash_to_pos + watermark_pos together bound this query to the
+    graph as it stood at the forward walk's RESUME POSITION. Before the
+    two-stream ingest a current-graph preload and a resume-position preload
+    were the same thing; the reverse stream broke that by writing structural
+    facts across the whole frontier-high region, with Stage B's lifecycle pass
+    then applying that region's deletions and renames. Both directions of the
+    mismatch corrupt the graph, and they are NOT equally severe:
 
-      * an entity born in the reverse region is present in file_entities, is
-        absent from the parse of the (earlier) commit the forward walk is
-        replaying, and so is closed and _forget_closed_entity-purged as a
-        "removed" entity -- with an orig_ts LATER than the close's valid_to,
-        an inverted valid interval;
-      * an entity CLOSED in the reverse region is missing from the state
-        entirely, so replaying an earlier commit that still contains it takes
-        _build_code_triples' introduction branch and mints a second live
-        :introduced-by.
+      * an entity wrongly INCLUDED (born in the reverse region) is absent from
+        the parse of the earlier commit being replayed, so it is closed and
+        _forget_closed_entity-purged with an orig_ts LATER than the close's
+        valid_to -- an inverted valid interval. UNRECOVERABLE.
+      * an entity wrongly EXCLUDED (closed in the reverse region) makes replay
+        take _build_code_triples' introduction branch and mint a second live
+        :introduced-by. RECOVERABLE -- #235's correction sweep repairs it, and
+        a still-provisional entity is reconciled in place by
+        _forward_reconcile_provisional rather than duplicated.
 
-    Passing None restores the pre-#222 behaviour exactly, which is what a
-    fresh graph (no watermark) wants.
+    Wrong-inclusion is caused SOLELY by the introduction end, and the
+    introduction position is exactly recoverable: [?e :introduced-by ?c]
+    [?c :hash ?hash] -> hash_to_pos[?hash]. So watermark_pos closes the
+    unrecoverable direction exactly, with no fact-model change (#238).
 
-    Known residual, deliberately not papered over: valid-time is populated
-    from AUTHOR dates -- _git_commits reads `%at`, not `%ct` -- which are not
-    monotonic in topological order, and are MORE inversion-prone than
-    committer dates would be (a rebase, a cherry-pick or a long-lived branch
-    merged late all carry the original author date forward, while rewriting
-    the committer date). So this bound is looser than a committer-date bound,
-    and looser still than a position-indexed one.
+    The close END is not recoverable at all -- _ingest_close records a close
+    as valid_to = commit_ts_iso and holds no reference to the closing commit.
+    valid_at therefore stays, but is DEMOTED: it no longer carries the safety
+    property, only "how widely do we re-admit entities closed above the
+    watermark". Callers pass the monotone envelope T_hi(W) = max(ts[0..W])
+    rather than ts(W), the widest value that still excludes every close at or
+    below W (a close at position p <= W has valid_to = ts[p] <= T_hi(W), and
+    :valid-at's half-open semantics require valid_at < valid_to).
 
-    The residual therefore runs in BOTH directions, not just one:
+    This is a REPLACEMENT of the old ts(W) bound, not a union with it. Read
+    #238 before changing it: widening the date bound alone is the "add-back"
+    that looks like a fix and isn't, and
+    test_the_envelope_alone_does_not_close_the_hole pins exactly that.
 
-      * a commit at or below the watermark dated LATER than the watermark
-        commit -- its entities drop out of this snapshot and are treated as
-        new, i.e. duplicate introduction (the second bullet above, rarer);
-      * a commit ABOVE the watermark dated EARLIER than the watermark commit
-        -- its entities stay in this snapshot, are absent from the parse of
-        the earlier commit being replayed, and are closed and
-        _forget_closed_entity-purged: B1's original DATA-LOSS mode, surviving
-        in narrow form.
+    Residual, deliberately accepted: an entity introduced at or below W,
+    deleted or renamed above W with a close date earlier than T_hi(W), where a
+    prior run's Stage B already applied that deletion. It is excluded, so
+    replay mints a duplicate :introduced-by -- the recoverable direction, left
+    to #235's sweep.
 
-    Both are live on this repository: of 552 watermark positions, 6 (118-123)
-    have a strictly-earlier-dated LATER position, and those later positions
-    (124-128, a side branch authored 2026-04-26/27 landing topologically
-    after the 2026-05-02 merges) are confirmed descendants of 118-123 via
-    `git merge-base --is-ancestor`. Consequence for whoever closes this: the
-    eventual ancestry- or position-indexed filter must REPLACE this
-    valid-time bound, not be unioned with it as an "add-back" -- a union only
-    re-admits the benign duplicate-introduction direction and leaves the
-    data-loss direction wide open. (The linearization is not available on
-    this code path, which is why the bound is expressed in valid-time here.)
+    :depends-on and :pinned-commit carry no commit reference of any kind, so
+    _preload_known_deps and _preload_pinned_commits get no position clause and
+    stay at ts(W). Tracked as #245; do NOT widen them to the envelope without
+    one, which would make their data-loss direction worse.
+
+    Passing all three as None restores the pre-#222 behaviour exactly, which
+    is what a fresh graph (no watermark) wants.
 
     external-dependency entities share the module ident namespace and use the
     same "path" attribute as modules, so folding them into this same query
@@ -7054,16 +7150,15 @@ def _preload_known_entities(
     find any module file even when processing early commits — before those files
     have been introduced in the chronological commit walk.
 
-    Returns (entity_valid_from, entity_descriptions, file_entities, submodule_paths).
-    entity_valid_from maps ident → git commit timestamp of first introduction.
-    entity_descriptions maps ident → human-readable name (function/class/file).
-    submodule_paths maps external-dependency (submodule) ident → its :path,
-    used by the gitlink "add"/stub-creation linking in #112's fix to tell a
-    real submodule ident apart from an unresolved-import stub ident (which
-    never has a :path).
+    Returns (entity_valid_from, entity_descriptions, entity_introduced_by,
+    file_entities, submodule_paths). entity_introduced_by maps ident -> the
+    :commit/... ident that introduced it, derived from the same ?hash the
+    position clause uses -- #231's close-time retract value. submodule_paths
+    stays LAST: an existing test destructures with `*_, submodule_paths`.
     """
     entity_valid_from: Dict[str, str] = {}
     entity_descriptions: Dict[str, str] = {}
+    entity_introduced_by: Dict[str, str] = {}
     file_entities: Dict[str, List[str]] = {}
     submodule_paths: Dict[str, str] = {}
 
@@ -7090,19 +7185,62 @@ def _preload_known_entities(
         try:
             raw = _db_execute(
                 db,
-                f'(query [:find ?ident ?path ?desc ?date '
+                f'(query [:find ?ident ?path ?desc ?date ?hash '
                 f'{valid_at_clause}'
                 f':where [?e :entity-type :type/{entity_type}] '
                 f'[?e :ident ?ident] '
                 f'[?e :{path_attr} ?path] '
                 f'[?e :description ?desc] '
                 f'[?e :introduced-by ?c] '
-                f'[?c :date ?date]])',
+                f'[?c :date ?date] '
+                f'[?c :hash ?hash]])',
             )
             rows = json.loads(raw).get("results", [])
-            for ident, path, desc, date in rows:
+            for ident, path, desc, date, hash_ in rows:
+                # #238: the resume bound, POSITION-indexed. This clause is
+                # CONJUNCTIVE over every row -- that is what makes the widened
+                # valid_at envelope safe, and it is the distinction #238
+                # insists on. Wrong-INCLUSION (the unrecoverable direction) is
+                # caused solely by the introduction end, which this closes
+                # exactly; the date bound above only governs how widely
+                # entities closed ABOVE the watermark are re-admitted. Never
+                # turn this into an "add-back" branch beside the date bound --
+                # that re-admits the benign direction and leaves data loss
+                # wide open.
+                #
+                # pos is None means the introducing commit is not in this
+                # linearization (a rewritten or foreign history): exclude,
+                # which is the benign direction.
+                if watermark_pos is not None:
+                    pos = hash_to_pos.get(hash_) if hash_to_pos is not None else None
+                    if pos is None or pos > watermark_pos:
+                        continue
                 entity_valid_from[ident] = date
                 entity_descriptions[ident] = desc
+                # Reconstructed from ?hash, not read off a bound ?c, and
+                # deliberately so (final-review Finding 3): ?c is a SUBJECT
+                # variable here ([?e :introduced-by ?c] [?c :date ?date]
+                # [?c :hash ?hash]), and binding a subject variable in :find
+                # position returns minigraf's internal UUID, not the keyword
+                # ident string -- the same reason _preload_known_deps binds
+                # ?srci instead of ?src and _preload_pinned_commits binds ?ei
+                # instead of ?e (see their docstrings, and #141's root-cause
+                # note at _rebuild_index_from_graph). Verified empirically
+                # for ?c specifically, not just assumed by analogy: adding
+                # ?c to this query's :find list returns a UUID like
+                # "bd5e9774-8fbd-5ec4-81e8-7310073fa5c3", never
+                # ":commit/abc123456789". Reconstructing via f":commit/
+                # {hash_[:12]}" is therefore correct AND necessary, not a
+                # missed opportunity to simplify -- it must stay byte-for-
+                # byte identical to the commit_ident both write sites
+                # (mcp_server.py, the forward-walk and _forward_apply commit
+                # triples) build the same way, since this value becomes the
+                # :introduced-by retract value at close time (#231) and a
+                # silent mismatch would make that retract a no-op.
+                # test_entity_introduced_by_matches_commit_write_site pins
+                # this against the real write sites, not just this format
+                # string in isolation.
+                entity_introduced_by[ident] = f":commit/{hash_[:12]}"
                 file_entities.setdefault(path, [])
                 if ident not in file_entities[path]:
                     file_entities[path].append(ident)
@@ -7111,46 +7249,123 @@ def _preload_known_entities(
         except Exception:
             pass
 
-    return entity_valid_from, entity_descriptions, file_entities, submodule_paths
+    return (
+        entity_valid_from, entity_descriptions, entity_introduced_by,
+        file_entities, submodule_paths,
+    )
 
 
 def _preload_unresolved_dep_idents(
-    db: Any, submodule_paths: Dict[str, str], valid_at: Optional[str] = None
+    db: Any, valid_at: Optional[str] = None
 ) -> Dict[str, str]:
     """Reload ident -> import_name for every unresolved-import stub (#112).
 
     _preload_known_entities' external-dependency branch requires a :path fact,
     which only real submodule entities have — unresolved-import stubs (see
-    _run_ingestion's dep-edge handling) never get one, so they're invisible to
+    _forward_apply's dep-edge handling) never get one, so they're invisible to
     that query. This runs the same :entity-type match WITHOUT the :path
-    requirement, then subtracts submodule_paths' idents (already known
-    submodules) to get exactly the stub idents, restart-safe.
+    requirement, then subtracts the idents that DO have a :path to get exactly
+    the stub idents, restart-safe.
 
     Needed so a submodule added in a later, separate ingestion run can still
     find and link any stub created in an earlier run (see the gitlink "add"
-    handling in _run_ingestion) — without this, only same-run stubs would
-    ever get linked.
+    handling in _forward_apply) — without this, only same-run stubs would ever
+    get linked.
 
-    valid_at MUST be the same resume-position bound _preload_known_entities
-    was given (#222 phase 2d review, B1), because submodule_paths is that
-    function's OUTPUT: this query is a minuend and submodule_paths is its
-    subtrahend, so bounding one without the other breaks the subtraction. A
-    real submodule created above the watermark by a prior run's Stage B would
-    drop out of the (bounded) subtrahend while staying in an unbounded
-    minuend, and be misclassified as a stub — reaching
-    state.unresolved_dep_idents, where the replayed gitlink "add" handler's
-    _submodule_path_matches_import check can fire on it (a submodule's
-    :description is `name or path`) and mint a bogus
-    [:module/sub-b :resolves-to :module/sub-a].
+    The subtrahend is the UNION of two queries, deliberately not
+    _preload_known_entities' submodule_paths (#238). Stub-ness is "has no
+    :path" — a property of the entity, not of the resume position — and
+    submodule_paths is filtered by the introducing commit's LINEARIZATION
+    POSITION (hash_to_pos[hash] <= watermark_pos), not by date. That
+    position bound is exactly what makes this reachable: because commit
+    author-dates are not monotonic in topological order (a rebase,
+    cherry-pick or side branch can carry an earlier author-date onto a
+    later position — measured on this repo, 6 of 552 watermark positions
+    have a strictly-earlier-dated later position), a real submodule's own
+    facts can be dated below ts(W) — so this function's DATE-bounded minuend
+    includes it — while its introducing commit sits at a POSITION above the
+    watermark — so a position-filtered subtrahend excludes it anyway. That
+    misclassifies it as a stub, reaching state.unresolved_dep_idents, where
+    the replayed gitlink "add" handler's _submodule_path_matches_import
+    check can fire on it (a submodule's :description is `name or path`) and
+    mint a bogus [:module/sub-b :resolves-to :module/sub-a]. This is not a
+    date-bound mismatch; a shared date bound on both sides would not
+    reproduce it (round-2 review caught an earlier draft of this reasoning,
+    and the test file's docstring, making exactly that substitution).
 
-    Unlike _preload_field_class_idents, this set has no asymmetry arguing for
-    the unrestricted read: an EXTRA entry is the bogus edge above, while a
-    MISSING one (a stub the reverse stream created above the watermark) is
-    merely a link the forward-only oracle would not have made at that
-    position either.
+    Final-review Finding 1: an unbounded-only subtrahend opened a SECOND
+    direction of the same failure. Its temporal base disagreed with the
+    minuend's own ts(W) bound below, and that mismatch has its own concrete
+    trigger: a submodule live AT OR BELOW the watermark whose gitlink is
+    removed ABOVE it. A prior run's Stage B _forward_apply(lifecycle_only=
+    True) calls _build_close_triples(..., file_value=path), retracting the
+    entity's :path (and :ident/:description) — so it drops out of an
+    unbounded-only subtrahend (no longer live at current time), while the
+    minuend below still sees it (:ident/:description/:path were all still
+    live at ts(W)). That dead submodule then reaches
+    state.unresolved_dep_idents, where a later gitlink "add" whose path
+    prefixes its :description mints a bogus :resolves-to edge — but this
+    time pointing at a CLOSED entity, the exact thing #112's dedup exists to
+    prevent. Fixed by widening the subtrahend to the UNION of the unbounded
+    query and a second, :valid-at ts(W)-bounded :path query — matching the
+    minuend's own temporal base for exactly this case, while leaving the
+    unbounded disjunct in place for the ordinary (still-live) case. See
+    test_removed_above_watermark_submodule_is_not_misclassified_as_a_stub,
+    which fails against an unbounded-only subtrahend.
+
+    A ts(W)-ONLY subtrahend (replacing the unbounded disjunct rather than
+    unioning with it) would instead regress the FIRST direction: it would
+    reintroduce exactly the position-inversion failure
+    test_above_watermark_submodule_is_not_misclassified_as_a_stub and
+    test_position_inverted_submodule_is_not_misclassified_as_a_stub pin,
+    where a real submodule introduced above the watermark (so absent at
+    ts(W)) but still live right now would drop back out of the subtrahend.
+    The union is required, not either bound alone.
+
+    The MINUEND keeps the narrow ts(W) bound rather than #238's widened
+    envelope, because this set's asymmetry runs the other way from
+    _preload_known_entities': an EXTRA entry is the bogus edge above, while a
+    MISSING one is merely a link the forward-only oracle would not have made
+    at that position either. Narrower is safer for the minuend — and by the
+    same asymmetry, WIDER is safer for the subtrahend: a wider subtrahend can
+    only ever remove idents from the stub set, never add one, so unioning in
+    a second query is the safe direction here even though it looks like it
+    is loosening the bound.
     """
     unresolved: Dict[str, str] = {}
     valid_at_clause = f':valid-at "{_edn_escape(valid_at)}" ' if valid_at else ""
+    path_bearing: set = set()
+    try:
+        raw = _db_execute(
+            db,
+            "(query [:find ?ident "
+            ":where "
+            "[?e :entity-type :type/external-dependency] "
+            "[?e :ident ?ident] "
+            "[?e :path ?path]])",
+        )
+        path_bearing = {row[0] for row in json.loads(raw).get("results", [])}
+    except Exception:
+        return unresolved
+    if valid_at_clause:
+        # Second subtrahend disjunct (final-review Finding 1): a submodule
+        # live at ts(W) but already closed at current time (see docstring
+        # above). Best-effort like the unbounded query above — a failure
+        # here just falls back to the unbounded-only result rather than
+        # aborting the whole function.
+        try:
+            raw = _db_execute(
+                db,
+                "(query [:find ?ident "
+                f"{valid_at_clause}"
+                ":where "
+                "[?e :entity-type :type/external-dependency] "
+                "[?e :ident ?ident] "
+                "[?e :path ?path]])",
+            )
+            path_bearing |= {row[0] for row in json.loads(raw).get("results", [])}
+        except Exception:
+            pass
     try:
         raw = _db_execute(
             db,
@@ -7162,7 +7377,7 @@ def _preload_unresolved_dep_idents(
             "[?e :description ?desc]])",
         )
         for ident, desc in json.loads(raw).get("results", []):
-            if ident not in submodule_paths:
+            if ident not in path_bearing:
                 unresolved[ident] = desc
     except Exception:
         pass
@@ -7272,6 +7487,16 @@ def _preload_known_deps(
     [valid_from, valid_to) containing valid_at_ms, which is exactly
     :valid-at's own half-open semantics.
 
+    #238/#245: this bound is still ts(W), NOT the monotone envelope
+    _preload_known_entities now takes, and it has no position clause. A
+    :depends-on fact carries no commit reference of any kind -- its
+    introduction timestamp comes from its own :db/valid-from -- so there is
+    nothing to join to a :hash and no position to filter on. Widening it to
+    the envelope WITHOUT a position clause would make its data-loss direction
+    worse, which is exactly the union #238 forbids. It therefore retains
+    #238's residual in both directions. Tracked as #245; do not "fix" this by
+    widening the bound.
+
     Mirrors _preload_known_entities, but :depends-on facts have no
     :introduced-by-style companion edge to a commit's :date, so the
     introduction timestamp has to come from the fact's own :db/valid-from
@@ -7353,6 +7578,13 @@ def _preload_pinned_commits(db: Any, valid_at_ms: Optional[int] = None) -> Dict[
     region, so a completed two-stream run can leave a bump recorded above the
     watermark (#222 phase 2d review, B1).
 
+    #238/#245: still ts(W), with no position clause, for the same reason
+    _preload_known_deps has none -- a :pinned-commit fact carries no commit
+    reference to derive a linearization position from. Retains #238's residual
+    in both directions: a bump recorded above the watermark can be closed
+    against the wrong prior SHA. Tracked as #245. Do not widen this to
+    _preload_known_entities' envelope without a position clause.
+
     Needed because :pinned-commit is bi-temporally closed and reopened on
     every bump (see _run_ingestion's gitlink handling) — without this, the
     server would lose track of the prior SHA and valid-from across a restart,
@@ -7415,7 +7647,44 @@ def _preload_provisional_idents(db: Any) -> Set[str]:
     return {row[0] for row in json.loads(raw).get("results", [])}
 
 
-def _load_ingestion_preload_state(repo_path: str) -> tuple:
+def _resume_envelope(
+    commit_metadata: List[Tuple[str, str, str, str]], watermark_pos: Optional[int]
+) -> Optional[str]:
+    """T_hi(W) = max(ts[0..W]) -- the monotone envelope of every author date at
+    or below the resume position, and the valid-time bound
+    _preload_known_entities takes (#238).
+
+    NOT ts(W). Author dates are not monotonic in topological order
+    (_git_commits reads %at, not %ct), so ts(W) does not cleanly separate "at
+    or below the resume position" from "above it". The envelope is the widest
+    bound that still excludes every close at or below W: such a close has
+    valid_to = ts[p] <= T_hi(W), and :valid-at's half-open semantics require
+    valid_at < valid_to.
+
+    Widening the bound this way is only safe BECAUSE _preload_known_entities
+    also applies a conjunctive position clause. Alone it is the "add-back
+    union" #238 warns produces a change that looks like a fix and isn't -- see
+    test_the_envelope_alone_does_not_close_the_hole.
+
+    Timestamps are fixed-width UTC ("%Y-%m-%dT%H:%M:%SZ") from _git_commits, so
+    lexicographic max is chronological max.
+
+    Returns None for a None position (a fresh graph, no watermark), which
+    degrades the preload to its pre-#222 unrestricted form.
+    """
+    if watermark_pos is None:
+        return None
+    window = commit_metadata[: watermark_pos + 1]
+    if not window:
+        return None
+    return max(ts for _hash, ts, _author, _subject in window)
+
+
+def _load_ingestion_preload_state(
+    repo_path: str,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+) -> tuple:
     """Open the DB and run every startup preload query for _run_ingestion.
 
     Executed via run_in_executor on a worker thread (see _run_ingestion), not
@@ -7430,28 +7699,81 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     entering a permanent "error" state (#106). Mirrors get_db()'s
     "reuse the already-open handle" short-circuit rather than reopening
     unconditionally.
+
+    linearization and commit_metadata are #238's resume bound. They are
+    supplied by the caller rather than built here because the git enumeration
+    must not run while this function holds the graph file lock -- see
+    _run_ingestion, which now runs both enumerations before the preload rather
+    than after it. That ordering, not any preference for valid-time, is the
+    whole reason the bound used to be expressed in author dates: the
+    linearization simply did not exist yet when this ran.
+
+    Both are validated for positional alignment before use: length AND
+    per-position hash equality, matching _reverse_apply's own check
+    (mcp_server.py, `commit_hash != linearization[pos]`) for the same reason
+    (silent, systematic error) -- but the consequence here is worse: a
+    misaligned pair mis-filters the ENTIRE preload rather than misattributing
+    one commit. Length alone is not enough: build_linearization and
+    _git_commits(repo_path, None, branch) are two separate `git log`
+    invocations, so a ref moving between them can keep lengths equal while
+    permuting hashes across positions.
     """
     db = _db if _db is not None else _open_db_at_with_extended_retry(_graph_path or _get_graph_path())
     watermark = _watermark_query(db)
-    # #222 phase 2d review, B1: the MUTABLE walk state must describe the graph
-    # at the forward walk's resume position, not "now" -- see
-    # _preload_known_entities' valid_at docstring for what goes wrong
-    # otherwise. The resume position IS the watermark (both the forward walk
-    # and Stage B's lifecycle pass start there), so the bound is that
-    # commit's own :date, read back out of the graph. Wall-clock time would
-    # be wrong twice over: it is not the resume position, and ingest
-    # valid-time is denominated in AUTHOR dates (_git_commits reads `%at`,
-    # not `%ct`), not real time. Author dates invert more readily than
-    # committer dates -- see _preload_known_entities' docstring for the
-    # residual this leaves open in BOTH directions, and for why the eventual
-    # ancestry-indexed fix must replace this bound rather than union with it.
-    # No watermark means a fresh graph, where None degrades this to exactly
-    # the pre-#222 unrestricted queries rather than to an empty state.
+    if len(commit_metadata) != len(linearization):
+        raise ValueError(
+            "commit_metadata must be positionally aligned with linearization "
+            f"(got {len(commit_metadata)} entries vs {len(linearization)}); "
+            "a misaligned pair mis-filters the entire preload (#238)"
+        )
+    # Length equality alone does not rule out a PERMUTATION: build_linearization
+    # and _git_commits(repo_path, None, branch) are two separate `git log`
+    # invocations, so a ref moving between them can keep both lists the same
+    # length while reordering hashes across positions -- silently shifting
+    # T_hi(W) (_resume_envelope reads commit_metadata by index) and
+    # mis-filtering the whole preload without ever raising. Mirrors
+    # _reverse_apply's own per-position `commit_hash != linearization[pos]`
+    # check, generalized to every position since this function has no single
+    # `pos` to check -- it consumes the full lists up front.
+    for i, (meta_hash, linearization_hash) in enumerate(zip(
+        (h for h, _t, _a, _s in commit_metadata), linearization,
+    )):
+        if meta_hash != linearization_hash:
+            raise ValueError(
+                f"commit_metadata[{i}] is {meta_hash}, but linearization[{i}] is "
+                f"{linearization_hash}: the two must be positionally aligned "
+                "(#238) -- a ref move between the two git-log invocations can "
+                "keep lengths equal while permuting hashes"
+            )
+    hash_to_pos = {h: i for i, h in enumerate(linearization)}
+    watermark_pos = hash_to_pos.get(watermark) if watermark is not None else None
+
+    # #238: two DIFFERENT bounds now, deliberately.
+    #
+    # resume_valid_at is ts(W), the watermark commit's own :date. It is what
+    # :depends-on and :pinned-commit still use, because those facts carry no
+    # commit reference of any kind and so admit no position clause. Widening
+    # THEM to the envelope without one would make their data-loss direction
+    # worse -- exactly the union #238 forbids. Tracked as #245.
+    #
+    # entity_valid_at is the monotone envelope T_hi(W) = max(ts[0..W]), which
+    # is safe only because _preload_known_entities pairs it with the
+    # conjunctive position clause below. A None watermark_pos (fresh graph, or
+    # a watermark absent from this linearization -- a rewritten history)
+    # degrades both to the pre-#222 unrestricted queries rather than to an
+    # empty state.
     resume_valid_at = _commit_date_query(db, watermark)
     resume_valid_at_ms = _iso_to_epoch_ms(resume_valid_at)
+    entity_valid_at = _resume_envelope(commit_metadata, watermark_pos)
+    if entity_valid_at is None:
+        entity_valid_at = resume_valid_at
     prior_ingested = _count_commit_entities(db)
-    entity_valid_from, entity_descriptions, file_entities, submodule_paths = _preload_known_entities(
-        db, repo_path, valid_at=resume_valid_at,
+    (
+        entity_valid_from, entity_descriptions, entity_introduced_by,
+        file_entities, submodule_paths,
+    ) = _preload_known_entities(
+        db, repo_path, valid_at=entity_valid_at,
+        hash_to_pos=hash_to_pos, watermark_pos=watermark_pos,
     )
     file_deps, dep_valid_from = _preload_known_deps(
         db, file_entities, valid_at_ms=resume_valid_at_ms,
@@ -7459,10 +7781,12 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     pinned_commit_state = _preload_pinned_commits(db, valid_at_ms=resume_valid_at_ms)
     field_class_ident = _preload_field_class_idents(db)
     field_static_ident = _preload_field_static_idents(db)
-    # Same bound as _preload_known_entities above, and not optional: this
-    # preload subtracts submodule_paths, which that call already bounded.
+    # Independent of _preload_known_entities' bound now (#238): the subtrahend
+    # is that function's own unbounded :path query, so stub classification no
+    # longer moves with the resume position. Keeps ts(W), not the envelope --
+    # see its docstring for why narrower is safer for this set.
     unresolved_dep_idents = _preload_unresolved_dep_idents(
-        db, submodule_paths, valid_at=resume_valid_at,
+        db, valid_at=resume_valid_at,
     )
     # No provisional-ident preload (#235): the forward walk's reconciliation
     # gate is _lineage_is_provisional(db, ident), queried per ident at the
@@ -7474,8 +7798,9 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     # deliberately not part of the walk's state.
     return (
         watermark, prior_ingested, entity_valid_from, entity_descriptions,
-        file_entities, file_deps, dep_valid_from, pinned_commit_state,
-        field_class_ident, field_static_ident, submodule_paths, unresolved_dep_idents,
+        entity_introduced_by, file_entities, file_deps, dep_valid_from,
+        pinned_commit_state, field_class_ident, field_static_ident,
+        submodule_paths, unresolved_dep_idents,
     )
 
 
@@ -7994,9 +8319,15 @@ def _reverse_apply(
             + [ident for ident, _name, _t in precomputed["global_entries"]]
             + [ident for ident, _name, _t in precomputed["field_entries"]]
         )
+        # #231: LIVENESS, not lineage. _entity_introduced_by_query was unsound
+        # here -- a closed-and-purged entity kept its :introduced-by forever,
+        # so this gate answered "known" for it, _build_code_triples took its
+        # "already known" branch, and the entity came back as a ghost with no
+        # current :ident. Same one query per candidate ident, so #239's cost
+        # profile is unchanged.
         known_before: Dict[str, str] = {
             ident: "known" for ident in candidate_idents
-            if _entity_introduced_by_query(db, ident) is not None
+            if _entity_ident_is_live(db, ident)
         }
         known_before_snapshot = set(known_before.keys())
 
@@ -8300,6 +8631,7 @@ def _forward_apply(
         f'[{commit_ident} :date "{commit_ts_iso}"]',
     ]
     close_items: List[tuple] = []  # (triples, original_ts_iso)
+    closed_idents: List[str] = []  # idents closed this commit (lineage discard)
     dep_add_triples: List[str] = []  # :depends-on triples to transact individually
     # Old paths of files renamed this commit (R status). Their
     # unmatched child entities / dependency edges are closed in a
@@ -8322,13 +8654,15 @@ def _forward_apply(
                         state.field_class_ident.get(ident),
                         close_entity_type=True, file_value=file_path,
                         is_static=state.field_static_ident.get(ident),
+                        introduced_by=_resolve_introduced_by(db, state, ident),
                     ), orig_ts)
                 )
                 _forget_closed_entity(
                     ident, file_path, state.entity_valid_from,
                     state.entity_descriptions, state.field_class_ident, state.file_entities,
-                    state.field_static_ident,
+                    state.field_static_ident, state.entity_introduced_by,
                 )
+                closed_idents.append(ident)
             # Whole file is gone: drop its (now-empty) state.file_entities key
             # so nothing stale lingers under this path (matches state.file_deps).
             state.file_entities.pop(file_path, None)
@@ -8357,6 +8691,7 @@ def _forward_apply(
                     _build_close_triples(
                         old_module_ident, old_desc, old_module_ident,
                         close_entity_type=True, file_value=old_path,
+                        introduced_by=_resolve_introduced_by(db, state, old_module_ident),
                     ),
                     orig_ts,
                 ))
@@ -8369,8 +8704,9 @@ def _forward_apply(
                 _forget_closed_entity(
                     old_module_ident, old_path, state.entity_valid_from,
                     state.entity_descriptions, state.field_class_ident, state.file_entities,
-                    state.field_static_ident,
+                    state.field_static_ident, state.entity_introduced_by,
                 )
+                closed_idents.append(old_module_ident)
             previous_idents = set(state.file_entities.get(file_path, []))
             # #222 phase 2d: an entity Stream 2 already introduced
             # provisionally is NOT authoritatively introduced, so the
@@ -8451,7 +8787,7 @@ def _forward_apply(
             triples = _build_code_triples(
                 file_path, extracted, commit_ts_iso, state.entity_valid_from,
                 state.entity_descriptions, state.file_entities, commit_ident, precomputed,
-                state.field_class_ident, state.field_static_ident,
+                state.field_class_ident, state.field_static_ident, state.entity_introduced_by,
             )
             # lifecycle_only: called for its dict side effects, output
             # DISCARDED for "A"/"M" (see this function's docstring). "R" keeps
@@ -8498,6 +8834,7 @@ def _forward_apply(
                             state.field_class_ident.get(ident),
                             close_entity_type=True, file_value=file_path,
                             is_static=state.field_static_ident.get(ident),
+                            introduced_by=_resolve_introduced_by(db, state, ident),
                         ), orig_ts)
                     )
                     # File survives (M), only this child was removed:
@@ -8505,8 +8842,9 @@ def _forward_apply(
                     _forget_closed_entity(
                         ident, file_path, state.entity_valid_from,
                         state.entity_descriptions, state.field_class_ident, state.file_entities,
-                        state.field_static_ident,
+                        state.field_static_ident, state.entity_introduced_by,
                     )
+                    closed_idents.append(ident)
             # Compute dep edges for this file and diff against previous.
             # Resolution itself already happened in _extract_commit
             # (precomputed["resolved_imports"]) against that commit's
@@ -8566,14 +8904,16 @@ def _forward_apply(
                 state.field_class_ident.get(old_ident),
                 close_entity_type=True, file_value=old_file,
                 is_static=state.field_static_ident.get(old_ident),
+                introduced_by=_resolve_introduced_by(db, state, old_ident),
             ),
             orig_ts,
         ))
         _forget_closed_entity(
             old_ident, old_file, state.entity_valid_from,
             state.entity_descriptions, state.field_class_ident, state.file_entities,
-            state.field_static_ident,
+            state.field_static_ident, state.entity_introduced_by,
         )
+        closed_idents.append(old_ident)
 
     # A file rename (R status) only closes the old MODULE above.
     # Child entities and dependency edges under the old path are
@@ -8605,13 +8945,15 @@ def _forward_apply(
                         state.field_class_ident.get(ident),
                         close_entity_type=True, file_value=r_old_path,
                         is_static=state.field_static_ident.get(ident),
+                        introduced_by=_resolve_introduced_by(db, state, ident),
                     ), orig_ts)
                 )
                 _forget_closed_entity(
                     ident, r_old_path, state.entity_valid_from,
                     state.entity_descriptions, state.field_class_ident, state.file_entities,
-                    state.field_static_ident,
+                    state.field_static_ident, state.entity_introduced_by,
                 )
+                closed_idents.append(ident)
             # Whole old path is gone (renamed away): drop the key so
             # no stale ident lingers to be re-discovered by a later
             # commit that reuses this path (e.g. a shim at old_path).
@@ -8678,6 +9020,7 @@ def _forward_apply(
                     ext_ident, desc, ext_ident,
                     entity_type_kw=":type/external-dependency",
                     file_value=path,
+                    introduced_by=_resolve_introduced_by(db, state, ext_ident),
                 ), orig_ts)
             )
             # Submodule removed: purge lifecycle state so a later
@@ -8687,7 +9030,9 @@ def _forward_apply(
             _forget_closed_entity(
                 ext_ident, path, state.entity_valid_from,
                 state.entity_descriptions, state.field_class_ident, state.file_entities,
+                state.field_static_ident, state.entity_introduced_by,
             )
+            closed_idents.append(ext_ident)
             old_sha, pin_orig_ts = state.pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
             if old_sha is not None:
                 close_items.append(
@@ -8710,6 +9055,20 @@ def _forward_apply(
         _ingest_transact(db, [dt], commit_ts_iso, reason, index_con)
     for close_triples, orig_ts in close_items:
         _ingest_close(db, close_triples, orig_ts, commit_ts_iso, reason, index_con)
+
+    # A closed entity must not leave its :type/lineage-marker behind:
+    # _lineage_is_provisional is the sole authority for reconcilability
+    # (#235), so a stale marker makes a re-introduction at the same ident read
+    # as provisional and hands _forward_reconcile_provisional a guess that
+    # belongs to the dead entity.
+    #
+    # Batched once per commit rather than per close site: the batch form
+    # issues ONE retract for the whole set (idents with no marker are skipped),
+    # where six per-site calls would issue up to six. "confirm" is the
+    # existing name for "retract the marker" -- semantically it is a discard
+    # here, but delegating to the batch keeps the two from drifting (#233).
+    if closed_idents:
+        _lineage_confirm_batch(db, closed_idents, index_con=index_con)
 
     # Ingest :parent edges — one transact per parent to avoid EAVT
     # collision for merge commits (which have two parent hashes).
@@ -9398,6 +9757,20 @@ class _ForwardWalkState:
     # a run-start snapshot of it is wrong on a fresh ingest in both
     # directions and must not be reintroduced as a prefilter.
     ts_by_commit_ident: Dict[str, str] = field(default_factory=dict)
+    # #231/#238: ident -> the :commit/... ident that introduced it. Mirrors
+    # entity_valid_from (which holds the same introduction's TIMESTAMP) and is
+    # maintained at exactly the same points: set at _build_code_triples'
+    # introduction branches, popped by _forget_closed_entity, seeded by
+    # _preload_known_entities. Close sites need it as the retract VALUE for
+    # [ident :introduced-by commit] -- a retract needs the exact value, and
+    # entity_valid_from only carries the timestamp.
+    #
+    # Entities the REVERSE walk introduced during this run are absent here:
+    # they were never written through the forward state. Close sites must
+    # therefore go through _resolve_introduced_by, which falls back to a DB
+    # read, or #231 survives for exactly those entities when Stage B's
+    # lifecycle pass closes them.
+    entity_introduced_by: Dict[str, str] = field(default_factory=dict)
 
 
 async def _run_ingestion(repo_path: str, branch: str) -> None:
@@ -9433,23 +9806,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     # see _reset_introduced_by_ambiguity_log_budget.
     _reset_introduced_by_ambiguity_log_budget()
     try:
-        # Read watermark and pre-load known entities/deps before releasing DB.
-        # Off-loaded to a worker thread (see _load_ingestion_preload_state)
-        # so this potentially slow phase never blocks the event loop from
-        # servicing the stdio handshake concurrently (issue #103).
-        loop = asyncio.get_running_loop()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as preload_executor:
-            (
-                watermark, prior_ingested, entity_valid_from, entity_descriptions,
-                file_entities, file_deps, dep_valid_from, pinned_commit_state,
-                field_class_ident, field_static_ident, submodule_paths, unresolved_dep_idents,
-            ) = await loop.run_in_executor(preload_executor, _load_ingestion_preload_state, repo_path)
-        # minigraf exposes no explicit close(): the file lock is only released once
-        # every reference to the handle is gone — the worker thread's own `db`
-        # local already went out of scope when it returned above, so clearing
-        # the global here is enough to release the lock.
-        _db = None  # release file lock while enumerating commits
-
+        # Enumerated BEFORE the preload (#238), which needs the positions to
+        # bound its queries. Above the DB open too, not merely above the
+        # `_db = None` lock release, so the graph file lock is held for no
+        # longer than it was. These are git subprocesses and touch no DB.
         linearization = frontier_registry.build_linearization(repo_path, branch)
         # FULL history, positionally aligned with linearization. Both
         # _reverse_apply and _correction_sweep_select_position index it
@@ -9458,6 +9818,28 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # to hand them.
         commit_metadata = _git_commits(repo_path, None, branch)
         ignore_patterns = _load_ignore_patterns(repo_path)
+
+        # Read watermark and pre-load known entities/deps before releasing DB.
+        # Off-loaded to a worker thread (see _load_ingestion_preload_state)
+        # so this potentially slow phase never blocks the event loop from
+        # servicing the stdio handshake concurrently (issue #103).
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as preload_executor:
+            (
+                watermark, prior_ingested, entity_valid_from, entity_descriptions,
+                entity_introduced_by, file_entities, file_deps, dep_valid_from,
+                pinned_commit_state, field_class_ident, field_static_ident,
+                submodule_paths, unresolved_dep_idents,
+            ) = await loop.run_in_executor(
+                preload_executor, _load_ingestion_preload_state,
+                repo_path, linearization, commit_metadata,
+            )
+        # minigraf exposes no explicit close(): the file lock is only released once
+        # every reference to the handle is gone — the worker thread's own `db`
+        # local already went out of scope when it returned above, so clearing
+        # the global here is enough to release the lock.
+        _db = None  # release file lock now that the preload has read what it needs
+
         state = _ForwardWalkState(
             entity_valid_from=entity_valid_from,
             entity_descriptions=entity_descriptions,
@@ -9469,6 +9851,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             field_static_ident=field_static_ident,
             submodule_paths=submodule_paths,
             unresolved_dep_idents=unresolved_dep_idents,
+            entity_introduced_by=entity_introduced_by,
             # Full-history, so a resumed run's retroactive :modified-in for a
             # guess commit at or below the watermark still finds a timestamp
             # (a post-watermark-only map would silently skip it).

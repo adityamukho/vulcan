@@ -6646,6 +6646,45 @@ class TestEntityIntroducedByValuesQuery:
         )
 
 
+class TestEntityIdentIsLive:
+    """#231: the reverse walk's known-entity gate must test LIVENESS, not lineage.
+
+    _build_close_triples never retracted :introduced-by, so a closed-and-purged
+    entity kept that fact forever and _entity_introduced_by_query answered
+    "known" for it. Gating on a live :ident instead is correct regardless of
+    whether any close site remembers to retract :introduced-by.
+    """
+
+    def test_live_ident_is_live(self, real_db):
+        import mcp_server
+        real_db.execute('(transact [[:function/a-py-f :ident ":function/a-py-f"]])')
+        assert mcp_server._entity_ident_is_live(real_db, ":function/a-py-f") is True
+
+    def test_absent_ident_is_not_live(self, real_db):
+        import mcp_server
+        assert mcp_server._entity_ident_is_live(real_db, ":function/a-py-f") is False
+
+    def test_closed_ident_is_not_live_even_with_live_introduced_by(self, real_db):
+        """The exact #231 shape: :ident closed, :introduced-by left behind."""
+        import mcp_server
+        real_db.execute(
+            '(transact {:valid-from "2020-01-01T00:00:00Z"} '
+            '[[:function/a-py-f :ident ":function/a-py-f"] '
+            '[:function/a-py-f :introduced-by :commit/c1]])'
+        )
+        mcp_server._ingest_close(
+            real_db,
+            ['[:function/a-py-f :ident ":function/a-py-f"]'],
+            "2020-01-01T00:00:00Z",
+            "2020-01-02T00:00:00Z",
+            "close f",
+        )
+        assert mcp_server._entity_introduced_by_query(real_db, ":function/a-py-f") is not None, (
+            "precondition: the stale :introduced-by is what made the old gate unsound"
+        )
+        assert mcp_server._entity_ident_is_live(real_db, ":function/a-py-f") is False
+
+
 class TestEntityIntroducedBySetProvisionalBatch:
     """#233: _reverse_apply's two loops were the only production callers of
     the per-ident function, at one retract + one transact each -- 8,618
@@ -8321,6 +8360,25 @@ class TestIngestionWrites:
         triples = mcp_server._build_close_triples(module_ident, "auth.py", module_ident)
         assert not any(":contains" in t for t in triples)
 
+    def test_build_close_triples_closes_introduced_by_when_given(self):
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        triples = mcp_server._build_close_triples(
+            fn_ident, "login", module_ident, introduced_by=":commit/abc123def456",
+        )
+        assert f"[{fn_ident} :introduced-by :commit/abc123def456]" in triples
+
+    def test_build_close_triples_omits_introduced_by_when_not_given(self):
+        """Opt-in for the same reason close_entity_type is: unresolved-import
+        stubs reuse the module ident prefix and never carry :introduced-by, so
+        deriving one would retract a fact that was never asserted."""
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        triples = mcp_server._build_close_triples(fn_ident, "login", module_ident)
+        assert not any(":introduced-by" in t for t in triples)
+
     def test_build_code_triples_writes_modified_in_for_preexisting_functions(self):
         import mcp_server
         fn_ident = mcp_server._code_ident("function", "auth.py", "login")
@@ -8447,10 +8505,11 @@ class TestIngestionWrites:
     ):
         """_preload_known_entities' query (see its source) requires the full
         [:entity-type :ident :file/:path :description :introduced-by] shape
-        plus the introducing commit's :date — a bare :description/:file pair
-        (as an earlier draft of this test assumed) never matches the query
-        and silently yields empty results, so the seed below mirrors the
-        real fact shape _run_ingestion actually writes."""
+        plus the introducing commit's :date and :hash — a bare
+        :description/:file pair (as an earlier draft of this test assumed)
+        never matches the query and silently yields empty results, so the
+        seed below mirrors the real fact shape _run_ingestion actually
+        writes."""
         import mcp_server
         real_db.execute(
             '(transact [[:function/auth-py-login :entity-type :type/function] '
@@ -8458,15 +8517,76 @@ class TestIngestionWrites:
             '[:function/auth-py-login :file "auth.py"] '
             '[:function/auth-py-login :description "login"] '
             '[:function/auth-py-login :introduced-by :commit/c1] '
-            '[:commit/c1 :date "2025-01-15T10:00:00Z"]])'
+            '[:commit/c1 :date "2025-01-15T10:00:00Z"] '
+            '[:commit/c1 :hash "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"]])'
         )
 
-        entity_valid_from, entity_descriptions, file_entities, submodule_paths = (
+        entity_valid_from, entity_descriptions, entity_introduced_by, file_entities, submodule_paths = (
             mcp_server._preload_known_entities(real_db, str(git_repo))
         )
 
         assert entity_valid_from.get(":function/auth-py-login") == "2025-01-15T10:00:00Z"
         assert entity_descriptions.get(":function/auth-py-login") == "login"
+
+    def test_entity_introduced_by_matches_commit_write_site(self, real_db, git_repo):
+        """Final-review Finding 3: entity_introduced_by's value is built by
+        reconstructing f":commit/{hash_[:12]}" in Python rather than binding
+        the query's own ?c directly. The reviewer asked whether that is a
+        missed simplification (bind ?c, drop the reconstruction) or load-
+        bearing, given the query already binds ?c in :where. It is load-
+        bearing: minigraf returns an internal UUID for a subject variable
+        bound in :find position (verified empirically here, and matches
+        the documented reason _preload_known_deps binds ?srci instead of
+        ?src and _preload_pinned_commits binds ?ei instead of ?e).
+
+        This pins the full round trip on a real backend, not just the
+        string format in isolation: the commit entity is seeded exactly the
+        way BOTH real write sites build it (_reverse_apply and
+        _forward_apply: commit_ident = f":commit/{hash[:12]}", also written
+        as the commit's own :ident), and the value _preload_known_entities
+        returns is then fed straight into _build_close_triples'
+        introduced_by kwarg and actually retracted. A mismatched ident
+        (e.g. an internal UUID) would make that retract a silent no-op --
+        exactly #231 reopened.
+        """
+        import mcp_server
+        commit_hash = "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+        commit_ident = f":commit/{commit_hash[:12]}"
+        real_db.execute(
+            f'(transact [[{commit_ident} :entity-type :type/commit] '
+            f'[{commit_ident} :ident "{commit_ident}"] '
+            f'[{commit_ident} :hash "{commit_hash}"] '
+            f'[{commit_ident} :date "2025-01-15T10:00:00Z"] '
+            '[:function/auth-py-login :entity-type :type/function] '
+            '[:function/auth-py-login :ident ":function/auth-py-login"] '
+            '[:function/auth-py-login :file "auth.py"] '
+            '[:function/auth-py-login :description "login"] '
+            f'[:function/auth-py-login :introduced-by {commit_ident}]])'
+        )
+
+        _, _, entity_introduced_by, _, _ = mcp_server._preload_known_entities(
+            real_db, str(git_repo)
+        )
+
+        assert entity_introduced_by[":function/auth-py-login"] == commit_ident, (
+            "must be the keyword ident string, not minigraf's internal UUID"
+        )
+
+        close_triples = mcp_server._build_close_triples(
+            ":function/auth-py-login", "login", ":module/auth-py",
+            introduced_by=entity_introduced_by[":function/auth-py-login"],
+        )
+        retract_triple = next(t for t in close_triples if ":introduced-by" in t)
+        mcp_server._retract(real_db, f"[{retract_triple}]")
+
+        live = json.loads(real_db.execute(
+            '(query [:find ?c :where [:function/auth-py-login :introduced-by ?c]])'
+        ))["results"]
+        assert live == [], (
+            "retracting with the preload's returned value must remove the live "
+            ":introduced-by fact -- a mismatched ident would make this a "
+            "silent no-op (#231)"
+        )
 
     def test_last_run_write_transacts_correct_fields(self, real_db):
         import mcp_server
@@ -9293,10 +9413,11 @@ class TestPreloadExternalDependencies:
             '[:module/vendor-lib :path "vendor/lib"] '
             '[:module/vendor-lib :description "lib"] '
             '[:module/vendor-lib :introduced-by :commit/c1] '
-            '[:commit/c1 :date "2026-01-01T00:00:00Z"]])'
+            '[:commit/c1 :date "2026-01-01T00:00:00Z"] '
+            '[:commit/c1 :hash "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"]])'
         )
 
-        entity_valid_from, entity_descriptions, file_entities, submodule_paths = (
+        entity_valid_from, entity_descriptions, entity_introduced_by, file_entities, submodule_paths = (
             mcp_server._preload_known_entities(real_db, str(tmp_path))
         )
 
@@ -9342,23 +9463,59 @@ class TestPreloadExternalDependencies:
 
         assert pinned[":module/vendor-lib"] == ("abc123", "2026-01-01T00:00:00.000Z")
 
-    def test_unresolved_stubs_share_the_resume_bound_with_submodule_paths(
+    def test_above_watermark_submodule_is_not_misclassified_as_a_stub(
         self, real_db, tmp_path,
     ):
-        """#222 phase 2d review, B1 follow-up: _preload_unresolved_dep_idents
-        is a minuend whose subtrahend (submodule_paths) is bounded to the
-        resume position, so it must carry the same bound.
+        """#238 follow-on: stub-ness is "has no :path", a property of the
+        ENTITY, not of the resume position.
 
-        Seeds two REAL submodules with prefix-related paths — one introduced
-        below the watermark, one above it (as a prior run's Stage B would
-        leave it) — plus one genuine unresolved-import stub. Bounded to the
-        watermark, the above-watermark submodule drops out of BOTH sides and
-        only the stub remains. Unbounded (the pre-fix shape, asserted below
-        so the misclassification is pinned and not merely described), it
-        drops out of the subtrahend only and is misclassified as a stub —
-        at which point the replayed gitlink "add" for vendor/lib mints
-        [:module/vendor-lib-extra :resolves-to :module/vendor-lib], since a
-        submodule's :description is `name or path`.
+        This function is a minuend whose subtrahend used to be
+        _preload_known_entities' submodule_paths. Once that output is
+        position-filtered (#238), a real submodule whose :path fact lands
+        above the watermark drops out of the subtrahend while staying in the
+        minuend, and is misclassified as a stub -- reaching
+        state.unresolved_dep_idents, where the replayed gitlink "add"
+        handler's _submodule_path_matches_import check fires on it (a
+        submodule's :description is `name or path`) and mints a bogus
+        [:module/vendor-lib-extra :resolves-to :module/vendor-lib].
+
+        The subtrahend is therefore its own UNBOUNDED :path query.
+
+        SEEDING NOTE (do not "simplify" this back into one transact):
+        vendor-lib-extra's :ident/:description are asserted BELOW the
+        watermark, and its :path is asserted SEPARATELY, ABOVE the watermark,
+        on the same entity. That split is what makes this test capable of
+        catching the bug: with a single above-watermark transact for
+        vendor-lib-extra (the original, pre-review shape of this test), the
+        MINUEND's own ts(W) bound already excludes the entity -- its
+        :ident/:description aren't valid at ts(W) either -- so a bounded and
+        an unbounded subtrahend produce the identical (correct) result and
+        the test cannot distinguish them. A reviewer caught this: reinstating
+        the old bounded subtrahend left the single-transact version of this
+        test green. Only when :ident/:description are already valid at ts(W)
+        (so the entity IS in the minuend) and :path becomes valid strictly
+        later (so a bounded subtrahend misses it while an unbounded one still
+        catches it) does the assertion actually depend on the subtrahend
+        being unbounded.
+
+        CORRECTED (round 2): an earlier version of this docstring claimed the
+        split-write shape below was therefore "not reachable in production."
+        That conclusion was wrong, and so was the experiment behind it -- both
+        simulated the OLD subtrahend as a date-bounded version of the new
+        query, when the actual old subtrahend was _preload_known_entities'
+        submodule_paths, which #238 made POSITION-filtered
+        (hash_to_pos[hash] <= watermark_pos), not date-filtered. Under a
+        position-filtered subtrahend, #238's own inverted-author-date shape
+        (a single atomic transact: a submodule dated below ts(W) but
+        introduced by a commit positioned ABOVE the watermark -- see
+        test_position_inverted_submodule_is_not_misclassified_as_a_stub,
+        below, which is the test that actually demonstrates reachability) DOES
+        reproduce the misclassification, with no split writes at all. This
+        test's split-write shape remains a valid, distinct guard -- it pins
+        the subtrahend's unboundedness against a hypothetical future writer
+        that stops writing a submodule's facts atomically -- but it is not
+        the mechanism that makes #238 reachable today; that is the position
+        inversion, covered below.
         """
         import mcp_server
 
@@ -9368,44 +9525,172 @@ class TestPreloadExternalDependencies:
             '[:module/vendor-lib :ident ":module/vendor-lib"] '
             '[:module/vendor-lib :path "vendor/lib"] '
             '[:module/vendor-lib :description "vendor/lib"] '
-            '[:module/vendor-lib :introduced-by :commit/c1] '
-            '[:commit/c1 :date "2026-01-01T00:00:00Z"] '
+            # A genuine unresolved-import stub: no :path, ever.
+            '[:module/pkg-missing :entity-type :type/external-dependency] '
+            '[:module/pkg-missing :ident ":module/pkg-missing"] '
+            '[:module/pkg-missing :description "pkg.missing"] '
+            # vendor-lib-extra: ident/description go in below the watermark
+            # too -- only its :path is asserted later, above it, in the
+            # separate transact below. See the seeding note above.
+            '[:module/vendor-lib-extra :entity-type :type/external-dependency] '
+            '[:module/vendor-lib-extra :ident ":module/vendor-lib-extra"] '
+            '[:module/vendor-lib-extra :description "vendor/lib/extra"]])'
+        )
+        # Above the watermark: vendor-lib-extra's :path fact ALONE, asserted
+        # in a transact separate from (and later than) its ident/description
+        # above. This is the split that actually distinguishes a bounded
+        # subtrahend from an unbounded one -- see the seeding note above.
+        real_db.execute(
+            '(transact {:valid-from "2026-06-01T00:00:00Z"} '
+            '[[:module/vendor-lib-extra :path "vendor/lib/extra"]])'
+        )
+
+        stubs = mcp_server._preload_unresolved_dep_idents(
+            real_db, valid_at="2026-03-01T00:00:00Z",
+        )
+        assert stubs == {":module/pkg-missing": "pkg.missing"}, (
+            "a real (:path-bearing) submodule must never be classified as a stub, "
+            "regardless of which side of the watermark its :path fact lands on"
+        )
+
+    def test_position_inverted_submodule_is_not_misclassified_as_a_stub(
+        self, real_db, tmp_path,
+    ):
+        """#238's OWN inverted-author-date shape -- the one that actually
+        makes the misclassification reachable in production, in a single
+        atomic transact. No split writes needed.
+
+        _preload_known_entities' submodule_paths is POSITION-filtered (#238):
+        hash_to_pos[hash] <= watermark_pos, keyed off the introducing
+        commit's place in the linearization, not its author-date.
+        _preload_unresolved_dep_idents' minuend, by contrast, has always been
+        DATE-bounded (:valid-at ts(W)) -- it has no :introduced-by/:hash join
+        at all. Those two bounds diverge exactly when a commit's author-date
+        doesn't track its topological position: a rebase, cherry-pick or
+        side branch can carry an EARLIER author-date onto a LATER position.
+        Measured on this repo (see TestPreloadKnownEntitiesPositionBound,
+        above): of 552 watermark positions, 6 (118-123) have a
+        strictly-earlier-dated later position, with 124-128 confirmed
+        descendants of them. Not hypothetical.
+
+        A submodule introduced by such a commit -- dated below ts(W), so the
+        date-bounded minuend includes it, but positioned ABOVE the
+        watermark, so a position-filtered subtrahend excludes it -- is
+        misclassified as a stub under the OLD (submodule_paths) subtrahend.
+        Verified experimentally (task-7-report.md, round 2): temporarily
+        giving _preload_unresolved_dep_idents back a submodule_paths
+        parameter and subtracting POSITION-filtered output from
+        _preload_known_entities(..., hash_to_pos=..., watermark_pos=...)
+        (not a date-bounded stand-in) reproduces the misclassification; this
+        test then fails. The fix -- an unbounded :path-presence subtrahend
+        that never looks at :introduced-by, :hash or position at all --
+        closes it regardless of which side of the watermark the introducing
+        commit's POSITION falls on.
+        """
+        import mcp_server
+
+        # Linearization convention matches TestPreloadKnownEntitiesPositionBound:
+        # pos 0 = c0 (unused here), pos 1 = c1 (the watermark), pos 2 = c2.
+        # c2 is ABOVE the watermark position but dated EARLIER than it.
+        real_db.execute(
+            '(transact {:valid-from "2026-04-26T00:00:00Z"} '
+            '[[:commit/c2 :hash "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"] '
+            '[:commit/c2 :date "2026-04-26T00:00:00Z"] '
+            '[:module/vendor-lib-extra :entity-type :type/external-dependency] '
+            '[:module/vendor-lib-extra :ident ":module/vendor-lib-extra"] '
+            '[:module/vendor-lib-extra :path "vendor/lib/extra"] '
+            '[:module/vendor-lib-extra :description "vendor/lib/extra"] '
+            '[:module/vendor-lib-extra :introduced-by :commit/c2] '
             # A genuine unresolved-import stub: no :path, ever.
             '[:module/pkg-missing :entity-type :type/external-dependency] '
             '[:module/pkg-missing :ident ":module/pkg-missing"] '
             '[:module/pkg-missing :description "pkg.missing"]])'
         )
-        # Above the watermark: what a prior run's Stage B leaves behind.
+
+        # ts(W) = the watermark commit's own date (2026-05-02, per the
+        # TestPreloadKnownEntitiesPositionBound convention) -- later than
+        # c2's date, so the date-bounded minuend includes vendor-lib-extra.
+        stubs = mcp_server._preload_unresolved_dep_idents(
+            real_db, valid_at="2026-05-02T00:00:00Z",
+        )
+        assert stubs == {":module/pkg-missing": "pkg.missing"}, (
+            "a real (:path-bearing) submodule must never be classified as a "
+            "stub, even when its introducing commit's author-date is earlier "
+            "than its linearization position implies"
+        )
+
+    def test_stub_above_the_watermark_is_excluded_by_the_bound(self, real_db, tmp_path):
+        """For stubs, MISSING is benign (a link the forward-only oracle would
+        not have made either) while EXTRA is harmful (a bogus :resolves-to), so
+        this minuend keeps the NARROWER ts(W) bound rather than #238's widened
+        envelope."""
+        import mcp_server
         real_db.execute(
             '(transact {:valid-from "2026-06-01T00:00:00Z"} '
-            '[[:module/vendor-lib-extra :entity-type :type/external-dependency] '
-            '[:module/vendor-lib-extra :ident ":module/vendor-lib-extra"] '
-            '[:module/vendor-lib-extra :path "vendor/lib/extra"] '
-            '[:module/vendor-lib-extra :description "vendor/lib/extra"] '
-            '[:module/vendor-lib-extra :introduced-by :commit/c2] '
-            '[:commit/c2 :date "2026-06-01T00:00:00Z"]])'
+            '[[:module/pkg-late :entity-type :type/external-dependency] '
+            '[:module/pkg-late :ident ":module/pkg-late"] '
+            '[:module/pkg-late :description "pkg.late"]])'
+        )
+        stubs = mcp_server._preload_unresolved_dep_idents(
+            real_db, valid_at="2026-03-01T00:00:00Z",
+        )
+        assert stubs == {}
+
+    def test_removed_above_watermark_submodule_is_not_misclassified_as_a_stub(
+        self, real_db, tmp_path,
+    ):
+        """Final-review Finding 1: the subtrahend's temporal base must agree
+        with the minuend's, or a submodule that was live AT ts(W) but whose
+        gitlink got removed ABOVE the watermark falls out of the (unbounded,
+        current-time) subtrahend while staying in the (ts(W)-bounded) minuend
+        -- misclassified as a stub, reaching state.unresolved_dep_idents,
+        where a later gitlink "add" whose path prefixes its :description can
+        mint a bogus :resolves-to edge pointing at a CLOSED entity (the exact
+        thing #112's dedup was built to prevent).
+
+        Sequence mirrors _ingest_close's real two-step close exactly: retract
+        the open :ident/:description/:path facts, then re-transact the same
+        triples bounded [orig_ts, close_ts) -- precisely what a prior run's
+        Stage B _forward_apply(lifecycle_only=True) does via
+        _build_close_triples(..., file_value=path) when a submodule's gitlink
+        is removed. At current (unbounded) time the entity has no live
+        :path -- an old, unbounded-only subtrahend misses it entirely -- but
+        at valid_at=ts(W) (before the close) it is still fully live.
+        """
+        import mcp_server
+
+        real_db.execute(
+            '(transact {:valid-from "2026-01-01T00:00:00Z"} '
+            '[[:module/vendor-lib :entity-type :type/external-dependency] '
+            '[:module/vendor-lib :ident ":module/vendor-lib"] '
+            '[:module/vendor-lib :path "vendor/lib"] '
+            '[:module/vendor-lib :description "vendor/lib"]])'
+        )
+        # Stage B's lifecycle-only close, ABOVE the watermark: retract the
+        # live facts, then re-assert them bounded [orig_ts, close_ts).
+        real_db.execute(
+            '(retract [[:module/vendor-lib :ident ":module/vendor-lib"] '
+            '[:module/vendor-lib :description "vendor/lib"] '
+            '[:module/vendor-lib :path "vendor/lib"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-01-01T00:00:00Z" '
+            ':valid-to "2026-06-01T00:00:00Z"} '
+            '[[:module/vendor-lib :ident ":module/vendor-lib"] '
+            '[:module/vendor-lib :description "vendor/lib"] '
+            '[:module/vendor-lib :path "vendor/lib"]])'
         )
 
-        resume_valid_at = "2026-03-01T00:00:00Z"
-        *_, submodule_paths = mcp_server._preload_known_entities(
-            real_db, str(tmp_path), valid_at=resume_valid_at,
+        # ts(W): strictly between the introduction and the close, so the
+        # entity is live at valid_at but not at current time.
+        stubs = mcp_server._preload_unresolved_dep_idents(
+            real_db, valid_at="2026-03-01T00:00:00Z",
         )
-        assert submodule_paths == {":module/vendor-lib": "vendor/lib"}, (
-            "precondition: the above-watermark submodule must be out of the subtrahend"
+        assert ":module/vendor-lib" not in stubs, (
+            "a submodule live at ts(W) but closed above the watermark must "
+            "never be classified as a stub, even though its :path is no "
+            "longer live at current (unbounded) time"
         )
-
-        bounded = mcp_server._preload_unresolved_dep_idents(
-            real_db, submodule_paths, valid_at=resume_valid_at,
-        )
-        assert bounded == {":module/pkg-missing": "pkg.missing"}
-
-        unbounded = mcp_server._preload_unresolved_dep_idents(real_db, submodule_paths)
-        assert ":module/vendor-lib-extra" in unbounded, (
-            "the pre-fix shape must still misclassify, or this test proves nothing"
-        )
-        assert mcp_server._submodule_path_matches_import(
-            "vendor/lib", unbounded[":module/vendor-lib-extra"]
-        ), "and the gitlink 'add' linking would then fire on it"
 
     def test_preload_pinned_commits_returns_empty_on_query_failure(self, real_db, monkeypatch):
         """Same malformed-query technique as
@@ -9417,6 +9702,217 @@ class TestPreloadExternalDependencies:
         monkeypatch.setattr(mcp_server, "_VALID_TIME_FOREVER_MS", "))) malformed [[[")
 
         assert mcp_server._preload_pinned_commits(real_db) == {}
+
+
+class TestPreloadKnownEntitiesPositionBound:
+    """#238: the preload's resume bound must be POSITION-indexed, not
+    author-date valid-time.
+
+    Author dates are not monotonic in topological order (_git_commits reads
+    %at, not %ct; a rebase, cherry-pick or late-merged branch carries the
+    original author date forward). Measured on this repo: of 552 watermark
+    positions, 6 (118-123) have a strictly-earlier-dated LATER position, and
+    124-128 are confirmed descendants of them.
+
+    Linearization used throughout: position 0 = c0, 1 = c1 (the watermark),
+    2 = c2. c2 is ABOVE the watermark but dated EARLIER than c1 -- the
+    inversion.
+    """
+
+    LINEARIZATION = ["c0" * 20, "c1" * 20, "c2" * 20]
+    HASH_TO_POS = {h: i for i, h in enumerate(LINEARIZATION)}
+    WATERMARK_POS = 1
+    T_HI = "2026-05-02T00:00:00Z"  # max(ts[0..1]) -- the monotone envelope
+
+    def _seed(self, real_db):
+        """c0 @ 2026-04-01, c1 (watermark) @ 2026-05-02, c2 (above) @ 2026-04-26.
+
+        below_w:  introduced at c0 -- must always be present.
+        later_dated_below_w: introduced at c1's own date; today's ts(W) bound
+            keeps it, but a commit at/below W dated LATER than W would drop out.
+        above_w:  introduced at c2, dated EARLIER than the watermark -- today's
+            bound keeps it, which is #238's DATA-LOSS direction.
+        """
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            f'[[:commit/c0 :hash "{self.LINEARIZATION[0]}"] '
+            '[:commit/c0 :date "2026-04-01T00:00:00Z"] '
+            '[:module/below-w :entity-type :type/module] '
+            '[:module/below-w :ident ":module/below-w"] '
+            '[:module/below-w :path "below.py"] '
+            '[:module/below-w :description "below.py"] '
+            '[:module/below-w :introduced-by :commit/c0]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-05-02T00:00:00Z"} '
+            f'[[:commit/c1 :hash "{self.LINEARIZATION[1]}"] '
+            '[:commit/c1 :date "2026-05-02T00:00:00Z"] '
+            '[:module/later-dated-below-w :entity-type :type/module] '
+            '[:module/later-dated-below-w :ident ":module/later-dated-below-w"] '
+            '[:module/later-dated-below-w :path "later.py"] '
+            '[:module/later-dated-below-w :description "later.py"] '
+            '[:module/later-dated-below-w :introduced-by :commit/c1]])'
+        )
+        # Above the watermark, dated EARLIER than it: the side-branch shape.
+        real_db.execute(
+            '(transact {:valid-from "2026-04-26T00:00:00Z"} '
+            f'[[:commit/c2 :hash "{self.LINEARIZATION[2]}"] '
+            '[:commit/c2 :date "2026-04-26T00:00:00Z"] '
+            '[:module/above-w :entity-type :type/module] '
+            '[:module/above-w :ident ":module/above-w"] '
+            '[:module/above-w :path "above.py"] '
+            '[:module/above-w :description "above.py"] '
+            '[:module/above-w :introduced-by :commit/c2]])'
+        )
+
+    def test_entity_introduced_above_the_watermark_is_excluded(self, real_db, tmp_path):
+        """#238's DATA-LOSS direction, and the test that actually guards the
+        position clause: removing the `if watermark_pos is not None:` block
+        entirely makes this test (and test_unknown_hash_is_excluded) fail --
+        verified experimentally by deleting the clause and re-running the
+        class. (test_the_envelope_alone_does_not_close_the_hole, below, does
+        NOT independently guard the clause -- see its docstring.) Wrongly
+        included, this entity is absent from the parse of the earlier commit
+        being replayed, so the forward walk closes and
+        _forget_closed_entity-purges it with an orig_ts LATER than the
+        close's valid_to: an inverted valid interval, permanent loss."""
+        import mcp_server
+        self._seed(real_db)
+        entity_valid_from, *_ = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+            hash_to_pos=self.HASH_TO_POS, watermark_pos=self.WATERMARK_POS,
+        )
+        assert ":module/above-w" not in entity_valid_from
+        assert ":module/below-w" in entity_valid_from
+
+    def test_entity_at_the_watermark_position_is_included(self, real_db, tmp_path):
+        """#238's benign direction. Excluded, replay mints a duplicate
+        :introduced-by."""
+        import mcp_server
+        self._seed(real_db)
+        entity_valid_from, *_ = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+            hash_to_pos=self.HASH_TO_POS, watermark_pos=self.WATERMARK_POS,
+        )
+        assert ":module/later-dated-below-w" in entity_valid_from
+
+    def test_the_envelope_alone_does_not_close_the_hole(self, real_db, tmp_path):
+        """Documents the motivation for the position clause: widening the
+        date bound to the monotone envelope WITHOUT it (this call passes no
+        hash_to_pos/watermark_pos at all) re-admits the above-W entity -- the
+        'add-back union' #238 warns produces a change that looks like a fix
+        and isn't.
+
+        This test does NOT independently guard the position clause itself --
+        it never passes watermark_pos, so the clause is already a no-op on
+        this call, and experimentally deleting the clause leaves this test
+        passing. test_entity_introduced_above_the_watermark_is_excluded and
+        test_unknown_hash_is_excluded are the tests that fail when the clause
+        is removed; keep this one anyway, for what it documents about the
+        date bound alone being insufficient."""
+        import mcp_server
+        self._seed(real_db)
+        entity_valid_from, *_ = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+        )
+        assert ":module/above-w" in entity_valid_from
+
+    def test_all_bounds_none_restores_unrestricted_behaviour(self, real_db, tmp_path):
+        """A fresh graph has no watermark and wants the pre-#222 behaviour."""
+        import mcp_server
+        self._seed(real_db)
+        entity_valid_from, *_ = mcp_server._preload_known_entities(
+            real_db, str(tmp_path),
+        )
+        assert ":module/above-w" in entity_valid_from
+        assert ":module/below-w" in entity_valid_from
+
+    def test_unknown_hash_is_excluded(self, real_db, tmp_path):
+        """An introducing commit absent from this linearization -- a rewritten
+        or foreign history. Excluding is the benign direction."""
+        import mcp_server
+        self._seed(real_db)
+        entity_valid_from, *_ = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+            hash_to_pos={self.LINEARIZATION[0]: 0}, watermark_pos=self.WATERMARK_POS,
+        )
+        assert ":module/later-dated-below-w" not in entity_valid_from
+        assert ":module/below-w" in entity_valid_from
+
+    def test_returns_the_introducing_commit_ident(self, real_db, tmp_path):
+        """#231's retract value, from #238's new bound variable."""
+        import mcp_server
+        self._seed(real_db)
+        _vf, _desc, entity_introduced_by, _fe, _sp = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+            hash_to_pos=self.HASH_TO_POS, watermark_pos=self.WATERMARK_POS,
+        )
+        expected = f":commit/{self.LINEARIZATION[0][:12]}"
+        assert entity_introduced_by[":module/below-w"] == expected
+
+    def test_submodule_paths_stays_last(self, real_db, tmp_path):
+        """Guards tests that destructure with `*_, submodule_paths = ...`.
+
+        The seeded :type/external-dependency ident is deliberately NOT one
+        of _seed's :type/module idents: entity_introduced_by's keys are all
+        ":module/..." too (from _seed), so an assertion like
+        `all(k.startswith(":module/"))` would pass even if
+        entity_introduced_by were bound to submodule_paths by mistake --
+        that vacuous shape was caught by review. Asserting exact equality
+        against a dict whose only key is this dependency's ident, mapped to
+        its :path (not a :commit/... value), is what actually discriminates
+        the two dicts. Verified by temporarily moving entity_introduced_by
+        to last in _preload_known_entities' return tuple: this test then
+        fails (submodule_paths binds to a 4-key dict of :commit/... idents
+        instead), and passes again once the order is restored.
+        """
+        import mcp_server
+        self._seed(real_db)
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            '[[:module/dep :entity-type :type/external-dependency] '
+            '[:module/dep :ident ":module/dep"] '
+            '[:module/dep :path "vendor/dep"] '
+            '[:module/dep :description "vendor/dep"] '
+            '[:module/dep :introduced-by :commit/c0]])'
+        )
+        result = mcp_server._preload_known_entities(real_db, str(tmp_path))
+        assert len(result) == 5
+        *_, submodule_paths = result
+        assert submodule_paths == {":module/dep": "vendor/dep"}
+
+    def test_stale_live_introduced_by_does_not_pull_a_dead_entity_in(self, real_db, tmp_path):
+        """Pins the spec's no-migration claim.
+
+        Graphs written before #231 hold closed entities whose :introduced-by
+        was never retracted. That stale fact must not by itself pull such an
+        entity into the preload: this query also requires the entity's :ident,
+        :path and :description to be visible at the same bound, so the row
+        appears only when the :ident window covers the bound -- i.e. exactly
+        when the entity was closed ABOVE the watermark and SHOULD be included.
+
+        Here below-w is closed at 2026-04-15, below the envelope, with its
+        :introduced-by deliberately left open the way a pre-#231 graph would.
+        """
+        import mcp_server
+        self._seed(real_db)
+        mcp_server._ingest_close(
+            real_db,
+            ['[:module/below-w :ident ":module/below-w"]',
+             '[:module/below-w :path "below.py"]',
+             '[:module/below-w :description "below.py"]'],
+            "2026-04-01T00:00:00Z",
+            "2026-04-15T00:00:00Z",
+            "close below-w without retracting :introduced-by (pre-#231 shape)",
+        )
+        assert mcp_server._entity_introduced_by_query(real_db, ":module/below-w") is not None, (
+            "precondition: the stale live :introduced-by is the pre-#231 residue"
+        )
+        entity_valid_from, *_ = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+            hash_to_pos=self.HASH_TO_POS, watermark_pos=self.WATERMARK_POS,
+        )
+        assert ":module/below-w" not in entity_valid_from
 
 
 class TestPreloadProvisionalIdents:
@@ -9455,11 +9951,113 @@ class TestPreloadProvisionalIdents:
         mcp_server._lineage_mark_provisional(real_db, ":code/fn-a", "2026-01-01T00:00:00Z")
         assert mcp_server._preload_provisional_idents(real_db) == {":code/fn-a"}
 
-        result = mcp_server._load_ingestion_preload_state(str(repo))
-        assert len(result) == 12
+        result = mcp_server._load_ingestion_preload_state(str(repo), [], [])
+        assert len(result) == 13
         assert {":code/fn-a"} not in result
         assert not any(isinstance(element, set) and ":code/fn-a" in element
                        for element in result)
+
+
+class TestPreloadStateLinearizationWiring:
+    """#238: the linearization must reach the preload.
+
+    It did not before, for a purely mechanical reason:
+    _load_ingestion_preload_state ran BEFORE build_linearization was called, so
+    the positions did not exist yet. build_linearization needs only repo_path
+    and branch, no DB handle, so both git enumerations move above the preload
+    block -- and above the DB open, so the graph file lock is held no longer
+    than it was.
+    """
+
+    def test_envelope_is_the_max_date_at_or_below_the_watermark(self):
+        """T_hi(W) = max(ts[0..W]), not ts(W). Timestamps are fixed-width UTC
+        from _git_commits, so lexicographic max is chronological max."""
+        import mcp_server
+        commit_metadata = [
+            ("a" * 40, "2026-04-01T00:00:00Z", "a@e", "c0"),
+            ("b" * 40, "2026-05-02T00:00:00Z", "a@e", "c1"),
+            ("c" * 40, "2026-04-26T00:00:00Z", "a@e", "c2"),
+        ]
+        assert mcp_server._resume_envelope(commit_metadata, 1) == "2026-05-02T00:00:00Z"
+        # The inversion: at W=0 the envelope is ts(0), and c2 (position 2,
+        # dated EARLIER than c1) is still correctly above it by POSITION.
+        assert mcp_server._resume_envelope(commit_metadata, 0) == "2026-04-01T00:00:00Z"
+
+    def test_envelope_of_none_position_is_none(self):
+        import mcp_server
+        assert mcp_server._resume_envelope([], None) is None
+
+    @pytest.mark.asyncio
+    async def test_preload_state_accepts_and_uses_the_linearization(self, git_repo, monkeypatch):
+        """Smoke test that the new parameters are threaded, on a real graph."""
+        import mcp_server
+        # frontier_registry is a top-level module in this repo (imported
+        # module-wide above), not a submodule of the installed minigraf
+        # package -- `from minigraf import frontier_registry` does not exist.
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "complete"
+
+        mcp_server._db = None
+        linearization = frontier_registry.build_linearization(str(git_repo), "HEAD")
+        commit_metadata = mcp_server._git_commits(str(git_repo), None, "HEAD")
+        result = mcp_server._load_ingestion_preload_state(
+            str(git_repo), linearization, commit_metadata,
+        )
+        assert len(result) == 13
+        # (watermark, prior_ingested, entity_valid_from, entity_descriptions,
+        #  entity_introduced_by, ...) -- index 4, not 3.
+        entity_introduced_by = result[4]
+        assert entity_introduced_by, "the preload must seed entity_introduced_by"
+        assert all(v.startswith(":commit/") for v in entity_introduced_by.values())
+
+    @pytest.mark.asyncio
+    async def test_misaligned_metadata_raises(self, git_repo):
+        """A misaligned pair silently mis-filters the ENTIRE preload, which is
+        worse than the misattribution _reverse_apply's own check prevents."""
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._db = None
+        with pytest.raises(ValueError, match="positionally aligned"):
+            mcp_server._load_ingestion_preload_state(
+                str(git_repo), ["a" * 40, "b" * 40], [("a" * 40, "2026-01-01T00:00:00Z", "e", "s")],
+            )
+
+    @pytest.mark.asyncio
+    async def test_misaligned_metadata_equal_length_permuted_raises(self, git_repo):
+        """Final-review Finding 2: length equality alone is not enough. The
+        design spec's Error handling section says this performs "the same
+        check _reverse_apply already performs", and _reverse_apply's check
+        is length PLUS per-position hash equality
+        (`commit_hash != linearization[pos]`) -- not length alone.
+        build_linearization and _git_commits(repo_path, None, branch) are
+        two separate `git log` invocations, so a ref moving between them can
+        keep both lists the same length while permuting hashes across
+        positions, silently shifting T_hi(W) and mis-filtering the whole
+        preload without ever raising."""
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._db = None
+        linearization = ["a" * 40, "b" * 40]
+        # Same length as linearization, but positions 0 and 1 are swapped.
+        commit_metadata = [
+            ("b" * 40, "2026-01-01T00:00:00Z", "e", "s"),
+            ("a" * 40, "2026-01-02T00:00:00Z", "e", "s"),
+        ]
+        with pytest.raises(ValueError, match="positionally aligned"):
+            mcp_server._load_ingestion_preload_state(
+                str(git_repo), linearization, commit_metadata,
+            )
 
 
 class TestIngestTransactFactIndex:
@@ -9605,9 +10203,9 @@ class TestRunIngestion:
         leaving the server permanently unable to connect."""
         import mcp_server
 
-        def slow_preload(db, repo_path, valid_at=None):
+        def slow_preload(db, repo_path, valid_at=None, hash_to_pos=None, watermark_pos=None):
             time.sleep(0.3)
-            return {}, {}, {}
+            return {}, {}, {}, {}, {}
 
         monkeypatch.setattr(mcp_server, "_preload_known_entities", slow_preload)
         mcp_server._ingest_progress = {
@@ -9654,7 +10252,7 @@ class TestRunIngestion:
         assert all(db_none_snapshots), f"_db was not None at yield: {db_none_snapshots}"
 
     @pytest.mark.asyncio
-    async def test_local_db_reference_dropped_before_commit_enumeration(
+    async def test_local_db_reference_dropped_before_repo_total_enumeration(
         self, git_repo, monkeypatch
     ):
         """Regression test for #84's deeper root cause: minigraf exposes no
@@ -9665,13 +10263,17 @@ class TestRunIngestion:
         object — verified against the real (unmocked) minigraf FFI, where a
         stale local reference left the `.lock` file in place.
 
-        This specifically targets the pre-loop release point (before
-        `_git_commits` walks the repo's history), because that call has no
-        `await` before it: unlike the per-commit loop — where CPython's
-        dead-local clearing at the `await asyncio.sleep(0)` yield point can
-        mask a missing explicit clear — a potentially slow, synchronous
-        `git log` walk here would hold the lock for its entire duration
-        unless `db` is explicitly dropped.
+        #238 moved `_git_commits`' FULL-history walk (and
+        `build_linearization`) to ABOVE the DB open entirely, so that
+        enumeration no longer has a stale-reference window to guard at all —
+        no DB handle exists yet when it runs (see
+        test_git_commits_runs_before_any_db_is_opened below, which pins
+        exactly that). The next potentially slow git subprocess after the
+        preload releases the lock is now the `git rev-list --count HEAD`
+        total-count call just below `_db = None`, so this test retargets
+        there: that call has no `await` before it either, so a stale local
+        `db` reference in `_run_ingestion`'s frame would hold the lock for
+        its entire duration same as before.
 
         No real_db fixture here — this test's whole point
         is CPython refcounting on the DB handle object itself, so it needs a
@@ -9708,14 +10310,15 @@ class TestRunIngestion:
         }
 
         refcount_at_enumeration = {}
-        real_git_commits = mcp_server._git_commits
+        real_run = mcp_server._subprocess.run
 
-        def spy_git_commits(repo, watermark, branch):
-            assert len(opened_instances) == 1
-            refcount_at_enumeration["count"] = sys.getrefcount(opened_instances[0])
-            return real_git_commits(repo, watermark, branch)
+        def spy_run(cmd, *args, **kwargs):
+            if cmd[:2] == ["git", "rev-list"]:
+                assert len(opened_instances) == 1
+                refcount_at_enumeration["count"] = sys.getrefcount(opened_instances[0])
+            return real_run(cmd, *args, **kwargs)
 
-        with patch.object(mcp_server, "_git_commits", side_effect=spy_git_commits):
+        with patch.object(mcp_server._subprocess, "run", side_effect=spy_run):
             await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
         # 1 ref for opened_instances' slot + 1 for the local `inst` in
@@ -9723,8 +10326,57 @@ class TestRunIngestion:
         # stale `db` local in _run_ingestion's frame) is still holding it.
         assert refcount_at_enumeration["count"] <= 2, (
             "a stale local reference kept the DB instance (and its file "
-            f"lock) alive during commit enumeration: "
+            f"lock) alive during the repo-total enumeration: "
             f"refcount={refcount_at_enumeration['count']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_git_commits_runs_before_any_db_is_opened(
+        self, git_repo, monkeypatch
+    ):
+        """#238: `_git_commits` (and `build_linearization`) must run ABOVE
+        the DB open, not merely above the `_db = None` lock-release, so the
+        graph file lock is never held during the full-history walk at all --
+        see _run_ingestion's comment above `build_linearization`. Pins the
+        ordering directly: no DB has been opened yet at the moment
+        `_git_commits` is called.
+        """
+        import mcp_server
+        from minigraf import MiniGrafDb
+
+        class _FakeDb:
+            def execute(self, *a, **k):
+                return json.dumps({"results": []})
+            def checkpoint(self):
+                pass
+
+        opened_instances = []
+
+        def _open(path):
+            inst = _FakeDb()
+            opened_instances.append(inst)
+            return inst
+
+        monkeypatch.setattr(MiniGrafDb, "open", staticmethod(_open))
+        mcp_server._db = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+
+        opened_count_at_enumeration = {}
+        real_git_commits = mcp_server._git_commits
+
+        def spy_git_commits(repo, watermark, branch):
+            opened_count_at_enumeration["count"] = len(opened_instances)
+            return real_git_commits(repo, watermark, branch)
+
+        with patch.object(mcp_server, "_git_commits", side_effect=spy_git_commits):
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert opened_count_at_enumeration["count"] == 0, (
+            "a DB was already open when _git_commits ran -- the full-history "
+            "enumeration must precede the DB open entirely (#238)"
         )
 
     @pytest.mark.asyncio
@@ -11798,6 +12450,95 @@ def _reused_path_repo(repo, variant):
     return repo
 
 
+def _inverted_author_date_repo(path):
+    """A repo whose topological order and AUTHOR-date order disagree, shaped
+    so a resumed, BIDIRECTIONAL ingestion (forward + reverse streams) can
+    durably write an entity ABOVE the forward watermark before the forward
+    walk's own preload runs -- #238's actual precondition.
+
+    Reproduces #238's measured shape on this repository: positions 118-123
+    have a strictly-earlier-dated LATER position (124-128, a side branch
+    authored 2026-04-26/27 that lands topologically after the 2026-05-02
+    merges, and is a confirmed descendant of them).
+
+    Five commits, topological order c0 -> c1 -> c2 -> c3 -> c4:
+
+        pos 0  c0  base.py (base_fn) + late.py (helper_fn)  @ 2026-04-01
+        pos 1  c1  mid.py (mid_fn)                          @ 2026-05-02  <- the resume watermark W
+        pos 2  c2  late.py modified (helper_fn body only)   @ 2026-04-20  <- inside the post-resume forward GAP
+        pos 3  c3  late.py modified again, adds late_fn     @ 2026-04-26  <- above W, dated earlier -- late_fn's true introduction
+        pos 4  c4  base.py modified, adds base_fn2          @ 2026-04-27  <- above W, dated earlier
+
+    Why a plain forward-only resume cannot reach the bug (and why this
+    fixture needs a bidirectional first run): a pure forward walk only ever
+    writes entities strictly up to its own watermark position, so nothing
+    "above the watermark" ever exists in the DB when a forward-only run
+    resumes -- #238's over-inclusive DATE-only bound and the position clause
+    that replaces it would then agree on every row, and the bug is
+    unobservable. The real defect needs the REVERSE stream to have already
+    written an entity above the forward watermark (c3's late_fn, via
+    _reverse_apply's provisional introduction) before a forward-only resume's
+    preload runs. See TestResumeWithInvertedAuthorDates' run-1 stream ratio
+    ("2:1000000") and stop point (processed == 4) for how this repo drives
+    that: forward claims c0, c1 (advancing the watermark to c1); reverse then
+    claims c4, c3 (writing late_fn's provisional introduction at c3, ABOVE
+    the watermark); run 1 stops before reverse reaches c2.
+
+    On resume, run 2's forward walk (Stage A) replays the still-unclaimed GAP
+    commit c2 -- late.py's file, but a version that does NOT yet contain
+    late_fn -- BEFORE Stage B's correction sweep ever revisits c3 (Stage A
+    always precedes Stage B). Under the old date-only preload bound, late_fn
+    (dated 2026-04-26, <= the watermark's own envelope 2026-05-02) is wrongly
+    treated as already known as of c2, is absent from c2's actual parse, and
+    gets closed with valid_to = c2's date (2026-04-20) -- earlier than its
+    own true valid_from (2026-04-26): an inverted interval, permanent loss.
+    The position clause excludes it (c3's position is above watermark_pos),
+    so c2's replay never touches it.
+
+    GIT_AUTHOR_DATE drives valid-time (_git_commits reads %at);
+    GIT_COMMITTER_DATE is kept monotonic so the topological order is
+    unambiguous.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    _subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=path,
+                    check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=path,
+                    check=True, capture_output=True)
+
+    def commit(files, author_date, committer_date, msg):
+        for filename, body in files.items():
+            (path / filename).write_text(body)
+        _subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
+        env = {**os.environ,
+               "GIT_AUTHOR_DATE": author_date, "GIT_COMMITTER_DATE": committer_date}
+        _subprocess.run(["git", "commit", "-m", msg], cwd=path,
+                        check=True, capture_output=True, env=env)
+
+    commit(
+        {"base.py": "def base_fn():\n    return 1\n",
+         "late.py": "def helper_fn():\n    return 0\n"},
+        "2026-04-01T00:00:00Z", "2026-04-01T00:00:00Z", "c0 base+late",
+    )
+    commit(
+        {"mid.py": "def mid_fn():\n    return 2\n"},
+        "2026-05-02T00:00:00Z", "2026-05-03T00:00:00Z", "c1 mid",
+    )
+    commit(
+        {"late.py": "def helper_fn():\n    return 99\n"},
+        "2026-04-20T00:00:00Z", "2026-05-04T00:00:00Z", "c2 late-mod-helper",
+    )
+    commit(
+        {"late.py": "def helper_fn():\n    return 99\n\ndef late_fn():\n    return 3\n"},
+        "2026-04-26T00:00:00Z", "2026-05-05T00:00:00Z", "c3 late-add-late_fn",
+    )
+    commit(
+        {"base.py": "def base_fn():\n    return 1\n\ndef base_fn2():\n    return 4\n"},
+        "2026-04-27T00:00:00Z", "2026-05-06T00:00:00Z", "c4 base-add-base_fn2",
+    )
+    return path
+
+
 class TestClosedEntityLifecyclePurge:
     """Real-backend regression tests for the closed-entity lifecycle purge.
 
@@ -11842,29 +12583,12 @@ class TestClosedEntityLifecyclePurge:
         """The module re-created at the reused path a.py must have a CURRENT
         :ident fact (join target for nearly every query).
 
-        #222 phase 2d Task 9 STILL PINS this one test forward-only, while the
-        rest of this class now runs at the 1:1 default. The remaining failure
-        is NOT the D/R/gitlink gap Stage B closes -- it is an independent
-        _reverse_apply (phase 2b) defect in A/M territory:
-
-          _build_close_triples never retracts :introduced-by, so a closed
-          entity keeps that fact forever. _reverse_apply's "is this entity
-          already known?" gate is _entity_introduced_by_query(db, ident),
-          which therefore still answers "known" for an ident that was closed
-          and purged by the forward walk. When such a path is RE-CREATED at a
-          position the reverse stream claims, _build_code_triples takes its
-          "already known" branch and emits only :modified-in -- the module
-          never re-asserts :ident/:description/:path and stays a ghost.
-          _correction_sweep_apply cannot repair it either: it reconciles
-          lineage only and never emits structural facts.
-
-        Fixing it means changing _reverse_apply's gate to test liveness (a
-        current :ident) rather than :introduced-by, which is phase-2b surface
-        and out of this task's scope. Measured directly: after a 1:1 run of
-        _reused_path_repo, :module/a-py has a live :introduced-by pointing at
-        the ORIGINAL c1 commit and no live :ident at all.
+        Ran forward-only-pinned (MINIGRAF_INGEST_STREAM_RATIO=10**6:1) until
+        #231 was fixed, because _reverse_apply's known-entity gate keyed on
+        :introduced-by -- which _build_close_triples never retracted -- and so
+        answered "known" for a closed-and-purged ident. The gate now tests
+        live :ident (#231), so this runs at the shipping default.
         """
-        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
         repo = _reused_path_repo(tmp_path / "repo", variant)
         db = await self._ingest_and_open(repo, monkeypatch)
 
@@ -11882,44 +12606,19 @@ class TestClosedEntityLifecyclePurge:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("variant", ["rename", "delete"])
-    @pytest.mark.xfail(
-        strict=True,
-        # Narrowed to the assertion this test actually makes (#222 phase 2d
-        # whole-branch review, finding (o)). Without raises=, ANY exception
-        # counts as the expected failure -- an unrelated breakage in the
-        # ingest path (a TypeError from a changed signature, a git fixture
-        # that stops building) would keep registering as XFAIL and this
-        # alarm would stay silently disarmed.
-        raises=AssertionError,
-        reason=(
-            "KNOWN pre-existing phase-2b defect, NOT the D/R gap #222 phase 2d "
-            "Stage B closes: _build_close_triples never retracts :introduced-by, "
-            "so a closed-and-purged entity keeps that fact forever, and "
-            "_reverse_apply's known-entity gate -- "
-            "_entity_introduced_by_query(db, ident) is not None -- still answers "
-            "'known' for it. At the 1:1 default, c3 (which re-creates a.py) lands "
-            "in frontier-high's territory, so _build_code_triples takes its "
-            "'already known' branch and emits only :modified-in: the module is "
-            "resurrected as a ghost with no current :ident. Fixing it means "
-            "changing that gate to test liveness, which is out of Task 9's scope."
-        ),
-    )
     async def test_reused_path_new_entity_is_not_a_ghost_at_default_ratio(
         self, tmp_path, monkeypatch, variant
     ):
         """Companion to the forward-only-pinned variant above, at the 1:1
         DEFAULT ratio -- the configuration that actually ships.
 
-        The pin alone makes the suite green at exactly the configuration
-        that hides the ghost, with nothing left to notice when the bug is
-        fixed or when it spreads. This test is that alarm: strict=True means
-        it FAILS the day someone repairs _reverse_apply's gate, forcing both
-        the xfail and the forward-only pin to be removed together rather than
-        letting a stale exemption silently mask a later regression.
+        The two tests are now identical in outcome and kept separate only
+        because the pin above documents which configuration used to hide the
+        ghost. The strict=True xfail that guarded this was removed with #231.
         """
         # Explicitly at the default: an ambient MINIGRAF_INGEST_STREAM_RATIO
-        # would otherwise decide which stream claims c3 and make the xfail
-        # non-deterministic.
+        # would otherwise decide which stream claims c3 and make this test's
+        # outcome non-deterministic.
         monkeypatch.delenv("MINIGRAF_INGEST_STREAM_RATIO", raising=False)
         repo = _reused_path_repo(tmp_path / "repo", variant)
         db = await self._ingest_and_open(repo, monkeypatch)
@@ -11964,6 +12663,60 @@ class TestClosedEntityLifecyclePurge:
         # And f must have no CURRENT :ident either.
         assert self._results(db, f'(query [:find ?i :where [{f_ident} :ident ?i]])') == [], \
             f"[{variant}] f (closed at c2) must not be visible at current time"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("variant", ["rename", "delete"])
+    async def test_closed_entity_has_no_live_introduced_by(self, tmp_path, monkeypatch, variant):
+        """#231: the original function f, closed at commit2, must not answer a
+        bare [?e :introduced-by ?c] query afterwards."""
+        repo = _reused_path_repo(tmp_path / "repo", variant)
+        db = await self._ingest_and_open(repo, monkeypatch)
+
+        import mcp_server
+        f_ident = mcp_server._code_ident("function", "a.py", "f")
+        live = self._results(db, f'(query [:find ?c :where [{f_ident} :introduced-by ?c]])')
+        assert live == [], f"[{variant}] closed entity kept a live :introduced-by: {live}"
+
+
+class TestCloseDiscardsLineageMarker:
+    """A closed entity must not leave its :type/lineage-marker behind.
+
+    _lineage_is_provisional is the SOLE authority for reconcilability since
+    #235, so a stale marker makes a re-introduction at the same ident read as
+    provisional -- and _forward_reconcile_provisional then re-dates structural
+    facts against a lineage guess that belongs to the DEAD entity.
+
+    Both parametrizations PASS on this fixture even pre-fix: a.py's module is
+    never provisional at the moment _reused_path_repo closes it (nothing in
+    this single-repo forward-only ingestion mints a provisional guess for it
+    before the close), so there is no marker for an unfixed close to leave
+    behind here. Kept as a guard rather than deleted -- the batch discard it
+    guards is still required for the at-scale path where Stage B closes
+    entities that a preceding reverse-stream provisional guess touched,
+    which this fixture does not exercise.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("variant", ["rename", "delete"])
+    async def test_reintroduced_ident_is_not_provisional(self, tmp_path, monkeypatch, variant):
+        import mcp_server
+        repo = _reused_path_repo(tmp_path / "repo", variant)
+        graph = str(repo / "memory.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._db = None
+        mcp_server._graph_path = graph
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None, "prior_ingested": 0,
+        }
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+
+        db = mcp_server.get_db()
+        module_ident = mcp_server._code_ident("module", "a.py")
+        assert mcp_server._lineage_is_provisional(db, module_ident) is False, (
+            f"[{variant}] re-created module inherited a stale provisional marker"
+        )
 
 
 class TestRunIngestionBitemporalClose:
@@ -14617,9 +15370,14 @@ class TestReverseFillClaimAndProcess:
 
         fn_ident = mcp_server._code_ident("function", "auth.py", "login")
         # Simulate Stream 1 having already confirmed login() authoritatively
-        # at the oldest commit, before Stream 2 ever runs.
+        # at the oldest commit, before Stream 2 ever runs -- with a live
+        # :ident alongside :introduced-by, matching what a real confirmation
+        # always writes together (#231: the reverse walk's known-entity gate
+        # keys on :ident liveness, not :introduced-by alone).
         mcp_server._transact(
-            real_db, f"[[{fn_ident} :introduced-by :commit/preexisting]]", "2025-01-01T00:00:00Z",
+            real_db,
+            f'[[{fn_ident} :introduced-by :commit/preexisting] [{fn_ident} :ident "{fn_ident}"]]',
+            "2025-01-01T00:00:00Z",
         )
 
         claimed_hash = mcp_server._reverse_fill_claim_and_process(
@@ -14849,6 +15607,14 @@ class TestReverseApplySplit:
         fake_before_ident = f":commit/{fake_before_hash[:12]}"
         fake_after_ident = f":commit/{fake_after_hash[:12]}"
 
+        # A real provisional guess always carries a live :ident, asserted at
+        # the same sighting (#231: the reverse walk's known-entity gate keys
+        # on :ident liveness, not :introduced-by alone).
+        mcp_server._transact(
+            real_db,
+            f'[[{fa_ident} :ident "{fa_ident}"] [{fb_ident} :ident "{fb_ident}"]]',
+            seed_ts,
+        )
         # Seed both as already-provisional, guessed-introduced at the two
         # fabricated commits -- real writes through the real batch helper,
         # not a mock, mirroring test_monotonicity_refusal_is_per_ident_not_per_batch.
@@ -17117,6 +17883,51 @@ class TestForwardApplyReconcilesProvisional:
         assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
 
 
+class TestCloseRetractsIntroducedBy:
+    """#231: every close site must retract :introduced-by, including for
+    entities the reverse walk introduced (which the forward state never saw).
+    """
+
+    def test_resolve_prefers_the_walk_state(self, real_db):
+        import mcp_server
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={}, entity_descriptions={}, file_entities={},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+        )
+        state.entity_introduced_by[":function/a-py-f"] = ":commit/aaaaaaaaaaaa"
+        real_db.execute('(transact [[:function/a-py-f :introduced-by :commit/zzzzzzzzzzzz]])')
+        assert mcp_server._resolve_introduced_by(
+            real_db, state, ":function/a-py-f") == ":commit/aaaaaaaaaaaa"
+
+    def test_resolve_falls_back_to_the_db_for_reverse_introduced_entities(self, real_db):
+        """Stage B closes entities Stream 2 introduced this run. They were never
+        written through the forward state, so without this fallback #231 would
+        survive for exactly those."""
+        import mcp_server
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={}, entity_descriptions={}, file_entities={},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+        )
+        real_db.execute('(transact [[:function/a-py-f :introduced-by :commit/zzzzzzzzzzzz]])')
+        assert mcp_server._resolve_introduced_by(
+            real_db, state, ":function/a-py-f") == ":commit/zzzzzzzzzzzz"
+
+    def test_resolve_returns_none_for_an_entity_with_no_lineage(self, real_db):
+        """Unresolved-import stubs never get :introduced-by."""
+        import mcp_server
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={}, entity_descriptions={}, file_entities={},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+        )
+        assert mcp_server._resolve_introduced_by(real_db, state, ":module/pkg-missing") is None
+
+
 class TestRoundRobinClaimer:
     def _claimer(self, total, forward, reverse):
         import mcp_server, frontier_registry
@@ -18052,14 +18863,14 @@ class TestMultiStreamParityWithForwardOnly:
 
     NOTE ON THE FIXTURE: it deliberately contains NO path reuse -- nothing
     is re-created at a path that was earlier deleted or renamed away. That
-    is not to hide anything; it is because path reuse hits a KNOWN,
-    out-of-scope phase-2b defect (_build_close_triples never retracts
-    :introduced-by, so _reverse_apply's known-entity gate resurrects a
-    ghost) which is already pinned by
+    is not to hide anything; it is because path reuse used to hit a phase-2b
+    defect (_build_close_triples never retracted :introduced-by, so
+    _reverse_apply's known-entity gate resurrected a ghost), fixed by #231,
+    which was covered by
     TestClosedEntityLifecyclePurge::test_reused_path_new_entity_is_not_a_ghost
-    and its strict-xfail companion. Mixing that failure into the parity
-    oracle would only make this test say something the pins already say,
-    while destroying its ability to report a genuine parity break.
+    and its now-passing default-ratio companion. Mixing path reuse into the
+    parity oracle here would only duplicate what that class already covers,
+    not exercise anything new.
     """
 
     # frontier-high and :ingestion/correction-sweep-through only exist when a
@@ -18720,3 +19531,251 @@ class TestStagingAndShutdown:
 
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete"
+
+
+class TestEntityIntroducedByState:
+    """#231/#238: the forward walk tracks each entity's introducing commit ident
+    so close sites have the value they must retract, and #238's preload can seed
+    it. Mirrors entity_valid_from exactly -- set at introduction, popped on close.
+    """
+
+    EXTRACTED = {"functions": ["f"], "classes": [], "imports": []}
+
+    def test_introduction_records_the_commit_ident(self):
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "a.py")
+        fn_ident = mcp_server._code_ident("function", "a.py", "f")
+        commit_ident = ":commit/aaaaaaaaaaaa"
+        precomputed = mcp_server._precompute_file_triples(
+            "a.py", self.EXTRACTED, commit_ident, {})
+        entity_introduced_by = {}
+        mcp_server._build_code_triples(
+            "a.py", self.EXTRACTED, "2020-01-01T00:00:00Z",
+            {}, {}, {},
+            commit_ident,
+            precomputed,
+            None, None,
+            entity_introduced_by,
+        )
+        assert entity_introduced_by[module_ident] == commit_ident
+        assert entity_introduced_by[fn_ident] == commit_ident
+
+    def test_already_known_entity_does_not_overwrite_the_commit_ident(self):
+        """The introducing commit is written ONCE, like :introduced-by itself."""
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "a.py")
+        fn_ident = mcp_server._code_ident("function", "a.py", "f")
+        entity_valid_from = {module_ident: "2020-01-01T00:00:00Z",
+                             fn_ident: "2020-01-01T00:00:00Z"}
+        entity_introduced_by = {module_ident: ":commit/aaaaaaaaaaaa",
+                                fn_ident: ":commit/aaaaaaaaaaaa"}
+        precomputed = mcp_server._precompute_file_triples(
+            "a.py", self.EXTRACTED, ":commit/bbbbbbbbbbbb", {})
+        mcp_server._build_code_triples(
+            "a.py", self.EXTRACTED, "2020-01-02T00:00:00Z",
+            entity_valid_from, {}, {},
+            ":commit/bbbbbbbbbbbb",
+            precomputed,
+            None, None,
+            entity_introduced_by,
+        )
+        assert entity_introduced_by[fn_ident] == ":commit/aaaaaaaaaaaa"
+
+    def test_none_is_accepted_so_the_reverse_walk_is_unaffected(self):
+        """_reverse_apply owns :introduced-by timing itself and must not have a
+        forward-biased guess written into its state."""
+        import mcp_server
+        commit_ident = ":commit/aaaaaaaaaaaa"
+        precomputed = mcp_server._precompute_file_triples(
+            "a.py", self.EXTRACTED, commit_ident, {})
+        mcp_server._build_code_triples(
+            "a.py", self.EXTRACTED, "2020-01-01T00:00:00Z",
+            {}, {}, {},
+            commit_ident,
+            precomputed,
+            None, None,
+            None,
+        )  # must not raise
+
+    def test_forget_closed_entity_pops_it(self):
+        import mcp_server
+        entity_introduced_by = {":function/a-py-f": ":commit/aaaaaaaaaaaa"}
+        mcp_server._forget_closed_entity(
+            ":function/a-py-f", None, {}, {}, {}, {}, None, entity_introduced_by,
+        )
+        assert entity_introduced_by == {}
+
+    def test_state_defaults_to_an_empty_dict(self):
+        import mcp_server
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={}, entity_descriptions={}, file_entities={},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+        )
+        assert state.entity_introduced_by == {}
+
+
+class TestResumeWithInvertedAuthorDates:
+    """#238 end-to-end: a RESUMED run whose watermark sits at an inverted
+    position must not corrupt the graph.
+
+    The failure needs a resumed run; a fresh ingestion cannot show it. It is
+    constructed explicitly here, which is what #238 asks for.
+
+    A plain forward-only resume (both runs pinned via
+    MINIGRAF_INGEST_STREAM_RATIO=1000000:1) cannot reach the bug: a pure
+    forward walk only ever writes entities up to its own watermark, so
+    nothing "above the watermark" ever exists in the DB when a forward-only
+    run resumes, and #238's date-only bound and the position clause that
+    replaces it then agree on every row -- verified experimentally while
+    building this test (see task-9-report.md). The defect needs the REVERSE
+    stream to have already written an entity above the forward watermark
+    before a resumed run's preload runs, so run 1 here uses a
+    forward-then-reverse-biased ratio ("2:1000000") instead, and is
+    interrupted mid-run after a specific number of commits (not "the first
+    commit") to land the DB in exactly that state. Run 2 is forced
+    forward-only (1000000:1) so its own remaining work -- one gap commit via
+    Stage A, then two swept commits via Stage B -- is deterministic. See
+    _inverted_author_date_repo's docstring for the full mechanism.
+
+    These three tests do NOT bracket the position clause symmetrically. The
+    clause is purely exclusionary -- it can only make the preload DROP rows,
+    never add them -- so removing it can only cause OVER-inclusion, never
+    under-inclusion. test_resumed_run_does_not_close_a_future_entity and
+    test_resumed_run_writes_no_inverted_valid_interval both pin consequences
+    of over-inclusion and both fail if the clause is removed.
+    test_resumed_run_mints_no_duplicate_introduced_by pins a standing #235
+    invariant that a DIFFERENT failure mode (under-inclusion) would violate;
+    it is kept because that invariant is worth checking on this same
+    resumed-run path, but see its own docstring for why no ablation of the
+    position clause -- in this fixture or any other -- can make it fail.
+    """
+
+    def _progress(self):
+        return {"status": "idle", "processed": 0, "total": 0,
+                "current_commit": "", "error": None, "prior_ingested": 0}
+
+    @staticmethod
+    def _results(db, datalog):
+        return json.loads(db.execute(datalog))["results"]
+
+    async def _run_resume(self, repo, graph, monkeypatch):
+        """Drives the exact two-run sequence _inverted_author_date_repo's
+        docstring describes and returns the reopened, post-resume db.
+
+        Run 1: ratio 2:1000000 so forward claims c0, c1 (watermark -> c1,
+        dated 2026-05-02, wide enough to admit c2/c3's earlier dates) and
+        reverse then claims c4, c3 (writing late_fn's provisional
+        introduction ABOVE the watermark) before stopping -- interrupted
+        after exactly 4 commits, i.e. BEFORE reverse reaches c2. Run 2:
+        forced forward-only so Stage A deterministically claims the single
+        remaining gap commit (c2) fresh, then Stage B deterministically
+        sweeps c3 and c4.
+        """
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "2:1000000")
+        mcp_server._db = None
+        mcp_server._graph_path = graph
+
+        mcp_server._ingest_progress = self._progress()
+        original_sleep = asyncio.sleep
+        sleep_calls = {"n": 0}
+
+        async def stop_after_fourth(t):
+            sleep_calls["n"] += 1
+            if sleep_calls["n"] == 4:
+                mcp_server._shutdown_requested.set()
+            await original_sleep(t)
+
+        with patch("mcp_server.asyncio.sleep", stop_after_fourth):
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "stopped"
+        assert mcp_server._ingest_progress["processed"] == 4
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
+        mcp_server._ingest_progress = self._progress()
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+
+        mcp_server._db = None
+        from minigraf import MiniGrafDb
+        return MiniGrafDb.open(graph)
+
+    @pytest.mark.asyncio
+    async def test_resumed_run_does_not_close_a_future_entity(self, tmp_path, monkeypatch):
+        """The DATA-LOSS direction. late_fn is introduced at c3, above the
+        watermark, dated EARLIER than it. Under the old author-date bound it
+        stayed in the preload snapshot, was absent from the parse of c2 (the
+        gap commit run 2's forward walk replays before Stage B ever revisits
+        c3), and was closed and _forget_closed_entity-purged -- with an
+        orig_ts LATER than the close's valid_to, an inverted valid
+        interval."""
+        import mcp_server
+        repo = _inverted_author_date_repo(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        db = await self._run_resume(repo, graph, monkeypatch)
+
+        for ident in [
+            mcp_server._code_ident("function", "late.py", "late_fn"),
+            mcp_server._code_ident("function", "base.py", "base_fn2"),
+            mcp_server._code_ident("function", "mid.py", "mid_fn"),
+        ]:
+            live = self._results(db, f'(query [:find ?i :where [{ident} :ident ?i]])')
+            assert live == [[ident]], (
+                f"{ident} lost its :ident across a resumed run at an inverted "
+                f"author-date position (#238): {live}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_resumed_run_mints_no_duplicate_introduced_by(self, tmp_path, monkeypatch):
+        """No entity may hold two live :introduced-by values -- that is
+        #235's corruption, reachable through #238's preload.
+
+        This test does NOT guard the position clause and cannot fail if that
+        clause is removed, in this fixture or any other:
+        `_preload_known_entities`' position clause is purely exclusionary
+        (`if pos is None or pos > watermark_pos: continue`) -- removing it
+        can only make the preload MORE inclusive, never less. The duplicate
+        :introduced-by failure mode checked here needs the opposite:  an
+        entity that IS live at the watermark being wrongly EXCLUDED from the
+        preload, so replay takes _build_code_triples' introduction branch a
+        second time and mints a second live :introduced-by. That is a
+        date-bound-too-narrow defect (the OLD ts(W) bound, before it was
+        widened to the T_hi(W) envelope), not something the position clause
+        -- present or absent -- has any say over.
+
+        The two tests in this class that DO pin the position clause are
+        test_resumed_run_does_not_close_a_future_entity and
+        test_resumed_run_writes_no_inverted_valid_interval; see their
+        docstrings and the class docstring. This test is kept anyway because
+        "no entity holds two live :introduced-by values" is a real, standing
+        #235 invariant worth checking on this same resumed-run path -- it
+        just isn't evidence for #238's fix specifically."""
+        import mcp_server
+        repo = _inverted_author_date_repo(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        db = await self._run_resume(repo, graph, monkeypatch)
+
+        rows = self._results(
+            db, '(query [:find ?i (count ?c) :where [?e :ident ?i] [?e :introduced-by ?c]])')
+        multi = [(i, n) for i, n in rows if n > 1]
+        assert multi == [], f"entities with more than one live :introduced-by: {multi}"
+
+    @pytest.mark.asyncio
+    async def test_resumed_run_writes_no_inverted_valid_interval(self, tmp_path, monkeypatch):
+        """The purge's signature: a close whose valid_to precedes its
+        valid_from."""
+        import mcp_server
+        repo = _inverted_author_date_repo(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        db = await self._run_resume(repo, graph, monkeypatch)
+
+        rows = self._results(
+            db,
+            '(query [:find ?i ?vf ?vt :any-valid-time '
+            ':where [?e :ident ?i] [?e :db/valid-from ?vf] [?e :db/valid-to ?vt]])',
+        )
+        inverted = [(i, vf, vt) for i, vf, vt in rows if vt is not None and vt < vf]
+        assert inverted == [], f"inverted valid intervals on :ident facts: {inverted}"
