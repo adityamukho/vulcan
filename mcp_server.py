@@ -7412,6 +7412,16 @@ def _preload_known_deps(
     [valid_from, valid_to) containing valid_at_ms, which is exactly
     :valid-at's own half-open semantics.
 
+    #238/#245: this bound is still ts(W), NOT the monotone envelope
+    _preload_known_entities now takes, and it has no position clause. A
+    :depends-on fact carries no commit reference of any kind -- its
+    introduction timestamp comes from its own :db/valid-from -- so there is
+    nothing to join to a :hash and no position to filter on. Widening it to
+    the envelope WITHOUT a position clause would make its data-loss direction
+    worse, which is exactly the union #238 forbids. It therefore retains
+    #238's residual in both directions. Tracked as #245; do not "fix" this by
+    widening the bound.
+
     Mirrors _preload_known_entities, but :depends-on facts have no
     :introduced-by-style companion edge to a commit's :date, so the
     introduction timestamp has to come from the fact's own :db/valid-from
@@ -7492,6 +7502,13 @@ def _preload_pinned_commits(db: Any, valid_at_ms: Optional[int] = None) -> Dict[
     Stage B's lifecycle pass runs the gitlink handling over the reverse
     region, so a completed two-stream run can leave a bump recorded above the
     watermark (#222 phase 2d review, B1).
+
+    #238/#245: still ts(W), with no position clause, for the same reason
+    _preload_known_deps has none -- a :pinned-commit fact carries no commit
+    reference to derive a linearization position from. Retains #238's residual
+    in both directions: a bump recorded above the watermark can be closed
+    against the wrong prior SHA. Tracked as #245. Do not widen this to
+    _preload_known_entities' envelope without a position clause.
 
     Needed because :pinned-commit is bi-temporally closed and reopened on
     every bump (see _run_ingestion's gitlink handling) — without this, the
