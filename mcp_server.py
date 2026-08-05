@@ -4737,6 +4737,7 @@ def _forget_closed_entity(
     field_class_ident: Dict[str, str],
     file_entities: Dict[str, List[str]],
     field_static_ident: Optional[Dict[str, bool]] = None,
+    entity_introduced_by: Optional[Dict[str, str]] = None,
 ) -> None:
     """Purge a just-closed ident from all in-memory lifecycle bookkeeping.
 
@@ -4758,6 +4759,10 @@ def _forget_closed_entity(
     - entity_descriptions / field_class_ident / field_static_ident: purged for
       consistency so no stale description, class-containment parent, or
       :static value is read for a future re-introduction of the same ident.
+    - entity_introduced_by: holds the ident's introducing commit for #231's
+      close-time retract. A stale entry would make a re-introduction at the
+      same ident retract the OLD introduction's :introduced-by on its next
+      close -- a fact that no longer exists at that value.
 
     Call this at EVERY entity close site, AFTER that site has read whatever it
     needs (description, orig_ts, class ident) to build its close triples — never
@@ -4774,6 +4779,8 @@ def _forget_closed_entity(
     field_class_ident.pop(ident, None)
     if field_static_ident is not None:
         field_static_ident.pop(ident, None)
+    if entity_introduced_by is not None:
+        entity_introduced_by.pop(ident, None)
     if file_path is not None:
         idents = file_entities.get(file_path)
         if idents is not None:
@@ -6920,6 +6927,7 @@ def _build_code_triples(
     precomputed: Dict[str, Any],
     field_class_ident: Optional[Dict[str, str]] = None,
     field_static_ident: Optional[Dict[str, bool]] = None,
+    entity_introduced_by: Optional[Dict[str, str]] = None,
 ) -> List[str]:
     """Return Datalog triple strings for a file's extracted code entities.
 
@@ -6939,6 +6947,15 @@ def _build_code_triples(
 
     :depends-on edges are written in the commit loop by _run_ingestion as the
     file's imports change, giving them proper bi-temporal bounds.
+
+    entity_introduced_by, when supplied, records ident -> commit_ident at every
+    introduction branch -- the same five places entity_valid_from is written,
+    and written once for the same reason. Close sites need the commit IDENT to
+    retract [ident :introduced-by commit] (#231); entity_valid_from only has
+    the timestamp. Optional and defaulting to None because _reverse_apply
+    filters this function's :introduced-by output out entirely and owns that
+    attribute's write timing itself, so a forward-biased guess must never
+    reach its state.
     """
     triples: List[str] = []
     module_ident = precomputed["module_ident"]
@@ -6958,6 +6975,8 @@ def _build_code_triples(
         if module_ident not in idents_for_file:
             idents_for_file.append(module_ident)
         entity_valid_from[module_ident] = commit_ts_iso
+        if entity_introduced_by is not None:
+            entity_introduced_by[module_ident] = commit_ident
         entity_descriptions[module_ident] = file_path
     else:
         # Existing module: only record that this commit modified it. NOT
@@ -6971,6 +6990,8 @@ def _build_code_triples(
             if fn_ident not in idents_for_file:
                 idents_for_file.append(fn_ident)
             entity_valid_from[fn_ident] = commit_ts_iso
+            if entity_introduced_by is not None:
+                entity_introduced_by[fn_ident] = commit_ident
             entity_descriptions[fn_ident] = fn_name
         elif fn_ident not in unchanged_idents:
             # Pre-existing function whose body actually changed (#221):
@@ -6983,6 +7004,8 @@ def _build_code_triples(
             if cls_ident not in idents_for_file:
                 idents_for_file.append(cls_ident)
             entity_valid_from[cls_ident] = commit_ts_iso
+            if entity_introduced_by is not None:
+                entity_introduced_by[cls_ident] = commit_ident
             entity_descriptions[cls_ident] = cls_name
         elif cls_ident not in unchanged_idents:
             # Pre-existing class whose body actually changed (#221): record
@@ -6995,6 +7018,8 @@ def _build_code_triples(
             if gvar_ident not in idents_for_file:
                 idents_for_file.append(gvar_ident)
             entity_valid_from[gvar_ident] = commit_ts_iso
+            if entity_introduced_by is not None:
+                entity_introduced_by[gvar_ident] = commit_ident
             entity_descriptions[gvar_ident] = gvar_name
         elif gvar_ident not in unchanged_idents:
             triples.append(f"[{gvar_ident} :modified-in {commit_ident}]")
@@ -7005,6 +7030,8 @@ def _build_code_triples(
             if field_ident not in idents_for_file:
                 idents_for_file.append(field_ident)
             entity_valid_from[field_ident] = commit_ts_iso
+            if entity_introduced_by is not None:
+                entity_introduced_by[field_ident] = commit_ident
             entity_descriptions[field_ident] = field_name
             # Record the field's real owning-class parent so every close path
             # can retract the [class :contains field] edge alongside the module
@@ -9445,6 +9472,20 @@ class _ForwardWalkState:
     # a run-start snapshot of it is wrong on a fresh ingest in both
     # directions and must not be reintroduced as a prefilter.
     ts_by_commit_ident: Dict[str, str] = field(default_factory=dict)
+    # #231/#238: ident -> the :commit/... ident that introduced it. Mirrors
+    # entity_valid_from (which holds the same introduction's TIMESTAMP) and is
+    # maintained at exactly the same points: set at _build_code_triples'
+    # introduction branches, popped by _forget_closed_entity, seeded by
+    # _preload_known_entities. Close sites need it as the retract VALUE for
+    # [ident :introduced-by commit] -- a retract needs the exact value, and
+    # entity_valid_from only carries the timestamp.
+    #
+    # Entities the REVERSE walk introduced during this run are absent here:
+    # they were never written through the forward state. Close sites must
+    # therefore go through _resolve_introduced_by, which falls back to a DB
+    # read, or #231 survives for exactly those entities when Stage B's
+    # lifecycle pass closes them.
+    entity_introduced_by: Dict[str, str] = field(default_factory=dict)
 
 
 async def _run_ingestion(repo_path: str, branch: str) -> None:

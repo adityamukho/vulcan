@@ -18749,3 +18749,86 @@ class TestStagingAndShutdown:
 
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete"
+
+
+class TestEntityIntroducedByState:
+    """#231/#238: the forward walk tracks each entity's introducing commit ident
+    so close sites have the value they must retract, and #238's preload can seed
+    it. Mirrors entity_valid_from exactly -- set at introduction, popped on close.
+    """
+
+    EXTRACTED = {"functions": ["f"], "classes": [], "imports": []}
+
+    def test_introduction_records_the_commit_ident(self):
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "a.py")
+        fn_ident = mcp_server._code_ident("function", "a.py", "f")
+        commit_ident = ":commit/aaaaaaaaaaaa"
+        precomputed = mcp_server._precompute_file_triples(
+            "a.py", self.EXTRACTED, commit_ident, {})
+        entity_introduced_by = {}
+        mcp_server._build_code_triples(
+            "a.py", self.EXTRACTED, "2020-01-01T00:00:00Z",
+            {}, {}, {},
+            commit_ident,
+            precomputed,
+            None, None,
+            entity_introduced_by,
+        )
+        assert entity_introduced_by[module_ident] == commit_ident
+        assert entity_introduced_by[fn_ident] == commit_ident
+
+    def test_already_known_entity_does_not_overwrite_the_commit_ident(self):
+        """The introducing commit is written ONCE, like :introduced-by itself."""
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "a.py")
+        fn_ident = mcp_server._code_ident("function", "a.py", "f")
+        entity_valid_from = {module_ident: "2020-01-01T00:00:00Z",
+                             fn_ident: "2020-01-01T00:00:00Z"}
+        entity_introduced_by = {module_ident: ":commit/aaaaaaaaaaaa",
+                                fn_ident: ":commit/aaaaaaaaaaaa"}
+        precomputed = mcp_server._precompute_file_triples(
+            "a.py", self.EXTRACTED, ":commit/bbbbbbbbbbbb", {})
+        mcp_server._build_code_triples(
+            "a.py", self.EXTRACTED, "2020-01-02T00:00:00Z",
+            entity_valid_from, {}, {},
+            ":commit/bbbbbbbbbbbb",
+            precomputed,
+            None, None,
+            entity_introduced_by,
+        )
+        assert entity_introduced_by[fn_ident] == ":commit/aaaaaaaaaaaa"
+
+    def test_none_is_accepted_so_the_reverse_walk_is_unaffected(self):
+        """_reverse_apply owns :introduced-by timing itself and must not have a
+        forward-biased guess written into its state."""
+        import mcp_server
+        commit_ident = ":commit/aaaaaaaaaaaa"
+        precomputed = mcp_server._precompute_file_triples(
+            "a.py", self.EXTRACTED, commit_ident, {})
+        mcp_server._build_code_triples(
+            "a.py", self.EXTRACTED, "2020-01-01T00:00:00Z",
+            {}, {}, {},
+            commit_ident,
+            precomputed,
+            None, None,
+            None,
+        )  # must not raise
+
+    def test_forget_closed_entity_pops_it(self):
+        import mcp_server
+        entity_introduced_by = {":function/a-py-f": ":commit/aaaaaaaaaaaa"}
+        mcp_server._forget_closed_entity(
+            ":function/a-py-f", None, {}, {}, {}, {}, None, entity_introduced_by,
+        )
+        assert entity_introduced_by == {}
+
+    def test_state_defaults_to_an_empty_dict(self):
+        import mcp_server
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={}, entity_descriptions={}, file_entities={},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+        )
+        assert state.entity_introduced_by == {}
