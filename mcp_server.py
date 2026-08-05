@@ -7251,14 +7251,24 @@ def _preload_unresolved_dep_idents(
 
     The subtrahend is its OWN unbounded query, deliberately not
     _preload_known_entities' submodule_paths (#238). Stub-ness is "has no
-    :path" — a property of the entity, not of the resume position — and once
-    submodule_paths became position-filtered, sharing it would drop a real
-    submodule born above the watermark out of the subtrahend while it stayed
-    in the minuend. That misclassifies it as a stub, reaching
-    state.unresolved_dep_idents, where the replayed gitlink "add" handler's
-    _submodule_path_matches_import check can fire on it (a submodule's
-    :description is `name or path`) and mint a bogus
-    [:module/sub-b :resolves-to :module/sub-a].
+    :path" — a property of the entity, not of the resume position — and
+    submodule_paths is filtered by the introducing commit's LINEARIZATION
+    POSITION (hash_to_pos[hash] <= watermark_pos), not by date. That
+    position bound is exactly what makes this reachable: because commit
+    author-dates are not monotonic in topological order (a rebase,
+    cherry-pick or side branch can carry an earlier author-date onto a
+    later position — measured on this repo, 6 of 552 watermark positions
+    have a strictly-earlier-dated later position), a real submodule's own
+    facts can be dated below ts(W) — so this function's DATE-bounded minuend
+    includes it — while its introducing commit sits at a POSITION above the
+    watermark — so a position-filtered subtrahend excludes it anyway. That
+    misclassifies it as a stub, reaching state.unresolved_dep_idents, where
+    the replayed gitlink "add" handler's _submodule_path_matches_import
+    check can fire on it (a submodule's :description is `name or path`) and
+    mint a bogus [:module/sub-b :resolves-to :module/sub-a]. This is not a
+    date-bound mismatch; a shared date bound on both sides would not
+    reproduce it (round-2 review caught an earlier draft of this reasoning,
+    and the test file's docstring, making exactly that substitution).
 
     The MINUEND keeps the narrow ts(W) bound rather than #238's widened
     envelope, because this set's asymmetry runs the other way from

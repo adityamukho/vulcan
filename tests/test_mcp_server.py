@@ -9438,17 +9438,24 @@ class TestPreloadExternalDependencies:
         catches it) does the assertion actually depend on the subtrahend
         being unbounded.
 
-        Traced against every production writer of a submodule's facts (the
-        gitlink "add" handler in _forward_apply, replayed unchanged by Stage
-        B's lifecycle_only pass -- see that function's docstring): none of
-        them ever split a submodule's :ident/:description from its :path
-        across separate transacts. All of it is written atomically, in one
-        _ingest_transact call, whenever a submodule is added. This shape is
-        therefore a synthetic worst case, not a reproduction of an observed
-        production sequence -- it exists to pin the subtrahend's bound as an
-        invariant (defensive against a future writer, or a bi-temporal
-        correction, that no longer holds that atomicity), not because #238
-        is reachable this way today.
+        CORRECTED (round 2): an earlier version of this docstring claimed the
+        split-write shape below was therefore "not reachable in production."
+        That conclusion was wrong, and so was the experiment behind it -- both
+        simulated the OLD subtrahend as a date-bounded version of the new
+        query, when the actual old subtrahend was _preload_known_entities'
+        submodule_paths, which #238 made POSITION-filtered
+        (hash_to_pos[hash] <= watermark_pos), not date-filtered. Under a
+        position-filtered subtrahend, #238's own inverted-author-date shape
+        (a single atomic transact: a submodule dated below ts(W) but
+        introduced by a commit positioned ABOVE the watermark -- see
+        test_position_inverted_submodule_is_not_misclassified_as_a_stub,
+        below, which is the test that actually demonstrates reachability) DOES
+        reproduce the misclassification, with no split writes at all. This
+        test's split-write shape remains a valid, distinct guard -- it pins
+        the subtrahend's unboundedness against a hypothetical future writer
+        that stops writing a submodule's facts atomically -- but it is not
+        the mechanism that makes #238 reachable today; that is the position
+        inversion, covered below.
         """
         import mcp_server
 
@@ -9484,6 +9491,72 @@ class TestPreloadExternalDependencies:
         assert stubs == {":module/pkg-missing": "pkg.missing"}, (
             "a real (:path-bearing) submodule must never be classified as a stub, "
             "regardless of which side of the watermark its :path fact lands on"
+        )
+
+    def test_position_inverted_submodule_is_not_misclassified_as_a_stub(
+        self, real_db, tmp_path,
+    ):
+        """#238's OWN inverted-author-date shape -- the one that actually
+        makes the misclassification reachable in production, in a single
+        atomic transact. No split writes needed.
+
+        _preload_known_entities' submodule_paths is POSITION-filtered (#238):
+        hash_to_pos[hash] <= watermark_pos, keyed off the introducing
+        commit's place in the linearization, not its author-date.
+        _preload_unresolved_dep_idents' minuend, by contrast, has always been
+        DATE-bounded (:valid-at ts(W)) -- it has no :introduced-by/:hash join
+        at all. Those two bounds diverge exactly when a commit's author-date
+        doesn't track its topological position: a rebase, cherry-pick or
+        side branch can carry an EARLIER author-date onto a LATER position.
+        Measured on this repo (see TestPreloadKnownEntitiesPositionBound,
+        above): of 552 watermark positions, 6 (118-123) have a
+        strictly-earlier-dated later position, with 124-128 confirmed
+        descendants of them. Not hypothetical.
+
+        A submodule introduced by such a commit -- dated below ts(W), so the
+        date-bounded minuend includes it, but positioned ABOVE the
+        watermark, so a position-filtered subtrahend excludes it -- is
+        misclassified as a stub under the OLD (submodule_paths) subtrahend.
+        Verified experimentally (task-7-report.md, round 2): temporarily
+        giving _preload_unresolved_dep_idents back a submodule_paths
+        parameter and subtracting POSITION-filtered output from
+        _preload_known_entities(..., hash_to_pos=..., watermark_pos=...)
+        (not a date-bounded stand-in) reproduces the misclassification; this
+        test then fails. The fix -- an unbounded :path-presence subtrahend
+        that never looks at :introduced-by, :hash or position at all --
+        closes it regardless of which side of the watermark the introducing
+        commit's POSITION falls on.
+        """
+        import mcp_server
+
+        # Linearization convention matches TestPreloadKnownEntitiesPositionBound:
+        # pos 0 = c0 (unused here), pos 1 = c1 (the watermark), pos 2 = c2.
+        # c2 is ABOVE the watermark position but dated EARLIER than it.
+        real_db.execute(
+            '(transact {:valid-from "2026-04-26T00:00:00Z"} '
+            '[[:commit/c2 :hash "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"] '
+            '[:commit/c2 :date "2026-04-26T00:00:00Z"] '
+            '[:module/vendor-lib-extra :entity-type :type/external-dependency] '
+            '[:module/vendor-lib-extra :ident ":module/vendor-lib-extra"] '
+            '[:module/vendor-lib-extra :path "vendor/lib/extra"] '
+            '[:module/vendor-lib-extra :description "vendor/lib/extra"] '
+            '[:module/vendor-lib-extra :introduced-by :commit/c2] '
+            # A genuine unresolved-import stub: no :path, ever.
+            '[:module/pkg-missing :entity-type :type/external-dependency] '
+            '[:module/pkg-missing :ident ":module/pkg-missing"] '
+            '[:module/pkg-missing :description "pkg.missing"]])'
+        )
+
+        # ts(W) = the watermark commit's own date (2026-05-02, per the
+        # TestPreloadKnownEntitiesPositionBound convention) -- later than
+        # c2's date, so the date-bounded minuend includes vendor-lib-extra.
+        stubs = mcp_server._preload_unresolved_dep_idents(
+            real_db, valid_at="2026-05-02T00:00:00Z",
+        )
+        assert stubs == {":module/pkg-missing": "pkg.missing"}, (
+            "a real (:path-bearing) submodule must never be classified as a "
+            "stub, even when its introducing commit's author-date is earlier "
+            "than its linearization position implies"
         )
 
     def test_stub_above_the_watermark_is_excluded_by_the_bound(self, real_db, tmp_path):
