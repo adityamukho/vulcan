@@ -9411,14 +9411,44 @@ class TestPreloadExternalDependencies:
 
         This function is a minuend whose subtrahend used to be
         _preload_known_entities' submodule_paths. Once that output is
-        position-filtered (#238), a real submodule born above the watermark
-        drops out of the subtrahend while staying in the minuend, and is
-        misclassified as a stub -- reaching state.unresolved_dep_idents, where
-        the replayed gitlink "add" handler's _submodule_path_matches_import
-        check fires on it (a submodule's :description is `name or path`) and
-        mints a bogus [:module/vendor-lib-extra :resolves-to :module/vendor-lib].
+        position-filtered (#238), a real submodule whose :path fact lands
+        above the watermark drops out of the subtrahend while staying in the
+        minuend, and is misclassified as a stub -- reaching
+        state.unresolved_dep_idents, where the replayed gitlink "add"
+        handler's _submodule_path_matches_import check fires on it (a
+        submodule's :description is `name or path`) and mints a bogus
+        [:module/vendor-lib-extra :resolves-to :module/vendor-lib].
 
         The subtrahend is therefore its own UNBOUNDED :path query.
+
+        SEEDING NOTE (do not "simplify" this back into one transact):
+        vendor-lib-extra's :ident/:description are asserted BELOW the
+        watermark, and its :path is asserted SEPARATELY, ABOVE the watermark,
+        on the same entity. That split is what makes this test capable of
+        catching the bug: with a single above-watermark transact for
+        vendor-lib-extra (the original, pre-review shape of this test), the
+        MINUEND's own ts(W) bound already excludes the entity -- its
+        :ident/:description aren't valid at ts(W) either -- so a bounded and
+        an unbounded subtrahend produce the identical (correct) result and
+        the test cannot distinguish them. A reviewer caught this: reinstating
+        the old bounded subtrahend left the single-transact version of this
+        test green. Only when :ident/:description are already valid at ts(W)
+        (so the entity IS in the minuend) and :path becomes valid strictly
+        later (so a bounded subtrahend misses it while an unbounded one still
+        catches it) does the assertion actually depend on the subtrahend
+        being unbounded.
+
+        Traced against every production writer of a submodule's facts (the
+        gitlink "add" handler in _forward_apply, replayed unchanged by Stage
+        B's lifecycle_only pass -- see that function's docstring): none of
+        them ever split a submodule's :ident/:description from its :path
+        across separate transacts. All of it is written atomically, in one
+        _ingest_transact call, whenever a submodule is added. This shape is
+        therefore a synthetic worst case, not a reproduction of an observed
+        production sequence -- it exists to pin the subtrahend's bound as an
+        invariant (defensive against a future writer, or a bi-temporal
+        correction, that no longer holds that atomicity), not because #238
+        is reachable this way today.
         """
         import mcp_server
 
@@ -9431,15 +9461,21 @@ class TestPreloadExternalDependencies:
             # A genuine unresolved-import stub: no :path, ever.
             '[:module/pkg-missing :entity-type :type/external-dependency] '
             '[:module/pkg-missing :ident ":module/pkg-missing"] '
-            '[:module/pkg-missing :description "pkg.missing"]])'
+            '[:module/pkg-missing :description "pkg.missing"] '
+            # vendor-lib-extra: ident/description go in below the watermark
+            # too -- only its :path is asserted later, above it, in the
+            # separate transact below. See the seeding note above.
+            '[:module/vendor-lib-extra :entity-type :type/external-dependency] '
+            '[:module/vendor-lib-extra :ident ":module/vendor-lib-extra"] '
+            '[:module/vendor-lib-extra :description "vendor/lib/extra"]])'
         )
-        # Above the watermark: what a prior run's Stage B leaves behind.
+        # Above the watermark: vendor-lib-extra's :path fact ALONE, asserted
+        # in a transact separate from (and later than) its ident/description
+        # above. This is the split that actually distinguishes a bounded
+        # subtrahend from an unbounded one -- see the seeding note above.
         real_db.execute(
             '(transact {:valid-from "2026-06-01T00:00:00Z"} '
-            '[[:module/vendor-lib-extra :entity-type :type/external-dependency] '
-            '[:module/vendor-lib-extra :ident ":module/vendor-lib-extra"] '
-            '[:module/vendor-lib-extra :path "vendor/lib/extra"] '
-            '[:module/vendor-lib-extra :description "vendor/lib/extra"]])'
+            '[[:module/vendor-lib-extra :path "vendor/lib/extra"]])'
         )
 
         stubs = mcp_server._preload_unresolved_dep_idents(
@@ -9447,7 +9483,7 @@ class TestPreloadExternalDependencies:
         )
         assert stubs == {":module/pkg-missing": "pkg.missing"}, (
             "a real (:path-bearing) submodule must never be classified as a stub, "
-            "regardless of which side of the watermark it was born on"
+            "regardless of which side of the watermark its :path fact lands on"
         )
 
     def test_stub_above_the_watermark_is_excluded_by_the_bound(self, real_db, tmp_path):
