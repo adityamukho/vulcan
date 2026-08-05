@@ -19494,6 +19494,18 @@ class TestResumeWithInvertedAuthorDates:
     forward-only (1000000:1) so its own remaining work -- one gap commit via
     Stage A, then two swept commits via Stage B -- is deterministic. See
     _inverted_author_date_repo's docstring for the full mechanism.
+
+    These three tests do NOT bracket the position clause symmetrically. The
+    clause is purely exclusionary -- it can only make the preload DROP rows,
+    never add them -- so removing it can only cause OVER-inclusion, never
+    under-inclusion. test_resumed_run_does_not_close_a_future_entity and
+    test_resumed_run_writes_no_inverted_valid_interval both pin consequences
+    of over-inclusion and both fail if the clause is removed.
+    test_resumed_run_mints_no_duplicate_introduced_by pins a standing #235
+    invariant that a DIFFERENT failure mode (under-inclusion) would violate;
+    it is kept because that invariant is worth checking on this same
+    resumed-run path, but see its own docstring for why no ablation of the
+    position clause -- in this fixture or any other -- can make it fail.
     """
 
     def _progress(self):
@@ -19574,8 +19586,29 @@ class TestResumeWithInvertedAuthorDates:
 
     @pytest.mark.asyncio
     async def test_resumed_run_mints_no_duplicate_introduced_by(self, tmp_path, monkeypatch):
-        """The other direction. No entity may hold two live :introduced-by
-        values -- that is #235's corruption, reachable through #238's preload."""
+        """No entity may hold two live :introduced-by values -- that is
+        #235's corruption, reachable through #238's preload.
+
+        This test does NOT guard the position clause and cannot fail if that
+        clause is removed, in this fixture or any other:
+        `_preload_known_entities`' position clause is purely exclusionary
+        (`if pos is None or pos > watermark_pos: continue`) -- removing it
+        can only make the preload MORE inclusive, never less. The duplicate
+        :introduced-by failure mode checked here needs the opposite:  an
+        entity that IS live at the watermark being wrongly EXCLUDED from the
+        preload, so replay takes _build_code_triples' introduction branch a
+        second time and mints a second live :introduced-by. That is a
+        date-bound-too-narrow defect (the OLD ts(W) bound, before it was
+        widened to the T_hi(W) envelope), not something the position clause
+        -- present or absent -- has any say over.
+
+        The two tests in this class that DO pin the position clause are
+        test_resumed_run_does_not_close_a_future_entity and
+        test_resumed_run_writes_no_inverted_valid_interval; see their
+        docstrings and the class docstring. This test is kept anyway because
+        "no entity holds two live :introduced-by values" is a real, standing
+        #235 invariant worth checking on this same resumed-run path -- it
+        just isn't evidence for #238's fix specifically."""
         import mcp_server
         repo = _inverted_author_date_repo(tmp_path / "repo")
         graph = str(repo / "memory.graph")
