@@ -7555,7 +7555,44 @@ def _preload_provisional_idents(db: Any) -> Set[str]:
     return {row[0] for row in json.loads(raw).get("results", [])}
 
 
-def _load_ingestion_preload_state(repo_path: str) -> tuple:
+def _resume_envelope(
+    commit_metadata: List[Tuple[str, str, str, str]], watermark_pos: Optional[int]
+) -> Optional[str]:
+    """T_hi(W) = max(ts[0..W]) -- the monotone envelope of every author date at
+    or below the resume position, and the valid-time bound
+    _preload_known_entities takes (#238).
+
+    NOT ts(W). Author dates are not monotonic in topological order
+    (_git_commits reads %at, not %ct), so ts(W) does not cleanly separate "at
+    or below the resume position" from "above it". The envelope is the widest
+    bound that still excludes every close at or below W: such a close has
+    valid_to = ts[p] <= T_hi(W), and :valid-at's half-open semantics require
+    valid_at < valid_to.
+
+    Widening the bound this way is only safe BECAUSE _preload_known_entities
+    also applies a conjunctive position clause. Alone it is the "add-back
+    union" #238 warns produces a change that looks like a fix and isn't -- see
+    test_the_envelope_alone_does_not_close_the_hole.
+
+    Timestamps are fixed-width UTC ("%Y-%m-%dT%H:%M:%SZ") from _git_commits, so
+    lexicographic max is chronological max.
+
+    Returns None for a None position (a fresh graph, no watermark), which
+    degrades the preload to its pre-#222 unrestricted form.
+    """
+    if watermark_pos is None:
+        return None
+    window = commit_metadata[: watermark_pos + 1]
+    if not window:
+        return None
+    return max(ts for _hash, ts, _author, _subject in window)
+
+
+def _load_ingestion_preload_state(
+    repo_path: str,
+    linearization: List[str],
+    commit_metadata: List[Tuple[str, str, str, str]],
+) -> tuple:
     """Open the DB and run every startup preload query for _run_ingestion.
 
     Executed via run_in_executor on a worker thread (see _run_ingestion), not
@@ -7570,30 +7607,58 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     entering a permanent "error" state (#106). Mirrors get_db()'s
     "reuse the already-open handle" short-circuit rather than reopening
     unconditionally.
+
+    linearization and commit_metadata are #238's resume bound. They are
+    supplied by the caller rather than built here because the git enumeration
+    must not run while this function holds the graph file lock -- see
+    _run_ingestion, which now runs both enumerations before the preload rather
+    than after it. That ordering, not any preference for valid-time, is the
+    whole reason the bound used to be expressed in author dates: the
+    linearization simply did not exist yet when this ran.
+
+    Both are validated for positional alignment before use. _reverse_apply
+    performs the same check for the same reason (silent, systematic error), but
+    the consequence here is worse: a misaligned pair mis-filters the ENTIRE
+    preload rather than misattributing one commit.
     """
     db = _db if _db is not None else _open_db_at_with_extended_retry(_graph_path or _get_graph_path())
     watermark = _watermark_query(db)
-    # #222 phase 2d review, B1: the MUTABLE walk state must describe the graph
-    # at the forward walk's resume position, not "now" -- see
-    # _preload_known_entities' valid_at docstring for what goes wrong
-    # otherwise. The resume position IS the watermark (both the forward walk
-    # and Stage B's lifecycle pass start there), so the bound is that
-    # commit's own :date, read back out of the graph. Wall-clock time would
-    # be wrong twice over: it is not the resume position, and ingest
-    # valid-time is denominated in AUTHOR dates (_git_commits reads `%at`,
-    # not `%ct`), not real time. Author dates invert more readily than
-    # committer dates -- see _preload_known_entities' docstring for the
-    # residual this leaves open in BOTH directions, and for why the eventual
-    # ancestry-indexed fix must replace this bound rather than union with it.
-    # No watermark means a fresh graph, where None degrades this to exactly
-    # the pre-#222 unrestricted queries rather than to an empty state.
+    if len(commit_metadata) != len(linearization):
+        raise ValueError(
+            "commit_metadata must be positionally aligned with linearization "
+            f"(got {len(commit_metadata)} entries vs {len(linearization)}); "
+            "a misaligned pair mis-filters the entire preload (#238)"
+        )
+    hash_to_pos = {h: i for i, h in enumerate(linearization)}
+    watermark_pos = hash_to_pos.get(watermark) if watermark is not None else None
+
+    # #238: two DIFFERENT bounds now, deliberately.
+    #
+    # resume_valid_at is ts(W), the watermark commit's own :date. It is what
+    # :depends-on and :pinned-commit still use, because those facts carry no
+    # commit reference of any kind and so admit no position clause. Widening
+    # THEM to the envelope without one would make their data-loss direction
+    # worse -- exactly the union #238 forbids. Tracked as #245.
+    #
+    # entity_valid_at is the monotone envelope T_hi(W) = max(ts[0..W]), which
+    # is safe only because _preload_known_entities pairs it with the
+    # conjunctive position clause below. A None watermark_pos (fresh graph, or
+    # a watermark absent from this linearization -- a rewritten history)
+    # degrades both to the pre-#222 unrestricted queries rather than to an
+    # empty state.
     resume_valid_at = _commit_date_query(db, watermark)
     resume_valid_at_ms = _iso_to_epoch_ms(resume_valid_at)
+    entity_valid_at = _resume_envelope(commit_metadata, watermark_pos)
+    if entity_valid_at is None:
+        entity_valid_at = resume_valid_at
     prior_ingested = _count_commit_entities(db)
     (
         entity_valid_from, entity_descriptions, entity_introduced_by,
         file_entities, submodule_paths,
-    ) = _preload_known_entities(db, repo_path, valid_at=resume_valid_at)
+    ) = _preload_known_entities(
+        db, repo_path, valid_at=entity_valid_at,
+        hash_to_pos=hash_to_pos, watermark_pos=watermark_pos,
+    )
     file_deps, dep_valid_from = _preload_known_deps(
         db, file_entities, valid_at_ms=resume_valid_at_ms,
     )
@@ -9625,6 +9690,19 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     # see _reset_introduced_by_ambiguity_log_budget.
     _reset_introduced_by_ambiguity_log_budget()
     try:
+        # Enumerated BEFORE the preload (#238), which needs the positions to
+        # bound its queries. Above the DB open too, not merely above the
+        # `_db = None` lock release, so the graph file lock is held for no
+        # longer than it was. These are git subprocesses and touch no DB.
+        linearization = frontier_registry.build_linearization(repo_path, branch)
+        # FULL history, positionally aligned with linearization. Both
+        # _reverse_apply and _correction_sweep_select_position index it
+        # positionally, and _reverse_apply raises ValueError on a length
+        # mismatch -- a watermark-relative list is exactly the wrong thing
+        # to hand them.
+        commit_metadata = _git_commits(repo_path, None, branch)
+        ignore_patterns = _load_ignore_patterns(repo_path)
+
         # Read watermark and pre-load known entities/deps before releasing DB.
         # Off-loaded to a worker thread (see _load_ingestion_preload_state)
         # so this potentially slow phase never blocks the event loop from
@@ -9636,21 +9714,16 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 entity_introduced_by, file_entities, file_deps, dep_valid_from,
                 pinned_commit_state, field_class_ident, field_static_ident,
                 submodule_paths, unresolved_dep_idents,
-            ) = await loop.run_in_executor(preload_executor, _load_ingestion_preload_state, repo_path)
+            ) = await loop.run_in_executor(
+                preload_executor, _load_ingestion_preload_state,
+                repo_path, linearization, commit_metadata,
+            )
         # minigraf exposes no explicit close(): the file lock is only released once
         # every reference to the handle is gone — the worker thread's own `db`
         # local already went out of scope when it returned above, so clearing
         # the global here is enough to release the lock.
-        _db = None  # release file lock while enumerating commits
+        _db = None  # release file lock now that the preload has read what it needs
 
-        linearization = frontier_registry.build_linearization(repo_path, branch)
-        # FULL history, positionally aligned with linearization. Both
-        # _reverse_apply and _correction_sweep_select_position index it
-        # positionally, and _reverse_apply raises ValueError on a length
-        # mismatch -- a watermark-relative list is exactly the wrong thing
-        # to hand them.
-        commit_metadata = _git_commits(repo_path, None, branch)
-        ignore_patterns = _load_ignore_patterns(repo_path)
         state = _ForwardWalkState(
             entity_valid_from=entity_valid_from,
             entity_descriptions=entity_descriptions,

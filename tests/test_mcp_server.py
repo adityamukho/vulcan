@@ -9835,11 +9835,85 @@ class TestPreloadProvisionalIdents:
         mcp_server._lineage_mark_provisional(real_db, ":code/fn-a", "2026-01-01T00:00:00Z")
         assert mcp_server._preload_provisional_idents(real_db) == {":code/fn-a"}
 
-        result = mcp_server._load_ingestion_preload_state(str(repo))
+        result = mcp_server._load_ingestion_preload_state(str(repo), [], [])
         assert len(result) == 13
         assert {":code/fn-a"} not in result
         assert not any(isinstance(element, set) and ":code/fn-a" in element
                        for element in result)
+
+
+class TestPreloadStateLinearizationWiring:
+    """#238: the linearization must reach the preload.
+
+    It did not before, for a purely mechanical reason:
+    _load_ingestion_preload_state ran BEFORE build_linearization was called, so
+    the positions did not exist yet. build_linearization needs only repo_path
+    and branch, no DB handle, so both git enumerations move above the preload
+    block -- and above the DB open, so the graph file lock is held no longer
+    than it was.
+    """
+
+    def test_envelope_is_the_max_date_at_or_below_the_watermark(self):
+        """T_hi(W) = max(ts[0..W]), not ts(W). Timestamps are fixed-width UTC
+        from _git_commits, so lexicographic max is chronological max."""
+        import mcp_server
+        commit_metadata = [
+            ("a" * 40, "2026-04-01T00:00:00Z", "a@e", "c0"),
+            ("b" * 40, "2026-05-02T00:00:00Z", "a@e", "c1"),
+            ("c" * 40, "2026-04-26T00:00:00Z", "a@e", "c2"),
+        ]
+        assert mcp_server._resume_envelope(commit_metadata, 1) == "2026-05-02T00:00:00Z"
+        # The inversion: at W=0 the envelope is ts(0), and c2 (position 2,
+        # dated EARLIER than c1) is still correctly above it by POSITION.
+        assert mcp_server._resume_envelope(commit_metadata, 0) == "2026-04-01T00:00:00Z"
+
+    def test_envelope_of_none_position_is_none(self):
+        import mcp_server
+        assert mcp_server._resume_envelope([], None) is None
+
+    @pytest.mark.asyncio
+    async def test_preload_state_accepts_and_uses_the_linearization(self, git_repo, monkeypatch):
+        """Smoke test that the new parameters are threaded, on a real graph."""
+        import mcp_server
+        # frontier_registry is a top-level module in this repo (imported
+        # module-wide above), not a submodule of the installed minigraf
+        # package -- `from minigraf import frontier_registry` does not exist.
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "complete"
+
+        mcp_server._db = None
+        linearization = frontier_registry.build_linearization(str(git_repo), "HEAD")
+        commit_metadata = mcp_server._git_commits(str(git_repo), None, "HEAD")
+        result = mcp_server._load_ingestion_preload_state(
+            str(git_repo), linearization, commit_metadata,
+        )
+        assert len(result) == 13
+        # (watermark, prior_ingested, entity_valid_from, entity_descriptions,
+        #  entity_introduced_by, ...) -- index 4, not 3.
+        entity_introduced_by = result[4]
+        assert entity_introduced_by, "the preload must seed entity_introduced_by"
+        assert all(v.startswith(":commit/") for v in entity_introduced_by.values())
+
+    @pytest.mark.asyncio
+    async def test_misaligned_metadata_raises(self, git_repo):
+        """A misaligned pair silently mis-filters the ENTIRE preload, which is
+        worse than the misattribution _reverse_apply's own check prevents."""
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._db = None
+        with pytest.raises(ValueError, match="positionally aligned"):
+            mcp_server._load_ingestion_preload_state(
+                str(git_repo), ["a" * 40, "b" * 40], [("a" * 40, "2026-01-01T00:00:00Z", "e", "s")],
+            )
 
 
 class TestIngestTransactFactIndex:
@@ -9985,9 +10059,9 @@ class TestRunIngestion:
         leaving the server permanently unable to connect."""
         import mcp_server
 
-        def slow_preload(db, repo_path, valid_at=None):
+        def slow_preload(db, repo_path, valid_at=None, hash_to_pos=None, watermark_pos=None):
             time.sleep(0.3)
-            return {}, {}, {}
+            return {}, {}, {}, {}, {}
 
         monkeypatch.setattr(mcp_server, "_preload_known_entities", slow_preload)
         mcp_server._ingest_progress = {
@@ -10034,7 +10108,7 @@ class TestRunIngestion:
         assert all(db_none_snapshots), f"_db was not None at yield: {db_none_snapshots}"
 
     @pytest.mark.asyncio
-    async def test_local_db_reference_dropped_before_commit_enumeration(
+    async def test_local_db_reference_dropped_before_repo_total_enumeration(
         self, git_repo, monkeypatch
     ):
         """Regression test for #84's deeper root cause: minigraf exposes no
@@ -10045,13 +10119,17 @@ class TestRunIngestion:
         object — verified against the real (unmocked) minigraf FFI, where a
         stale local reference left the `.lock` file in place.
 
-        This specifically targets the pre-loop release point (before
-        `_git_commits` walks the repo's history), because that call has no
-        `await` before it: unlike the per-commit loop — where CPython's
-        dead-local clearing at the `await asyncio.sleep(0)` yield point can
-        mask a missing explicit clear — a potentially slow, synchronous
-        `git log` walk here would hold the lock for its entire duration
-        unless `db` is explicitly dropped.
+        #238 moved `_git_commits`' FULL-history walk (and
+        `build_linearization`) to ABOVE the DB open entirely, so that
+        enumeration no longer has a stale-reference window to guard at all —
+        no DB handle exists yet when it runs (see
+        test_git_commits_runs_before_any_db_is_opened below, which pins
+        exactly that). The next potentially slow git subprocess after the
+        preload releases the lock is now the `git rev-list --count HEAD`
+        total-count call just below `_db = None`, so this test retargets
+        there: that call has no `await` before it either, so a stale local
+        `db` reference in `_run_ingestion`'s frame would hold the lock for
+        its entire duration same as before.
 
         No real_db fixture here — this test's whole point
         is CPython refcounting on the DB handle object itself, so it needs a
@@ -10088,14 +10166,15 @@ class TestRunIngestion:
         }
 
         refcount_at_enumeration = {}
-        real_git_commits = mcp_server._git_commits
+        real_run = mcp_server._subprocess.run
 
-        def spy_git_commits(repo, watermark, branch):
-            assert len(opened_instances) == 1
-            refcount_at_enumeration["count"] = sys.getrefcount(opened_instances[0])
-            return real_git_commits(repo, watermark, branch)
+        def spy_run(cmd, *args, **kwargs):
+            if cmd[:2] == ["git", "rev-list"]:
+                assert len(opened_instances) == 1
+                refcount_at_enumeration["count"] = sys.getrefcount(opened_instances[0])
+            return real_run(cmd, *args, **kwargs)
 
-        with patch.object(mcp_server, "_git_commits", side_effect=spy_git_commits):
+        with patch.object(mcp_server._subprocess, "run", side_effect=spy_run):
             await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
         # 1 ref for opened_instances' slot + 1 for the local `inst` in
@@ -10103,8 +10182,57 @@ class TestRunIngestion:
         # stale `db` local in _run_ingestion's frame) is still holding it.
         assert refcount_at_enumeration["count"] <= 2, (
             "a stale local reference kept the DB instance (and its file "
-            f"lock) alive during commit enumeration: "
+            f"lock) alive during the repo-total enumeration: "
             f"refcount={refcount_at_enumeration['count']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_git_commits_runs_before_any_db_is_opened(
+        self, git_repo, monkeypatch
+    ):
+        """#238: `_git_commits` (and `build_linearization`) must run ABOVE
+        the DB open, not merely above the `_db = None` lock-release, so the
+        graph file lock is never held during the full-history walk at all --
+        see _run_ingestion's comment above `build_linearization`. Pins the
+        ordering directly: no DB has been opened yet at the moment
+        `_git_commits` is called.
+        """
+        import mcp_server
+        from minigraf import MiniGrafDb
+
+        class _FakeDb:
+            def execute(self, *a, **k):
+                return json.dumps({"results": []})
+            def checkpoint(self):
+                pass
+
+        opened_instances = []
+
+        def _open(path):
+            inst = _FakeDb()
+            opened_instances.append(inst)
+            return inst
+
+        monkeypatch.setattr(MiniGrafDb, "open", staticmethod(_open))
+        mcp_server._db = None
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+
+        opened_count_at_enumeration = {}
+        real_git_commits = mcp_server._git_commits
+
+        def spy_git_commits(repo, watermark, branch):
+            opened_count_at_enumeration["count"] = len(opened_instances)
+            return real_git_commits(repo, watermark, branch)
+
+        with patch.object(mcp_server, "_git_commits", side_effect=spy_git_commits):
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert opened_count_at_enumeration["count"] == 0, (
+            "a DB was already open when _git_commits ran -- the full-history "
+            "enumeration must precede the DB open entirely (#238)"
         )
 
     @pytest.mark.asyncio
