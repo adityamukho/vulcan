@@ -8505,10 +8505,11 @@ class TestIngestionWrites:
     ):
         """_preload_known_entities' query (see its source) requires the full
         [:entity-type :ident :file/:path :description :introduced-by] shape
-        plus the introducing commit's :date — a bare :description/:file pair
-        (as an earlier draft of this test assumed) never matches the query
-        and silently yields empty results, so the seed below mirrors the
-        real fact shape _run_ingestion actually writes."""
+        plus the introducing commit's :date and :hash — a bare
+        :description/:file pair (as an earlier draft of this test assumed)
+        never matches the query and silently yields empty results, so the
+        seed below mirrors the real fact shape _run_ingestion actually
+        writes."""
         import mcp_server
         real_db.execute(
             '(transact [[:function/auth-py-login :entity-type :type/function] '
@@ -8516,10 +8517,11 @@ class TestIngestionWrites:
             '[:function/auth-py-login :file "auth.py"] '
             '[:function/auth-py-login :description "login"] '
             '[:function/auth-py-login :introduced-by :commit/c1] '
-            '[:commit/c1 :date "2025-01-15T10:00:00Z"]])'
+            '[:commit/c1 :date "2025-01-15T10:00:00Z"] '
+            '[:commit/c1 :hash "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"]])'
         )
 
-        entity_valid_from, entity_descriptions, file_entities, submodule_paths = (
+        entity_valid_from, entity_descriptions, entity_introduced_by, file_entities, submodule_paths = (
             mcp_server._preload_known_entities(real_db, str(git_repo))
         )
 
@@ -9351,10 +9353,11 @@ class TestPreloadExternalDependencies:
             '[:module/vendor-lib :path "vendor/lib"] '
             '[:module/vendor-lib :description "lib"] '
             '[:module/vendor-lib :introduced-by :commit/c1] '
-            '[:commit/c1 :date "2026-01-01T00:00:00Z"]])'
+            '[:commit/c1 :date "2026-01-01T00:00:00Z"] '
+            '[:commit/c1 :hash "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"]])'
         )
 
-        entity_valid_from, entity_descriptions, file_entities, submodule_paths = (
+        entity_valid_from, entity_descriptions, entity_introduced_by, file_entities, submodule_paths = (
             mcp_server._preload_known_entities(real_db, str(tmp_path))
         )
 
@@ -9428,6 +9431,7 @@ class TestPreloadExternalDependencies:
             '[:module/vendor-lib :description "vendor/lib"] '
             '[:module/vendor-lib :introduced-by :commit/c1] '
             '[:commit/c1 :date "2026-01-01T00:00:00Z"] '
+            '[:commit/c1 :hash "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"] '
             # A genuine unresolved-import stub: no :path, ever.
             '[:module/pkg-missing :entity-type :type/external-dependency] '
             '[:module/pkg-missing :ident ":module/pkg-missing"] '
@@ -9441,7 +9445,8 @@ class TestPreloadExternalDependencies:
             '[:module/vendor-lib-extra :path "vendor/lib/extra"] '
             '[:module/vendor-lib-extra :description "vendor/lib/extra"] '
             '[:module/vendor-lib-extra :introduced-by :commit/c2] '
-            '[:commit/c2 :date "2026-06-01T00:00:00Z"]])'
+            '[:commit/c2 :date "2026-06-01T00:00:00Z"] '
+            '[:commit/c2 :hash "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"]])'
         )
 
         resume_valid_at = "2026-03-01T00:00:00Z"
@@ -9475,6 +9480,183 @@ class TestPreloadExternalDependencies:
         monkeypatch.setattr(mcp_server, "_VALID_TIME_FOREVER_MS", "))) malformed [[[")
 
         assert mcp_server._preload_pinned_commits(real_db) == {}
+
+
+class TestPreloadKnownEntitiesPositionBound:
+    """#238: the preload's resume bound must be POSITION-indexed, not
+    author-date valid-time.
+
+    Author dates are not monotonic in topological order (_git_commits reads
+    %at, not %ct; a rebase, cherry-pick or late-merged branch carries the
+    original author date forward). Measured on this repo: of 552 watermark
+    positions, 6 (118-123) have a strictly-earlier-dated LATER position, and
+    124-128 are confirmed descendants of them.
+
+    Linearization used throughout: position 0 = c0, 1 = c1 (the watermark),
+    2 = c2. c2 is ABOVE the watermark but dated EARLIER than c1 -- the
+    inversion.
+    """
+
+    LINEARIZATION = ["c0" * 20, "c1" * 20, "c2" * 20]
+    HASH_TO_POS = {h: i for i, h in enumerate(LINEARIZATION)}
+    WATERMARK_POS = 1
+    T_HI = "2026-05-02T00:00:00Z"  # max(ts[0..1]) -- the monotone envelope
+
+    def _seed(self, real_db):
+        """c0 @ 2026-04-01, c1 (watermark) @ 2026-05-02, c2 (above) @ 2026-04-26.
+
+        below_w:  introduced at c0 -- must always be present.
+        later_dated_below_w: introduced at c1's own date; today's ts(W) bound
+            keeps it, but a commit at/below W dated LATER than W would drop out.
+        above_w:  introduced at c2, dated EARLIER than the watermark -- today's
+            bound keeps it, which is #238's DATA-LOSS direction.
+        """
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            f'[[:commit/c0 :hash "{self.LINEARIZATION[0]}"] '
+            '[:commit/c0 :date "2026-04-01T00:00:00Z"] '
+            '[:module/below-w :entity-type :type/module] '
+            '[:module/below-w :ident ":module/below-w"] '
+            '[:module/below-w :path "below.py"] '
+            '[:module/below-w :description "below.py"] '
+            '[:module/below-w :introduced-by :commit/c0]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-05-02T00:00:00Z"} '
+            f'[[:commit/c1 :hash "{self.LINEARIZATION[1]}"] '
+            '[:commit/c1 :date "2026-05-02T00:00:00Z"] '
+            '[:module/later-dated-below-w :entity-type :type/module] '
+            '[:module/later-dated-below-w :ident ":module/later-dated-below-w"] '
+            '[:module/later-dated-below-w :path "later.py"] '
+            '[:module/later-dated-below-w :description "later.py"] '
+            '[:module/later-dated-below-w :introduced-by :commit/c1]])'
+        )
+        # Above the watermark, dated EARLIER than it: the side-branch shape.
+        real_db.execute(
+            '(transact {:valid-from "2026-04-26T00:00:00Z"} '
+            f'[[:commit/c2 :hash "{self.LINEARIZATION[2]}"] '
+            '[:commit/c2 :date "2026-04-26T00:00:00Z"] '
+            '[:module/above-w :entity-type :type/module] '
+            '[:module/above-w :ident ":module/above-w"] '
+            '[:module/above-w :path "above.py"] '
+            '[:module/above-w :description "above.py"] '
+            '[:module/above-w :introduced-by :commit/c2]])'
+        )
+
+    def test_entity_introduced_above_the_watermark_is_excluded(self, real_db, tmp_path):
+        """#238's DATA-LOSS direction. Wrongly included, this entity is absent
+        from the parse of the earlier commit being replayed, so the forward walk
+        closes and _forget_closed_entity-purges it with an orig_ts LATER than
+        the close's valid_to: an inverted valid interval, permanent loss."""
+        import mcp_server
+        self._seed(real_db)
+        entity_valid_from, *_ = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+            hash_to_pos=self.HASH_TO_POS, watermark_pos=self.WATERMARK_POS,
+        )
+        assert ":module/above-w" not in entity_valid_from
+        assert ":module/below-w" in entity_valid_from
+
+    def test_entity_at_the_watermark_position_is_included(self, real_db, tmp_path):
+        """#238's benign direction. Excluded, replay mints a duplicate
+        :introduced-by."""
+        import mcp_server
+        self._seed(real_db)
+        entity_valid_from, *_ = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+            hash_to_pos=self.HASH_TO_POS, watermark_pos=self.WATERMARK_POS,
+        )
+        assert ":module/later-dated-below-w" in entity_valid_from
+
+    def test_the_envelope_alone_does_not_close_the_hole(self, real_db, tmp_path):
+        """THE test that pins the design. Widening the date bound to the
+        monotone envelope WITHOUT the position clause re-admits the above-W
+        entity -- the 'add-back union' #238 warns produces a change that looks
+        like a fix and isn't. The position clause is what closes data loss;
+        the date bound only governs how widely entities closed above W are
+        re-admitted. Do not delete this test to make a refactor pass."""
+        import mcp_server
+        self._seed(real_db)
+        entity_valid_from, *_ = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+        )
+        assert ":module/above-w" in entity_valid_from
+
+    def test_all_bounds_none_restores_unrestricted_behaviour(self, real_db, tmp_path):
+        """A fresh graph has no watermark and wants the pre-#222 behaviour."""
+        import mcp_server
+        self._seed(real_db)
+        entity_valid_from, *_ = mcp_server._preload_known_entities(
+            real_db, str(tmp_path),
+        )
+        assert ":module/above-w" in entity_valid_from
+        assert ":module/below-w" in entity_valid_from
+
+    def test_unknown_hash_is_excluded(self, real_db, tmp_path):
+        """An introducing commit absent from this linearization -- a rewritten
+        or foreign history. Excluding is the benign direction."""
+        import mcp_server
+        self._seed(real_db)
+        entity_valid_from, *_ = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+            hash_to_pos={self.LINEARIZATION[0]: 0}, watermark_pos=self.WATERMARK_POS,
+        )
+        assert ":module/later-dated-below-w" not in entity_valid_from
+        assert ":module/below-w" in entity_valid_from
+
+    def test_returns_the_introducing_commit_ident(self, real_db, tmp_path):
+        """#231's retract value, from #238's new bound variable."""
+        import mcp_server
+        self._seed(real_db)
+        _vf, _desc, entity_introduced_by, _fe, _sp = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+            hash_to_pos=self.HASH_TO_POS, watermark_pos=self.WATERMARK_POS,
+        )
+        expected = f":commit/{self.LINEARIZATION[0][:12]}"
+        assert entity_introduced_by[":module/below-w"] == expected
+
+    def test_submodule_paths_stays_last(self, real_db, tmp_path):
+        """Guards tests that destructure with `*_, submodule_paths = ...`."""
+        import mcp_server
+        self._seed(real_db)
+        result = mcp_server._preload_known_entities(real_db, str(tmp_path))
+        assert len(result) == 5
+        *_, submodule_paths = result
+        assert isinstance(submodule_paths, dict)
+        assert all(k.startswith(":module/") for k in submodule_paths)
+
+    def test_stale_live_introduced_by_does_not_pull_a_dead_entity_in(self, real_db, tmp_path):
+        """Pins the spec's no-migration claim.
+
+        Graphs written before #231 hold closed entities whose :introduced-by
+        was never retracted. That stale fact must not by itself pull such an
+        entity into the preload: this query also requires the entity's :ident,
+        :path and :description to be visible at the same bound, so the row
+        appears only when the :ident window covers the bound -- i.e. exactly
+        when the entity was closed ABOVE the watermark and SHOULD be included.
+
+        Here below-w is closed at 2026-04-15, below the envelope, with its
+        :introduced-by deliberately left open the way a pre-#231 graph would.
+        """
+        import mcp_server
+        self._seed(real_db)
+        mcp_server._ingest_close(
+            real_db,
+            ['[:module/below-w :ident ":module/below-w"]',
+             '[:module/below-w :path "below.py"]',
+             '[:module/below-w :description "below.py"]'],
+            "2026-04-01T00:00:00Z",
+            "2026-04-15T00:00:00Z",
+            "close below-w without retracting :introduced-by (pre-#231 shape)",
+        )
+        assert mcp_server._entity_introduced_by_query(real_db, ":module/below-w") is not None, (
+            "precondition: the stale live :introduced-by is the pre-#231 residue"
+        )
+        entity_valid_from, *_ = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+            hash_to_pos=self.HASH_TO_POS, watermark_pos=self.WATERMARK_POS,
+        )
+        assert ":module/below-w" not in entity_valid_from
 
 
 class TestPreloadProvisionalIdents:
@@ -9514,7 +9696,7 @@ class TestPreloadProvisionalIdents:
         assert mcp_server._preload_provisional_idents(real_db) == {":code/fn-a"}
 
         result = mcp_server._load_ingestion_preload_state(str(repo))
-        assert len(result) == 12
+        assert len(result) == 13
         assert {":code/fn-a"} not in result
         assert not any(isinstance(element, set) and ":code/fn-a" in element
                        for element in result)

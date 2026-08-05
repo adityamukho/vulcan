@@ -7076,65 +7076,66 @@ def _build_code_triples(
 
 
 def _preload_known_entities(
-    db: Any, repo_path: str, valid_at: Optional[str] = None
+    db: Any,
+    repo_path: str,
+    valid_at: Optional[str] = None,
+    hash_to_pos: Optional[Dict[str, int]] = None,
+    watermark_pos: Optional[int] = None,
 ) -> tuple:
     """Load all existing module/function/class/external-dependency idents from
     the DB, and pre-seed file_entities with all currently tracked files in the
     repo.
 
-    valid_at (#222 phase 2d review, B1) bounds the entity queries to the graph
-    as it stood at the forward walk's RESUME POSITION -- i.e. at the
-    :ingestion/watermark commit's own timestamp -- instead of "now". Before the
-    two-stream ingest, the two were the same thing: the graph never held facts
-    for a commit above the watermark. The reverse stream breaks that. It writes
-    structural facts across the whole frontier-high region, and Stage B's
-    lifecycle pass then applies that region's deletions and renames, so a
-    CURRENT-graph preload hands the resuming forward walk a state describing
-    commits it has not reached yet. Both directions of that mismatch corrupt
-    the graph:
+    valid_at + hash_to_pos + watermark_pos together bound this query to the
+    graph as it stood at the forward walk's RESUME POSITION. Before the
+    two-stream ingest a current-graph preload and a resume-position preload
+    were the same thing; the reverse stream broke that by writing structural
+    facts across the whole frontier-high region, with Stage B's lifecycle pass
+    then applying that region's deletions and renames. Both directions of the
+    mismatch corrupt the graph, and they are NOT equally severe:
 
-      * an entity born in the reverse region is present in file_entities, is
-        absent from the parse of the (earlier) commit the forward walk is
-        replaying, and so is closed and _forget_closed_entity-purged as a
-        "removed" entity -- with an orig_ts LATER than the close's valid_to,
-        an inverted valid interval;
-      * an entity CLOSED in the reverse region is missing from the state
-        entirely, so replaying an earlier commit that still contains it takes
-        _build_code_triples' introduction branch and mints a second live
-        :introduced-by.
+      * an entity wrongly INCLUDED (born in the reverse region) is absent from
+        the parse of the earlier commit being replayed, so it is closed and
+        _forget_closed_entity-purged with an orig_ts LATER than the close's
+        valid_to -- an inverted valid interval. UNRECOVERABLE.
+      * an entity wrongly EXCLUDED (closed in the reverse region) makes replay
+        take _build_code_triples' introduction branch and mint a second live
+        :introduced-by. RECOVERABLE -- #235's correction sweep repairs it, and
+        a still-provisional entity is reconciled in place by
+        _forward_reconcile_provisional rather than duplicated.
 
-    Passing None restores the pre-#222 behaviour exactly, which is what a
-    fresh graph (no watermark) wants.
+    Wrong-inclusion is caused SOLELY by the introduction end, and the
+    introduction position is exactly recoverable: [?e :introduced-by ?c]
+    [?c :hash ?hash] -> hash_to_pos[?hash]. So watermark_pos closes the
+    unrecoverable direction exactly, with no fact-model change (#238).
 
-    Known residual, deliberately not papered over: valid-time is populated
-    from AUTHOR dates -- _git_commits reads `%at`, not `%ct` -- which are not
-    monotonic in topological order, and are MORE inversion-prone than
-    committer dates would be (a rebase, a cherry-pick or a long-lived branch
-    merged late all carry the original author date forward, while rewriting
-    the committer date). So this bound is looser than a committer-date bound,
-    and looser still than a position-indexed one.
+    The close END is not recoverable at all -- _ingest_close records a close
+    as valid_to = commit_ts_iso and holds no reference to the closing commit.
+    valid_at therefore stays, but is DEMOTED: it no longer carries the safety
+    property, only "how widely do we re-admit entities closed above the
+    watermark". Callers pass the monotone envelope T_hi(W) = max(ts[0..W])
+    rather than ts(W), the widest value that still excludes every close at or
+    below W (a close at position p <= W has valid_to = ts[p] <= T_hi(W), and
+    :valid-at's half-open semantics require valid_at < valid_to).
 
-    The residual therefore runs in BOTH directions, not just one:
+    This is a REPLACEMENT of the old ts(W) bound, not a union with it. Read
+    #238 before changing it: widening the date bound alone is the "add-back"
+    that looks like a fix and isn't, and
+    test_the_envelope_alone_does_not_close_the_hole pins exactly that.
 
-      * a commit at or below the watermark dated LATER than the watermark
-        commit -- its entities drop out of this snapshot and are treated as
-        new, i.e. duplicate introduction (the second bullet above, rarer);
-      * a commit ABOVE the watermark dated EARLIER than the watermark commit
-        -- its entities stay in this snapshot, are absent from the parse of
-        the earlier commit being replayed, and are closed and
-        _forget_closed_entity-purged: B1's original DATA-LOSS mode, surviving
-        in narrow form.
+    Residual, deliberately accepted: an entity introduced at or below W,
+    deleted or renamed above W with a close date earlier than T_hi(W), where a
+    prior run's Stage B already applied that deletion. It is excluded, so
+    replay mints a duplicate :introduced-by -- the recoverable direction, left
+    to #235's sweep.
 
-    Both are live on this repository: of 552 watermark positions, 6 (118-123)
-    have a strictly-earlier-dated LATER position, and those later positions
-    (124-128, a side branch authored 2026-04-26/27 landing topologically
-    after the 2026-05-02 merges) are confirmed descendants of 118-123 via
-    `git merge-base --is-ancestor`. Consequence for whoever closes this: the
-    eventual ancestry- or position-indexed filter must REPLACE this
-    valid-time bound, not be unioned with it as an "add-back" -- a union only
-    re-admits the benign duplicate-introduction direction and leaves the
-    data-loss direction wide open. (The linearization is not available on
-    this code path, which is why the bound is expressed in valid-time here.)
+    :depends-on and :pinned-commit carry no commit reference of any kind, so
+    _preload_known_deps and _preload_pinned_commits get no position clause and
+    stay at ts(W). Tracked as #245; do NOT widen them to the envelope without
+    one, which would make their data-loss direction worse.
+
+    Passing all three as None restores the pre-#222 behaviour exactly, which
+    is what a fresh graph (no watermark) wants.
 
     external-dependency entities share the module ident namespace and use the
     same "path" attribute as modules, so folding them into this same query
@@ -7149,16 +7150,15 @@ def _preload_known_entities(
     find any module file even when processing early commits — before those files
     have been introduced in the chronological commit walk.
 
-    Returns (entity_valid_from, entity_descriptions, file_entities, submodule_paths).
-    entity_valid_from maps ident → git commit timestamp of first introduction.
-    entity_descriptions maps ident → human-readable name (function/class/file).
-    submodule_paths maps external-dependency (submodule) ident → its :path,
-    used by the gitlink "add"/stub-creation linking in #112's fix to tell a
-    real submodule ident apart from an unresolved-import stub ident (which
-    never has a :path).
+    Returns (entity_valid_from, entity_descriptions, entity_introduced_by,
+    file_entities, submodule_paths). entity_introduced_by maps ident -> the
+    :commit/... ident that introduced it, derived from the same ?hash the
+    position clause uses -- #231's close-time retract value. submodule_paths
+    stays LAST: an existing test destructures with `*_, submodule_paths`.
     """
     entity_valid_from: Dict[str, str] = {}
     entity_descriptions: Dict[str, str] = {}
+    entity_introduced_by: Dict[str, str] = {}
     file_entities: Dict[str, List[str]] = {}
     submodule_paths: Dict[str, str] = {}
 
@@ -7185,19 +7185,39 @@ def _preload_known_entities(
         try:
             raw = _db_execute(
                 db,
-                f'(query [:find ?ident ?path ?desc ?date '
+                f'(query [:find ?ident ?path ?desc ?date ?hash '
                 f'{valid_at_clause}'
                 f':where [?e :entity-type :type/{entity_type}] '
                 f'[?e :ident ?ident] '
                 f'[?e :{path_attr} ?path] '
                 f'[?e :description ?desc] '
                 f'[?e :introduced-by ?c] '
-                f'[?c :date ?date]])',
+                f'[?c :date ?date] '
+                f'[?c :hash ?hash]])',
             )
             rows = json.loads(raw).get("results", [])
-            for ident, path, desc, date in rows:
+            for ident, path, desc, date, hash_ in rows:
+                # #238: the resume bound, POSITION-indexed. This clause is
+                # CONJUNCTIVE over every row -- that is what makes the widened
+                # valid_at envelope safe, and it is the distinction #238
+                # insists on. Wrong-INCLUSION (the unrecoverable direction) is
+                # caused solely by the introduction end, which this closes
+                # exactly; the date bound above only governs how widely
+                # entities closed ABOVE the watermark are re-admitted. Never
+                # turn this into an "add-back" branch beside the date bound --
+                # that re-admits the benign direction and leaves data loss
+                # wide open.
+                #
+                # pos is None means the introducing commit is not in this
+                # linearization (a rewritten or foreign history): exclude,
+                # which is the benign direction.
+                if watermark_pos is not None:
+                    pos = hash_to_pos.get(hash_) if hash_to_pos is not None else None
+                    if pos is None or pos > watermark_pos:
+                        continue
                 entity_valid_from[ident] = date
                 entity_descriptions[ident] = desc
+                entity_introduced_by[ident] = f":commit/{hash_[:12]}"
                 file_entities.setdefault(path, [])
                 if ident not in file_entities[path]:
                     file_entities[path].append(ident)
@@ -7206,7 +7226,10 @@ def _preload_known_entities(
         except Exception:
             pass
 
-    return entity_valid_from, entity_descriptions, file_entities, submodule_paths
+    return (
+        entity_valid_from, entity_descriptions, entity_introduced_by,
+        file_entities, submodule_paths,
+    )
 
 
 def _preload_unresolved_dep_idents(
@@ -7545,9 +7568,10 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     resume_valid_at = _commit_date_query(db, watermark)
     resume_valid_at_ms = _iso_to_epoch_ms(resume_valid_at)
     prior_ingested = _count_commit_entities(db)
-    entity_valid_from, entity_descriptions, file_entities, submodule_paths = _preload_known_entities(
-        db, repo_path, valid_at=resume_valid_at,
-    )
+    (
+        entity_valid_from, entity_descriptions, entity_introduced_by,
+        file_entities, submodule_paths,
+    ) = _preload_known_entities(db, repo_path, valid_at=resume_valid_at)
     file_deps, dep_valid_from = _preload_known_deps(
         db, file_entities, valid_at_ms=resume_valid_at_ms,
     )
@@ -7569,8 +7593,9 @@ def _load_ingestion_preload_state(repo_path: str) -> tuple:
     # deliberately not part of the walk's state.
     return (
         watermark, prior_ingested, entity_valid_from, entity_descriptions,
-        file_entities, file_deps, dep_valid_from, pinned_commit_state,
-        field_class_ident, field_static_ident, submodule_paths, unresolved_dep_idents,
+        entity_introduced_by, file_entities, file_deps, dep_valid_from,
+        pinned_commit_state, field_class_ident, field_static_ident,
+        submodule_paths, unresolved_dep_idents,
     )
 
 
@@ -9584,8 +9609,9 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as preload_executor:
             (
                 watermark, prior_ingested, entity_valid_from, entity_descriptions,
-                file_entities, file_deps, dep_valid_from, pinned_commit_state,
-                field_class_ident, field_static_ident, submodule_paths, unresolved_dep_idents,
+                entity_introduced_by, file_entities, file_deps, dep_valid_from,
+                pinned_commit_state, field_class_ident, field_static_ident,
+                submodule_paths, unresolved_dep_idents,
             ) = await loop.run_in_executor(preload_executor, _load_ingestion_preload_state, repo_path)
         # minigraf exposes no explicit close(): the file lock is only released once
         # every reference to the handle is gone — the worker thread's own `db`
@@ -9612,6 +9638,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             field_static_ident=field_static_ident,
             submodule_paths=submodule_paths,
             unresolved_dep_idents=unresolved_dep_idents,
+            entity_introduced_by=entity_introduced_by,
             # Full-history, so a resumed run's retroactive :modified-in for a
             # guess commit at or below the watermark still finds a timestamp
             # (a post-watermark-only map would silently skip it).
