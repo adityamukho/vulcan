@@ -26,7 +26,14 @@ clause only governs how widely entities closed above W are re-admitted.
 - **`:contains` / `:parent` / `:depends-on` must be one transact per triple** — minigraf#287 (EAVT keys omit value bytes). Do not batch them.
 - **No closing keywords for #238.** Every commit message and the PR body must say `Refs #238`, never `Closes`/`Fixes`. GitHub scans both, and on this project a *negated* "does not close #N" has still auto-closed an issue. #238 stays open, blocked on #245. `Closes #231` is correct and intended.
 - **All ingest timestamps are `"%Y-%m-%dT%H:%M:%SZ"`** (fixed-width UTC, from `_git_commits`), so lexicographic string comparison equals chronological comparison. `max()` over these strings is safe.
-- **Run the full suite before each commit:** `python -m pytest tests/test_mcp_server.py -x -q`
+- **Run the full suite before each commit:** `python -m pytest tests/test_mcp_server.py -q --tb=no`
+- **"All pass" means "no NEW failures", not zero failures.** This dev environment is missing the tree-sitter grammars for ~14 languages, so **120 tests fail on this branch's base commit** — all in language-parser classes (`TestHaskell*`, `TestLua*`, `TestElixir*`, `TestCpp*`, `TestGo*`, `TestRuby*`, `TestSwift*`, `TestScala*`, `TestKotlin*`, `TestPhp*`, `TestJava*`, `TestJsFamily*`, `TestRustGoC*`, `TestFieldClassContainment`) plus `TestMcpToolWiring::test_call_tool_memory_finalize_turn`. CI installs the grammars and is green. The authoritative baseline list is `.superpowers/sdd/2026-08-04-position-indexed-preload/baseline-failures.txt`; compare against it with:
+  ```bash
+  python -m pytest tests/test_mcp_server.py -q --tb=no 2>&1 | grep '^FAILED' | sed 's/^FAILED //' | sort \
+    | comm -13 .superpowers/sdd/2026-08-04-position-indexed-preload/baseline-failures.txt -
+  ```
+  Empty output = clean. **Never `--deselect` a test to make a run look green**, and never touch a language-parser test — none of them are in scope for any task here.
+- **No XFAIL and no XPASS lines** may appear after Task 1.
 
 ## File Structure
 
