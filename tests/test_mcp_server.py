@@ -9544,10 +9544,16 @@ class TestPreloadKnownEntitiesPositionBound:
         )
 
     def test_entity_introduced_above_the_watermark_is_excluded(self, real_db, tmp_path):
-        """#238's DATA-LOSS direction. Wrongly included, this entity is absent
-        from the parse of the earlier commit being replayed, so the forward walk
-        closes and _forget_closed_entity-purges it with an orig_ts LATER than
-        the close's valid_to: an inverted valid interval, permanent loss."""
+        """#238's DATA-LOSS direction, and the test that actually guards the
+        position clause: removing the `if watermark_pos is not None:` block
+        entirely makes this test (and test_unknown_hash_is_excluded) fail --
+        verified experimentally by deleting the clause and re-running the
+        class. (test_the_envelope_alone_does_not_close_the_hole, below, does
+        NOT independently guard the clause -- see its docstring.) Wrongly
+        included, this entity is absent from the parse of the earlier commit
+        being replayed, so the forward walk closes and
+        _forget_closed_entity-purges it with an orig_ts LATER than the
+        close's valid_to: an inverted valid interval, permanent loss."""
         import mcp_server
         self._seed(real_db)
         entity_valid_from, *_ = mcp_server._preload_known_entities(
@@ -9569,12 +9575,19 @@ class TestPreloadKnownEntitiesPositionBound:
         assert ":module/later-dated-below-w" in entity_valid_from
 
     def test_the_envelope_alone_does_not_close_the_hole(self, real_db, tmp_path):
-        """THE test that pins the design. Widening the date bound to the
-        monotone envelope WITHOUT the position clause re-admits the above-W
-        entity -- the 'add-back union' #238 warns produces a change that looks
-        like a fix and isn't. The position clause is what closes data loss;
-        the date bound only governs how widely entities closed above W are
-        re-admitted. Do not delete this test to make a refactor pass."""
+        """Documents the motivation for the position clause: widening the
+        date bound to the monotone envelope WITHOUT it (this call passes no
+        hash_to_pos/watermark_pos at all) re-admits the above-W entity -- the
+        'add-back union' #238 warns produces a change that looks like a fix
+        and isn't.
+
+        This test does NOT independently guard the position clause itself --
+        it never passes watermark_pos, so the clause is already a no-op on
+        this call, and experimentally deleting the clause leaves this test
+        passing. test_entity_introduced_above_the_watermark_is_excluded and
+        test_unknown_hash_is_excluded are the tests that fail when the clause
+        is removed; keep this one anyway, for what it documents about the
+        date bound alone being insufficient."""
         import mcp_server
         self._seed(real_db)
         entity_valid_from, *_ = mcp_server._preload_known_entities(
@@ -9616,14 +9629,35 @@ class TestPreloadKnownEntitiesPositionBound:
         assert entity_introduced_by[":module/below-w"] == expected
 
     def test_submodule_paths_stays_last(self, real_db, tmp_path):
-        """Guards tests that destructure with `*_, submodule_paths = ...`."""
+        """Guards tests that destructure with `*_, submodule_paths = ...`.
+
+        The seeded :type/external-dependency ident is deliberately NOT one
+        of _seed's :type/module idents: entity_introduced_by's keys are all
+        ":module/..." too (from _seed), so an assertion like
+        `all(k.startswith(":module/"))` would pass even if
+        entity_introduced_by were bound to submodule_paths by mistake --
+        that vacuous shape was caught by review. Asserting exact equality
+        against a dict whose only key is this dependency's ident, mapped to
+        its :path (not a :commit/... value), is what actually discriminates
+        the two dicts. Verified by temporarily moving entity_introduced_by
+        to last in _preload_known_entities' return tuple: this test then
+        fails (submodule_paths binds to a 4-key dict of :commit/... idents
+        instead), and passes again once the order is restored.
+        """
         import mcp_server
         self._seed(real_db)
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            '[[:module/dep :entity-type :type/external-dependency] '
+            '[:module/dep :ident ":module/dep"] '
+            '[:module/dep :path "vendor/dep"] '
+            '[:module/dep :description "vendor/dep"] '
+            '[:module/dep :introduced-by :commit/c0]])'
+        )
         result = mcp_server._preload_known_entities(real_db, str(tmp_path))
         assert len(result) == 5
         *_, submodule_paths = result
-        assert isinstance(submodule_paths, dict)
-        assert all(k.startswith(":module/") for k in submodule_paths)
+        assert submodule_paths == {":module/dep": "vendor/dep"}
 
     def test_stale_live_introduced_by_does_not_pull_a_dead_entity_in(self, real_db, tmp_path):
         """Pins the spec's no-migration claim.
