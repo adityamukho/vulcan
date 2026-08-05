@@ -8528,6 +8528,66 @@ class TestIngestionWrites:
         assert entity_valid_from.get(":function/auth-py-login") == "2025-01-15T10:00:00Z"
         assert entity_descriptions.get(":function/auth-py-login") == "login"
 
+    def test_entity_introduced_by_matches_commit_write_site(self, real_db, git_repo):
+        """Final-review Finding 3: entity_introduced_by's value is built by
+        reconstructing f":commit/{hash_[:12]}" in Python rather than binding
+        the query's own ?c directly. The reviewer asked whether that is a
+        missed simplification (bind ?c, drop the reconstruction) or load-
+        bearing, given the query already binds ?c in :where. It is load-
+        bearing: minigraf returns an internal UUID for a subject variable
+        bound in :find position (verified empirically here, and matches
+        the documented reason _preload_known_deps binds ?srci instead of
+        ?src and _preload_pinned_commits binds ?ei instead of ?e).
+
+        This pins the full round trip on a real backend, not just the
+        string format in isolation: the commit entity is seeded exactly the
+        way BOTH real write sites build it (_reverse_apply and
+        _forward_apply: commit_ident = f":commit/{hash[:12]}", also written
+        as the commit's own :ident), and the value _preload_known_entities
+        returns is then fed straight into _build_close_triples'
+        introduced_by kwarg and actually retracted. A mismatched ident
+        (e.g. an internal UUID) would make that retract a silent no-op --
+        exactly #231 reopened.
+        """
+        import mcp_server
+        commit_hash = "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"
+        commit_ident = f":commit/{commit_hash[:12]}"
+        real_db.execute(
+            f'(transact [[{commit_ident} :entity-type :type/commit] '
+            f'[{commit_ident} :ident "{commit_ident}"] '
+            f'[{commit_ident} :hash "{commit_hash}"] '
+            f'[{commit_ident} :date "2025-01-15T10:00:00Z"] '
+            '[:function/auth-py-login :entity-type :type/function] '
+            '[:function/auth-py-login :ident ":function/auth-py-login"] '
+            '[:function/auth-py-login :file "auth.py"] '
+            '[:function/auth-py-login :description "login"] '
+            f'[:function/auth-py-login :introduced-by {commit_ident}]])'
+        )
+
+        _, _, entity_introduced_by, _, _ = mcp_server._preload_known_entities(
+            real_db, str(git_repo)
+        )
+
+        assert entity_introduced_by[":function/auth-py-login"] == commit_ident, (
+            "must be the keyword ident string, not minigraf's internal UUID"
+        )
+
+        close_triples = mcp_server._build_close_triples(
+            ":function/auth-py-login", "login", ":module/auth-py",
+            introduced_by=entity_introduced_by[":function/auth-py-login"],
+        )
+        retract_triple = next(t for t in close_triples if ":introduced-by" in t)
+        mcp_server._retract(real_db, f"[{retract_triple}]")
+
+        live = json.loads(real_db.execute(
+            '(query [:find ?c :where [:function/auth-py-login :introduced-by ?c]])'
+        ))["results"]
+        assert live == [], (
+            "retracting with the preload's returned value must remove the live "
+            ":introduced-by fact -- a mismatched ident would make this a "
+            "silent no-op (#231)"
+        )
+
     def test_last_run_write_transacts_correct_fields(self, real_db):
         import mcp_server
         mcp_server._last_run_write(real_db, "deadbeef", "2026-05-27T10:00:00Z", 1017)
@@ -9576,6 +9636,62 @@ class TestPreloadExternalDependencies:
         )
         assert stubs == {}
 
+    def test_removed_above_watermark_submodule_is_not_misclassified_as_a_stub(
+        self, real_db, tmp_path,
+    ):
+        """Final-review Finding 1: the subtrahend's temporal base must agree
+        with the minuend's, or a submodule that was live AT ts(W) but whose
+        gitlink got removed ABOVE the watermark falls out of the (unbounded,
+        current-time) subtrahend while staying in the (ts(W)-bounded) minuend
+        -- misclassified as a stub, reaching state.unresolved_dep_idents,
+        where a later gitlink "add" whose path prefixes its :description can
+        mint a bogus :resolves-to edge pointing at a CLOSED entity (the exact
+        thing #112's dedup was built to prevent).
+
+        Sequence mirrors _ingest_close's real two-step close exactly: retract
+        the open :ident/:description/:path facts, then re-transact the same
+        triples bounded [orig_ts, close_ts) -- precisely what a prior run's
+        Stage B _forward_apply(lifecycle_only=True) does via
+        _build_close_triples(..., file_value=path) when a submodule's gitlink
+        is removed. At current (unbounded) time the entity has no live
+        :path -- an old, unbounded-only subtrahend misses it entirely -- but
+        at valid_at=ts(W) (before the close) it is still fully live.
+        """
+        import mcp_server
+
+        real_db.execute(
+            '(transact {:valid-from "2026-01-01T00:00:00Z"} '
+            '[[:module/vendor-lib :entity-type :type/external-dependency] '
+            '[:module/vendor-lib :ident ":module/vendor-lib"] '
+            '[:module/vendor-lib :path "vendor/lib"] '
+            '[:module/vendor-lib :description "vendor/lib"]])'
+        )
+        # Stage B's lifecycle-only close, ABOVE the watermark: retract the
+        # live facts, then re-assert them bounded [orig_ts, close_ts).
+        real_db.execute(
+            '(retract [[:module/vendor-lib :ident ":module/vendor-lib"] '
+            '[:module/vendor-lib :description "vendor/lib"] '
+            '[:module/vendor-lib :path "vendor/lib"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-01-01T00:00:00Z" '
+            ':valid-to "2026-06-01T00:00:00Z"} '
+            '[[:module/vendor-lib :ident ":module/vendor-lib"] '
+            '[:module/vendor-lib :description "vendor/lib"] '
+            '[:module/vendor-lib :path "vendor/lib"]])'
+        )
+
+        # ts(W): strictly between the introduction and the close, so the
+        # entity is live at valid_at but not at current time.
+        stubs = mcp_server._preload_unresolved_dep_idents(
+            real_db, valid_at="2026-03-01T00:00:00Z",
+        )
+        assert ":module/vendor-lib" not in stubs, (
+            "a submodule live at ts(W) but closed above the watermark must "
+            "never be classified as a stub, even though its :path is no "
+            "longer live at current (unbounded) time"
+        )
+
     def test_preload_pinned_commits_returns_empty_on_query_failure(self, real_db, monkeypatch):
         """Same malformed-query technique as
         TestPreloadKnownDeps.test_query_failure_is_non_fatal: corrupt
@@ -9913,6 +10029,34 @@ class TestPreloadStateLinearizationWiring:
         with pytest.raises(ValueError, match="positionally aligned"):
             mcp_server._load_ingestion_preload_state(
                 str(git_repo), ["a" * 40, "b" * 40], [("a" * 40, "2026-01-01T00:00:00Z", "e", "s")],
+            )
+
+    @pytest.mark.asyncio
+    async def test_misaligned_metadata_equal_length_permuted_raises(self, git_repo):
+        """Final-review Finding 2: length equality alone is not enough. The
+        design spec's Error handling section says this performs "the same
+        check _reverse_apply already performs", and _reverse_apply's check
+        is length PLUS per-position hash equality
+        (`commit_hash != linearization[pos]`) -- not length alone.
+        build_linearization and _git_commits(repo_path, None, branch) are
+        two separate `git log` invocations, so a ref moving between them can
+        keep both lists the same length while permuting hashes across
+        positions, silently shifting T_hi(W) and mis-filtering the whole
+        preload without ever raising."""
+        import mcp_server
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._db = None
+        linearization = ["a" * 40, "b" * 40]
+        # Same length as linearization, but positions 0 and 1 are swapped.
+        commit_metadata = [
+            ("b" * 40, "2026-01-01T00:00:00Z", "e", "s"),
+            ("a" * 40, "2026-01-02T00:00:00Z", "e", "s"),
+        ]
+        with pytest.raises(ValueError, match="positionally aligned"):
+            mcp_server._load_ingestion_preload_state(
+                str(git_repo), linearization, commit_metadata,
             )
 
 

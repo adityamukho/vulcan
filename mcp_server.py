@@ -7217,6 +7217,29 @@ def _preload_known_entities(
                         continue
                 entity_valid_from[ident] = date
                 entity_descriptions[ident] = desc
+                # Reconstructed from ?hash, not read off a bound ?c, and
+                # deliberately so (final-review Finding 3): ?c is a SUBJECT
+                # variable here ([?e :introduced-by ?c] [?c :date ?date]
+                # [?c :hash ?hash]), and binding a subject variable in :find
+                # position returns minigraf's internal UUID, not the keyword
+                # ident string -- the same reason _preload_known_deps binds
+                # ?srci instead of ?src and _preload_pinned_commits binds ?ei
+                # instead of ?e (see their docstrings, and #141's root-cause
+                # note at _rebuild_index_from_graph). Verified empirically
+                # for ?c specifically, not just assumed by analogy: adding
+                # ?c to this query's :find list returns a UUID like
+                # "bd5e9774-8fbd-5ec4-81e8-7310073fa5c3", never
+                # ":commit/abc123456789". Reconstructing via f":commit/
+                # {hash_[:12]}" is therefore correct AND necessary, not a
+                # missed opportunity to simplify -- it must stay byte-for-
+                # byte identical to the commit_ident both write sites
+                # (mcp_server.py, the forward-walk and _forward_apply commit
+                # triples) build the same way, since this value becomes the
+                # :introduced-by retract value at close time (#231) and a
+                # silent mismatch would make that retract a no-op.
+                # test_entity_introduced_by_matches_commit_write_site pins
+                # this against the real write sites, not just this format
+                # string in isolation.
                 entity_introduced_by[ident] = f":commit/{hash_[:12]}"
                 file_entities.setdefault(path, [])
                 if ident not in file_entities[path]:
@@ -7249,7 +7272,7 @@ def _preload_unresolved_dep_idents(
     handling in _forward_apply) — without this, only same-run stubs would ever
     get linked.
 
-    The subtrahend is its OWN unbounded query, deliberately not
+    The subtrahend is the UNION of two queries, deliberately not
     _preload_known_entities' submodule_paths (#238). Stub-ness is "has no
     :path" — a property of the entity, not of the resume position — and
     submodule_paths is filtered by the introducing commit's LINEARIZATION
@@ -7270,11 +7293,44 @@ def _preload_unresolved_dep_idents(
     reproduce it (round-2 review caught an earlier draft of this reasoning,
     and the test file's docstring, making exactly that substitution).
 
+    Final-review Finding 1: an unbounded-only subtrahend opened a SECOND
+    direction of the same failure. Its temporal base disagreed with the
+    minuend's own ts(W) bound below, and that mismatch has its own concrete
+    trigger: a submodule live AT OR BELOW the watermark whose gitlink is
+    removed ABOVE it. A prior run's Stage B _forward_apply(lifecycle_only=
+    True) calls _build_close_triples(..., file_value=path), retracting the
+    entity's :path (and :ident/:description) — so it drops out of an
+    unbounded-only subtrahend (no longer live at current time), while the
+    minuend below still sees it (:ident/:description/:path were all still
+    live at ts(W)). That dead submodule then reaches
+    state.unresolved_dep_idents, where a later gitlink "add" whose path
+    prefixes its :description mints a bogus :resolves-to edge — but this
+    time pointing at a CLOSED entity, the exact thing #112's dedup exists to
+    prevent. Fixed by widening the subtrahend to the UNION of the unbounded
+    query and a second, :valid-at ts(W)-bounded :path query — matching the
+    minuend's own temporal base for exactly this case, while leaving the
+    unbounded disjunct in place for the ordinary (still-live) case. See
+    test_removed_above_watermark_submodule_is_not_misclassified_as_a_stub,
+    which fails against an unbounded-only subtrahend.
+
+    A ts(W)-ONLY subtrahend (replacing the unbounded disjunct rather than
+    unioning with it) would instead regress the FIRST direction: it would
+    reintroduce exactly the position-inversion failure
+    test_above_watermark_submodule_is_not_misclassified_as_a_stub and
+    test_position_inverted_submodule_is_not_misclassified_as_a_stub pin,
+    where a real submodule introduced above the watermark (so absent at
+    ts(W)) but still live right now would drop back out of the subtrahend.
+    The union is required, not either bound alone.
+
     The MINUEND keeps the narrow ts(W) bound rather than #238's widened
     envelope, because this set's asymmetry runs the other way from
     _preload_known_entities': an EXTRA entry is the bogus edge above, while a
     MISSING one is merely a link the forward-only oracle would not have made
-    at that position either. Narrower is safer here.
+    at that position either. Narrower is safer for the minuend — and by the
+    same asymmetry, WIDER is safer for the subtrahend: a wider subtrahend can
+    only ever remove idents from the stub set, never add one, so unioning in
+    a second query is the safe direction here even though it looks like it
+    is loosening the bound.
     """
     unresolved: Dict[str, str] = {}
     valid_at_clause = f':valid-at "{_edn_escape(valid_at)}" ' if valid_at else ""
@@ -7291,6 +7347,25 @@ def _preload_unresolved_dep_idents(
         path_bearing = {row[0] for row in json.loads(raw).get("results", [])}
     except Exception:
         return unresolved
+    if valid_at_clause:
+        # Second subtrahend disjunct (final-review Finding 1): a submodule
+        # live at ts(W) but already closed at current time (see docstring
+        # above). Best-effort like the unbounded query above — a failure
+        # here just falls back to the unbounded-only result rather than
+        # aborting the whole function.
+        try:
+            raw = _db_execute(
+                db,
+                "(query [:find ?ident "
+                f"{valid_at_clause}"
+                ":where "
+                "[?e :entity-type :type/external-dependency] "
+                "[?e :ident ?ident] "
+                "[?e :path ?path]])",
+            )
+            path_bearing |= {row[0] for row in json.loads(raw).get("results", [])}
+        except Exception:
+            pass
     try:
         raw = _db_execute(
             db,
@@ -7633,10 +7708,15 @@ def _load_ingestion_preload_state(
     whole reason the bound used to be expressed in author dates: the
     linearization simply did not exist yet when this ran.
 
-    Both are validated for positional alignment before use. _reverse_apply
-    performs the same check for the same reason (silent, systematic error), but
-    the consequence here is worse: a misaligned pair mis-filters the ENTIRE
-    preload rather than misattributing one commit.
+    Both are validated for positional alignment before use: length AND
+    per-position hash equality, matching _reverse_apply's own check
+    (mcp_server.py, `commit_hash != linearization[pos]`) for the same reason
+    (silent, systematic error) -- but the consequence here is worse: a
+    misaligned pair mis-filters the ENTIRE preload rather than misattributing
+    one commit. Length alone is not enough: build_linearization and
+    _git_commits(repo_path, None, branch) are two separate `git log`
+    invocations, so a ref moving between them can keep lengths equal while
+    permuting hashes across positions.
     """
     db = _db if _db is not None else _open_db_at_with_extended_retry(_graph_path or _get_graph_path())
     watermark = _watermark_query(db)
@@ -7646,6 +7726,25 @@ def _load_ingestion_preload_state(
             f"(got {len(commit_metadata)} entries vs {len(linearization)}); "
             "a misaligned pair mis-filters the entire preload (#238)"
         )
+    # Length equality alone does not rule out a PERMUTATION: build_linearization
+    # and _git_commits(repo_path, None, branch) are two separate `git log`
+    # invocations, so a ref moving between them can keep both lists the same
+    # length while reordering hashes across positions -- silently shifting
+    # T_hi(W) (_resume_envelope reads commit_metadata by index) and
+    # mis-filtering the whole preload without ever raising. Mirrors
+    # _reverse_apply's own per-position `commit_hash != linearization[pos]`
+    # check, generalized to every position since this function has no single
+    # `pos` to check -- it consumes the full lists up front.
+    for i, (meta_hash, linearization_hash) in enumerate(zip(
+        (h for h, _t, _a, _s in commit_metadata), linearization,
+    )):
+        if meta_hash != linearization_hash:
+            raise ValueError(
+                f"commit_metadata[{i}] is {meta_hash}, but linearization[{i}] is "
+                f"{linearization_hash}: the two must be positionally aligned "
+                "(#238) -- a ref move between the two git-log invocations can "
+                "keep lengths equal while permuting hashes"
+            )
     hash_to_pos = {h: i for i, h in enumerate(linearization)}
     watermark_pos = hash_to_pos.get(watermark) if watermark is not None else None
 
