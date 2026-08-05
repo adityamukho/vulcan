@@ -12306,6 +12306,95 @@ def _reused_path_repo(repo, variant):
     return repo
 
 
+def _inverted_author_date_repo(path):
+    """A repo whose topological order and AUTHOR-date order disagree, shaped
+    so a resumed, BIDIRECTIONAL ingestion (forward + reverse streams) can
+    durably write an entity ABOVE the forward watermark before the forward
+    walk's own preload runs -- #238's actual precondition.
+
+    Reproduces #238's measured shape on this repository: positions 118-123
+    have a strictly-earlier-dated LATER position (124-128, a side branch
+    authored 2026-04-26/27 that lands topologically after the 2026-05-02
+    merges, and is a confirmed descendant of them).
+
+    Five commits, topological order c0 -> c1 -> c2 -> c3 -> c4:
+
+        pos 0  c0  base.py (base_fn) + late.py (helper_fn)  @ 2026-04-01
+        pos 1  c1  mid.py (mid_fn)                          @ 2026-05-02  <- the resume watermark W
+        pos 2  c2  late.py modified (helper_fn body only)   @ 2026-04-20  <- inside the post-resume forward GAP
+        pos 3  c3  late.py modified again, adds late_fn     @ 2026-04-26  <- above W, dated earlier -- late_fn's true introduction
+        pos 4  c4  base.py modified, adds base_fn2          @ 2026-04-27  <- above W, dated earlier
+
+    Why a plain forward-only resume cannot reach the bug (and why this
+    fixture needs a bidirectional first run): a pure forward walk only ever
+    writes entities strictly up to its own watermark position, so nothing
+    "above the watermark" ever exists in the DB when a forward-only run
+    resumes -- #238's over-inclusive DATE-only bound and the position clause
+    that replaces it would then agree on every row, and the bug is
+    unobservable. The real defect needs the REVERSE stream to have already
+    written an entity above the forward watermark (c3's late_fn, via
+    _reverse_apply's provisional introduction) before a forward-only resume's
+    preload runs. See TestResumeWithInvertedAuthorDates' run-1 stream ratio
+    ("2:1000000") and stop point (processed == 4) for how this repo drives
+    that: forward claims c0, c1 (advancing the watermark to c1); reverse then
+    claims c4, c3 (writing late_fn's provisional introduction at c3, ABOVE
+    the watermark); run 1 stops before reverse reaches c2.
+
+    On resume, run 2's forward walk (Stage A) replays the still-unclaimed GAP
+    commit c2 -- late.py's file, but a version that does NOT yet contain
+    late_fn -- BEFORE Stage B's correction sweep ever revisits c3 (Stage A
+    always precedes Stage B). Under the old date-only preload bound, late_fn
+    (dated 2026-04-26, <= the watermark's own envelope 2026-05-02) is wrongly
+    treated as already known as of c2, is absent from c2's actual parse, and
+    gets closed with valid_to = c2's date (2026-04-20) -- earlier than its
+    own true valid_from (2026-04-26): an inverted interval, permanent loss.
+    The position clause excludes it (c3's position is above watermark_pos),
+    so c2's replay never touches it.
+
+    GIT_AUTHOR_DATE drives valid-time (_git_commits reads %at);
+    GIT_COMMITTER_DATE is kept monotonic so the topological order is
+    unambiguous.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    _subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=path,
+                    check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=path,
+                    check=True, capture_output=True)
+
+    def commit(files, author_date, committer_date, msg):
+        for filename, body in files.items():
+            (path / filename).write_text(body)
+        _subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
+        env = {**os.environ,
+               "GIT_AUTHOR_DATE": author_date, "GIT_COMMITTER_DATE": committer_date}
+        _subprocess.run(["git", "commit", "-m", msg], cwd=path,
+                        check=True, capture_output=True, env=env)
+
+    commit(
+        {"base.py": "def base_fn():\n    return 1\n",
+         "late.py": "def helper_fn():\n    return 0\n"},
+        "2026-04-01T00:00:00Z", "2026-04-01T00:00:00Z", "c0 base+late",
+    )
+    commit(
+        {"mid.py": "def mid_fn():\n    return 2\n"},
+        "2026-05-02T00:00:00Z", "2026-05-03T00:00:00Z", "c1 mid",
+    )
+    commit(
+        {"late.py": "def helper_fn():\n    return 99\n"},
+        "2026-04-20T00:00:00Z", "2026-05-04T00:00:00Z", "c2 late-mod-helper",
+    )
+    commit(
+        {"late.py": "def helper_fn():\n    return 99\n\ndef late_fn():\n    return 3\n"},
+        "2026-04-26T00:00:00Z", "2026-05-05T00:00:00Z", "c3 late-add-late_fn",
+    )
+    commit(
+        {"base.py": "def base_fn():\n    return 1\n\ndef base_fn2():\n    return 4\n"},
+        "2026-04-27T00:00:00Z", "2026-05-06T00:00:00Z", "c4 base-add-base_fn2",
+    )
+    return path
+
+
 class TestClosedEntityLifecyclePurge:
     """Real-backend regression tests for the closed-entity lifecycle purge.
 
@@ -19381,3 +19470,135 @@ class TestEntityIntroducedByState:
             unresolved_dep_idents={},
         )
         assert state.entity_introduced_by == {}
+
+
+class TestResumeWithInvertedAuthorDates:
+    """#238 end-to-end: a RESUMED run whose watermark sits at an inverted
+    position must not corrupt the graph.
+
+    The failure needs a resumed run; a fresh ingestion cannot show it. It is
+    constructed explicitly here, which is what #238 asks for.
+
+    A plain forward-only resume (both runs pinned via
+    MINIGRAF_INGEST_STREAM_RATIO=1000000:1) cannot reach the bug: a pure
+    forward walk only ever writes entities up to its own watermark, so
+    nothing "above the watermark" ever exists in the DB when a forward-only
+    run resumes, and #238's date-only bound and the position clause that
+    replaces it then agree on every row -- verified experimentally while
+    building this test (see task-9-report.md). The defect needs the REVERSE
+    stream to have already written an entity above the forward watermark
+    before a resumed run's preload runs, so run 1 here uses a
+    forward-then-reverse-biased ratio ("2:1000000") instead, and is
+    interrupted mid-run after a specific number of commits (not "the first
+    commit") to land the DB in exactly that state. Run 2 is forced
+    forward-only (1000000:1) so its own remaining work -- one gap commit via
+    Stage A, then two swept commits via Stage B -- is deterministic. See
+    _inverted_author_date_repo's docstring for the full mechanism.
+    """
+
+    def _progress(self):
+        return {"status": "idle", "processed": 0, "total": 0,
+                "current_commit": "", "error": None, "prior_ingested": 0}
+
+    @staticmethod
+    def _results(db, datalog):
+        return json.loads(db.execute(datalog))["results"]
+
+    async def _run_resume(self, repo, graph, monkeypatch):
+        """Drives the exact two-run sequence _inverted_author_date_repo's
+        docstring describes and returns the reopened, post-resume db.
+
+        Run 1: ratio 2:1000000 so forward claims c0, c1 (watermark -> c1,
+        dated 2026-05-02, wide enough to admit c2/c3's earlier dates) and
+        reverse then claims c4, c3 (writing late_fn's provisional
+        introduction ABOVE the watermark) before stopping -- interrupted
+        after exactly 4 commits, i.e. BEFORE reverse reaches c2. Run 2:
+        forced forward-only so Stage A deterministically claims the single
+        remaining gap commit (c2) fresh, then Stage B deterministically
+        sweeps c3 and c4.
+        """
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "2:1000000")
+        mcp_server._db = None
+        mcp_server._graph_path = graph
+
+        mcp_server._ingest_progress = self._progress()
+        original_sleep = asyncio.sleep
+        sleep_calls = {"n": 0}
+
+        async def stop_after_fourth(t):
+            sleep_calls["n"] += 1
+            if sleep_calls["n"] == 4:
+                mcp_server._shutdown_requested.set()
+            await original_sleep(t)
+
+        with patch("mcp_server.asyncio.sleep", stop_after_fourth):
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "stopped"
+        assert mcp_server._ingest_progress["processed"] == 4
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
+        mcp_server._ingest_progress = self._progress()
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+
+        mcp_server._db = None
+        from minigraf import MiniGrafDb
+        return MiniGrafDb.open(graph)
+
+    @pytest.mark.asyncio
+    async def test_resumed_run_does_not_close_a_future_entity(self, tmp_path, monkeypatch):
+        """The DATA-LOSS direction. late_fn is introduced at c3, above the
+        watermark, dated EARLIER than it. Under the old author-date bound it
+        stayed in the preload snapshot, was absent from the parse of c2 (the
+        gap commit run 2's forward walk replays before Stage B ever revisits
+        c3), and was closed and _forget_closed_entity-purged -- with an
+        orig_ts LATER than the close's valid_to, an inverted valid
+        interval."""
+        import mcp_server
+        repo = _inverted_author_date_repo(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        db = await self._run_resume(repo, graph, monkeypatch)
+
+        for ident in [
+            mcp_server._code_ident("function", "late.py", "late_fn"),
+            mcp_server._code_ident("function", "base.py", "base_fn2"),
+            mcp_server._code_ident("function", "mid.py", "mid_fn"),
+        ]:
+            live = self._results(db, f'(query [:find ?i :where [{ident} :ident ?i]])')
+            assert live == [[ident]], (
+                f"{ident} lost its :ident across a resumed run at an inverted "
+                f"author-date position (#238): {live}"
+            )
+
+    @pytest.mark.asyncio
+    async def test_resumed_run_mints_no_duplicate_introduced_by(self, tmp_path, monkeypatch):
+        """The other direction. No entity may hold two live :introduced-by
+        values -- that is #235's corruption, reachable through #238's preload."""
+        import mcp_server
+        repo = _inverted_author_date_repo(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        db = await self._run_resume(repo, graph, monkeypatch)
+
+        rows = self._results(
+            db, '(query [:find ?i (count ?c) :where [?e :ident ?i] [?e :introduced-by ?c]])')
+        multi = [(i, n) for i, n in rows if n > 1]
+        assert multi == [], f"entities with more than one live :introduced-by: {multi}"
+
+    @pytest.mark.asyncio
+    async def test_resumed_run_writes_no_inverted_valid_interval(self, tmp_path, monkeypatch):
+        """The purge's signature: a close whose valid_to precedes its
+        valid_from."""
+        import mcp_server
+        repo = _inverted_author_date_repo(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        db = await self._run_resume(repo, graph, monkeypatch)
+
+        rows = self._results(
+            db,
+            '(query [:find ?i ?vf ?vt :any-valid-time '
+            ':where [?e :ident ?i] [?e :db/valid-from ?vf] [?e :db/valid-to ?vt]])',
+        )
+        inverted = [(i, vf, vt) for i, vf, vt in rows if vt is not None and vt < vf]
+        assert inverted == [], f"inverted valid intervals on :ident facts: {inverted}"
