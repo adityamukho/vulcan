@@ -8401,6 +8401,7 @@ def _forward_apply(
         f'[{commit_ident} :date "{commit_ts_iso}"]',
     ]
     close_items: List[tuple] = []  # (triples, original_ts_iso)
+    closed_idents: List[str] = []  # idents closed this commit (lineage discard)
     dep_add_triples: List[str] = []  # :depends-on triples to transact individually
     # Old paths of files renamed this commit (R status). Their
     # unmatched child entities / dependency edges are closed in a
@@ -8431,6 +8432,7 @@ def _forward_apply(
                     state.entity_descriptions, state.field_class_ident, state.file_entities,
                     state.field_static_ident, state.entity_introduced_by,
                 )
+                closed_idents.append(ident)
             # Whole file is gone: drop its (now-empty) state.file_entities key
             # so nothing stale lingers under this path (matches state.file_deps).
             state.file_entities.pop(file_path, None)
@@ -8474,6 +8476,7 @@ def _forward_apply(
                     state.entity_descriptions, state.field_class_ident, state.file_entities,
                     state.field_static_ident, state.entity_introduced_by,
                 )
+                closed_idents.append(old_module_ident)
             previous_idents = set(state.file_entities.get(file_path, []))
             # #222 phase 2d: an entity Stream 2 already introduced
             # provisionally is NOT authoritatively introduced, so the
@@ -8611,6 +8614,7 @@ def _forward_apply(
                         state.entity_descriptions, state.field_class_ident, state.file_entities,
                         state.field_static_ident, state.entity_introduced_by,
                     )
+                    closed_idents.append(ident)
             # Compute dep edges for this file and diff against previous.
             # Resolution itself already happened in _extract_commit
             # (precomputed["resolved_imports"]) against that commit's
@@ -8679,6 +8683,7 @@ def _forward_apply(
             state.entity_descriptions, state.field_class_ident, state.file_entities,
             state.field_static_ident, state.entity_introduced_by,
         )
+        closed_idents.append(old_ident)
 
     # A file rename (R status) only closes the old MODULE above.
     # Child entities and dependency edges under the old path are
@@ -8718,6 +8723,7 @@ def _forward_apply(
                     state.entity_descriptions, state.field_class_ident, state.file_entities,
                     state.field_static_ident, state.entity_introduced_by,
                 )
+                closed_idents.append(ident)
             # Whole old path is gone (renamed away): drop the key so
             # no stale ident lingers to be re-discovered by a later
             # commit that reuses this path (e.g. a shim at old_path).
@@ -8796,6 +8802,7 @@ def _forward_apply(
                 state.entity_descriptions, state.field_class_ident, state.file_entities,
                 state.field_static_ident, state.entity_introduced_by,
             )
+            closed_idents.append(ext_ident)
             old_sha, pin_orig_ts = state.pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
             if old_sha is not None:
                 close_items.append(
@@ -8818,6 +8825,20 @@ def _forward_apply(
         _ingest_transact(db, [dt], commit_ts_iso, reason, index_con)
     for close_triples, orig_ts in close_items:
         _ingest_close(db, close_triples, orig_ts, commit_ts_iso, reason, index_con)
+
+    # A closed entity must not leave its :type/lineage-marker behind:
+    # _lineage_is_provisional is the sole authority for reconcilability
+    # (#235), so a stale marker makes a re-introduction at the same ident read
+    # as provisional and hands _forward_reconcile_provisional a guess that
+    # belongs to the dead entity.
+    #
+    # Batched once per commit rather than per close site: the batch form
+    # issues ONE retract for the whole set (idents with no marker are skipped),
+    # where six per-site calls would issue up to six. "confirm" is the
+    # existing name for "retract the marker" -- semantically it is a discard
+    # here, but delegating to the batch keeps the two from drifting (#233).
+    if closed_idents:
+        _lineage_confirm_batch(db, closed_idents, index_con=index_con)
 
     # Ingest :parent edges — one transact per parent to avoid EAVT
     # collision for merge commits (which have two parent hashes).

@@ -11995,6 +11995,47 @@ class TestClosedEntityLifecyclePurge:
         assert live == [], f"[{variant}] closed entity kept a live :introduced-by: {live}"
 
 
+class TestCloseDiscardsLineageMarker:
+    """A closed entity must not leave its :type/lineage-marker behind.
+
+    _lineage_is_provisional is the SOLE authority for reconcilability since
+    #235, so a stale marker makes a re-introduction at the same ident read as
+    provisional -- and _forward_reconcile_provisional then re-dates structural
+    facts against a lineage guess that belongs to the DEAD entity.
+
+    Both parametrizations PASS on this fixture even pre-fix: a.py's module is
+    never provisional at the moment _reused_path_repo closes it (nothing in
+    this single-repo forward-only ingestion mints a provisional guess for it
+    before the close), so there is no marker for an unfixed close to leave
+    behind here. Kept as a guard rather than deleted -- the batch discard it
+    guards is still required for the at-scale path where Stage B closes
+    entities that a preceding reverse-stream provisional guess touched,
+    which this fixture does not exercise.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("variant", ["rename", "delete"])
+    async def test_reintroduced_ident_is_not_provisional(self, tmp_path, monkeypatch, variant):
+        import mcp_server
+        repo = _reused_path_repo(tmp_path / "repo", variant)
+        graph = str(repo / "memory.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._db = None
+        mcp_server._graph_path = graph
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None, "prior_ingested": 0,
+        }
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+
+        db = mcp_server.get_db()
+        module_ident = mcp_server._code_ident("module", "a.py")
+        assert mcp_server._lineage_is_provisional(db, module_ident) is False, (
+            f"[{variant}] re-created module inherited a stale provisional marker"
+        )
+
+
 class TestRunIngestionBitemporalClose:
     """Integration tests verifying bi-temporal correctness of entity lifecycle handling."""
 
