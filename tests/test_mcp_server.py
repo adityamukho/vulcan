@@ -11981,6 +11981,19 @@ class TestClosedEntityLifecyclePurge:
         assert self._results(db, f'(query [:find ?i :where [{f_ident} :ident ?i]])') == [], \
             f"[{variant}] f (closed at c2) must not be visible at current time"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("variant", ["rename", "delete"])
+    async def test_closed_entity_has_no_live_introduced_by(self, tmp_path, monkeypatch, variant):
+        """#231: the original function f, closed at commit2, must not answer a
+        bare [?e :introduced-by ?c] query afterwards."""
+        repo = _reused_path_repo(tmp_path / "repo", variant)
+        db = await self._ingest_and_open(repo, monkeypatch)
+
+        import mcp_server
+        f_ident = mcp_server._code_ident("function", "a.py", "f")
+        live = self._results(db, f'(query [:find ?c :where [{f_ident} :introduced-by ?c]])')
+        assert live == [], f"[{variant}] closed entity kept a live :introduced-by: {live}"
+
 
 class TestRunIngestionBitemporalClose:
     """Integration tests verifying bi-temporal correctness of entity lifecycle handling."""
@@ -17144,6 +17157,51 @@ class TestForwardApplyReconcilesProvisional:
         )
         assert {row[0] for row in json.loads(raw)["results"]} == {f":commit/{linearization[0][:12]}"}
         assert mcp_server._lineage_is_provisional(real_db, fn_ident) is False
+
+
+class TestCloseRetractsIntroducedBy:
+    """#231: every close site must retract :introduced-by, including for
+    entities the reverse walk introduced (which the forward state never saw).
+    """
+
+    def test_resolve_prefers_the_walk_state(self, real_db):
+        import mcp_server
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={}, entity_descriptions={}, file_entities={},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+        )
+        state.entity_introduced_by[":function/a-py-f"] = ":commit/aaaaaaaaaaaa"
+        real_db.execute('(transact [[:function/a-py-f :introduced-by :commit/zzzzzzzzzzzz]])')
+        assert mcp_server._resolve_introduced_by(
+            real_db, state, ":function/a-py-f") == ":commit/aaaaaaaaaaaa"
+
+    def test_resolve_falls_back_to_the_db_for_reverse_introduced_entities(self, real_db):
+        """Stage B closes entities Stream 2 introduced this run. They were never
+        written through the forward state, so without this fallback #231 would
+        survive for exactly those."""
+        import mcp_server
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={}, entity_descriptions={}, file_entities={},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+        )
+        real_db.execute('(transact [[:function/a-py-f :introduced-by :commit/zzzzzzzzzzzz]])')
+        assert mcp_server._resolve_introduced_by(
+            real_db, state, ":function/a-py-f") == ":commit/zzzzzzzzzzzz"
+
+    def test_resolve_returns_none_for_an_entity_with_no_lineage(self, real_db):
+        """Unresolved-import stubs never get :introduced-by."""
+        import mcp_server
+        state = mcp_server._ForwardWalkState(
+            entity_valid_from={}, entity_descriptions={}, file_entities={},
+            file_deps={}, dep_valid_from={}, pinned_commit_state={},
+            field_class_ident={}, field_static_ident={}, submodule_paths={},
+            unresolved_dep_idents={},
+        )
+        assert mcp_server._resolve_introduced_by(real_db, state, ":module/pkg-missing") is None
 
 
 class TestRoundRobinClaimer:

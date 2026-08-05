@@ -4642,6 +4642,33 @@ def _git_tags(repo_path: str) -> List[tuple]:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_introduced_by(
+    db: Any, state: "_ForwardWalkState", ident: str
+) -> Optional[str]:
+    """The commit ident to retract for ident's :introduced-by at a close site.
+
+    Prefers the walk state, which the forward walk maintains for free at every
+    introduction. Falls back to a DB read for entities the state never saw --
+    principally entities Stream 2 introduced during THIS run, which Stage B's
+    _forward_apply(lifecycle_only=True) then closes. Without the fallback #231
+    would survive for exactly those.
+
+    The fallback is a per-CLOSE read, not per-ident-per-commit, so it does not
+    feed #239's hot path (1.33M :introduced-by point queries, 33.6% of at-scale
+    wall clock). Do not hoist it into a preloaded set: #235 removed a
+    provisional-ident prefilter for being wrong in both directions, and the
+    same argument applies to any run-start snapshot of lineage.
+
+    Returns None when the entity genuinely has no :introduced-by (an
+    unresolved-import stub), which _build_close_triples treats as "do not
+    retract".
+    """
+    known = state.entity_introduced_by.get(ident)
+    if known is not None:
+        return known
+    return _entity_introduced_by_query(db, ident)
+
+
 def _build_close_triples(
     ident: str,
     description: str,
@@ -8396,12 +8423,13 @@ def _forward_apply(
                         state.field_class_ident.get(ident),
                         close_entity_type=True, file_value=file_path,
                         is_static=state.field_static_ident.get(ident),
+                        introduced_by=_resolve_introduced_by(db, state, ident),
                     ), orig_ts)
                 )
                 _forget_closed_entity(
                     ident, file_path, state.entity_valid_from,
                     state.entity_descriptions, state.field_class_ident, state.file_entities,
-                    state.field_static_ident,
+                    state.field_static_ident, state.entity_introduced_by,
                 )
             # Whole file is gone: drop its (now-empty) state.file_entities key
             # so nothing stale lingers under this path (matches state.file_deps).
@@ -8431,6 +8459,7 @@ def _forward_apply(
                     _build_close_triples(
                         old_module_ident, old_desc, old_module_ident,
                         close_entity_type=True, file_value=old_path,
+                        introduced_by=_resolve_introduced_by(db, state, old_module_ident),
                     ),
                     orig_ts,
                 ))
@@ -8443,7 +8472,7 @@ def _forward_apply(
                 _forget_closed_entity(
                     old_module_ident, old_path, state.entity_valid_from,
                     state.entity_descriptions, state.field_class_ident, state.file_entities,
-                    state.field_static_ident,
+                    state.field_static_ident, state.entity_introduced_by,
                 )
             previous_idents = set(state.file_entities.get(file_path, []))
             # #222 phase 2d: an entity Stream 2 already introduced
@@ -8525,7 +8554,7 @@ def _forward_apply(
             triples = _build_code_triples(
                 file_path, extracted, commit_ts_iso, state.entity_valid_from,
                 state.entity_descriptions, state.file_entities, commit_ident, precomputed,
-                state.field_class_ident, state.field_static_ident,
+                state.field_class_ident, state.field_static_ident, state.entity_introduced_by,
             )
             # lifecycle_only: called for its dict side effects, output
             # DISCARDED for "A"/"M" (see this function's docstring). "R" keeps
@@ -8572,6 +8601,7 @@ def _forward_apply(
                             state.field_class_ident.get(ident),
                             close_entity_type=True, file_value=file_path,
                             is_static=state.field_static_ident.get(ident),
+                            introduced_by=_resolve_introduced_by(db, state, ident),
                         ), orig_ts)
                     )
                     # File survives (M), only this child was removed:
@@ -8579,7 +8609,7 @@ def _forward_apply(
                     _forget_closed_entity(
                         ident, file_path, state.entity_valid_from,
                         state.entity_descriptions, state.field_class_ident, state.file_entities,
-                        state.field_static_ident,
+                        state.field_static_ident, state.entity_introduced_by,
                     )
             # Compute dep edges for this file and diff against previous.
             # Resolution itself already happened in _extract_commit
@@ -8640,13 +8670,14 @@ def _forward_apply(
                 state.field_class_ident.get(old_ident),
                 close_entity_type=True, file_value=old_file,
                 is_static=state.field_static_ident.get(old_ident),
+                introduced_by=_resolve_introduced_by(db, state, old_ident),
             ),
             orig_ts,
         ))
         _forget_closed_entity(
             old_ident, old_file, state.entity_valid_from,
             state.entity_descriptions, state.field_class_ident, state.file_entities,
-            state.field_static_ident,
+            state.field_static_ident, state.entity_introduced_by,
         )
 
     # A file rename (R status) only closes the old MODULE above.
@@ -8679,12 +8710,13 @@ def _forward_apply(
                         state.field_class_ident.get(ident),
                         close_entity_type=True, file_value=r_old_path,
                         is_static=state.field_static_ident.get(ident),
+                        introduced_by=_resolve_introduced_by(db, state, ident),
                     ), orig_ts)
                 )
                 _forget_closed_entity(
                     ident, r_old_path, state.entity_valid_from,
                     state.entity_descriptions, state.field_class_ident, state.file_entities,
-                    state.field_static_ident,
+                    state.field_static_ident, state.entity_introduced_by,
                 )
             # Whole old path is gone (renamed away): drop the key so
             # no stale ident lingers to be re-discovered by a later
@@ -8752,6 +8784,7 @@ def _forward_apply(
                     ext_ident, desc, ext_ident,
                     entity_type_kw=":type/external-dependency",
                     file_value=path,
+                    introduced_by=_resolve_introduced_by(db, state, ext_ident),
                 ), orig_ts)
             )
             # Submodule removed: purge lifecycle state so a later
@@ -8761,6 +8794,7 @@ def _forward_apply(
             _forget_closed_entity(
                 ext_ident, path, state.entity_valid_from,
                 state.entity_descriptions, state.field_class_ident, state.file_entities,
+                state.field_static_ident, state.entity_introduced_by,
             )
             old_sha, pin_orig_ts = state.pinned_commit_state.pop(ext_ident, (None, commit_ts_iso))
             if old_sha is not None:
