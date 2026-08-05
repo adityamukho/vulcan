@@ -6646,6 +6646,45 @@ class TestEntityIntroducedByValuesQuery:
         )
 
 
+class TestEntityIdentIsLive:
+    """#231: the reverse walk's known-entity gate must test LIVENESS, not lineage.
+
+    _build_close_triples never retracted :introduced-by, so a closed-and-purged
+    entity kept that fact forever and _entity_introduced_by_query answered
+    "known" for it. Gating on a live :ident instead is correct regardless of
+    whether any close site remembers to retract :introduced-by.
+    """
+
+    def test_live_ident_is_live(self, real_db):
+        import mcp_server
+        real_db.execute('(transact [[:function/a-py-f :ident ":function/a-py-f"]])')
+        assert mcp_server._entity_ident_is_live(real_db, ":function/a-py-f") is True
+
+    def test_absent_ident_is_not_live(self, real_db):
+        import mcp_server
+        assert mcp_server._entity_ident_is_live(real_db, ":function/a-py-f") is False
+
+    def test_closed_ident_is_not_live_even_with_live_introduced_by(self, real_db):
+        """The exact #231 shape: :ident closed, :introduced-by left behind."""
+        import mcp_server
+        real_db.execute(
+            '(transact {:valid-from "2020-01-01T00:00:00Z"} '
+            '[[:function/a-py-f :ident ":function/a-py-f"] '
+            '[:function/a-py-f :introduced-by :commit/c1]])'
+        )
+        mcp_server._ingest_close(
+            real_db,
+            ['[:function/a-py-f :ident ":function/a-py-f"]'],
+            "2020-01-01T00:00:00Z",
+            "2020-01-02T00:00:00Z",
+            "close f",
+        )
+        assert mcp_server._entity_introduced_by_query(real_db, ":function/a-py-f") is not None, (
+            "precondition: the stale :introduced-by is what made the old gate unsound"
+        )
+        assert mcp_server._entity_ident_is_live(real_db, ":function/a-py-f") is False
+
+
 class TestEntityIntroducedBySetProvisionalBatch:
     """#233: _reverse_apply's two loops were the only production callers of
     the per-ident function, at one retract + one transact each -- 8,618
@@ -11842,29 +11881,12 @@ class TestClosedEntityLifecyclePurge:
         """The module re-created at the reused path a.py must have a CURRENT
         :ident fact (join target for nearly every query).
 
-        #222 phase 2d Task 9 STILL PINS this one test forward-only, while the
-        rest of this class now runs at the 1:1 default. The remaining failure
-        is NOT the D/R/gitlink gap Stage B closes -- it is an independent
-        _reverse_apply (phase 2b) defect in A/M territory:
-
-          _build_close_triples never retracts :introduced-by, so a closed
-          entity keeps that fact forever. _reverse_apply's "is this entity
-          already known?" gate is _entity_introduced_by_query(db, ident),
-          which therefore still answers "known" for an ident that was closed
-          and purged by the forward walk. When such a path is RE-CREATED at a
-          position the reverse stream claims, _build_code_triples takes its
-          "already known" branch and emits only :modified-in -- the module
-          never re-asserts :ident/:description/:path and stays a ghost.
-          _correction_sweep_apply cannot repair it either: it reconciles
-          lineage only and never emits structural facts.
-
-        Fixing it means changing _reverse_apply's gate to test liveness (a
-        current :ident) rather than :introduced-by, which is phase-2b surface
-        and out of this task's scope. Measured directly: after a 1:1 run of
-        _reused_path_repo, :module/a-py has a live :introduced-by pointing at
-        the ORIGINAL c1 commit and no live :ident at all.
+        Ran forward-only-pinned (MINIGRAF_INGEST_STREAM_RATIO=10**6:1) until
+        #231 was fixed, because _reverse_apply's known-entity gate keyed on
+        :introduced-by -- which _build_close_triples never retracted -- and so
+        answered "known" for a closed-and-purged ident. The gate now tests
+        live :ident (#231), so this runs at the shipping default.
         """
-        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", f"{10**6}:1")
         repo = _reused_path_repo(tmp_path / "repo", variant)
         db = await self._ingest_and_open(repo, monkeypatch)
 
@@ -11882,44 +11904,19 @@ class TestClosedEntityLifecyclePurge:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("variant", ["rename", "delete"])
-    @pytest.mark.xfail(
-        strict=True,
-        # Narrowed to the assertion this test actually makes (#222 phase 2d
-        # whole-branch review, finding (o)). Without raises=, ANY exception
-        # counts as the expected failure -- an unrelated breakage in the
-        # ingest path (a TypeError from a changed signature, a git fixture
-        # that stops building) would keep registering as XFAIL and this
-        # alarm would stay silently disarmed.
-        raises=AssertionError,
-        reason=(
-            "KNOWN pre-existing phase-2b defect, NOT the D/R gap #222 phase 2d "
-            "Stage B closes: _build_close_triples never retracts :introduced-by, "
-            "so a closed-and-purged entity keeps that fact forever, and "
-            "_reverse_apply's known-entity gate -- "
-            "_entity_introduced_by_query(db, ident) is not None -- still answers "
-            "'known' for it. At the 1:1 default, c3 (which re-creates a.py) lands "
-            "in frontier-high's territory, so _build_code_triples takes its "
-            "'already known' branch and emits only :modified-in: the module is "
-            "resurrected as a ghost with no current :ident. Fixing it means "
-            "changing that gate to test liveness, which is out of Task 9's scope."
-        ),
-    )
     async def test_reused_path_new_entity_is_not_a_ghost_at_default_ratio(
         self, tmp_path, monkeypatch, variant
     ):
         """Companion to the forward-only-pinned variant above, at the 1:1
         DEFAULT ratio -- the configuration that actually ships.
 
-        The pin alone makes the suite green at exactly the configuration
-        that hides the ghost, with nothing left to notice when the bug is
-        fixed or when it spreads. This test is that alarm: strict=True means
-        it FAILS the day someone repairs _reverse_apply's gate, forcing both
-        the xfail and the forward-only pin to be removed together rather than
-        letting a stale exemption silently mask a later regression.
+        The two tests are now identical in outcome and kept separate only
+        because the pin above documents which configuration used to hide the
+        ghost. The strict=True xfail that guarded this was removed with #231.
         """
         # Explicitly at the default: an ambient MINIGRAF_INGEST_STREAM_RATIO
-        # would otherwise decide which stream claims c3 and make the xfail
-        # non-deterministic.
+        # would otherwise decide which stream claims c3 and make this test's
+        # outcome non-deterministic.
         monkeypatch.delenv("MINIGRAF_INGEST_STREAM_RATIO", raising=False)
         repo = _reused_path_repo(tmp_path / "repo", variant)
         db = await self._ingest_and_open(repo, monkeypatch)
@@ -14617,9 +14614,14 @@ class TestReverseFillClaimAndProcess:
 
         fn_ident = mcp_server._code_ident("function", "auth.py", "login")
         # Simulate Stream 1 having already confirmed login() authoritatively
-        # at the oldest commit, before Stream 2 ever runs.
+        # at the oldest commit, before Stream 2 ever runs -- with a live
+        # :ident alongside :introduced-by, matching what a real confirmation
+        # always writes together (#231: the reverse walk's known-entity gate
+        # keys on :ident liveness, not :introduced-by alone).
         mcp_server._transact(
-            real_db, f"[[{fn_ident} :introduced-by :commit/preexisting]]", "2025-01-01T00:00:00Z",
+            real_db,
+            f'[[{fn_ident} :introduced-by :commit/preexisting] [{fn_ident} :ident "{fn_ident}"]]',
+            "2025-01-01T00:00:00Z",
         )
 
         claimed_hash = mcp_server._reverse_fill_claim_and_process(
@@ -14849,6 +14851,14 @@ class TestReverseApplySplit:
         fake_before_ident = f":commit/{fake_before_hash[:12]}"
         fake_after_ident = f":commit/{fake_after_hash[:12]}"
 
+        # A real provisional guess always carries a live :ident, asserted at
+        # the same sighting (#231: the reverse walk's known-entity gate keys
+        # on :ident liveness, not :introduced-by alone).
+        mcp_server._transact(
+            real_db,
+            f'[[{fa_ident} :ident "{fa_ident}"] [{fb_ident} :ident "{fb_ident}"]]',
+            seed_ts,
+        )
         # Seed both as already-provisional, guessed-introduced at the two
         # fabricated commits -- real writes through the real batch helper,
         # not a mock, mirroring test_monotonicity_refusal_is_per_ident_not_per_batch.
@@ -18052,14 +18062,14 @@ class TestMultiStreamParityWithForwardOnly:
 
     NOTE ON THE FIXTURE: it deliberately contains NO path reuse -- nothing
     is re-created at a path that was earlier deleted or renamed away. That
-    is not to hide anything; it is because path reuse hits a KNOWN,
-    out-of-scope phase-2b defect (_build_close_triples never retracts
-    :introduced-by, so _reverse_apply's known-entity gate resurrects a
-    ghost) which is already pinned by
+    is not to hide anything; it is because path reuse used to hit a phase-2b
+    defect (_build_close_triples never retracted :introduced-by, so
+    _reverse_apply's known-entity gate resurrected a ghost), fixed by #231,
+    which was covered by
     TestClosedEntityLifecyclePurge::test_reused_path_new_entity_is_not_a_ghost
-    and its strict-xfail companion. Mixing that failure into the parity
-    oracle would only make this test say something the pins already say,
-    while destroying its ability to report a genuine parity break.
+    and its now-passing default-ratio companion. Mixing path reuse into the
+    parity oracle here would only duplicate what that class already covers,
+    not exercise anything new.
     """
 
     # frontier-high and :ingestion/correction-sweep-through only exist when a

@@ -5375,6 +5375,32 @@ def _candidate_diff_purge_legacy(db: Any, index_con: Optional[Any] = None) -> in
     return len(rows)
 
 
+def _entity_ident_is_live(db: Any, entity_ident: str) -> bool:
+    """True iff entity_ident currently has a live :ident fact.
+
+    The reverse walk's "do I already know this entity?" gate (#231). It used
+    to ask _entity_introduced_by_query(db, ident) is not None, which was
+    unsound: _build_close_triples never retracted :introduced-by, so a
+    closed-and-purged entity kept that fact forever and the gate answered
+    "known" for it. _build_code_triples then took its "already known" branch
+    and emitted only :modified-in -- the entity was resurrected with lineage
+    but no identity, invisible to nearly every query, and
+    _correction_sweep_apply could not repair it either (it reconciles lineage
+    only and never emits structural facts).
+
+    Task 4 of this change does make close sites retract :introduced-by, which
+    would make the old gate correct too. This gate stays on :ident anyway: the
+    question it asks IS liveness, and coupling it to a lineage attribute is
+    what made #231 possible. It also stays correct if a future close site
+    forgets :introduced-by.
+
+    Current-time query by design -- an entity live in a CLOSED window is
+    exactly the resurrection case this must answer False for.
+    """
+    raw = _db_execute(db, f"(query [:find ?i :where [{entity_ident} :ident ?i]])")
+    return bool(json.loads(raw).get("results", []))
+
+
 def _entity_introduced_by_values_query(db: Any, entity_ident: str) -> List[str]:
     """Every live :introduced-by value for entity_ident, in the backend's
     unspecified order; [] if it has none.
@@ -7994,9 +8020,15 @@ def _reverse_apply(
             + [ident for ident, _name, _t in precomputed["global_entries"]]
             + [ident for ident, _name, _t in precomputed["field_entries"]]
         )
+        # #231: LIVENESS, not lineage. _entity_introduced_by_query was unsound
+        # here -- a closed-and-purged entity kept its :introduced-by forever,
+        # so this gate answered "known" for it, _build_code_triples took its
+        # "already known" branch, and the entity came back as a ghost with no
+        # current :ident. Same one query per candidate ident, so #239's cost
+        # profile is unchanged.
         known_before: Dict[str, str] = {
             ident: "known" for ident in candidate_idents
-            if _entity_introduced_by_query(db, ident) is not None
+            if _entity_ident_is_live(db, ident)
         }
         known_before_snapshot = set(known_before.keys())
 
