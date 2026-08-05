@@ -4652,6 +4652,7 @@ def _build_close_triples(
     entity_type_kw: Optional[str] = None,
     file_value: Optional[str] = None,
     is_static: Optional[bool] = None,
+    introduced_by: Optional[str] = None,
 ) -> List[str]:
     """Return triple strings needed to bi-temporally close an entity.
 
@@ -4687,6 +4688,18 @@ def _build_close_triples(
     ident prefix, for callers whose ident prefix does NOT match their real
     :entity-type. Takes precedence over close_entity_type when both are given
     (they shouldn't be — pass one or the other).
+
+    introduced_by is the entity's :introduced-by commit ident, closed alongside
+    everything else (#231). Opt-in for the same reason close_entity_type is:
+    unresolved-import stubs reuse the module ident prefix but never have an
+    :introduced-by fact (see _forward_apply's dep-edge handling), so deriving
+    one here would retract a fact that was never asserted. Callers get the
+    value from _resolve_introduced_by, which prefers the walk state and falls
+    back to a DB read.
+
+    Leaving this fact open was the whole of #231: a closed-and-purged entity
+    still answered a bare [?e :introduced-by ?c] query, which made
+    _entity_introduced_by_query an unsound liveness test.
     """
     triples = [
         f'[{ident} :ident "{_edn_escape(ident)}"]',
@@ -4711,6 +4724,8 @@ def _build_close_triples(
         triples.append(f'[{ident} {attr} "{_edn_escape(file_value)}"]')
     if is_static is not None:
         triples.append(f"[{ident} :static {'true' if is_static else 'false'}]")
+    if introduced_by is not None:
+        triples.append(f"[{ident} :introduced-by {introduced_by}]")
     return triples
 
 

@@ -8360,6 +8360,25 @@ class TestIngestionWrites:
         triples = mcp_server._build_close_triples(module_ident, "auth.py", module_ident)
         assert not any(":contains" in t for t in triples)
 
+    def test_build_close_triples_closes_introduced_by_when_given(self):
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        triples = mcp_server._build_close_triples(
+            fn_ident, "login", module_ident, introduced_by=":commit/abc123def456",
+        )
+        assert f"[{fn_ident} :introduced-by :commit/abc123def456]" in triples
+
+    def test_build_close_triples_omits_introduced_by_when_not_given(self):
+        """Opt-in for the same reason close_entity_type is: unresolved-import
+        stubs reuse the module ident prefix and never carry :introduced-by, so
+        deriving one would retract a fact that was never asserted."""
+        import mcp_server
+        module_ident = mcp_server._code_ident("module", "auth.py")
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        triples = mcp_server._build_close_triples(fn_ident, "login", module_ident)
+        assert not any(":introduced-by" in t for t in triples)
+
     def test_build_code_triples_writes_modified_in_for_preexisting_functions(self):
         import mcp_server
         fn_ident = mcp_server._code_ident("function", "auth.py", "login")
