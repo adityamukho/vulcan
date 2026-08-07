@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import json
 import os
 import resource
@@ -31,24 +32,82 @@ _STATUS_QUERY = "[:find (count ?e) :where [?e :entity-type :type/commit]]"
 async def _poll_during_ingestion(
     ingest_task: "asyncio.Task[None]",
     poll_interval: float,
-) -> tuple[list[float], list[float]]:
-    """Poll ingest_status and a cheap query at poll_interval while ingest_task
-    runs. Returns (status_latencies, query_latencies) in seconds."""
+    duty_factor: float = 10.0,
+) -> tuple[list[float], list[float], list[float]]:
+    """Poll ingest_status and a graph query while ingest_task runs.
+
+    Returns (status_latencies, query_latencies, poll_offsets); latencies in
+    seconds, offsets in seconds since polling began.
+
+    #242: both halves of this are load-bearing.
+
+    The handlers run on a dedicated single-worker executor rather than inline,
+    because handle_minigraf_query is synchronous -- calling it on the event
+    loop stalls the _run_ingestion coroutine, the process-pool result
+    collection, and every write_executor completion. Two full-history runs
+    were killed at 3h54m and 36m on code measured at +3% before this was
+    understood.
+
+    Off-loop alone is NOT sufficient. handle_minigraf_query acquires
+    _db_native_lock (mcp_server._db_execute), and _STATUS_QUERY counts every
+    :type/commit entity, so its cost grows for the whole run -- a ~1s scan
+    every 0.5s would still serialize against every ingestion write from
+    another thread. The adaptive interval is what bounds the instrument's
+    share of that lock: at duty_factor=10 the poller holds it for at most
+    ~9% of the run however large the scan grows.
+
+    _STATUS_QUERY is deliberately unchanged, so the QUERY being timed is the
+    same one every entry already in benchmark.md timed. That is NOT the same
+    claim as "the recorded latency series stays comparable", which an earlier
+    version of this docstring made and which is false. The adaptive interval
+    sleeps in proportion to the poll's own cost, so it undersamples exactly
+    the late, expensive polls -- and _STATUS_QUERY's cost grows monotonically
+    through a run, because it counts every :type/commit entity. Pre-fix
+    entries polled every 0.5s regardless and sampled that expensive tail at
+    full density. So query_latency p50/p99 recorded here are biased LOW
+    against every pre-fix entry, in the opposite direction from the pre-fix
+    wall-clock inflation. benchmark.md's 2026-08-07 note says both halves.
+
+    A dedicated executor, rather than the loop default, keeps the poll off any
+    thread the ingestion may want.
+
+    Known limitation: a cancelled run still waits on an in-flight poll thread
+    at executor shutdown. The previous implementation blocked the event loop
+    outright, so this is strictly better, but it is not zero.
+    """
     import mcp_server
 
+    loop = asyncio.get_running_loop()
     status_latencies: list[float] = []
     query_latencies: list[float] = []
-    while not ingest_task.done():
-        t0 = time.perf_counter()
-        mcp_server.handle_minigraf_ingest_status()
-        status_latencies.append(time.perf_counter() - t0)
+    poll_offsets: list[float] = []
+    started = time.perf_counter()
 
-        t0 = time.perf_counter()
-        mcp_server.handle_minigraf_query(_STATUS_QUERY)
-        query_latencies.append(time.perf_counter() - t0)
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="bench-poll"
+    ) as poll_executor:
+        while not ingest_task.done():
+            poll_offsets.append(time.perf_counter() - started)
 
-        await asyncio.sleep(poll_interval)
-    return status_latencies, query_latencies
+            t0 = time.perf_counter()
+            await loop.run_in_executor(
+                poll_executor, mcp_server.handle_minigraf_ingest_status
+            )
+            status_duration = time.perf_counter() - t0
+            status_latencies.append(status_duration)
+
+            t0 = time.perf_counter()
+            await loop.run_in_executor(
+                poll_executor, mcp_server.handle_minigraf_query, _STATUS_QUERY
+            )
+            query_duration = time.perf_counter() - t0
+            query_latencies.append(query_duration)
+
+            await asyncio.sleep(
+                max(poll_interval, duty_factor * (status_duration + query_duration))
+            )
+
+    return status_latencies, query_latencies, poll_offsets
 
 
 async def run_ingestion_benchmark(
@@ -56,6 +115,7 @@ async def run_ingestion_benchmark(
     branch: Optional[str],
     graph_path: Path,
     poll_interval: float = 0.5,
+    duty_factor: float = 10.0,
     compare_ignore: bool = False,
 ) -> dict[str, Any]:
     """Run a full git ingestion against repo_path into an isolated graph at
@@ -80,7 +140,9 @@ async def run_ingestion_benchmark(
     start = time.perf_counter()
     ingest_task = asyncio.create_task(mcp_server._run_ingestion(repo_path, resolved_branch))
     try:
-        status_latencies, query_latencies = await _poll_during_ingestion(ingest_task, poll_interval)
+        status_latencies, query_latencies, poll_offsets = await _poll_during_ingestion(
+            ingest_task, poll_interval, duty_factor
+        )
         await ingest_task
     except BaseException:
         if not ingest_task.done():
@@ -91,6 +153,9 @@ async def run_ingestion_benchmark(
                 pass
         raise
     wall_clock = time.perf_counter() - start
+
+    poll_seconds = sum(status_latencies) + sum(query_latencies)
+    poll_duty_fraction = (poll_seconds / wall_clock) if wall_clock > 0 else 0.0
 
     commits_ingested = mcp_server._ingest_progress["processed"]
     final_status = mcp_server._ingest_progress["status"]
@@ -112,6 +177,9 @@ async def run_ingestion_benchmark(
         "status_latency": latency_stats(status_latencies),
         "query_latency": latency_stats(query_latencies),
         "final_status": final_status,
+        "poll_count": len(poll_offsets),
+        "poll_duty_fraction": poll_duty_fraction,
+        "poll_offsets": poll_offsets,
     }
 
     if compare_ignore:
@@ -152,6 +220,11 @@ def main() -> int:
     parser.add_argument("--repo-path", default=".")
     parser.add_argument("--branch", default=None)
     parser.add_argument("--poll-interval", type=float, default=0.5)
+    parser.add_argument(
+        "--poll-duty-factor", type=float, default=10.0,
+        help="Sleep max(poll_interval, N * last_poll_duration) between polls, "
+             "bounding the instrument's share of _db_native_lock (#242).",
+    )
     parser.add_argument("--compare-ignore", action="store_true")
     args = parser.parse_args()
 
@@ -160,7 +233,12 @@ def main() -> int:
         graph_path = Path(tmpdir) / "bench.graph"
         metrics = asyncio.run(
             run_ingestion_benchmark(
-                args.repo_path, args.branch, graph_path, args.poll_interval, args.compare_ignore
+                args.repo_path,
+                args.branch,
+                graph_path,
+                poll_interval=args.poll_interval,
+                duty_factor=args.poll_duty_factor,
+                compare_ignore=args.compare_ignore,
             )
         )
 

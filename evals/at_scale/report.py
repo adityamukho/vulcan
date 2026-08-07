@@ -22,6 +22,28 @@ def write_json_result(metrics: dict[str, Any], results_dir: Path, prefix: str = 
     return path
 
 
+def _poll_duty_row(metrics: dict[str, Any]) -> str:
+    """The "Poll duty cycle" row, rendered whether or not the metrics carry it.
+
+    The row is ALWAYS emitted: benchmark.md's own note tells the reader to
+    treat a missing duty cycle as "unmeasured, assume inflated", which only
+    works if the absence is visible. Reading metrics['poll_duty_fraction']
+    unconditionally instead raised KeyError on any result JSON produced before
+    2026-08-07 (#242), making every pre-fix artifact un-re-renderable -- the
+    opposite of the note's intent.
+    """
+    fraction = metrics.get("poll_duty_fraction")
+    if fraction is None:
+        return (
+            "| Poll duty cycle (#242) | not measured "
+            "(pre-2026-08-07 harness; assume inflated) |"
+        )
+    return (
+        f"| Poll duty cycle (#242) | {fraction*100:.2f}% "
+        f"over {metrics.get('poll_count', 'unknown')} polls |"
+    )
+
+
 def append_ingestion_report(metrics: dict[str, Any], report_path: Path) -> None:
     """Append a dated ingestion-run section to report_path, creating it with
     the shared header first if it doesn't exist yet."""
@@ -53,6 +75,7 @@ def append_ingestion_report(metrics: dict[str, Any], report_path: Path) -> None:
         f"{metrics['query_latency']['p50']*1000:.1f}ms / "
         f"{metrics['query_latency']['p99']*1000:.1f}ms / "
         f"{metrics['query_latency']['max']*1000:.1f}ms |",
+        _poll_duty_row(metrics),
     ]
     if "ignore_comparison" in metrics:
         comp = metrics["ignore_comparison"]

@@ -9,6 +9,7 @@ SAMPLE_METRICS = {
     "status_latency": {"min": 0.001, "p50": 0.002, "p99": 0.004, "max": 0.005},
     "query_latency": {"min": 0.002, "p50": 0.003, "p99": 0.006, "max": 0.008},
     "final_status": "complete",
+    "poll_count": 5, "poll_duty_fraction": 0.042,
 }
 
 
@@ -46,6 +47,29 @@ class TestAppendIngestionReport:
         append_ingestion_report(SAMPLE_METRICS, report_path)
         assert len(report_path.read_text()) > first_len
         assert report_path.read_text().count("## Ingestion Run") == 2
+
+    def test_poll_duty_cycle_row_renders_with_formatted_values(self, tmp_path):
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(SAMPLE_METRICS, report_path)
+        text = report_path.read_text()
+        assert "Poll duty cycle (#242)" in text
+        assert "4.20%" in text  # poll_duty_fraction=0.042 -> 4.20%
+        assert "over 5 polls" in text  # poll_count=5
+
+    def test_poll_duty_cycle_row_still_renders_for_a_pre_fix_result(self, tmp_path):
+        # Every result JSON written before 2026-08-07 lacks the #242 poll
+        # keys. Re-rendering one used to raise KeyError; the row must instead
+        # render and say so, matching benchmark.md's own "treat its absence as
+        # unmeasured, assume inflated" framing.
+        pre_fix = {
+            k: v for k, v in SAMPLE_METRICS.items()
+            if k not in ("poll_count", "poll_duty_fraction")
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(pre_fix, report_path)
+        text = report_path.read_text()
+        assert "Poll duty cycle (#242)" in text
+        assert "not measured" in text
 
 
 SAMPLE_QUERY_RESULTS = [

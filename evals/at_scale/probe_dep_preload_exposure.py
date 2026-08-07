@@ -1,0 +1,905 @@
+# evals/at_scale/probe_dep_preload_exposure.py
+"""#245 exposure probe: how much does the :depends-on preload's ts(W) bound
+actually misclassify against real history?
+
+#238 replaced the forward-walk entity preload's author-date bound with a
+position-indexed one. That fix reached three of four preload sites.
+_preload_known_deps and _preload_pinned_commits stayed at ts(W) -- the
+watermark commit's own author date -- because those facts carry no commit
+reference to join a :hash to, and so admit no position clause.
+
+This probe MEASURES that residual. It fixes nothing, and the oracle below is
+NOT a candidate fix -- see position_exact_live_edges' docstring.
+
+TWO figures, not one (final whole-branch review, CRITICAL finding). The first
+version of this probe held file_entities -- the output of
+_preload_known_entities -- fixed on both sides of the diff, on the claim that
+#238 made that narrowing position-correct and so left the ts(W) :depends-on
+bound as the single variable. That claim is FALSE. #238 made
+_preload_known_entities position-correct on the INTRODUCTION side only: its
+position clause keys on the introducing commit ([?e :introduced-by ?c]
+[?c :hash ?hash] -> hash_to_pos, mcp_server.py:7213-7215). Its CLOSE side is
+still governed by valid_at = T_hi(W), a date bound suffering the identical
+author-date inversion this probe exists to measure -- the function's own
+comment says so ("the date bound above only governs how widely entities closed
+ABOVE the watermark are re-admitted").
+
+Consequence: a module whose close DATE falls below ts(W) but whose close
+POSITION sits above W disappears from file_entities at that W, taking its
+:depends-on edges out of BOTH sides of the diff before the diff is computed.
+On this repository that is four modules deleted by df6b8be at position 124,
+and 30 misclassified edges that the narrow figure never saw (measured
+2026-08-07: narrow 2 distinct vs wide 32, a factor of 16).
+
+So the sweep reports both, side by side:
+
+  NARROW -- file_entities exactly as _preload_known_entities returns it. This
+    measures the ts(W) :depends-on bound CONDITIONAL ON #238's still-open
+    close-side residual: the entity preload has already discarded the modules
+    whose own close inverted, so what is left is only the edges that survived
+    that discard. It is the figure the shipped code produces today.
+
+  WIDE -- file_entities rebuilt position-correctly, from :path facts whose
+    both ends are inverted to positions. This measures the ts(W) :depends-on
+    bound IN ISOLATION, with the entity preload's own close-side defect
+    removed.
+
+The comparison between the two IS the finding. Neither alone is the number.
+"""
+
+from __future__ import annotations
+
+import datetime
+from typing import Dict, List, Optional, Sequence, Tuple
+
+# minigraf's i64::MAX "still open" :db/valid-to sentinel. Mirrors
+# mcp_server._VALID_TIME_FOREVER_MS (mcp_server.py:7450) exactly; duplicated
+# rather than imported so the analysis primitives stay importable without
+# opening a graph. If the two ever diverge, every open edge is misread as
+# closed at a nonsense position, so keep them identical.
+VALID_TIME_FOREVER_MS = (1 << 63) - 1
+
+CommitMeta = Tuple[str, str, str, str]  # (hash, ts_iso, author_email, subject)
+
+
+def build_ts_positions(commit_metadata: Sequence[CommitMeta]) -> Dict[str, List[int]]:
+    """Map each author-date timestamp to every linearization position holding it.
+
+    A LIST, not a single position, and deliberately so: _git_commits formats
+    "%Y-%m-%dT%H:%M:%SZ" (second granularity), so distinct commits routinely
+    share an instant. Collapsing that to one position would silently pick a
+    winner and produce a confidently wrong exposure number.
+    """
+    ts_positions: Dict[str, List[int]] = {}
+    for pos, (_hash, ts_iso, _author, _subject) in enumerate(commit_metadata):
+        ts_positions.setdefault(ts_iso, []).append(pos)
+    return ts_positions
+
+
+def resume_envelopes(commit_metadata: Sequence[CommitMeta]) -> List[str]:
+    """T_hi(W) = max(ts[0..W]) for every W, the bound _preload_known_entities
+    takes after #238.
+
+    Timestamps are fixed-width UTC, so lexicographic max is chronological max
+    -- the same property mcp_server._resume_envelope relies on.
+    """
+    envelopes: List[str] = []
+    running_max = ""
+    for _hash, ts_iso, _author, _subject in commit_metadata:
+        running_max = max(running_max, ts_iso)
+        envelopes.append(running_max)
+    return envelopes
+
+
+def affected_positions(commit_metadata: Sequence[CommitMeta]) -> List[int]:
+    """Positions where the ts(W) bound is structurally capable of misclassifying.
+
+    This is a position-level precondition computed from commit_metadata alone,
+    independent of any fact. It is what keeps the sweep off every position in
+    the history.
+
+    W is exposed iff either structural condition holds. The UNION is what this
+    returns, and the union is what matters -- but do not read either condition
+    as belonging to one misclassification direction. Each condition enables one
+    of EACH direction, because the bound is half-open containment
+    [vf, vt) ∋ ts(W) (mcp_server._valid_time_window_clauses) and a fact's
+    CLOSE is date-bounded on exactly the same terms as its introduction:
+
+      condition A -- min(ts[W+1..]) <= ts(W): some commit ABOVE W carries a
+      date at or below W's own.
+        * wrong INCLUSION via introduction: a fact introduced at that commit
+          has vf <= ts(W), so it passes the bound, but its introducing
+          position is above W -- the walk sees a future edge.
+        * wrong EXCLUSION via close: a fact CLOSED at that commit has
+          vt <= ts(W), so half-open containment rejects it, but its closing
+          position is above W -- the edge is still live at W and the walk
+          cannot see it.
+
+      condition B -- T_hi(W) > ts(W): some commit at position <= W carries a
+      LATER date.
+        * wrong EXCLUSION via introduction: a fact introduced there has
+          vf > ts(W), outside the bound, though it is live at W.
+        * wrong INCLUSION via close: a fact CLOSED there has vt > ts(W), so
+          the bound still reads it as open, though its close position is at
+          or below W and the edge is already dead.
+
+    An earlier version of this docstring labelled condition A "wrong
+    inclusion" and condition B "wrong exclusion" outright, which is wrong and
+    was empirically decisive in the wrong direction: on this repository
+    positions 118-123 are flagged by condition A alone, and every one of them
+    misclassifies by wrong EXCLUSION -- via close, the arm the old labelling
+    did not name.
+
+    Condition A uses <=, not <, because the bound's vf test is `<=` -- a fact
+    starting exactly at the instant is live.
+    """
+    timestamps = [ts for _h, ts, _a, _s in commit_metadata]
+    n = len(timestamps)
+    if n == 0:
+        return []
+
+    envelopes = resume_envelopes(commit_metadata)
+
+    # suffix_min[i] = min(timestamps[i+1 .. n-1]), or None past the end.
+    suffix_min: List[Optional[str]] = [None] * n
+    running_min: Optional[str] = None
+    for i in range(n - 1, -1, -1):
+        suffix_min[i] = running_min
+        running_min = timestamps[i] if running_min is None else min(running_min, timestamps[i])
+
+    affected: List[int] = []
+    for w in range(n):
+        # Named for the structural conditions, not for directions: see the
+        # docstring -- each one enables a wrong inclusion AND a wrong exclusion.
+        condition_b_later_dated_at_or_below_w = envelopes[w] > timestamps[w]
+        condition_a_earlier_dated_above_w = (
+            suffix_min[w] is not None and suffix_min[w] <= timestamps[w]
+        )
+        if condition_b_later_dated_at_or_below_w or condition_a_earlier_dated_above_w:
+            affected.append(w)
+    return affected
+
+
+def invert_ms_to_positions(ms: int, ts_positions: Dict[str, List[int]]) -> List[int]:
+    """Map an epoch-millisecond :db/valid-from or :db/valid-to back to the
+    linearization positions whose commit carries that instant.
+
+    Returns [] when no commit matches. The caller MUST treat that as a
+    diagnostic, not as an empty result to skip: an unmappable fact means the
+    inversion assumption is broken, which invalidates the measurement rather
+    than shrinking it.
+    """
+    ts_iso = (
+        datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    return list(ts_positions.get(ts_iso, []))
+
+
+def edge_live_at(
+    vf_positions: List[int],
+    vt_positions: Optional[List[int]],
+    w: int,
+) -> bool:
+    """Is a fact introduced at vf_positions and closed at vt_positions live at
+    position w?
+
+    vt_positions is None for a fact still open (the forever sentinel).
+
+    Ambiguity resolution is deliberately asymmetric, and always in the
+    direction that cannot UNDERSTATE exposure: an ambiguous introduction takes
+    the earliest colliding position, an ambiguous close the latest. Understating
+    is the dangerous direction here -- it would argue for closing #245 as
+    negligible on a number that was rounded in our own favour.
+
+    An empty vf_positions (unmappable introduction) is never live; the driver
+    counts these separately.
+    """
+    if not vf_positions:
+        return False
+    introduced_at = min(vf_positions)
+    if introduced_at > w:
+        return False
+    if vt_positions:
+        return w < max(vt_positions)
+    return True
+
+
+def gitlink_event_count(repo_path: str) -> int:
+    """Number of raw diff entries across all history touching a gitlink
+    (mode 160000).
+
+    :pinned-commit facts are written only by gitlink handling, so a zero here
+    means this history produces none and its #245 exposure is structurally
+    unmeasurable -- not zero-risk, unmeasurable. That distinction goes in the
+    report verbatim.
+    """
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "log", "--all", "--raw", "--no-abbrev", "--format=%H"],
+        cwd=repo_path, capture_output=True, text=True, check=True,
+    )
+    return sum(
+        1 for line in result.stdout.splitlines()
+        if line.startswith(":") and "160000" in line
+    )
+
+
+def position_exact_live_edges(
+    edges: Sequence[Dict],
+    ts_positions: Dict[str, List[int]],
+    file_entities: Dict[str, List[str]],
+    w: int,
+) -> set:
+    """The (src_ident, dep_ident) edges genuinely live at position w.
+
+    NOT A CANDIDATE FIX, and must never be read as one. This works only
+    because the entire history is in hand at analysis time: it inverts each
+    fact's stored timestamps back to positions. A resuming forward walk has no
+    such thing -- that is the whole reason #245 exists. It is a measurement
+    device and nothing else. None of #245's three options resemble it.
+
+    Restricted to edges whose source module appears in file_entities, mirroring
+    _preload_known_deps' own ident_to_file filter. WHICH file_entities the
+    caller passes is what selects the NARROW or the WIDE measurement, and the
+    two answer different questions:
+
+    - _preload_known_entities' own output -> NARROW. That narrowing is
+      position-correct on the INTRODUCTION side only; its close side is a
+      T_hi(W) date bound carrying the same inversion defect (see the module
+      docstring). So the narrow figure measures the ts(W) :depends-on bound
+      conditional on #238's still-open close-side residual, not in isolation.
+      An earlier version of this docstring claimed the narrowing was
+      position-correct outright and that holding it fixed left the
+      :depends-on bound as the single variable. It does not, and that claim
+      understated the measured exposure by ~16x.
+
+    - position_correct_file_entities' output -> WIDE. Both ends of each
+      module's :path fact inverted to positions, so the entity preload's own
+      defect is out of the picture and the :depends-on bound is measured
+      alone.
+
+    An unmappable CLOSE (a non-sentinel vt_ms whose instant matches no commit)
+    falls through here to vt_positions=[], which edge_live_at's `if
+    vt_positions:` treats identically to vt_positions=None -- "still open".
+    That is deliberate, not an oversight: it is the same cannot-understate
+    direction edge_live_at's own ambiguous-position handling takes. It does
+    mean such an edge reads as live at every later w, inflating
+    wrongly_excluded at each of them. The driver (sweep) counts these
+    separately as unmappable_valid_to_facts so that inflation stays visible
+    instead of being silently baked into the headline numbers.
+    """
+    import mcp_server
+
+    known_src_idents = {
+        mcp_server._code_ident("module", file_path) for file_path in file_entities
+    }
+
+    live = set()
+    for edge in edges:
+        if edge["src"] not in known_src_idents:
+            continue
+        vf_positions = invert_ms_to_positions(edge["vf_ms"], ts_positions)
+        vt_positions = (
+            None if edge["vt_ms"] >= VALID_TIME_FOREVER_MS
+            else invert_ms_to_positions(edge["vt_ms"], ts_positions)
+        )
+        if edge_live_at(vf_positions, vt_positions, w):
+            live.add((edge["src"], edge["dep"]))
+    return live
+
+
+def load_dep_edges(db) -> List[Dict]:
+    """Every :depends-on fact in the graph, current and historical, with its
+    validity window.
+
+    Mirrors _preload_known_deps' own query shape exactly, including the clause
+    ORDER: [?src :ident ?srci] must precede [?src :depends-on ?dep], because
+    minigraf's :db/valid-from / :db/valid-to pseudo-attributes bind to
+    whichever EAV clause on ?src most recently precedes them. Putting :ident
+    between :depends-on and the pseudo-attributes would bind ?vf to the :ident
+    fact's own valid-from instead -- wrong, and silently so.
+
+    Deduplicated on (src, dep, vf, vt): an entity carrying more than one
+    :ident fact across time (a rename, or a retract/reassert of the same
+    value) makes the [?src :ident ?srci] join under :any-valid-time multiply
+    each of that source's :depends-on rows once per :ident fact, which would
+    otherwise inflate dep_edges_total and the unmappable-fact counts without
+    changing which edges are actually live at any position.
+    """
+    import json
+
+    import mcp_server
+
+    raw = mcp_server._db_execute(
+        db,
+        "(query [:find ?srci ?dep ?vf ?vt "
+        ":any-valid-time "
+        ":where [?src :ident ?srci] "
+        "[?src :depends-on ?dep] "
+        "[?src :db/valid-from ?vf] "
+        "[?src :db/valid-to ?vt]])",
+    )
+    seen = set()
+    edges = []
+    for src, dep, vf, vt in json.loads(raw).get("results", []):
+        key = (src, dep, int(vf), int(vt))
+        if key in seen:
+            continue
+        seen.add(key)
+        edges.append({"src": src, "dep": dep, "vf_ms": int(vf), "vt_ms": int(vt)})
+    return edges
+
+
+def load_module_path_facts(db) -> List[Dict]:
+    """Every :path fact on a module entity, current and historical, with its
+    validity window.
+
+    The raw material for the WIDE measurement. Same clause-order rule as
+    load_dep_edges: [?e :path ?path] must be the EAV clause immediately
+    preceding the :db/valid-from / :db/valid-to pseudo-attributes, because
+    those bind to whichever EAV clause on ?e most recently precedes them.
+    Putting :entity-type between them would bind ?vf to the :entity-type
+    fact's window instead -- wrong, and silently so.
+
+    Restricted to :type/module deliberately. :path is also carried by
+    external-dependency entities, but _preload_known_deps keys its
+    ident_to_file on _code_ident("module", path); admitting a submodule path
+    there would synthesize a module ident for an entity that is not one.
+
+    Deduplicated on (path, vf, vt) for the same reason load_dep_edges dedupes:
+    an entity carrying more than one :entity-type fact across time would
+    otherwise multiply each :path row without changing any liveness answer.
+    A rename legitimately produces two DISTINCT (path, vf, vt) rows -- the old
+    path closed, the new one opened -- and both are kept, which is what makes
+    the set position-correct across renames.
+    """
+    import json
+
+    import mcp_server
+
+    raw = mcp_server._db_execute(
+        db,
+        "(query [:find ?path ?vf ?vt "
+        ":any-valid-time "
+        ":where [?e :entity-type :type/module] "
+        "[?e :path ?path] "
+        "[?e :db/valid-from ?vf] "
+        "[?e :db/valid-to ?vt]])",
+    )
+    seen = set()
+    facts = []
+    for path, vf, vt in json.loads(raw).get("results", []):
+        key = (path, int(vf), int(vt))
+        if key in seen:
+            continue
+        seen.add(key)
+        facts.append({"path": path, "vf_ms": int(vf), "vt_ms": int(vt)})
+    return facts
+
+
+def position_correct_file_entities(
+    path_facts: Sequence[Dict],
+    ts_positions: Dict[str, List[int]],
+    w: int,
+) -> Dict[str, List[str]]:
+    """The module paths genuinely live at position w, shaped like the
+    file_entities dict _preload_known_deps and position_exact_live_edges both
+    consume.
+
+    This is the WIDE side's replacement for _preload_known_entities' own
+    file_entities. It is position-correct at BOTH ends -- introduction and
+    close -- because it inverts both :db/valid-from and :db/valid-to through
+    the same primitives the edge oracle uses (invert_ms_to_positions,
+    edge_live_at), rather than trusting either against a date bound.
+
+    That second end is the whole point. A module deleted at a position ABOVE w
+    by a commit whose author date falls BELOW ts(w) -- the exact shape of
+    df6b8be at position 124 on this repository -- reads as already closed to
+    any date bound, and so vanishes from _preload_known_entities' output at w.
+    Here it stays live, because max(close positions) > w.
+
+    Values are empty lists: only the KEYS (the paths) are load-bearing
+    downstream. _preload_known_deps reads only `for file_path in
+    file_entities`, and position_exact_live_edges only
+    _code_ident("module", file_path) over the same keys.
+
+    Like everything else here, this is a measurement device and NOT a
+    candidate fix -- it needs the whole history in hand, which a resuming
+    forward walk does not have.
+    """
+    live: Dict[str, List[str]] = {}
+    for fact in path_facts:
+        vf_positions = invert_ms_to_positions(fact["vf_ms"], ts_positions)
+        vt_positions = (
+            None if fact["vt_ms"] >= VALID_TIME_FOREVER_MS
+            else invert_ms_to_positions(fact["vt_ms"], ts_positions)
+        )
+        if edge_live_at(vf_positions, vt_positions, w):
+            live.setdefault(fact["path"], [])
+    return live
+
+
+def count_unmappable_module_path_facts(
+    path_facts: Sequence[Dict],
+    ts_positions: Dict[str, List[int]],
+) -> Tuple[int, int]:
+    """How many module :path facts carry a vf_ms/vt_ms whose instant matches
+    no commit -- the WIDE framing's own unmappable-fact diagnostic.
+
+    WIDE (position_correct_file_entities) is built entirely from these
+    :path facts, run through the same invert_ms_to_positions/edge_live_at
+    machinery as the :depends-on edges. An unmappable vf silently drops a
+    module from WIDE at every W (understating it); an unmappable non-sentinel
+    vt silently reads it as never-closed (overstating it). Mirrors sweep's
+    own unmappable_valid_from_facts/unmappable_valid_to_facts computation for
+    :depends-on edges, applied to :path instead.
+
+    Runs over ALL of path_facts, not a measured subset: unlike a
+    :depends-on edge, a :path fact has no "did it ever enter consideration"
+    filter to apply first -- it IS file_entities.
+
+    Returns (unmappable_valid_from, unmappable_valid_to).
+    """
+    unmappable_vf = sum(
+        1 for f in path_facts
+        if not invert_ms_to_positions(f["vf_ms"], ts_positions)
+    )
+    unmappable_vt = sum(
+        1 for f in path_facts
+        if f["vt_ms"] < VALID_TIME_FOREVER_MS
+        and not invert_ms_to_positions(f["vt_ms"], ts_positions)
+    )
+    return unmappable_vf, unmappable_vt
+
+
+def sweep(
+    db,
+    repo_path: str,
+    linearization: List[str],
+    commit_metadata: Sequence[CommitMeta],
+    branch: Optional[str] = None,
+) -> Dict:
+    """Drive the REAL preload functions at each affected position and diff
+    against the oracle, in BOTH the narrow and the wide entity framing.
+
+    Calls the functions under test rather than a restatement of what we
+    believe they do. On the #238 branch a reviewer and an implementer both
+    simulated the counterfactual with a date bound instead of the real
+    position-filtered one, which made an inadequate test look adequate and
+    produced a false "bug not reachable" conclusion -- two fix rounds lost.
+
+    NARROW vs WIDE. Every misclassification count below appears twice. The
+    real _preload_known_deps is driven twice per position, differing only in
+    the file_entities handed to it:
+
+      narrow_* -- file_entities straight from _preload_known_entities. What
+        the shipped code produces today, and the only figure the first
+        version of this probe reported. It measures the ts(W) :depends-on
+        bound CONDITIONAL ON #238's still-open close-side residual: entities
+        whose own close inverted are already gone from file_entities, so
+        their edges never reach either side of the diff.
+
+      wide_* -- file_entities from position_correct_file_entities, both ends
+        inverted to positions. It measures the ts(W) :depends-on bound in
+        ISOLATION.
+
+    Neither is "the" number; the gap between them is the finding, and it is
+    what the module docstring explains. Reporting only the narrow one
+    understated this repository's exposure by ~16x.
+
+    provenance. repo_path alone was not enough to reproduce the first
+    recorded artifact -- it named a scratch directory that no longer exists,
+    with no branch and no head SHA. branch and head_commit are recorded here
+    so a future run carries its own.
+
+    Three report fields exist purely to keep this sweep from lying quietly
+    about itself (#245 review round):
+
+    - actual_dep_counts_by_position / preload_deps_empty_everywhere:
+      _preload_known_deps swallows its own query failure (bare `except
+      Exception: return file_deps, dep_valid_from`, mcp_server.py:7554-7555)
+      and returns ({}, {}) on any runtime error. That failure mode and "this
+      position genuinely has zero live deps" are indistinguishable from a
+      *_wrongly_excluded_total alone -- both make every expected edge look
+      wrongly excluded. Recording each framing's actual and expected counts
+      per position, and flagging the all-positions-zero case explicitly, is
+      what lets a reader tell them apart. The flag keys on the NARROW actual,
+      the one the shipped code path produces.
+
+    - unmappable_valid_from_facts / unmappable_valid_to_facts: counted only
+      over the MEASURED population -- edges whose source module ident
+      appears in file_entities at at least one affected position -- not over
+      every row load_dep_edges returns. An edge that never enters the
+      oracle's or the preload's consideration at any position can't corrupt
+      either, so counting it would only make an unrelated, filtered-out
+      corner of the graph look like it invalidated this measurement.
+      unmappable_valid_to_facts exists because position_exact_live_edges
+      resolves an unmappable CLOSE by treating the edge as still open (see
+      its docstring); that is the correct not-understating direction, but it
+      is silent unless counted here.
+
+    - unmappable_module_path_valid_from / unmappable_module_path_valid_to:
+      the same diagnostic applied to the WIDE framing's own raw material.
+      WIDE is built from module :path facts via position_correct_file_entities,
+      which runs :path's vf_ms/vt_ms through the identical
+      invert_ms_to_positions/edge_live_at machinery as the :depends-on edges
+      above -- an unmappable :path vf silently drops a module from WIDE at
+      every W (understating it), and an unmappable :path vt silently reads it
+      as never-closed (overstating it). Counted over ALL of path_facts, not a
+      measured subset: unlike an edge, a :path fact has no "did it ever enter
+      consideration" filter to apply first -- it IS file_entities. Both fold
+      into measurement_invalid below, same as the edge counters.
+
+    Every *_total_position_weighted is position-weighted: one edge
+    misclassified at all N affected positions contributes N, not 1. The
+    distinct-edge counts alongside them are the union across positions, for
+    whichever unit the reader actually wants.
+    """
+    import mcp_server
+
+    if len(commit_metadata) != len(linearization):
+        raise ValueError(
+            f"commit_metadata has {len(commit_metadata)} entries but "
+            f"linearization has {len(linearization)}; a misaligned pair "
+            "mis-filters the entire sweep"
+        )
+    for i, ((meta_hash, _ts, _a, _s), lin_hash) in enumerate(
+        zip(commit_metadata, linearization)
+    ):
+        if meta_hash != lin_hash:
+            raise ValueError(
+                f"commit_metadata[{i}] is {meta_hash} but linearization[{i}] "
+                f"is {lin_hash}; the two must be positionally aligned"
+            )
+
+    hash_to_pos = {h: i for i, h in enumerate(linearization)}
+    ts_positions = build_ts_positions(commit_metadata)
+    envelopes = resume_envelopes(commit_metadata)
+    timestamps = [ts for _h, ts, _a, _s in commit_metadata]
+    edges = load_dep_edges(db)
+    path_facts = load_module_path_facts(db)
+    collisions = {ts: pos for ts, pos in ts_positions.items() if len(pos) > 1}
+
+    per_position = []
+    actual_dep_counts_by_position = []
+    measured_src_idents: set = set()
+    for w in affected_positions(commit_metadata):
+        valid_at_ms = mcp_server._iso_to_epoch_ms(timestamps[w])
+
+        (
+            _entity_valid_from, _entity_descriptions, _entity_introduced_by,
+            narrow_file_entities, _submodule_paths,
+        ) = mcp_server._preload_known_entities(
+            db, repo_path, valid_at=envelopes[w],
+            hash_to_pos=hash_to_pos, watermark_pos=w,
+        )
+        wide_file_entities = position_correct_file_entities(path_facts, ts_positions, w)
+
+        # The measured population spans BOTH framings: an edge the narrow
+        # entity set drops but the wide one keeps still enters the oracle, so
+        # an unmappable timestamp on it still invalidates a reported number.
+        measured_src_idents.update(
+            mcp_server._code_ident("module", file_path)
+            for file_path in (set(narrow_file_entities) | set(wide_file_entities))
+        )
+
+        # The SAME unmodified _preload_known_deps on both sides. Only the
+        # file_entities differ -- that is the single variable this comparison
+        # isolates.
+        _narrow_file_deps, narrow_dep_valid_from = mcp_server._preload_known_deps(
+            db, narrow_file_entities, valid_at_ms=valid_at_ms,
+        )
+        _wide_file_deps, wide_dep_valid_from = mcp_server._preload_known_deps(
+            db, wide_file_entities, valid_at_ms=valid_at_ms,
+        )
+        narrow_actual = set(narrow_dep_valid_from.keys())
+        wide_actual = set(wide_dep_valid_from.keys())
+
+        narrow_expected = position_exact_live_edges(
+            edges, ts_positions, narrow_file_entities, w
+        )
+        wide_expected = position_exact_live_edges(
+            edges, ts_positions, wide_file_entities, w
+        )
+
+        actual_dep_counts_by_position.append({
+            "position": w,
+            "narrow_actual_count": len(narrow_actual),
+            "narrow_expected_count": len(narrow_expected),
+            "wide_actual_count": len(wide_actual),
+            "wide_expected_count": len(wide_expected),
+            "narrow_module_count": len(narrow_file_entities),
+            "wide_module_count": len(wide_file_entities),
+            # The counts alone are NOT enough: they can match while the sets
+            # differ. Measured on a synthetic inverted-date repo, both sides
+            # held 3 modules at the affected position while the narrow side
+            # had dropped the deleted-later module and admitted a
+            # not-yet-introduced one (_preload_known_entities pre-seeds
+            # file_entities from `git ls-files` on the CURRENT worktree, so
+            # its errors cancel in the count). These two are the direct
+            # evidence of the entity preload's close-side residual.
+            "modules_wide_only": len(set(wide_file_entities) - set(narrow_file_entities)),
+            "modules_narrow_only": len(set(narrow_file_entities) - set(wide_file_entities)),
+        })
+
+        narrow_wrongly_included = sorted(narrow_actual - narrow_expected)
+        narrow_wrongly_excluded = sorted(narrow_expected - narrow_actual)
+        wide_wrongly_included = sorted(wide_actual - wide_expected)
+        wide_wrongly_excluded = sorted(wide_expected - wide_actual)
+        if (
+            narrow_wrongly_included or narrow_wrongly_excluded
+            or wide_wrongly_included or wide_wrongly_excluded
+        ):
+            per_position.append({
+                "position": w,
+                "commit": linearization[w],
+                "date": timestamps[w],
+                "narrow_wrongly_included": [list(e) for e in narrow_wrongly_included],
+                "narrow_wrongly_excluded": [list(e) for e in narrow_wrongly_excluded],
+                "wide_wrongly_included": [list(e) for e in wide_wrongly_included],
+                "wide_wrongly_excluded": [list(e) for e in wide_wrongly_excluded],
+            })
+
+    measured_edges = [e for e in edges if e["src"] in measured_src_idents]
+    unmappable_vf = sum(
+        1 for e in measured_edges
+        if not invert_ms_to_positions(e["vf_ms"], ts_positions)
+    )
+    unmappable_vt = sum(
+        1 for e in measured_edges
+        if e["vt_ms"] < VALID_TIME_FOREVER_MS
+        and not invert_ms_to_positions(e["vt_ms"], ts_positions)
+    )
+    unmappable_module_path_vf, unmappable_module_path_vt = count_unmappable_module_path_facts(
+        path_facts, ts_positions
+    )
+
+    # Keyed on the NARROW actual: that is the one produced by the shipped
+    # code path, so it is the one whose all-zero signature would mean
+    # _preload_known_deps' bare `except Exception` ate a real failure.
+    preload_deps_empty_everywhere = bool(actual_dep_counts_by_position) and all(
+        c["narrow_actual_count"] == 0 for c in actual_dep_counts_by_position
+    )
+
+    def _distinct(key: str) -> int:
+        return len({tuple(e) for p in per_position for e in p[key]})
+
+    return {
+        "repo_path": repo_path,
+        "branch": branch,
+        # The ingested head, taken from the linearization rather than from a
+        # fresh `git rev-parse`: it is the commit this sweep's graph actually
+        # ends at, which a later rev-parse of the same branch need not be.
+        "head_commit": linearization[-1] if linearization else None,
+        "commits": len(linearization),
+        "dep_edges_total": len(edges),
+        "measured_dep_edges_total": len(measured_edges),
+        "module_path_facts_total": len(path_facts),
+        "affected_positions": affected_positions(commit_metadata),
+        "misclassifying_positions": per_position,
+        "actual_dep_counts_by_position": actual_dep_counts_by_position,
+        "preload_deps_empty_everywhere": preload_deps_empty_everywhere,
+
+        # NARROW -- file_entities as _preload_known_entities returns it. The
+        # shipped behaviour, and the ts(W) :depends-on bound measured
+        # CONDITIONAL ON #238's still-open close-side residual.
+        "narrow_wrongly_included_total_position_weighted": sum(
+            len(p["narrow_wrongly_included"]) for p in per_position
+        ),
+        "narrow_wrongly_excluded_total_position_weighted": sum(
+            len(p["narrow_wrongly_excluded"]) for p in per_position
+        ),
+        "narrow_wrongly_included_distinct_edges": _distinct("narrow_wrongly_included"),
+        "narrow_wrongly_excluded_distinct_edges": _distinct("narrow_wrongly_excluded"),
+
+        # WIDE -- file_entities rebuilt position-correctly at BOTH ends. The
+        # ts(W) :depends-on bound measured in ISOLATION.
+        "wide_wrongly_included_total_position_weighted": sum(
+            len(p["wide_wrongly_included"]) for p in per_position
+        ),
+        "wide_wrongly_excluded_total_position_weighted": sum(
+            len(p["wide_wrongly_excluded"]) for p in per_position
+        ),
+        "wide_wrongly_included_distinct_edges": _distinct("wide_wrongly_included"),
+        "wide_wrongly_excluded_distinct_edges": _distinct("wide_wrongly_excluded"),
+
+        "timestamp_collisions": len(collisions),
+        "unmappable_valid_from_facts": unmappable_vf,
+        "unmappable_valid_to_facts": unmappable_vt,
+        "unmappable_module_path_valid_from": unmappable_module_path_vf,
+        "unmappable_module_path_valid_to": unmappable_module_path_vt,
+        "gitlink_events": gitlink_event_count(repo_path),
+    }
+
+
+async def _ingest_into(repo_path: str, branch: Optional[str], graph_path) -> Tuple[str, str]:
+    """Ingest repo_path into a fresh scratch graph, using the plain in-process
+    path.
+
+    Deliberately NOT run_ingestion_benchmark: its in-flight poller starved the
+    ingestion it measured (#242, fixed on this same branch). This probe needs
+    a completed ingestion, not a measured one, so it takes the simplest path
+    and no poller at all.
+
+    Returns (resolved_branch, status), where status is
+    mcp_server._ingest_progress["status"] read immediately after
+    _run_ingestion returns. That status is the ONLY signal available:
+    _run_ingestion wraps its whole body in `except Exception` (mcp_server.py:
+    10212-10220), sets status "error" and _db = None, and returns normally --
+    it never raises. A partial run that stopped short of the frontier sets
+    "stopped" the same way (mcp_server.py:10205-10208), also without raising.
+    Either way the caller gets a graph that opened successfully and a status
+    that says not to trust it; surfacing status is what makes that
+    distinguishable from a genuine "complete". Mirrors the sibling pattern in
+    evals/at_scale/run_ingestion_benchmark.py:151-152.
+    """
+    import mcp_server
+
+    mcp_server._db = None
+    mcp_server._graph_path = None
+    mcp_server.open_db(str(graph_path))
+    mcp_server._ingest_progress = {
+        "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+        "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+    }
+    resolved_branch = branch or mcp_server._default_git_branch(repo_path)
+    await mcp_server._run_ingestion(repo_path, resolved_branch)
+    return resolved_branch, mcp_server._ingest_progress["status"]
+
+
+def main() -> int:
+    import argparse
+    import asyncio
+    import json
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    repo_root = Path(__file__).parent.parent.parent.resolve()
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    parser = argparse.ArgumentParser(
+        description="Measure #245's :depends-on preload exposure against real history."
+    )
+    parser.add_argument("--repo-path", default=".")
+    parser.add_argument("--branch", default=None)
+    parser.add_argument("--json-out", default=None)
+    args = parser.parse_args()
+
+    import frontier_registry
+    import mcp_server
+
+    with tempfile.TemporaryDirectory(prefix="minigraf-245-probe-") as tmpdir:
+        graph_path = Path(tmpdir) / "probe.graph"
+        branch, ingest_status = asyncio.run(
+            _ingest_into(args.repo_path, args.branch, graph_path)
+        )
+
+        # _run_ingestion never raises on failure (see _ingest_into's
+        # docstring) -- ingest_status is the only signal that the graph
+        # underneath this sweep is actually complete. Sweeping a "stopped" or
+        # "error" graph would silently report on a partial ingestion as
+        # though it were the full history; refuse instead.
+        if ingest_status != "complete":
+            error = mcp_server._ingest_progress.get("error")
+            print(
+                f"Ingestion did not complete (status={ingest_status!r}"
+                + (f", error={error!r}" if error else "")
+                + "). Refusing to sweep a partial or failed graph."
+            )
+            return 1
+
+        linearization = frontier_registry.build_linearization(args.repo_path, branch)
+        commit_metadata = mcp_server._git_commits(args.repo_path, None, branch)
+        db = mcp_server._db if mcp_server._db is not None else mcp_server.open_db(str(graph_path))
+        report = sweep(
+            db, args.repo_path, linearization, commit_metadata, branch=branch
+        )
+        report["ingest_status"] = ingest_status
+
+    print(json.dumps(report, indent=2))
+    print()
+    print(f"repo:                                     {report['repo_path']} @ {report['branch']}")
+    print(f"ingested head:                            {report['head_commit']}")
+    print(f"commits:                                  {report['commits']}")
+    print(f":depends-on facts (raw, deduped):         {report['dep_edges_total']}")
+    print(f":depends-on facts (measured population):  {report['measured_dep_edges_total']}")
+    print(f"module :path facts (raw, deduped):        {report['module_path_facts_total']}")
+    print(f"structurally affected W:                  {len(report['affected_positions'])}")
+    print(f"W actually misclassifying:                {len(report['misclassifying_positions'])}")
+    print()
+    print("                                          NARROW      WIDE")
+    print("  (narrow = file_entities as _preload_known_entities returns it: the")
+    print("   ts(W) :depends-on bound CONDITIONAL on #238's open close-side residual.")
+    print("   wide = file_entities rebuilt position-correctly at both ends: the")
+    print("   ts(W) :depends-on bound in ISOLATION.")
+    print("   EXCLUDED gap = #238's own close-side leak: its date bound drops")
+    print("   modules deleted later but dated earlier, inflating narrow's excluded")
+    print("   count relative to wide's.")
+    print("   INCLUDED gap is a DIFFERENT effect, not #238's leak: _preload_known_")
+    print("   entities pre-seeds file_entities from the current worktree's `git")
+    print("   ls-files` and never removes from it, so narrow admits every current-")
+    print("   worktree module at every W, including ones not yet introduced. A")
+    print("   NEGATIVE included gap (wide < narrow) is expected from that pre-seed")
+    print("   and is NOT evidence #245's inclusion exposure is small.)")
+    print(
+        f"  wrongly INCLUDED, position-weighted:    "
+        f"{report['narrow_wrongly_included_total_position_weighted']:<11}"
+        f"{report['wide_wrongly_included_total_position_weighted']}"
+    )
+    print(
+        f"  wrongly INCLUDED, distinct edges:       "
+        f"{report['narrow_wrongly_included_distinct_edges']:<11}"
+        f"{report['wide_wrongly_included_distinct_edges']}"
+    )
+    print(
+        f"  wrongly EXCLUDED, position-weighted:    "
+        f"{report['narrow_wrongly_excluded_total_position_weighted']:<11}"
+        f"{report['wide_wrongly_excluded_total_position_weighted']}"
+    )
+    print(
+        f"  wrongly EXCLUDED, distinct edges:       "
+        f"{report['narrow_wrongly_excluded_distinct_edges']:<11}"
+        f"{report['wide_wrongly_excluded_distinct_edges']}"
+    )
+    print()
+    print(f"preload returned zero deps at every W:    {report['preload_deps_empty_everywhere']}")
+    print(f"timestamp collisions:                     {report['timestamp_collisions']}")
+    print(f"unmappable :valid-from facts (measured):  {report['unmappable_valid_from_facts']}")
+    print(f"unmappable :valid-to facts (measured):    {report['unmappable_valid_to_facts']}")
+    print(f"unmappable module :path valid-from facts: {report['unmappable_module_path_valid_from']}")
+    print(f"unmappable module :path valid-to facts:   {report['unmappable_module_path_valid_to']}")
+    print(f"gitlink events:                           {report['gitlink_events']}")
+
+    # Emphasis is deliberately inverted from a naive reading: nonzero
+    # unmappable facts mean the position-inversion assumption this whole
+    # sweep rests on is broken for at least one fact -- either in the
+    # :depends-on measured population, or in the module :path facts that are
+    # WIDE's own raw material -- which invalidates the wrongly_included/
+    # wrongly_excluded numbers above. Zero gitlink events only NARROWS what
+    # was measured; it does not call the rest of the report into question.
+    measurement_invalid = (
+        report["unmappable_valid_from_facts"] > 0
+        or report["unmappable_valid_to_facts"] > 0
+        or report["unmappable_module_path_valid_from"] > 0
+        or report["unmappable_module_path_valid_to"] > 0
+    )
+    if measurement_invalid:
+        print()
+        print(
+            "INVALID MEASUREMENT: nonzero unmappable :valid-from/:valid-to facts,\n"
+            "on either the :depends-on edges or the module :path facts WIDE is\n"
+            "built from, mean the timestamp-to-position inversion this sweep\n"
+            "depends on is broken for at least one fact. The wrongly_included/\n"
+            "wrongly_excluded numbers above are not trustworthy until this is zero."
+        )
+    if report["preload_deps_empty_everywhere"]:
+        print()
+        print(
+            "NOTE: _preload_known_deps returned zero live deps at every affected\n"
+            "position. That may be a genuinely dep-free history, or it may be\n"
+            "_preload_known_deps' own bare `except Exception` (mcp_server.py:\n"
+            "7554-7555) swallowing a real query failure -- the two are\n"
+            "indistinguishable from this report alone. Check dep_edges_total\n"
+            "above: nonzero there with zero here is the signature of the latter."
+        )
+
+    if report["gitlink_events"] == 0:
+        print()
+        print(
+            "NOTE: zero gitlink events -- this history produces no :pinned-commit\n"
+            "facts, so #245's :pinned-commit half is UNMEASURABLE here. That is\n"
+            "not the same as zero risk; its field exposure remains unknown."
+        )
+
+    if args.json_out:
+        Path(args.json_out).write_text(json.dumps(report, indent=2))
+        print(f"\nWrote {args.json_out}")
+    return 1 if measurement_invalid else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
