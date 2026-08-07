@@ -19902,3 +19902,39 @@ class TestGatedWrapperIsInertWithoutAPolicy:
         assert mcp_server._ingest_progress["status"] == "complete"
         assert mcp_server._ingest_checkpoint_policy is None
         assert len(calls) > 0, "a completed ingestion must checkpoint at least once"
+
+
+class TestStageBDoesNotDoubleCheckpoint:
+    """#241: the sweep loop checkpoints after _correction_sweep_through_update,
+    so _forward_apply's own tail checkpoint on the lifecycle_only pass is a
+    pure duplicate -- it fires BEFORE the watermark advances, so a crash
+    between the two re-processes the commit either way."""
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_only_pass_issues_no_checkpoint(self, git_repo, monkeypatch):
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+            "error_at": None, "phase": None,
+        }
+        seen = []
+        real = mcp_server._db_checkpoint_gated
+
+        def spy(db):
+            frame = sys._getframe(1)
+            seen.append((frame.f_code.co_name, frame.f_locals.get("lifecycle_only")))
+            return real(db)
+
+        monkeypatch.setattr(mcp_server, "_db_checkpoint_gated", spy)
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert ("_forward_apply", True) not in seen, (
+            "_forward_apply must not checkpoint on the lifecycle_only pass -- "
+            f"the sweep loop already does. Saw: {seen}"
+        )
+        assert ("_forward_apply", False) in seen, (
+            "the Stage A forward pass must still checkpoint; a gate that "
+            f"suppressed both would pass the assertion above vacuously. Saw: {seen}"
+        )

@@ -9192,7 +9192,14 @@ def _forward_apply(
         # folds its own region in later (Task 9); this watermark must not be
         # advanced past the forward frontier before that happens.
         _lineage_confirmed_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
-    _db_checkpoint_gated(db)
+    # Stage B's lifecycle pass is followed immediately by
+    # _correction_sweep_through_update and a checkpoint in _run_ingestion's
+    # sweep loop, so checkpointing here would be a pure duplicate -- and it
+    # fires BEFORE the watermark advances, so a crash between the two
+    # re-processes the commit either way. Measured at 25% of all ingestion
+    # checkpoints and 10.3% of wall clock (#241).
+    if not lifecycle_only:
+        _db_checkpoint_gated(db)
     _commit_index_writer_safe(index_con)
 
 
