@@ -270,3 +270,20 @@ should be re-run once #242 (below) is fixed.
   whole run. Likely missed by earlier per-call attributions because the
   per-thread cProfile hook used for them was killing the `write_executor`
   threads it was attached to.
+
+## Ingestion Run — 20260807T125753Z
+
+- Repo: `.` @ `HEAD`
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 626 |
+| Final status | complete |
+| Wall-clock | 3009.61s |
+| Throughput | 12.5 commits/min |
+| Peak RSS | 611488 KB |
+| Graph size | 212938752 bytes |
+| Fact-index size | 87404544 bytes |
+| Status-query latency (min/p50/p99/max) | 0.1ms / 0.4ms / 10.7ms / 32.2ms |
+| Graph-query latency (min/p50/p99/max) | 0.7ms / 29.7ms / 2006.9ms / 2270.6ms |
+| Poll duty cycle (#242) | 8.65% over 864 polls |
