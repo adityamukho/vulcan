@@ -10,6 +10,40 @@ reference to join a :hash to, and so admit no position clause.
 
 This probe MEASURES that residual. It fixes nothing, and the oracle below is
 NOT a candidate fix -- see position_exact_live_edges' docstring.
+
+TWO figures, not one (final whole-branch review, CRITICAL finding). The first
+version of this probe held file_entities -- the output of
+_preload_known_entities -- fixed on both sides of the diff, on the claim that
+#238 made that narrowing position-correct and so left the ts(W) :depends-on
+bound as the single variable. That claim is FALSE. #238 made
+_preload_known_entities position-correct on the INTRODUCTION side only: its
+position clause keys on the introducing commit ([?e :introduced-by ?c]
+[?c :hash ?hash] -> hash_to_pos, mcp_server.py:7213-7215). Its CLOSE side is
+still governed by valid_at = T_hi(W), a date bound suffering the identical
+author-date inversion this probe exists to measure -- the function's own
+comment says so ("the date bound above only governs how widely entities closed
+ABOVE the watermark are re-admitted").
+
+Consequence: a module whose close DATE falls below ts(W) but whose close
+POSITION sits above W disappears from file_entities at that W, taking its
+:depends-on edges out of BOTH sides of the diff before the diff is computed.
+On this repository that is five modules deleted by df6b8be at position 124,
+and 30 misclassified edges that the narrow figure never saw.
+
+So the sweep reports both, side by side:
+
+  NARROW -- file_entities exactly as _preload_known_entities returns it. This
+    measures the ts(W) :depends-on bound CONDITIONAL ON #238's still-open
+    close-side residual: the entity preload has already discarded the modules
+    whose own close inverted, so what is left is only the edges that survived
+    that discard. It is the figure the shipped code produces today.
+
+  WIDE -- file_entities rebuilt position-correctly, from :path facts whose
+    both ends are inverted to positions. This measures the ts(W) :depends-on
+    bound IN ISOLATION, with the entity preload's own close-side defect
+    removed.
+
+The comparison between the two IS the finding. Neither alone is the number.
 """
 
 from __future__ import annotations
@@ -63,19 +97,40 @@ def affected_positions(commit_metadata: Sequence[CommitMeta]) -> List[int]:
     independent of any fact. It is what keeps the sweep off every position in
     the history.
 
-    W is exposed iff either direction is possible there:
+    W is exposed iff either structural condition holds. The UNION is what this
+    returns, and the union is what matters -- but do not read either condition
+    as belonging to one misclassification direction. Each condition enables one
+    of EACH direction, because the bound is half-open containment
+    [vf, vt) ∋ ts(W) (mcp_server._valid_time_window_clauses) and a fact's
+    CLOSE is date-bounded on exactly the same terms as its introduction:
 
-      wrong exclusion -- T_hi(W) > ts(W): some commit at position <= W carries
-      a LATER date. A fact introduced there is live at W but falls outside the
-      ts(W) bound, so the resuming walk cannot see it.
+      condition A -- min(ts[W+1..]) <= ts(W): some commit ABOVE W carries a
+      date at or below W's own.
+        * wrong INCLUSION via introduction: a fact introduced at that commit
+          has vf <= ts(W), so it passes the bound, but its introducing
+          position is above W -- the walk sees a future edge.
+        * wrong EXCLUSION via close: a fact CLOSED at that commit has
+          vt <= ts(W), so half-open containment rejects it, but its closing
+          position is above W -- the edge is still live at W and the walk
+          cannot see it.
 
-      wrong inclusion -- min(ts[W+1..]) <= ts(W): some commit ABOVE W carries a
-      date at or below W's own. A fact introduced there is not yet live at W
-      but falls inside the bound, so the resuming walk sees a future edge.
+      condition B -- T_hi(W) > ts(W): some commit at position <= W carries a
+      LATER date.
+        * wrong EXCLUSION via introduction: a fact introduced there has
+          vf > ts(W), outside the bound, though it is live at W.
+        * wrong INCLUSION via close: a fact CLOSED there has vt > ts(W), so
+          the bound still reads it as open, though its close position is at
+          or below W and the edge is already dead.
 
-    The wrong-inclusion test uses <=, not <, because the bound is half-open
-    containment [vf, vt) ∋ ts(W) (mcp_server._valid_time_window_clauses), whose
-    vf test is `<=` -- a fact starting exactly at the instant is live.
+    An earlier version of this docstring labelled condition A "wrong
+    inclusion" and condition B "wrong exclusion" outright, which is wrong and
+    was empirically decisive in the wrong direction: on this repository
+    positions 118-123 are flagged by condition A alone, and every one of them
+    misclassifies by wrong EXCLUSION -- via close, the arm the old labelling
+    did not name.
+
+    Condition A uses <=, not <, because the bound's vf test is `<=` -- a fact
+    starting exactly at the instant is live.
     """
     timestamps = [ts for _h, ts, _a, _s in commit_metadata]
     n = len(timestamps)
@@ -93,9 +148,13 @@ def affected_positions(commit_metadata: Sequence[CommitMeta]) -> List[int]:
 
     affected: List[int] = []
     for w in range(n):
-        wrong_exclusion = envelopes[w] > timestamps[w]
-        wrong_inclusion = suffix_min[w] is not None and suffix_min[w] <= timestamps[w]
-        if wrong_exclusion or wrong_inclusion:
+        # Named for the structural conditions, not for directions: see the
+        # docstring -- each one enables a wrong inclusion AND a wrong exclusion.
+        condition_b_later_dated_at_or_below_w = envelopes[w] > timestamps[w]
+        condition_a_earlier_dated_above_w = (
+            suffix_min[w] is not None and suffix_min[w] <= timestamps[w]
+        )
+        if condition_b_later_dated_at_or_below_w or condition_a_earlier_dated_above_w:
             affected.append(w)
     return affected
 
@@ -181,9 +240,24 @@ def position_exact_live_edges(
     device and nothing else. None of #245's three options resemble it.
 
     Restricted to edges whose source module appears in file_entities, mirroring
-    _preload_known_deps' own ident_to_file filter. That narrowing is already
-    position-correct after #238, so holding it fixed leaves the ts(W)
-    :depends-on bound as the single variable under measurement.
+    _preload_known_deps' own ident_to_file filter. WHICH file_entities the
+    caller passes is what selects the NARROW or the WIDE measurement, and the
+    two answer different questions:
+
+    - _preload_known_entities' own output -> NARROW. That narrowing is
+      position-correct on the INTRODUCTION side only; its close side is a
+      T_hi(W) date bound carrying the same inversion defect (see the module
+      docstring). So the narrow figure measures the ts(W) :depends-on bound
+      conditional on #238's still-open close-side residual, not in isolation.
+      An earlier version of this docstring claimed the narrowing was
+      position-correct outright and that holding it fixed left the
+      :depends-on bound as the single variable. It does not, and that claim
+      understated the measured exposure by ~16x.
+
+    - position_correct_file_entities' output -> WIDE. Both ends of each
+      module's :path fact inverted to positions, so the entity preload's own
+      defect is out of the picture and the :depends-on bound is measured
+      alone.
 
     An unmappable CLOSE (a non-sentinel vt_ms whose instant matches no commit)
     falls through here to vt_positions=[], which edge_live_at's `if
@@ -257,20 +331,134 @@ def load_dep_edges(db) -> List[Dict]:
     return edges
 
 
+def load_module_path_facts(db) -> List[Dict]:
+    """Every :path fact on a module entity, current and historical, with its
+    validity window.
+
+    The raw material for the WIDE measurement. Same clause-order rule as
+    load_dep_edges: [?e :path ?path] must be the EAV clause immediately
+    preceding the :db/valid-from / :db/valid-to pseudo-attributes, because
+    those bind to whichever EAV clause on ?e most recently precedes them.
+    Putting :entity-type between them would bind ?vf to the :entity-type
+    fact's window instead -- wrong, and silently so.
+
+    Restricted to :type/module deliberately. :path is also carried by
+    external-dependency entities, but _preload_known_deps keys its
+    ident_to_file on _code_ident("module", path); admitting a submodule path
+    there would synthesize a module ident for an entity that is not one.
+
+    Deduplicated on (path, vf, vt) for the same reason load_dep_edges dedupes:
+    an entity carrying more than one :entity-type fact across time would
+    otherwise multiply each :path row without changing any liveness answer.
+    A rename legitimately produces two DISTINCT (path, vf, vt) rows -- the old
+    path closed, the new one opened -- and both are kept, which is what makes
+    the set position-correct across renames.
+    """
+    import json
+
+    import mcp_server
+
+    raw = mcp_server._db_execute(
+        db,
+        "(query [:find ?path ?vf ?vt "
+        ":any-valid-time "
+        ":where [?e :entity-type :type/module] "
+        "[?e :path ?path] "
+        "[?e :db/valid-from ?vf] "
+        "[?e :db/valid-to ?vt]])",
+    )
+    seen = set()
+    facts = []
+    for path, vf, vt in json.loads(raw).get("results", []):
+        key = (path, int(vf), int(vt))
+        if key in seen:
+            continue
+        seen.add(key)
+        facts.append({"path": path, "vf_ms": int(vf), "vt_ms": int(vt)})
+    return facts
+
+
+def position_correct_file_entities(
+    path_facts: Sequence[Dict],
+    ts_positions: Dict[str, List[int]],
+    w: int,
+) -> Dict[str, List[str]]:
+    """The module paths genuinely live at position w, shaped like the
+    file_entities dict _preload_known_deps and position_exact_live_edges both
+    consume.
+
+    This is the WIDE side's replacement for _preload_known_entities' own
+    file_entities. It is position-correct at BOTH ends -- introduction and
+    close -- because it inverts both :db/valid-from and :db/valid-to through
+    the same primitives the edge oracle uses (invert_ms_to_positions,
+    edge_live_at), rather than trusting either against a date bound.
+
+    That second end is the whole point. A module deleted at a position ABOVE w
+    by a commit whose author date falls BELOW ts(w) -- the exact shape of
+    df6b8be at position 124 on this repository -- reads as already closed to
+    any date bound, and so vanishes from _preload_known_entities' output at w.
+    Here it stays live, because max(close positions) > w.
+
+    Values are empty lists: only the KEYS (the paths) are load-bearing
+    downstream. _preload_known_deps reads only `for file_path in
+    file_entities`, and position_exact_live_edges only
+    _code_ident("module", file_path) over the same keys.
+
+    Like everything else here, this is a measurement device and NOT a
+    candidate fix -- it needs the whole history in hand, which a resuming
+    forward walk does not have.
+    """
+    live: Dict[str, List[str]] = {}
+    for fact in path_facts:
+        vf_positions = invert_ms_to_positions(fact["vf_ms"], ts_positions)
+        vt_positions = (
+            None if fact["vt_ms"] >= VALID_TIME_FOREVER_MS
+            else invert_ms_to_positions(fact["vt_ms"], ts_positions)
+        )
+        if edge_live_at(vf_positions, vt_positions, w):
+            live.setdefault(fact["path"], [])
+    return live
+
+
 def sweep(
     db,
     repo_path: str,
     linearization: List[str],
     commit_metadata: Sequence[CommitMeta],
+    branch: Optional[str] = None,
 ) -> Dict:
     """Drive the REAL preload functions at each affected position and diff
-    against the oracle.
+    against the oracle, in BOTH the narrow and the wide entity framing.
 
     Calls the functions under test rather than a restatement of what we
     believe they do. On the #238 branch a reviewer and an implementer both
     simulated the counterfactual with a date bound instead of the real
     position-filtered one, which made an inadequate test look adequate and
     produced a false "bug not reachable" conclusion -- two fix rounds lost.
+
+    NARROW vs WIDE. Every misclassification count below appears twice. The
+    real _preload_known_deps is driven twice per position, differing only in
+    the file_entities handed to it:
+
+      narrow_* -- file_entities straight from _preload_known_entities. What
+        the shipped code produces today, and the only figure the first
+        version of this probe reported. It measures the ts(W) :depends-on
+        bound CONDITIONAL ON #238's still-open close-side residual: entities
+        whose own close inverted are already gone from file_entities, so
+        their edges never reach either side of the diff.
+
+      wide_* -- file_entities from position_correct_file_entities, both ends
+        inverted to positions. It measures the ts(W) :depends-on bound in
+        ISOLATION.
+
+    Neither is "the" number; the gap between them is the finding, and it is
+    what the module docstring explains. Reporting only the narrow one
+    understated this repository's exposure by ~16x.
+
+    provenance. repo_path alone was not enough to reproduce the first
+    recorded artifact -- it named a scratch directory that no longer exists,
+    with no branch and no head SHA. branch and head_commit are recorded here
+    so a future run carries its own.
 
     Three report fields exist purely to keep this sweep from lying quietly
     about itself (#245 review round):
@@ -279,11 +467,12 @@ def sweep(
       _preload_known_deps swallows its own query failure (bare `except
       Exception: return file_deps, dep_valid_from`, mcp_server.py:7554-7555)
       and returns ({}, {}) on any runtime error. That failure mode and "this
-      position genuinely has zero live deps" are indistinguishable from
-      wrongly_excluded_total alone -- both make every expected edge look
-      wrongly excluded. Recording len(actual) per position, and flagging the
-      all-positions-zero case explicitly, is what lets a reader tell them
-      apart.
+      position genuinely has zero live deps" are indistinguishable from a
+      *_wrongly_excluded_total alone -- both make every expected edge look
+      wrongly excluded. Recording each framing's actual and expected counts
+      per position, and flagging the all-positions-zero case explicitly, is
+      what lets a reader tell them apart. The flag keys on the NARROW actual,
+      the one the shipped code path produces.
 
     - unmappable_valid_from_facts / unmappable_valid_to_facts: counted only
       over the MEASURED population -- edges whose source module ident
@@ -297,10 +486,10 @@ def sweep(
       its docstring); that is the correct not-understating direction, but it
       is silent unless counted here.
 
-    wrongly_included_total / wrongly_excluded_total are position-weighted:
-    one edge misclassified at all N affected positions contributes N, not 1.
-    The distinct-edge counts alongside them are the union across positions,
-    for whichever unit the reader actually wants.
+    Every *_total_position_weighted is position-weighted: one edge
+    misclassified at all N affected positions contributes N, not 1. The
+    distinct-edge counts alongside them are the union across positions, for
+    whichever unit the reader actually wants.
     """
     import mcp_server
 
@@ -324,39 +513,87 @@ def sweep(
     envelopes = resume_envelopes(commit_metadata)
     timestamps = [ts for _h, ts, _a, _s in commit_metadata]
     edges = load_dep_edges(db)
+    path_facts = load_module_path_facts(db)
     collisions = {ts: pos for ts, pos in ts_positions.items() if len(pos) > 1}
 
     per_position = []
     actual_dep_counts_by_position = []
     measured_src_idents: set = set()
     for w in affected_positions(commit_metadata):
+        valid_at_ms = mcp_server._iso_to_epoch_ms(timestamps[w])
+
         (
             _entity_valid_from, _entity_descriptions, _entity_introduced_by,
-            file_entities, _submodule_paths,
+            narrow_file_entities, _submodule_paths,
         ) = mcp_server._preload_known_entities(
             db, repo_path, valid_at=envelopes[w],
             hash_to_pos=hash_to_pos, watermark_pos=w,
         )
-        measured_src_idents.update(
-            mcp_server._code_ident("module", file_path) for file_path in file_entities
-        )
-        _file_deps, dep_valid_from = mcp_server._preload_known_deps(
-            db, file_entities,
-            valid_at_ms=mcp_server._iso_to_epoch_ms(timestamps[w]),
-        )
-        actual = set(dep_valid_from.keys())
-        actual_dep_counts_by_position.append({"position": w, "actual_count": len(actual)})
-        expected = position_exact_live_edges(edges, ts_positions, file_entities, w)
+        wide_file_entities = position_correct_file_entities(path_facts, ts_positions, w)
 
-        wrongly_included = sorted(actual - expected)
-        wrongly_excluded = sorted(expected - actual)
-        if wrongly_included or wrongly_excluded:
+        # The measured population spans BOTH framings: an edge the narrow
+        # entity set drops but the wide one keeps still enters the oracle, so
+        # an unmappable timestamp on it still invalidates a reported number.
+        measured_src_idents.update(
+            mcp_server._code_ident("module", file_path)
+            for file_path in (set(narrow_file_entities) | set(wide_file_entities))
+        )
+
+        # The SAME unmodified _preload_known_deps on both sides. Only the
+        # file_entities differ -- that is the single variable this comparison
+        # isolates.
+        _narrow_file_deps, narrow_dep_valid_from = mcp_server._preload_known_deps(
+            db, narrow_file_entities, valid_at_ms=valid_at_ms,
+        )
+        _wide_file_deps, wide_dep_valid_from = mcp_server._preload_known_deps(
+            db, wide_file_entities, valid_at_ms=valid_at_ms,
+        )
+        narrow_actual = set(narrow_dep_valid_from.keys())
+        wide_actual = set(wide_dep_valid_from.keys())
+
+        narrow_expected = position_exact_live_edges(
+            edges, ts_positions, narrow_file_entities, w
+        )
+        wide_expected = position_exact_live_edges(
+            edges, ts_positions, wide_file_entities, w
+        )
+
+        actual_dep_counts_by_position.append({
+            "position": w,
+            "narrow_actual_count": len(narrow_actual),
+            "narrow_expected_count": len(narrow_expected),
+            "wide_actual_count": len(wide_actual),
+            "wide_expected_count": len(wide_expected),
+            "narrow_module_count": len(narrow_file_entities),
+            "wide_module_count": len(wide_file_entities),
+            # The counts alone are NOT enough: they can match while the sets
+            # differ. Measured on a synthetic inverted-date repo, both sides
+            # held 3 modules at the affected position while the narrow side
+            # had dropped the deleted-later module and admitted a
+            # not-yet-introduced one (_preload_known_entities pre-seeds
+            # file_entities from `git ls-files` on the CURRENT worktree, so
+            # its errors cancel in the count). These two are the direct
+            # evidence of the entity preload's close-side residual.
+            "modules_wide_only": len(set(wide_file_entities) - set(narrow_file_entities)),
+            "modules_narrow_only": len(set(narrow_file_entities) - set(wide_file_entities)),
+        })
+
+        narrow_wrongly_included = sorted(narrow_actual - narrow_expected)
+        narrow_wrongly_excluded = sorted(narrow_expected - narrow_actual)
+        wide_wrongly_included = sorted(wide_actual - wide_expected)
+        wide_wrongly_excluded = sorted(wide_expected - wide_actual)
+        if (
+            narrow_wrongly_included or narrow_wrongly_excluded
+            or wide_wrongly_included or wide_wrongly_excluded
+        ):
             per_position.append({
                 "position": w,
                 "commit": linearization[w],
                 "date": timestamps[w],
-                "wrongly_included": [list(e) for e in wrongly_included],
-                "wrongly_excluded": [list(e) for e in wrongly_excluded],
+                "narrow_wrongly_included": [list(e) for e in narrow_wrongly_included],
+                "narrow_wrongly_excluded": [list(e) for e in narrow_wrongly_excluded],
+                "wide_wrongly_included": [list(e) for e in wide_wrongly_included],
+                "wide_wrongly_excluded": [list(e) for e in wide_wrongly_excluded],
             })
 
     measured_edges = [e for e in edges if e["src"] in measured_src_idents]
@@ -370,34 +607,55 @@ def sweep(
         and not invert_ms_to_positions(e["vt_ms"], ts_positions)
     )
 
+    # Keyed on the NARROW actual: that is the one produced by the shipped
+    # code path, so it is the one whose all-zero signature would mean
+    # _preload_known_deps' bare `except Exception` ate a real failure.
     preload_deps_empty_everywhere = bool(actual_dep_counts_by_position) and all(
-        c["actual_count"] == 0 for c in actual_dep_counts_by_position
+        c["narrow_actual_count"] == 0 for c in actual_dep_counts_by_position
     )
 
-    distinct_wrongly_included = {
-        tuple(e) for p in per_position for e in p["wrongly_included"]
-    }
-    distinct_wrongly_excluded = {
-        tuple(e) for p in per_position for e in p["wrongly_excluded"]
-    }
+    def _distinct(key: str) -> int:
+        return len({tuple(e) for p in per_position for e in p[key]})
 
     return {
         "repo_path": repo_path,
+        "branch": branch,
+        # The ingested head, taken from the linearization rather than from a
+        # fresh `git rev-parse`: it is the commit this sweep's graph actually
+        # ends at, which a later rev-parse of the same branch need not be.
+        "head_commit": linearization[-1] if linearization else None,
         "commits": len(linearization),
         "dep_edges_total": len(edges),
         "measured_dep_edges_total": len(measured_edges),
+        "module_path_facts_total": len(path_facts),
         "affected_positions": affected_positions(commit_metadata),
         "misclassifying_positions": per_position,
         "actual_dep_counts_by_position": actual_dep_counts_by_position,
         "preload_deps_empty_everywhere": preload_deps_empty_everywhere,
-        "wrongly_included_total_position_weighted": sum(
-            len(p["wrongly_included"]) for p in per_position
+
+        # NARROW -- file_entities as _preload_known_entities returns it. The
+        # shipped behaviour, and the ts(W) :depends-on bound measured
+        # CONDITIONAL ON #238's still-open close-side residual.
+        "narrow_wrongly_included_total_position_weighted": sum(
+            len(p["narrow_wrongly_included"]) for p in per_position
         ),
-        "wrongly_excluded_total_position_weighted": sum(
-            len(p["wrongly_excluded"]) for p in per_position
+        "narrow_wrongly_excluded_total_position_weighted": sum(
+            len(p["narrow_wrongly_excluded"]) for p in per_position
         ),
-        "wrongly_included_distinct_edges": len(distinct_wrongly_included),
-        "wrongly_excluded_distinct_edges": len(distinct_wrongly_excluded),
+        "narrow_wrongly_included_distinct_edges": _distinct("narrow_wrongly_included"),
+        "narrow_wrongly_excluded_distinct_edges": _distinct("narrow_wrongly_excluded"),
+
+        # WIDE -- file_entities rebuilt position-correctly at BOTH ends. The
+        # ts(W) :depends-on bound measured in ISOLATION.
+        "wide_wrongly_included_total_position_weighted": sum(
+            len(p["wide_wrongly_included"]) for p in per_position
+        ),
+        "wide_wrongly_excluded_total_position_weighted": sum(
+            len(p["wide_wrongly_excluded"]) for p in per_position
+        ),
+        "wide_wrongly_included_distinct_edges": _distinct("wide_wrongly_included"),
+        "wide_wrongly_excluded_distinct_edges": _distinct("wide_wrongly_excluded"),
+
         "timestamp_collisions": len(collisions),
         "unmappable_valid_from_facts": unmappable_vf,
         "unmappable_valid_to_facts": unmappable_vt,
@@ -486,20 +744,49 @@ def main() -> int:
         linearization = frontier_registry.build_linearization(args.repo_path, branch)
         commit_metadata = mcp_server._git_commits(args.repo_path, None, branch)
         db = mcp_server._db if mcp_server._db is not None else mcp_server.open_db(str(graph_path))
-        report = sweep(db, args.repo_path, linearization, commit_metadata)
+        report = sweep(
+            db, args.repo_path, linearization, commit_metadata, branch=branch
+        )
         report["ingest_status"] = ingest_status
 
     print(json.dumps(report, indent=2))
     print()
-    print(f"commits:                                 {report['commits']}")
+    print(f"repo:                                     {report['repo_path']} @ {report['branch']}")
+    print(f"ingested head:                            {report['head_commit']}")
+    print(f"commits:                                  {report['commits']}")
     print(f":depends-on facts (raw, deduped):         {report['dep_edges_total']}")
     print(f":depends-on facts (measured population):  {report['measured_dep_edges_total']}")
+    print(f"module :path facts (raw, deduped):        {report['module_path_facts_total']}")
     print(f"structurally affected W:                  {len(report['affected_positions'])}")
     print(f"W actually misclassifying:                {len(report['misclassifying_positions'])}")
-    print(f"  wrongly INCLUDED, position-weighted:    {report['wrongly_included_total_position_weighted']}")
-    print(f"  wrongly INCLUDED, distinct edges:       {report['wrongly_included_distinct_edges']}")
-    print(f"  wrongly EXCLUDED, position-weighted:    {report['wrongly_excluded_total_position_weighted']}")
-    print(f"  wrongly EXCLUDED, distinct edges:       {report['wrongly_excluded_distinct_edges']}")
+    print()
+    print("                                          NARROW      WIDE")
+    print("  (narrow = file_entities as _preload_known_entities returns it: the")
+    print("   ts(W) :depends-on bound CONDITIONAL on #238's open close-side residual.")
+    print("   wide = file_entities rebuilt position-correctly at both ends: the")
+    print("   ts(W) :depends-on bound in ISOLATION. The gap between them is #238's")
+    print("   own close-side leak, not #245's.)")
+    print(
+        f"  wrongly INCLUDED, position-weighted:    "
+        f"{report['narrow_wrongly_included_total_position_weighted']:<11}"
+        f"{report['wide_wrongly_included_total_position_weighted']}"
+    )
+    print(
+        f"  wrongly INCLUDED, distinct edges:       "
+        f"{report['narrow_wrongly_included_distinct_edges']:<11}"
+        f"{report['wide_wrongly_included_distinct_edges']}"
+    )
+    print(
+        f"  wrongly EXCLUDED, position-weighted:    "
+        f"{report['narrow_wrongly_excluded_total_position_weighted']:<11}"
+        f"{report['wide_wrongly_excluded_total_position_weighted']}"
+    )
+    print(
+        f"  wrongly EXCLUDED, distinct edges:       "
+        f"{report['narrow_wrongly_excluded_distinct_edges']:<11}"
+        f"{report['wide_wrongly_excluded_distinct_edges']}"
+    )
+    print()
     print(f"preload returned zero deps at every W:    {report['preload_deps_empty_everywhere']}")
     print(f"timestamp collisions:                     {report['timestamp_collisions']}")
     print(f"unmappable :valid-from facts (measured):  {report['unmappable_valid_from_facts']}")

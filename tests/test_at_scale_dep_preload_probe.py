@@ -30,6 +30,22 @@ META = [
 ]
 
 
+class TestSentinelMirrorsMcpServer:
+    """The probe duplicates minigraf's forever sentinel rather than importing
+    it, so the analysis primitives stay importable without opening a graph.
+    That duplication was guarded only by a comment saying "keep them
+    identical" -- and the import of VALID_TIME_FOREVER_MS in this module was
+    left unused (ruff F401), which is the assertion that was written and then
+    lost. If the two ever diverge, every open edge is misread as CLOSED at a
+    nonsense position and the whole measurement silently changes value.
+    """
+
+    def test_forever_sentinel_matches_the_value_mcp_server_writes(self):
+        import mcp_server
+
+        assert VALID_TIME_FOREVER_MS == mcp_server._VALID_TIME_FOREVER_MS
+
+
 class TestBuildTsPositions:
     def test_maps_each_timestamp_to_its_positions(self):
         assert build_ts_positions(META)["2026-01-01T00:00:00Z"] == [0]
@@ -119,17 +135,113 @@ import pytest
 
 from evals.at_scale.probe_dep_preload_exposure import (
     gitlink_event_count,
+    position_correct_file_entities,
     position_exact_live_edges,
 )
+
+# Epoch-ms for META's dates, so a fact can be pinned to a known POSITION.
+MS = {
+    0: 1767225600000,  # 2026-01-01, position 0
+    1: 1767571200000,  # 2026-01-05, position 1
+    2: 1767312000000,  # 2026-01-02, position 2  <- INVERTED: later pos, earlier date
+    3: 1767657600000,  # 2026-01-06, positions 3 AND 4 (collision)
+}
+
+
+class TestPositionCorrectFileEntities:
+    """The WIDE measurement's entity set, and the reason it exists.
+
+    Final whole-branch review, CRITICAL finding: _preload_known_entities is
+    position-correct on the INTRODUCTION side only (its position clause keys
+    on the introducing commit's hash). Its CLOSE side is still valid_at =
+    T_hi(W), a date bound carrying the identical author-date inversion the
+    probe exists to measure. A module whose close DATE falls below ts(W) but
+    whose close POSITION sits above W therefore vanishes from file_entities
+    at W -- taking its :depends-on edges out of BOTH sides of the diff before
+    the diff is computed, and understating the measurement.
+
+    The first test below is that exact case, and it is the one that was
+    invisible: on this repository, five modules deleted by df6b8be at
+    position 124 and 30 misclassified edges.
+    """
+
+    def _ts_positions(self):
+        return build_ts_positions(META)
+
+    def test_close_date_below_the_watermark_but_close_position_above_it_stays_live(self):
+        # vulcan.py is closed by the commit at POSITION 2, whose date
+        # (2026-01-02) is EARLIER than position 1's own (2026-01-05).
+        #
+        # A date bound at W=1 sees vt = 01-02 <= ts(W) = 01-05 and calls the
+        # module closed -- that is _preload_known_entities' close side, and it
+        # is wrong. Position-correctly, the close is at position 2 > 1, so the
+        # module is still live at W=1.
+        facts = [{"path": "vulcan.py", "vf_ms": MS[0], "vt_ms": MS[2]}]
+
+        assert "vulcan.py" in position_correct_file_entities(facts, self._ts_positions(), w=1)
+        # And it is correctly GONE from position 2 onward, where the close
+        # genuinely lands.
+        assert position_correct_file_entities(facts, self._ts_positions(), w=2) == {}
+
+    def test_open_module_is_live_from_its_introduction_onward(self):
+        facts = [{"path": "a.py", "vf_ms": MS[1], "vt_ms": VALID_TIME_FOREVER_MS}]
+        ts_positions = self._ts_positions()
+
+        assert position_correct_file_entities(facts, ts_positions, w=0) == {}
+        assert set(position_correct_file_entities(facts, ts_positions, w=1)) == {"a.py"}
+        assert set(position_correct_file_entities(facts, ts_positions, w=4)) == {"a.py"}
+
+    def test_shape_matches_the_file_entities_dict_its_consumers_expect(self):
+        # _preload_known_deps and position_exact_live_edges both read only the
+        # KEYS; the values must still be lists so the dict is drop-in.
+        facts = [{"path": "a.py", "vf_ms": MS[0], "vt_ms": VALID_TIME_FOREVER_MS}]
+        result = position_correct_file_entities(facts, self._ts_positions(), w=0)
+        assert result == {"a.py": []}
+
+    def test_a_rename_keeps_each_path_live_only_over_its_own_window(self):
+        # Two distinct (path, vf, vt) rows, as load_module_path_facts returns
+        # for a renamed module: old closed at position 2, new opened there.
+        facts = [
+            {"path": "old.py", "vf_ms": MS[0], "vt_ms": MS[2]},
+            {"path": "new.py", "vf_ms": MS[2], "vt_ms": VALID_TIME_FOREVER_MS},
+        ]
+        ts_positions = self._ts_positions()
+
+        assert set(position_correct_file_entities(facts, ts_positions, w=0)) == {"old.py"}
+        assert set(position_correct_file_entities(facts, ts_positions, w=2)) == {"new.py"}
+
+    def test_ambiguous_close_takes_the_latest_colliding_position(self):
+        # MS[3] collides across positions 3 and 4. edge_live_at resolves an
+        # ambiguous close to the LATEST -- the direction that cannot
+        # understate exposure -- so the module survives w=3 and dies at w=4.
+        facts = [{"path": "a.py", "vf_ms": MS[0], "vt_ms": MS[3]}]
+        ts_positions = self._ts_positions()
+
+        assert set(position_correct_file_entities(facts, ts_positions, w=3)) == {"a.py"}
+        assert position_correct_file_entities(facts, ts_positions, w=4) == {}
+
+    def test_an_unmappable_introduction_is_not_live_anywhere(self):
+        facts = [{"path": "a.py", "vf_ms": 1, "vt_ms": VALID_TIME_FOREVER_MS}]
+        ts_positions = self._ts_positions()
+
+        assert all(
+            position_correct_file_entities(facts, ts_positions, w=w) == {}
+            for w in range(len(META))
+        )
 
 
 class TestPositionExactLiveEdges:
     """The oracle restricts to edges whose SOURCE MODULE is present in
     file_entities at W, mirroring _preload_known_deps' own ident_to_file
-    filter (mcp_server.py:7526-7535, 7558-7560). That narrowing is already
-    position-correct after #238, so isolating it out leaves the :depends-on
-    bound as the only variable under measurement -- which is exactly #245's
-    residual class."""
+    filter (mcp_server.py:7526-7535, 7558-7560).
+
+    WHICH file_entities the caller passes selects the NARROW measurement
+    (_preload_known_entities' own output, position-correct on the
+    introduction side only) or the WIDE one
+    (position_correct_file_entities', correct at both ends). An earlier
+    version of this docstring asserted the narrowing was position-correct
+    outright and that holding it fixed isolated the :depends-on bound. It
+    does not -- see TestPositionCorrectFileEntities."""
 
     def _edges(self):
         return [
@@ -266,3 +378,32 @@ class TestIngestIntoSurfacesStatus:
 
         assert branch == "HEAD"
         assert status == "complete"
+
+
+class TestLoadModulePathFacts:
+    """Against a REAL ingested graph, because the failure mode this guards is
+    silent: a wrong clause order or a mistyped attribute returns zero rows
+    without raising, which would make position_correct_file_entities empty at
+    every position and the WIDE figure a confident, meaningless zero."""
+
+    @pytest.mark.asyncio
+    async def test_returns_a_windowed_fact_for_every_ingested_module(self, git_repo, tmp_path):
+        from evals.at_scale.probe_dep_preload_exposure import load_module_path_facts
+        import mcp_server
+
+        graph_path = tmp_path / "probe.graph"
+        _branch, status = await _ingest_into(str(git_repo), "HEAD", graph_path)
+        assert status == "complete"
+
+        # Same handle recovery main() does: _run_ingestion may leave _db None.
+        db = mcp_server._db or mcp_server.open_db(str(graph_path))
+        facts = load_module_path_facts(db)
+
+        assert {f["path"] for f in facts} == {"auth.py", "models.py"}
+        for f in facts:
+            assert isinstance(f["vf_ms"], int)
+            assert isinstance(f["vt_ms"], int)
+            # Neither module is ever deleted in this fixture, so both must
+            # still carry the open sentinel -- a stray finite vt here would
+            # mean the pseudo-attributes bound to the wrong EAV clause.
+            assert f["vt_ms"] == VALID_TIME_FOREVER_MS
