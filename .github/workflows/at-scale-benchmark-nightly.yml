@@ -20,7 +20,25 @@ permissions:
 jobs:
   at-scale-benchmark:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 360 minutes is GitHub's ceiling for hosted runners, and it is deliberate
+    # rather than generous. This job budgeted 30 minutes and was CANCELLED every
+    # night from 2026-08-03 to 2026-08-07 for exceeding it -- ingestion alone
+    # measured 3009s (50.2 min) locally for 626 commits on 2026-08-07, on
+    # hardware faster than a hosted runner, and the query benchmark runs after
+    # it. Ingestion cost grows with this repo's commit count (and superlinearly
+    # with graph size -- see #241), so any tight budget is a recurring failure
+    # waiting to happen; the ceiling is the only value that does not need
+    # revisiting on a schedule.
+    #
+    # Accepted trade-off: a genuinely hung run now burns up to 6h of Actions
+    # time before failing, where it used to surface in 30 minutes. That is
+    # tolerable because the known hang cause -- the in-flight poller starving
+    # the ingestion it measured (#242) -- is fixed, and the poll duty cycle is
+    # now recorded in each entry so a recurrence is visible in the numbers.
+    #
+    # Revisit by splitting ingestion and the query benchmark into separate jobs
+    # if the pair stops fitting, rather than by trimming this back.
+    timeout-minutes: 360
     steps:
       - name: Checkout repository (full history)
         uses: actions/checkout@v4
