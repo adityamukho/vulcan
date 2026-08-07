@@ -56,6 +56,21 @@ class TestAppendIngestionReport:
         assert "4.20%" in text  # poll_duty_fraction=0.042 -> 4.20%
         assert "over 5 polls" in text  # poll_count=5
 
+    def test_poll_duty_cycle_row_still_renders_for_a_pre_fix_result(self, tmp_path):
+        # Every result JSON written before 2026-08-07 lacks the #242 poll
+        # keys. Re-rendering one used to raise KeyError; the row must instead
+        # render and say so, matching benchmark.md's own "treat its absence as
+        # unmeasured, assume inflated" framing.
+        pre_fix = {
+            k: v for k, v in SAMPLE_METRICS.items()
+            if k not in ("poll_count", "poll_duty_fraction")
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(pre_fix, report_path)
+        text = report_path.read_text()
+        assert "Poll duty cycle (#242)" in text
+        assert "not measured" in text
+
 
 SAMPLE_QUERY_RESULTS = [
     {

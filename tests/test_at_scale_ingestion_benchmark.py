@@ -46,12 +46,18 @@ class TestRunIngestionBenchmark:
             "poll_count", "poll_duty_fraction", "poll_offsets",
         }
 
-    @pytest.mark.asyncio
-    async def test_poll_duty_fraction_is_a_bounded_fraction(self, git_repo, tmp_path):
-        graph_path = tmp_path / "bench.graph"
-        metrics = await run_ingestion_benchmark(str(git_repo), "HEAD", graph_path, poll_interval=0.05)
-        assert metrics["poll_count"] == len(metrics["poll_offsets"])
-        assert 0.0 <= metrics["poll_duty_fraction"] <= 1.0
+    # test_poll_duty_fraction_is_a_bounded_fraction was DELETED here (final
+    # whole-branch review). Both of its assertions were tautologies:
+    # poll_count is *defined* as len(poll_offsets)
+    # (run_ingestion_benchmark.py:171), and poll_duty_fraction is a serial sum
+    # of latencies measured INSIDE the same wall_clock it divides by
+    # (:148-149), so 0.0 <= f <= 1.0 cannot fail. It had zero discriminating
+    # power while being counted as #242 coverage -- the exact pattern this
+    # project has already shipped four times. Its only non-vacuous content
+    # (key presence) is covered by test_returns_expected_metric_keys above,
+    # and the real offsets/samples alignment by
+    # TestPollerDoesNotStarveTheEventLoop::test_returns_poll_offsets_aligned_with_samples,
+    # which is ablation-proven.
 
     @pytest.mark.asyncio
     async def test_ingests_all_commits(self, git_repo, tmp_path):
