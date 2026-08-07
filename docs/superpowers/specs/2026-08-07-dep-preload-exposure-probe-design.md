@@ -75,7 +75,7 @@ the inverted cluster. Of those five commits, two churn Python imports:
 
 | pos | commit | change |
 |---|---|---|
-| 124 | `df6b8be` | deletes `vulcan.py` and four test modules — heavy dep-edge removal |
+| 124 | `df6b8be` | deletes `vulcan.py` and three test modules — heavy dep-edge removal |
 | 125 | `0496d24` | "style: remove unused imports from conftest.py" — nothing but dep edges |
 | 126 | `2d756e2` | `pyproject.toml`, `requirements.txt` — no `.py` |
 | 127 | `5fbc354` | `ROADMAP.md` only |
@@ -117,8 +117,15 @@ outright, and the probe was built on that claim. **It is false, and it cost the
 measurement a factor of ~16.** A module whose close *date* falls below `ts(W)`
 but whose close *position* sits above `W` vanishes from `file_entities` at `W`,
 so its `:depends-on` edges never reach either side of the probe's diff. On this
-repository that is five modules deleted by `df6b8be` at position 124
-(`vulcan.py` plus four test modules) and 30 misclassified edges.
+repository that is four modules deleted by `df6b8be` at position 124
+(`vulcan.py` plus three test modules) and 30 misclassified edges.
+
+Both figures are now measured, not estimated. The 2026-08-07 run confirms the
+factor exactly: `narrow_wrongly_excluded_distinct_edges` 2 vs
+`wide_wrongly_excluded_distinct_edges` **32**, with `wide_expected_count` 68
+against `narrow_expected_count` 38 at each of positions 118-123, and
+`modules_wide_only` **4**. See
+`evals/at_scale/results/245-dep-preload-exposure.json`.
 
 Consequences for the design:
 

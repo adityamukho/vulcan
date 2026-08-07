@@ -162,7 +162,7 @@ class TestPositionCorrectFileEntities:
     the diff is computed, and understating the measurement.
 
     The first test below is that exact case, and it is the one that was
-    invisible: on this repository, five modules deleted by df6b8be at
+    invisible: on this repository, four modules deleted by df6b8be at
     position 124 and 30 misclassified edges.
     """
 

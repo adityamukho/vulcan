@@ -1,8 +1,11 @@
 {
   "repo_path": "/tmp/claude-1000/-home-aditya-Work-AMC-Minigraf-temporal-reasoning/a14e01bb-ebe0-4f07-b3d1-9318d0c0c0be/scratchpad/master-checkout",
+  "branch": "master",
+  "head_commit": "a1c4a5f777643c9f78238d1c86347c318db14f92",
   "commits": 610,
   "dep_edges_total": 358,
-  "measured_dep_edges_total": 298,
+  "measured_dep_edges_total": 331,
+  "module_path_facts_total": 51,
   "affected_positions": [
     118,
     119,
@@ -21,8 +24,8 @@
       "position": 118,
       "commit": "24d8460b83606a85972adf3fb6e5c45e89925449",
       "date": "2026-04-26T12:57:34Z",
-      "wrongly_included": [],
-      "wrongly_excluded": [
+      "narrow_wrongly_included": [],
+      "narrow_wrongly_excluded": [
         [
           ":module/tests-conftest-py",
           ":module/os"
@@ -30,6 +33,137 @@
         [
           ":module/tests-conftest-py",
           ":module/tempfile"
+        ]
+      ],
+      "wide_wrongly_included": [],
+      "wide_wrongly_excluded": [
+        [
+          ":module/tests-conftest-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-conftest-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/importlib"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/json"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/report-issue-py"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/subprocess"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/unittest-mock"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/urllib-parse"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/json"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/logging"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/os"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/pathlib"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/re"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/subprocess"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/sys"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/time"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/typing"
         ]
       ]
     },
@@ -37,8 +171,8 @@
       "position": 119,
       "commit": "3ef8a3e7a69bdf58c379d062f6739b7c476bf2fb",
       "date": "2026-04-26T12:58:03Z",
-      "wrongly_included": [],
-      "wrongly_excluded": [
+      "narrow_wrongly_included": [],
+      "narrow_wrongly_excluded": [
         [
           ":module/tests-conftest-py",
           ":module/os"
@@ -46,6 +180,137 @@
         [
           ":module/tests-conftest-py",
           ":module/tempfile"
+        ]
+      ],
+      "wide_wrongly_included": [],
+      "wide_wrongly_excluded": [
+        [
+          ":module/tests-conftest-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-conftest-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/importlib"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/json"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/report-issue-py"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/subprocess"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/unittest-mock"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/urllib-parse"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/json"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/logging"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/os"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/pathlib"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/re"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/subprocess"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/sys"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/time"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/typing"
         ]
       ]
     },
@@ -53,8 +318,8 @@
       "position": 120,
       "commit": "3d56441394e0c2bae1c30b7c4ed9c8e26cf642ae",
       "date": "2026-04-26T13:00:10Z",
-      "wrongly_included": [],
-      "wrongly_excluded": [
+      "narrow_wrongly_included": [],
+      "narrow_wrongly_excluded": [
         [
           ":module/tests-conftest-py",
           ":module/os"
@@ -62,6 +327,137 @@
         [
           ":module/tests-conftest-py",
           ":module/tempfile"
+        ]
+      ],
+      "wide_wrongly_included": [],
+      "wide_wrongly_excluded": [
+        [
+          ":module/tests-conftest-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-conftest-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/importlib"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/json"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/report-issue-py"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/subprocess"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/unittest-mock"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/urllib-parse"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/json"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/logging"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/os"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/pathlib"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/re"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/subprocess"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/sys"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/time"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/typing"
         ]
       ]
     },
@@ -69,8 +465,8 @@
       "position": 121,
       "commit": "c1ccc9af9ad97850d520ef0471017891d6013cca",
       "date": "2026-05-02T13:12:41Z",
-      "wrongly_included": [],
-      "wrongly_excluded": [
+      "narrow_wrongly_included": [],
+      "narrow_wrongly_excluded": [
         [
           ":module/tests-conftest-py",
           ":module/os"
@@ -78,6 +474,137 @@
         [
           ":module/tests-conftest-py",
           ":module/tempfile"
+        ]
+      ],
+      "wide_wrongly_included": [],
+      "wide_wrongly_excluded": [
+        [
+          ":module/tests-conftest-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-conftest-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/importlib"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/json"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/report-issue-py"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/subprocess"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/unittest-mock"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/urllib-parse"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/json"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/logging"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/os"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/pathlib"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/re"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/subprocess"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/sys"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/time"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/typing"
         ]
       ]
     },
@@ -85,8 +612,8 @@
       "position": 122,
       "commit": "ead40c4c97bd705604ad622991aeb44a23c33923",
       "date": "2026-05-02T13:13:10Z",
-      "wrongly_included": [],
-      "wrongly_excluded": [
+      "narrow_wrongly_included": [],
+      "narrow_wrongly_excluded": [
         [
           ":module/tests-conftest-py",
           ":module/os"
@@ -94,6 +621,137 @@
         [
           ":module/tests-conftest-py",
           ":module/tempfile"
+        ]
+      ],
+      "wide_wrongly_included": [],
+      "wide_wrongly_excluded": [
+        [
+          ":module/tests-conftest-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-conftest-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/importlib"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/json"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/report-issue-py"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/subprocess"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/unittest-mock"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/urllib-parse"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/json"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/logging"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/os"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/pathlib"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/re"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/subprocess"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/sys"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/time"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/typing"
         ]
       ]
     },
@@ -101,8 +759,8 @@
       "position": 123,
       "commit": "3ba7a507db064474bbc2a61b6f9db522e9808b73",
       "date": "2026-05-02T13:13:20Z",
-      "wrongly_included": [],
-      "wrongly_excluded": [
+      "narrow_wrongly_included": [],
+      "narrow_wrongly_excluded": [
         [
           ":module/tests-conftest-py",
           ":module/os"
@@ -111,63 +769,277 @@
           ":module/tests-conftest-py",
           ":module/tempfile"
         ]
+      ],
+      "wide_wrongly_included": [],
+      "wide_wrongly_excluded": [
+        [
+          ":module/tests-conftest-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-conftest-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/importlib"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/json"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/report-issue-py"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/subprocess"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/unittest-mock"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/urllib-parse"
+        ],
+        [
+          ":module/tests-test-advanced-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-harness-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/pytest"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/sys"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/tempfile"
+        ],
+        [
+          ":module/tests-test-vulcan-py",
+          ":module/vulcan-py"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/json"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/logging"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/os"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/pathlib"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/re"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/subprocess"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/sys"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/time"
+        ],
+        [
+          ":module/vulcan-py",
+          ":module/typing"
+        ]
       ]
     }
   ],
   "actual_dep_counts_by_position": [
     {
       "position": 118,
-      "actual_count": 36
+      "narrow_actual_count": 36,
+      "narrow_expected_count": 38,
+      "wide_actual_count": 36,
+      "wide_expected_count": 68,
+      "narrow_module_count": 43,
+      "wide_module_count": 10,
+      "modules_wide_only": 4,
+      "modules_narrow_only": 37
     },
     {
       "position": 119,
-      "actual_count": 36
+      "narrow_actual_count": 36,
+      "narrow_expected_count": 38,
+      "wide_actual_count": 36,
+      "wide_expected_count": 68,
+      "narrow_module_count": 43,
+      "wide_module_count": 10,
+      "modules_wide_only": 4,
+      "modules_narrow_only": 37
     },
     {
       "position": 120,
-      "actual_count": 36
+      "narrow_actual_count": 36,
+      "narrow_expected_count": 38,
+      "wide_actual_count": 36,
+      "wide_expected_count": 68,
+      "narrow_module_count": 43,
+      "wide_module_count": 10,
+      "modules_wide_only": 4,
+      "modules_narrow_only": 37
     },
     {
       "position": 121,
-      "actual_count": 36
+      "narrow_actual_count": 36,
+      "narrow_expected_count": 38,
+      "wide_actual_count": 36,
+      "wide_expected_count": 68,
+      "narrow_module_count": 43,
+      "wide_module_count": 10,
+      "modules_wide_only": 4,
+      "modules_narrow_only": 37
     },
     {
       "position": 122,
-      "actual_count": 36
+      "narrow_actual_count": 36,
+      "narrow_expected_count": 38,
+      "wide_actual_count": 36,
+      "wide_expected_count": 68,
+      "narrow_module_count": 43,
+      "wide_module_count": 10,
+      "modules_wide_only": 4,
+      "modules_narrow_only": 37
     },
     {
       "position": 123,
-      "actual_count": 36
+      "narrow_actual_count": 36,
+      "narrow_expected_count": 38,
+      "wide_actual_count": 36,
+      "wide_expected_count": 68,
+      "narrow_module_count": 43,
+      "wide_module_count": 10,
+      "modules_wide_only": 4,
+      "modules_narrow_only": 37
     },
     {
       "position": 124,
-      "actual_count": 38
+      "narrow_actual_count": 38,
+      "narrow_expected_count": 38,
+      "wide_actual_count": 38,
+      "wide_expected_count": 38,
+      "narrow_module_count": 43,
+      "wide_module_count": 6,
+      "modules_wide_only": 0,
+      "modules_narrow_only": 37
     },
     {
       "position": 125,
-      "actual_count": 36
+      "narrow_actual_count": 36,
+      "narrow_expected_count": 36,
+      "wide_actual_count": 36,
+      "wide_expected_count": 36,
+      "narrow_module_count": 43,
+      "wide_module_count": 6,
+      "modules_wide_only": 0,
+      "modules_narrow_only": 37
     },
     {
       "position": 126,
-      "actual_count": 36
+      "narrow_actual_count": 36,
+      "narrow_expected_count": 36,
+      "wide_actual_count": 36,
+      "wide_expected_count": 36,
+      "narrow_module_count": 43,
+      "wide_module_count": 6,
+      "modules_wide_only": 0,
+      "modules_narrow_only": 37
     },
     {
       "position": 127,
-      "actual_count": 36
+      "narrow_actual_count": 36,
+      "narrow_expected_count": 36,
+      "wide_actual_count": 36,
+      "wide_expected_count": 36,
+      "narrow_module_count": 43,
+      "wide_module_count": 6,
+      "modules_wide_only": 0,
+      "modules_narrow_only": 37
     },
     {
       "position": 128,
-      "actual_count": 36
+      "narrow_actual_count": 36,
+      "narrow_expected_count": 36,
+      "wide_actual_count": 36,
+      "wide_expected_count": 36,
+      "narrow_module_count": 43,
+      "wide_module_count": 6,
+      "modules_wide_only": 0,
+      "modules_narrow_only": 37
     }
   ],
   "preload_deps_empty_everywhere": false,
-  "wrongly_included_total_position_weighted": 0,
-  "wrongly_excluded_total_position_weighted": 12,
-  "wrongly_included_distinct_edges": 0,
-  "wrongly_excluded_distinct_edges": 2,
+  "narrow_wrongly_included_total_position_weighted": 0,
+  "narrow_wrongly_excluded_total_position_weighted": 12,
+  "narrow_wrongly_included_distinct_edges": 0,
+  "narrow_wrongly_excluded_distinct_edges": 2,
+  "wide_wrongly_included_total_position_weighted": 0,
+  "wide_wrongly_excluded_total_position_weighted": 192,
+  "wide_wrongly_included_distinct_edges": 0,
+  "wide_wrongly_excluded_distinct_edges": 32,
   "timestamp_collisions": 0,
   "unmappable_valid_from_facts": 0,
   "unmappable_valid_to_facts": 0,
+  "unmappable_module_path_valid_from": 0,
+  "unmappable_module_path_valid_to": 0,
   "gitlink_events": 0,
   "ingest_status": "complete"
 }

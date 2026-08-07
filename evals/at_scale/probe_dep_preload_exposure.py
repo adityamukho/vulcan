@@ -27,8 +27,9 @@ ABOVE the watermark are re-admitted").
 Consequence: a module whose close DATE falls below ts(W) but whose close
 POSITION sits above W disappears from file_entities at that W, taking its
 :depends-on edges out of BOTH sides of the diff before the diff is computed.
-On this repository that is five modules deleted by df6b8be at position 124,
-and 30 misclassified edges that the narrow figure never saw.
+On this repository that is four modules deleted by df6b8be at position 124,
+and 30 misclassified edges that the narrow figure never saw (measured
+2026-08-07: narrow 2 distinct vs wide 32, a factor of 16).
 
 So the sweep reports both, side by side:
 
