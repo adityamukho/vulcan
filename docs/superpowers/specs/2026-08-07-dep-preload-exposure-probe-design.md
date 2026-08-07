@@ -13,9 +13,16 @@ justify a fix. The issue deliberately makes no recommendation and asks for
 exposure to be quantified first, the way #238 quantified its own inverted
 positions. This spec builds that measurement. **It does not fix anything.**
 
-**#242** is folded in because a full-history ingestion is a prerequisite for the
-measurement, and today's benchmark harness cannot finish one: its poller starves
-the ingestion it measures.
+**#242** fixes the benchmark harness's in-flight poller, which starves the
+ingestion it measures.
+
+The two changes are **independent** and are bundled here only for convenience —
+one branch, one review. An earlier version of this spec justified the bundle by
+claiming a full-history ingestion through the benchmark harness was a
+prerequisite for the measurement. It is not: the probe deliberately bypasses
+`run_ingestion_benchmark` entirely and runs the plain in-process ingestion path
+with no poller at all (see `_ingest_into`). #245 would have been measurable with
+#242 unfixed.
 
 ## Scope
 
@@ -83,7 +90,7 @@ from #238's recorded 6 positions at 118–123 (552 commits). The probe must use
 discrepancy is expected — different linearization, larger history — and is not
 evidence that either measurement is wrong.
 
-### #245's option 2 is already half-implemented for `:depends-on`
+### #245's option 2 is *partly* implemented for `:depends-on` — on one side only
 
 `_preload_known_deps` builds `ident_to_file` from `file_entities` and drops any
 row whose source module ident is absent from it (`mcp_server.py:7526-7535`,
@@ -97,19 +104,32 @@ if file_path is None:
     continue
 ```
 
-`file_entities` comes from `_preload_known_entities`, which #238 **did**
-position-filter. So dep edges whose source module failed the position filter are
-already excluded — which is exactly #245's option 2, "narrow via the entity
-preload," applied to the source-module side.
+`file_entities` comes from `_preload_known_entities`, which #238 position-filtered
+— **but on the introduction side only.** Its position clause keys on the
+*introducing* commit (`[?e :introduced-by ?c] [?c :hash ?hash]` → `hash_to_pos`,
+`mcp_server.py:7213-7215`). The function's CLOSE side is still governed by
+`valid_at = T_hi(W)`, a date bound suffering the identical author-date inversion
+#245 is about. The function's own comment says so: *"the date bound above only
+governs how widely entities closed ABOVE the watermark are re-admitted."*
 
-The real residual is therefore only the class #245 names as option 2's leak:
-edges whose source module survived the position filter but whose *edge* was
-introduced or closed inside the inverted window. #245's impact section is
-correspondingly narrower than it reads.
+An earlier version of this section claimed the narrowing was position-correct
+outright, and the probe was built on that claim. **It is false, and it cost the
+measurement a factor of ~16.** A module whose close *date* falls below `ts(W)`
+but whose close *position* sits above `W` vanishes from `file_entities` at `W`,
+so its `:depends-on` edges never reach either side of the probe's diff. On this
+repository that is five modules deleted by `df6b8be` at position 124
+(`vulcan.py` plus four test modules) and 30 misclassified edges.
 
-This is also why the probe must drive the real `_preload_known_deps` rather than
-reimplement its semantics: an offline reimplementation would miss this narrowing
-and overstate the exposure.
+Consequences for the design:
+
+- The residual is *not* only "edges whose source module survived the position
+  filter but whose edge was introduced or closed inside the inverted window."
+  That is the residual **conditional on** #238's close-side leak. The
+  unconditional `:depends-on` residual is larger.
+- The probe must therefore report **two** numbers, not one. See "The oracle".
+- The probe must still drive the real `_preload_known_deps` rather than
+  reimplement its semantics — an offline reimplementation would miss the
+  `ident_to_file` narrowing entirely.
 
 `_preload_pinned_commits` has no equivalent narrowing — it consumes every
 `:pinned-commit` fact the bound admits.
@@ -151,32 +171,82 @@ Approach 2 was already run as a smoke check and is what produced the table above
    `commit_metadata = _git_commits(repo_path, None, branch)`. Both real, and
    validated for positional alignment before use (see Error handling).
 3. Build `ts → [positions]` from `commit_metadata`.
-4. Derive the **affected `W` set**. A position `W` is exposed iff either
-   direction is structurally possible there:
+4. Derive the **affected `W` set** — the *union* of two structural conditions.
+   Neither condition belongs to one misclassification direction; **each enables
+   one of each**, because the bound is half-open containment `[vf, vt) ∋ ts(W)`
+   and a fact's *close* is date-bounded on exactly the same terms as its
+   introduction:
 
-   - **wrong exclusion** — `T_hi(W) > ts(W)`, i.e. some commit at position
-     `≤ W` carries a later date than `W`'s own. A fact introduced there is live
-     at `W` but falls outside the `ts(W)` bound.
-   - **wrong inclusion** — `min(ts[W+1 .. N-1]) <= ts(W)`, i.e. some commit
-     *above* `W` carries a date at or below `W`'s own. A fact introduced there
-     is not yet live at `W` but falls inside the `ts(W)` bound.
+   | mechanism | condition |
+   |---|---|
+   | wrong inclusion via introduction | `min(ts[W+1 .. N-1]) <= ts(W)` |
+   | wrong exclusion via **close** | `min(ts[W+1 .. N-1]) <= ts(W)` |
+   | wrong exclusion via introduction | `T_hi(W) > ts(W)` |
+   | wrong inclusion via **close** | `T_hi(W) > ts(W)` |
 
-   `W` is swept if either holds. This is a position-level precondition computed
-   from `commit_metadata` alone, independent of any fact; it is what keeps the
-   sweep off all 610 positions.
-5. For each affected `W`:
-   - `_preload_known_entities(valid_at=T_hi(W), hash_to_pos=…, watermark_pos=W)`
-   - feed its `file_entities` into
-     `_preload_known_deps(valid_at_ms=ts(W))`
-   - diff the result against the position-exact oracle for `W`.
-6. Emit per-`W` wrong-inclusion and wrong-exclusion counts, the affected edge
-   idents, and the diagnostics below.
+   - `min(ts[W+1 .. N-1]) <= ts(W)` — some commit *above* `W` carries a date at
+     or below `W`'s own. A fact **introduced** there passes the bound but is not
+     yet live (wrong inclusion). A fact **closed** there has `vt <= ts(W)`, so
+     containment rejects it, though its close position is above `W` and it is
+     still live (wrong exclusion).
+   - `T_hi(W) > ts(W)` — some commit at position `≤ W` carries a later date. A
+     fact **introduced** there falls outside the bound though it is live (wrong
+     exclusion). A fact **closed** there has `vt > ts(W)`, so the bound still
+     reads it as open though it is already dead (wrong inclusion).
 
-### The oracle
+   An earlier version of this section labelled the first condition "wrong
+   inclusion" and the second "wrong exclusion" outright. That is wrong, and it
+   was empirically decisive in the wrong direction: positions 118–123 are
+   flagged by the first condition alone, and every one of them misclassifies by
+   wrong **exclusion** — via close, the arm the old labelling did not name.
+
+   The union is a position-level precondition computed from `commit_metadata`
+   alone, independent of any fact; it is what keeps the sweep off all 610
+   positions.
+5. For each affected `W`, run the diff **twice**, changing only the
+   `file_entities` handed to the (unmodified) `_preload_known_deps`:
+   - **narrow** — `file_entities` from
+     `_preload_known_entities(valid_at=T_hi(W), hash_to_pos=…, watermark_pos=W)`
+   - **wide** — `file_entities` rebuilt position-correctly from `:path` facts
+   - `_preload_known_deps(valid_at_ms=ts(W))` on each, diffed against the
+     position-exact oracle restricted to the same entity set.
+6. Emit per-`W` wrong-inclusion and wrong-exclusion counts **in both framings**,
+   the affected edge idents, and the diagnostics below.
+
+### The oracle, and the two entity framings
 
 For each `:depends-on` fact retrieved under `:any-valid-time`, invert **both**
 `:db/valid-from` and `:db/valid-to` to positions through the `ts → [positions]`
 map, then select the facts live at position `W` directly.
+
+The oracle is restricted to edges whose *source module* is in `file_entities`,
+mirroring `_preload_known_deps`' own `ident_to_file` filter. Which
+`file_entities` is passed is the one variable that separates the two reported
+figures:
+
+- **narrow** — `_preload_known_entities`' own output. Position-correct on the
+  introduction side, date-bounded on the close side (see the finding above).
+  This measures the `ts(W)` `:depends-on` bound **conditional on #238's
+  still-open close-side residual**: modules whose own close inverted are
+  already gone, so their edges never reach either side of the diff. This is the
+  figure the shipped code produces today, and the only one the first version of
+  this probe reported.
+- **wide** — `file_entities` rebuilt by `position_correct_file_entities`, from
+  module `:path` facts under `:any-valid-time` with **both** `:db/valid-from`
+  and `:db/valid-to` inverted to positions by the same
+  `invert_ms_to_positions` / `edge_live_at` primitives the edge oracle uses. A
+  module is in the wide set at `W` iff its `:path` fact is live at position
+  `W`. This measures the `ts(W)` `:depends-on` bound **in isolation**.
+
+Both go in the report dict and the printed summary, side by side and labelled.
+**Neither alone is "the" number** — the gap between them is #238's own
+close-side leak, and the comparison is the finding. Reporting only the narrow
+figure understated this repository's exposure by ~16x (2 distinct edges over 6
+positions, vs. 32 wrongly excluded at `W=118` alone).
+
+`position_correct_file_entities` is, like the edge oracle, a **measurement
+device and not a candidate fix**: it needs the whole history in hand, which a
+resuming forward walk does not have.
 
 Both ends matter. `_valid_time_window_clauses` expresses the bound as half-open
 containment `[?vf, ?vt) ∋ valid_at_ms` (`mcp_server.py:7466-7468`), so the
@@ -207,9 +277,15 @@ that exposure is therefore unmeasurable here and unknown in the field.
 ### Output
 
 A JSON report plus a short human-readable summary: total affected positions,
-per-`W` wrong-inclusion and wrong-exclusion counts, affected edge idents,
-timestamp-collision count, unmappable-fact count, and the `:pinned-commit`
-structural result.
+per-`W` wrong-inclusion and wrong-exclusion counts **in both the narrow and the
+wide framing**, affected edge idents, timestamp-collision count,
+unmappable-fact count, and the `:pinned-commit` structural result.
+
+The report also carries its own **provenance** — `repo_path`, `branch`, and the
+ingested `head_commit` (taken from the linearization's last entry, i.e. the
+commit the swept graph actually ends at). The first recorded artifact had
+`repo_path` alone, naming a scratch directory that no longer exists, and so was
+not reproducible from its own record.
 
 ## The #242 poller fix
 
@@ -231,8 +307,13 @@ bounds the instrument's share of that lock.
 - `duty_factor` defaults to 10, exposed as `--poll-duty-factor`. At 10 the
   poller holds `_db_native_lock` for at most ~9% of the run however large the
   scan grows.
-- `_STATUS_QUERY` is **unchanged**, so the recorded latency series stays
-  comparable to existing `benchmark.md` entries.
+- `_STATUS_QUERY` is **unchanged**, so the *query being timed* is the same one
+  every existing `benchmark.md` entry timed. That is not the same as saying the
+  recorded percentiles stay comparable, and the two must not be conflated: the
+  adaptive interval undersamples exactly the late, expensive polls (the scan
+  cost grows all run, and the backoff is proportional to it), so `query_latency`
+  p50/p99 from 2026-08-07 onward are biased **low** against every pre-fix entry.
+  Comparability of the query is not comparability of the percentiles.
 - A dedicated executor, rather than the loop default, keeps the poll off any
   thread the ingestion may want.
 
@@ -247,7 +328,11 @@ are recorded so an irregular sample stays interpretable.
 ### Limitations, recorded rather than papered over
 
 - Latency percentiles are now computed over an **irregular** sample, because the
-  interval adapts. The offsets are recorded for this reason.
+  interval adapts, and the irregularity is *correlated with cost*: the backoff
+  is longest exactly when the polled query is slowest. So post-fix p50/p99 are
+  biased low relative to pre-fix entries, in addition to the pre-fix entries'
+  wall clock being biased high. The offsets are recorded so the sample stays
+  interpretable; `benchmark.md`'s note says both halves of this outright.
 - A cancelled run still waits on an in-flight poll thread at executor shutdown.
   The old code blocked the event loop outright, so this is strictly better, but
   it is not zero.
@@ -255,8 +340,10 @@ are recorded so an irregular sample stays interpretable.
 ### `benchmark.md`
 
 A dated note that every entry recorded before this fix carries poller overhead:
-entry-to-entry comparisons remain valid, absolute figures overstate real
-ingestion cost.
+entry-to-entry comparisons remain valid, absolute wall-clock figures overstate
+real ingestion cost, **and** the latency percentiles move the other way — post-
+fix p50/p99 are biased low by the adaptive interval's cost-correlated
+undersampling, so a pre/post percentile comparison is not a like-for-like one.
 
 ## Testing
 
@@ -280,12 +367,26 @@ The probe's headline output cannot be asserted; the number is what we are trying
 to learn. The two components that could silently produce a *wrong* number can
 be, and are:
 
-- the `valid_from` → position inversion, and
-- the affected-`W` derivation,
+- the `valid_from` → position inversion,
+- the affected-`W` derivation, and
+- `position_correct_file_entities`, the wide framing's entity set — including a
+  module whose close *date* inverts against its close *position*, which is the
+  exact case that was invisible to the narrow-only measurement,
 
-both against a small synthetic fixture with known inverted dates and a
-deliberate timestamp collision. This is the exact error class that cost two fix
-rounds on #238.
+all against a small synthetic fixture with known inverted dates and a deliberate
+timestamp collision. This is the exact error class that cost two fix rounds on
+#238.
+
+Two further guards, both for silent failures rather than wrong arithmetic:
+
+- `VALID_TIME_FOREVER_MS` is asserted equal to
+  `mcp_server._VALID_TIME_FOREVER_MS`. The probe duplicates the sentinel so its
+  primitives stay importable without a graph; a comment said "keep them
+  identical" and nothing enforced it. Divergence would silently reread every
+  open edge as closed.
+- `load_module_path_facts` is exercised against a **real ingested graph**. A
+  wrong clause order or mistyped attribute returns zero rows without raising,
+  which would make the wide figure a confident, meaningless zero.
 
 ### Not tested
 

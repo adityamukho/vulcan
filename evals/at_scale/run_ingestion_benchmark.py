@@ -56,8 +56,17 @@ async def _poll_during_ingestion(
     share of that lock: at duty_factor=10 the poller holds it for at most
     ~9% of the run however large the scan grows.
 
-    _STATUS_QUERY is deliberately unchanged, so the recorded latency series
-    stays comparable to the entries already in benchmark.md.
+    _STATUS_QUERY is deliberately unchanged, so the QUERY being timed is the
+    same one every entry already in benchmark.md timed. That is NOT the same
+    claim as "the recorded latency series stays comparable", which an earlier
+    version of this docstring made and which is false. The adaptive interval
+    sleeps in proportion to the poll's own cost, so it undersamples exactly
+    the late, expensive polls -- and _STATUS_QUERY's cost grows monotonically
+    through a run, because it counts every :type/commit entity. Pre-fix
+    entries polled every 0.5s regardless and sampled that expensive tail at
+    full density. So query_latency p50/p99 recorded here are biased LOW
+    against every pre-fix entry, in the opposite direction from the pre-fix
+    wall-clock inflation. benchmark.md's 2026-08-07 note says both halves.
 
     A dedicated executor, rather than the loop default, keeps the poll off any
     thread the ingestion may want.

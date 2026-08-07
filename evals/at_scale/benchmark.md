@@ -28,6 +28,18 @@ that was wrong and has been corrected here.
 > 1,600.55s post-#236 figure, overstate real ingestion cost by an unquantified
 > margin. Entries from 2026-08-07 onward carry a "Poll duty cycle" row; treat
 > its absence as "unmeasured, assume inflated".
+>
+> **The latency percentiles are biased the OTHER way, and by a different
+> mechanism.** `_STATUS_QUERY` is unchanged across the fix, so the query being
+> timed is the same one — but comparability of the query is not comparability of
+> the percentiles. The post-fix poller sleeps `duty_factor × (status + query)`,
+> so it undersamples exactly the late, expensive polls: `_STATUS_QUERY` counts
+> every `:type/commit` entity, and its cost grows monotonically through a run.
+> Pre-fix entries polled every 0.5s regardless and so sampled the expensive tail
+> at full density. `query_latency` p50/p99 from 2026-08-07 onward are therefore
+> biased **low** relative to every earlier entry. Wall-clock comparisons
+> overstate the old runs; percentile comparisons understate the new ones. Do not
+> read a p99 drop across 2026-08-07 as a speedup.
 
 ## Ingestion Run — 20260719T074053Z
 
