@@ -3294,6 +3294,87 @@ def _db_checkpoint(db: Any) -> None:
         db.checkpoint()
 
 
+_ingest_checkpoint_policy: Optional["_CheckpointPolicy"] = None
+
+
+class _CheckpointPolicy:
+    """Decides when an ingestion write batch is compacted to disk.
+
+    db.checkpoint() is O(graph size) WAL compaction that is FLAT in dirty
+    bytes -- measured at ~4.9 ms/MB, a checkpoint after one fact costing the
+    same as one after 5,000 (#241). Running it once per commit therefore
+    costs N_commits x avg_graph_size, super-linear in history length, and was
+    ~51% of at-scale ingestion wall clock.
+
+    It is NOT a durability boundary. minigraf appends every transact to
+    <graph>.wal, and writes survive a hard kill with no checkpoint at all;
+    the handle also compacts on clean close. Deferring a checkpoint trades
+    REOPEN LATENCY (~45 ms per MB of outstanding WAL, paid once by the next
+    process to open the graph), never data integrity.
+
+    The gate holds checkpointing to `duty` of wall clock: after a checkpoint
+    costing d seconds the next is suppressed until d * (1/duty - 1) seconds
+    have passed, since d / (d + W) <= duty exactly when W >= d * (1/duty - 1).
+    Because the wait scales with d, the FRACTION stays fixed as the graph
+    grows -- that is what removes the super-linear term rather than dividing
+    it by a constant. Same self-scaling shape as #242's ingestion poller,
+    which held 8.56% duty on CI against 8.65% locally on 23%-slower hardware.
+
+    Thread confinement: every ingestion checkpoint site runs on
+    _run_ingestion's single-worker write_executor, so this object's mutable
+    state is confined to one thread and needs no lock of its own beyond the
+    _db_native_lock that _db_checkpoint already takes. Do not call it from
+    another thread without adding one.
+    """
+
+    def __init__(self, duty: float, clock: "Callable[[], float]" = time.monotonic) -> None:
+        if not 0.0 < duty <= 1.0:
+            raise ValueError(f"checkpoint duty must be in (0, 1], got {duty!r}")
+        self._duty = duty
+        self._clock = clock
+        self._last_duration: Optional[float] = None
+        self._last_finished_at = 0.0
+        self.checkpoints = 0
+        self.suppressed = 0
+
+    def _budget_elapsed(self) -> bool:
+        if self._last_duration is None:
+            return True  # nothing measured yet; checkpoint once to seed d
+        wait = self._last_duration * (1.0 / self._duty - 1.0)
+        return self._clock() - self._last_finished_at >= wait
+
+    def maybe(self, db: Any) -> bool:
+        """Checkpoint if the budget allows. Returns whether it did."""
+        if not self._budget_elapsed():
+            self.suppressed += 1
+            return False
+        self.force(db)
+        return True
+
+    def force(self, db: Any) -> None:
+        """Checkpoint regardless of budget, and re-measure d."""
+        started = self._clock()
+        _db_checkpoint(db)
+        finished = self._clock()
+        self._last_duration = finished - started
+        self._last_finished_at = finished
+        self.checkpoints += 1
+
+
+def _db_checkpoint_gated(db: Any) -> bool:
+    """Checkpoint unless the active ingestion policy says the budget is spent.
+
+    With no ingestion in flight the policy is None and this is exactly
+    _db_checkpoint(db), so the interactive write path is unchanged (#241).
+    Returns whether a checkpoint actually ran.
+    """
+    policy = _ingest_checkpoint_policy
+    if policy is None:
+        _db_checkpoint(db)
+        return True
+    return policy.maybe(db)
+
+
 def _checkpoint_after_write(db: Any, tool_name: str, result: Dict[str, Any]) -> None:
     """Checkpoint after a transact/retract that has already applied its graph
     and fact-index write. A checkpoint failure here must not flip an
@@ -8461,7 +8542,7 @@ def _reverse_apply(
         _transact(db, "[" + " ".join(triples) + "]", superseded_ts, index_con=index_con)
 
     _frontier_persist_claim(db, linearization, pos, from_low=False, commit_ts_iso=commit_ts_iso, index_con=index_con)
-    _db_checkpoint(db)
+    _db_checkpoint_gated(db)
     return commit_hash
 
 
@@ -9111,7 +9192,7 @@ def _forward_apply(
         # folds its own region in later (Task 9); this watermark must not be
         # advanced past the forward frontier before that happens.
         _lineage_confirmed_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
-    _db_checkpoint(db)
+    _db_checkpoint_gated(db)
     _commit_index_writer_safe(index_con)
 
 
@@ -9505,7 +9586,7 @@ def _correction_sweep_apply(
 
     if update_watermark:
         _correction_sweep_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
-        _db_checkpoint(db)
+        _db_checkpoint_gated(db)
     return skipped_events
 
 
@@ -10135,7 +10216,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     write_executor, _correction_sweep_through_update,
                                     db, sweep_hash, sweep_ts, index_con,
                                 )
-                                await loop.run_in_executor(write_executor, _db_checkpoint, db)
+                                await loop.run_in_executor(write_executor, _db_checkpoint_gated, db)
                             except concurrent.futures.process.BrokenProcessPool:
                                 raise
                             except Exception as e:
@@ -10166,7 +10247,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 write_executor, _lineage_confirmed_through_update,
                                 db, linearization[-1], commit_metadata[-1][1], index_con,
                             )
-                            await loop.run_in_executor(write_executor, _db_checkpoint, db)
+                            await loop.run_in_executor(write_executor, _db_checkpoint_gated, db)
                     finally:
                         _db = None
                         db = None

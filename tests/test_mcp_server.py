@@ -19779,3 +19779,126 @@ class TestResumeWithInvertedAuthorDates:
         )
         inverted = [(i, vf, vt) for i, vf, vt in rows if vt is not None and vt < vf]
         assert inverted == [], f"inverted valid intervals on :ident facts: {inverted}"
+
+
+class _FakeClock:
+    """Deterministic monotonic clock. Tests advance it explicitly, including
+    from inside the patched _db_checkpoint, so a checkpoint's measured
+    duration is exactly what the test says it is."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, dt):
+        self.t += dt
+
+
+class TestCheckpointPolicy:
+    """#241: the budget that replaces the once-per-commit cadence.
+
+    Patches mcp_server._db_checkpoint (our own wrapper, not MiniGrafDb) so a
+    checkpoint's cost is exact and the scheduling arithmetic is testable
+    without a multi-hundred-MB graph. real_db supplies a genuine handle so
+    the call still goes somewhere real.
+    """
+
+    def _policy(self, monkeypatch, clock, duty, cost):
+        import mcp_server
+        monkeypatch.setattr(
+            mcp_server, "_db_checkpoint", lambda db: clock.advance(cost)
+        )
+        return mcp_server._CheckpointPolicy(duty, clock=clock)
+
+    def test_first_call_checkpoints_and_seeds_the_duration(self, real_db, monkeypatch):
+        clock = _FakeClock()
+        policy = self._policy(monkeypatch, clock, duty=0.05, cost=0.1)
+        assert policy.maybe(real_db) is True
+        assert policy.checkpoints == 1
+        assert policy.suppressed == 0
+
+    def test_suppresses_until_the_budget_has_elapsed(self, real_db, monkeypatch):
+        clock = _FakeClock()
+        policy = self._policy(monkeypatch, clock, duty=0.05, cost=0.1)
+        policy.maybe(real_db)                       # seeds d = 0.1s
+        # duty 0.05 -> wait = 0.1 * (1/0.05 - 1) = 1.9s
+        clock.advance(1.8)
+        assert policy.maybe(real_db) is False
+        assert policy.suppressed == 1
+        clock.advance(0.2)                          # now 2.0s > 1.9s
+        assert policy.maybe(real_db) is True
+        assert policy.checkpoints == 2
+
+    def test_wait_scales_with_checkpoint_cost(self, real_db, monkeypatch):
+        """The graph-size-invariance property: a 10x more expensive
+        checkpoint must buy a 10x longer suppression window, so the FRACTION
+        of wall clock spent checkpointing stays fixed as the graph grows."""
+        clock = _FakeClock()
+        policy = self._policy(monkeypatch, clock, duty=0.05, cost=1.0)
+        policy.maybe(real_db)                       # seeds d = 1.0s
+        clock.advance(18.9)                         # < 1.0 * 19
+        assert policy.maybe(real_db) is False
+        clock.advance(0.2)                          # > 19s
+        assert policy.maybe(real_db) is True
+
+    def test_duty_bounds_the_checkpoint_fraction(self, real_db, monkeypatch):
+        """Drive a simulated run and assert the realised duty honours the
+        budget. This is the property the whole design exists to provide."""
+        clock = _FakeClock()
+        cost, duty = 0.1, 0.05
+        policy = self._policy(monkeypatch, clock, duty=duty, cost=cost)
+        for _ in range(2000):
+            policy.maybe(real_db)
+            clock.advance(0.05)                     # simulated per-commit work
+        spent = policy.checkpoints * cost
+        assert spent / clock.t <= duty * 1.05, (
+            f"realised duty {spent / clock.t:.4f} exceeds budget {duty}"
+        )
+        assert policy.suppressed > 0, "budget never suppressed anything"
+
+    def test_rejects_an_out_of_range_duty(self):
+        import mcp_server
+        for bad in (0.0, -0.1, 1.5):
+            with pytest.raises(ValueError):
+                mcp_server._CheckpointPolicy(bad)
+
+
+class TestDbCheckpointGated:
+    def test_checkpoints_every_call_with_no_policy_installed(self, real_db, monkeypatch):
+        """Everything outside ingestion runs with _ingest_checkpoint_policy
+        None, and must be indistinguishable from calling _db_checkpoint
+        directly (#241)."""
+        import mcp_server
+        assert mcp_server._ingest_checkpoint_policy is None
+        calls = []
+        monkeypatch.setattr(mcp_server, "_db_checkpoint", lambda db: calls.append(db))
+        for _ in range(5):
+            assert mcp_server._db_checkpoint_gated(real_db) is True
+        assert len(calls) == 5
+
+
+class TestGatedWrapperIsInertWithoutAPolicy:
+    @pytest.mark.asyncio
+    async def test_ingestion_checkpoint_count_is_unchanged(self, git_repo, monkeypatch):
+        """Task 1 is pure plumbing: routing ingestion through
+        _db_checkpoint_gated with no policy installed must not change how
+        many checkpoints a run performs (#241)."""
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+            "error_at": None, "phase": None,
+        }
+        calls = []
+        real = mcp_server._db_checkpoint
+        monkeypatch.setattr(
+            mcp_server, "_db_checkpoint",
+            lambda db: (calls.append(1), real(db))[1],
+        )
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_checkpoint_policy is None
+        assert len(calls) > 0, "a completed ingestion must checkpoint at least once"
