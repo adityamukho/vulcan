@@ -48,6 +48,14 @@ class TestAppendIngestionReport:
         assert len(report_path.read_text()) > first_len
         assert report_path.read_text().count("## Ingestion Run") == 2
 
+    def test_poll_duty_cycle_row_renders_with_formatted_values(self, tmp_path):
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(SAMPLE_METRICS, report_path)
+        text = report_path.read_text()
+        assert "Poll duty cycle (#242)" in text
+        assert "4.20%" in text  # poll_duty_fraction=0.042 -> 4.20%
+        assert "over 5 polls" in text  # poll_count=5
+
 
 SAMPLE_QUERY_RESULTS = [
     {
