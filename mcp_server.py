@@ -10269,10 +10269,33 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         await loop.run_in_executor(
                             write_executor, _last_run_write, db, last_hash, now, _ingest_progress["processed"], index_con
                         )
+                        # Redundant with the unconditional final checkpoint in
+                        # the outer finally below (#241) -- that one now
+                        # covers this path too. Left in place: harmless, and
+                        # removing it only widens this change's diff.
                         await loop.run_in_executor(write_executor, _db_checkpoint, db)
                     finally:
                         _db = None
             finally:
+                # Compact the WAL on EVERY terminal path, not just
+                # completed_all. Under the duty-cycle cadence an interrupted
+                # run can leave a whole run's writes outstanding in
+                # <graph>.wal, and the next process to open the graph pays
+                # the replay (~45 ms/MB). Nothing is lost if this fails --
+                # the WAL is already durable -- so a failure here must never
+                # mask the real error that brought us into this finally
+                # (same rule as _checkpoint_after_write, #176). Deliberately
+                # calls _db_checkpoint directly, not _db_checkpoint_gated:
+                # this one must never be suppressed. (The completed_all
+                # checkpoint further down is now redundant with this one for
+                # that path -- left in place, see its own comment.)
+                try:
+                    final_db = await _ensure_db_async()
+                    await loop.run_in_executor(write_executor, _db_checkpoint, final_db)
+                except Exception as e:
+                    print(f"[_run_ingestion] final checkpoint failed: {e}", file=sys.stderr)
+                finally:
+                    _db = None
                 # ProcessPoolExecutor.shutdown(wait=True) blocks joining the
                 # worker OS processes — measured ~90ms even for a pool that
                 # never did any real work, entirely from process-exit

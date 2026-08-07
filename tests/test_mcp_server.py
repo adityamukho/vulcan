@@ -19904,6 +19904,115 @@ class TestGatedWrapperIsInertWithoutAPolicy:
         assert len(calls) > 0, "a completed ingestion must checkpoint at least once"
 
 
+class TestFinalCheckpointOnEveryTerminalPath:
+    """#241: with a batched cadence an interrupted run can leave a whole
+    run's WAL uncompacted, and the next process to open the graph pays the
+    replay. The final checkpoint must therefore not be conditional on
+    completed_all. There is an implicit backstop -- _db = None drops the
+    handle and minigraf compacts on close -- but a durability-adjacent
+    property must not rest on refcount timing.
+
+    A naive `len(calls) > 0` is not ablation-proof here: today's per-commit
+    cadence checkpoints throughout every path regardless of this fix, so
+    that assertion passes against both old and new code. Instead, every
+    test below installs a _CheckpointPolicy with duty=1e-6 so every gated
+    mid-run checkpoint beyond the very first (which always fires -- it has
+    no measured duration yet and must seed one) is suppressed. Only a
+    genuinely unconditional final checkpoint can then grow the count after
+    the interruption/failure point.
+    """
+
+    def _fresh_progress(self):
+        return {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+            "error_at": None, "phase": None,
+        }
+
+    def _count_checkpoints(self, monkeypatch):
+        import mcp_server
+        calls = []
+        real = mcp_server._db_checkpoint
+        monkeypatch.setattr(
+            mcp_server, "_db_checkpoint",
+            lambda db: (calls.append(1), real(db))[1],
+        )
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_completed_run_checkpoints_at_the_end(self, git_repo, monkeypatch):
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = self._fresh_progress()
+        calls = self._count_checkpoints(monkeypatch)
+        monkeypatch.setattr(mcp_server, "_ingest_checkpoint_policy", mcp_server._CheckpointPolicy(duty=1e-6))
+
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert len(calls) > 0
+
+    @pytest.mark.asyncio
+    async def test_shutdown_mid_run_still_checkpoints(self, git_repo, monkeypatch):
+        """Mirrors TestRunIngestionShutdown's patched-sleep technique. Shutdown
+        is requested from inside the patched asyncio.sleep(0) that runs right
+        after the first commit's write lands, so exactly one gated checkpoint
+        (the policy's mandatory first-call seed) has already happened by the
+        time we capture the "before" count -- growth past that point can only
+        come from the unconditional final checkpoint."""
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = self._fresh_progress()
+        calls = self._count_checkpoints(monkeypatch)
+        monkeypatch.setattr(mcp_server, "_ingest_checkpoint_policy", mcp_server._CheckpointPolicy(duty=1e-6))
+
+        original_sleep = asyncio.sleep
+        pre_shutdown_calls = None
+
+        async def patched_sleep(t):
+            nonlocal pre_shutdown_calls
+            if pre_shutdown_calls is None:
+                pre_shutdown_calls = len(calls)
+            mcp_server._shutdown_requested.set()
+            await original_sleep(t)
+
+        try:
+            with patch("mcp_server.asyncio.sleep", patched_sleep):
+                await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        finally:
+            mcp_server._shutdown_requested.clear()
+
+        assert mcp_server._ingest_progress["status"] == "stopped"
+        assert pre_shutdown_calls is not None, "patched sleep was never invoked"
+        assert len(calls) > pre_shutdown_calls, "an interrupted run must still compact its WAL"
+
+    @pytest.mark.asyncio
+    async def test_stage_b_failure_still_checkpoints(self, git_repo, monkeypatch):
+        """A Stage B exception sets completed_all False and skips the
+        if-completed_all block entirely. Captures the checkpoint count at the
+        instant the injected failure fires (Stage A's own seed checkpoint has
+        already happened by then), so growth past that point can only come
+        from the unconditional final checkpoint."""
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = self._fresh_progress()
+        calls = self._count_checkpoints(monkeypatch)
+        monkeypatch.setattr(mcp_server, "_ingest_checkpoint_policy", mcp_server._CheckpointPolicy(duty=1e-6))
+
+        pre_failure_calls = None
+
+        def boom(*a, **k):
+            nonlocal pre_failure_calls
+            pre_failure_calls = len(calls)
+            raise RuntimeError("injected Stage B failure")
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", boom)
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert pre_failure_calls is not None, "the injected Stage B failure was never triggered"
+        assert len(calls) > pre_failure_calls, "a failed run must still compact its WAL"
+
+
 class TestStageBDoesNotDoubleCheckpoint:
     """#241: the sweep loop checkpoints after _correction_sweep_through_update,
     so _forward_apply's own tail checkpoint on the lifecycle_only pass is a
