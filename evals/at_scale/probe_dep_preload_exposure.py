@@ -420,6 +420,39 @@ def position_correct_file_entities(
     return live
 
 
+def count_unmappable_module_path_facts(
+    path_facts: Sequence[Dict],
+    ts_positions: Dict[str, List[int]],
+) -> Tuple[int, int]:
+    """How many module :path facts carry a vf_ms/vt_ms whose instant matches
+    no commit -- the WIDE framing's own unmappable-fact diagnostic.
+
+    WIDE (position_correct_file_entities) is built entirely from these
+    :path facts, run through the same invert_ms_to_positions/edge_live_at
+    machinery as the :depends-on edges. An unmappable vf silently drops a
+    module from WIDE at every W (understating it); an unmappable non-sentinel
+    vt silently reads it as never-closed (overstating it). Mirrors sweep's
+    own unmappable_valid_from_facts/unmappable_valid_to_facts computation for
+    :depends-on edges, applied to :path instead.
+
+    Runs over ALL of path_facts, not a measured subset: unlike a
+    :depends-on edge, a :path fact has no "did it ever enter consideration"
+    filter to apply first -- it IS file_entities.
+
+    Returns (unmappable_valid_from, unmappable_valid_to).
+    """
+    unmappable_vf = sum(
+        1 for f in path_facts
+        if not invert_ms_to_positions(f["vf_ms"], ts_positions)
+    )
+    unmappable_vt = sum(
+        1 for f in path_facts
+        if f["vt_ms"] < VALID_TIME_FOREVER_MS
+        and not invert_ms_to_positions(f["vt_ms"], ts_positions)
+    )
+    return unmappable_vf, unmappable_vt
+
+
 def sweep(
     db,
     repo_path: str,
@@ -485,6 +518,18 @@ def sweep(
       resolves an unmappable CLOSE by treating the edge as still open (see
       its docstring); that is the correct not-understating direction, but it
       is silent unless counted here.
+
+    - unmappable_module_path_valid_from / unmappable_module_path_valid_to:
+      the same diagnostic applied to the WIDE framing's own raw material.
+      WIDE is built from module :path facts via position_correct_file_entities,
+      which runs :path's vf_ms/vt_ms through the identical
+      invert_ms_to_positions/edge_live_at machinery as the :depends-on edges
+      above -- an unmappable :path vf silently drops a module from WIDE at
+      every W (understating it), and an unmappable :path vt silently reads it
+      as never-closed (overstating it). Counted over ALL of path_facts, not a
+      measured subset: unlike an edge, a :path fact has no "did it ever enter
+      consideration" filter to apply first -- it IS file_entities. Both fold
+      into measurement_invalid below, same as the edge counters.
 
     Every *_total_position_weighted is position-weighted: one edge
     misclassified at all N affected positions contributes N, not 1. The
@@ -606,6 +651,9 @@ def sweep(
         if e["vt_ms"] < VALID_TIME_FOREVER_MS
         and not invert_ms_to_positions(e["vt_ms"], ts_positions)
     )
+    unmappable_module_path_vf, unmappable_module_path_vt = count_unmappable_module_path_facts(
+        path_facts, ts_positions
+    )
 
     # Keyed on the NARROW actual: that is the one produced by the shipped
     # code path, so it is the one whose all-zero signature would mean
@@ -659,6 +707,8 @@ def sweep(
         "timestamp_collisions": len(collisions),
         "unmappable_valid_from_facts": unmappable_vf,
         "unmappable_valid_to_facts": unmappable_vt,
+        "unmappable_module_path_valid_from": unmappable_module_path_vf,
+        "unmappable_module_path_valid_to": unmappable_module_path_vt,
         "gitlink_events": gitlink_event_count(repo_path),
     }
 
@@ -764,8 +814,16 @@ def main() -> int:
     print("  (narrow = file_entities as _preload_known_entities returns it: the")
     print("   ts(W) :depends-on bound CONDITIONAL on #238's open close-side residual.")
     print("   wide = file_entities rebuilt position-correctly at both ends: the")
-    print("   ts(W) :depends-on bound in ISOLATION. The gap between them is #238's")
-    print("   own close-side leak, not #245's.)")
+    print("   ts(W) :depends-on bound in ISOLATION.")
+    print("   EXCLUDED gap = #238's own close-side leak: its date bound drops")
+    print("   modules deleted later but dated earlier, inflating narrow's excluded")
+    print("   count relative to wide's.")
+    print("   INCLUDED gap is a DIFFERENT effect, not #238's leak: _preload_known_")
+    print("   entities pre-seeds file_entities from the current worktree's `git")
+    print("   ls-files` and never removes from it, so narrow admits every current-")
+    print("   worktree module at every W, including ones not yet introduced. A")
+    print("   NEGATIVE included gap (wide < narrow) is expected from that pre-seed")
+    print("   and is NOT evidence #245's inclusion exposure is small.)")
     print(
         f"  wrongly INCLUDED, position-weighted:    "
         f"{report['narrow_wrongly_included_total_position_weighted']:<11}"
@@ -791,26 +849,31 @@ def main() -> int:
     print(f"timestamp collisions:                     {report['timestamp_collisions']}")
     print(f"unmappable :valid-from facts (measured):  {report['unmappable_valid_from_facts']}")
     print(f"unmappable :valid-to facts (measured):    {report['unmappable_valid_to_facts']}")
+    print(f"unmappable module :path valid-from facts: {report['unmappable_module_path_valid_from']}")
+    print(f"unmappable module :path valid-to facts:   {report['unmappable_module_path_valid_to']}")
     print(f"gitlink events:                           {report['gitlink_events']}")
 
     # Emphasis is deliberately inverted from a naive reading: nonzero
     # unmappable facts mean the position-inversion assumption this whole
-    # sweep rests on is broken for at least one fact in the measured
-    # population, which invalidates the wrongly_included/wrongly_excluded
-    # numbers above. Zero gitlink events only NARROWS what was measured; it
-    # does not call the rest of the report into question.
+    # sweep rests on is broken for at least one fact -- either in the
+    # :depends-on measured population, or in the module :path facts that are
+    # WIDE's own raw material -- which invalidates the wrongly_included/
+    # wrongly_excluded numbers above. Zero gitlink events only NARROWS what
+    # was measured; it does not call the rest of the report into question.
     measurement_invalid = (
         report["unmappable_valid_from_facts"] > 0
         or report["unmappable_valid_to_facts"] > 0
+        or report["unmappable_module_path_valid_from"] > 0
+        or report["unmappable_module_path_valid_to"] > 0
     )
     if measurement_invalid:
         print()
         print(
-            "INVALID MEASUREMENT: nonzero unmappable :valid-from/:valid-to facts\n"
-            "mean the timestamp-to-position inversion this sweep depends on is\n"
-            "broken for at least one fact in the measured population. The\n"
-            "wrongly_included/wrongly_excluded numbers above are not trustworthy\n"
-            "until this is zero."
+            "INVALID MEASUREMENT: nonzero unmappable :valid-from/:valid-to facts,\n"
+            "on either the :depends-on edges or the module :path facts WIDE is\n"
+            "built from, mean the timestamp-to-position inversion this sweep\n"
+            "depends on is broken for at least one fact. The wrongly_included/\n"
+            "wrongly_excluded numbers above are not trustworthy until this is zero."
         )
     if report["preload_deps_empty_everywhere"]:
         print()

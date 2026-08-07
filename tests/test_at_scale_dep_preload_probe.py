@@ -13,6 +13,7 @@ from evals.at_scale.probe_dep_preload_exposure import (
     VALID_TIME_FOREVER_MS,
     affected_positions,
     build_ts_positions,
+    count_unmappable_module_path_facts,
     edge_live_at,
     invert_ms_to_positions,
     resume_envelopes,
@@ -228,6 +229,56 @@ class TestPositionCorrectFileEntities:
             position_correct_file_entities(facts, ts_positions, w=w) == {}
             for w in range(len(META))
         )
+
+
+class TestCountUnmappableModulePathFacts:
+    """WIDE's own unmappable-fact diagnostic. WIDE is rebuilt entirely from
+    module :path facts, so a :path vf/vt that fails to invert to a position
+    breaks WIDE at every affected W silently -- understating it (unmappable
+    vf drops the module) or overstating it (unmappable vt reads it as never
+    closed) -- unless counted, exactly as unmappable_valid_from_facts /
+    unmappable_valid_to_facts already do for :depends-on edges.
+    """
+
+    def _ts_positions(self):
+        return build_ts_positions(META)
+
+    def test_a_fully_mappable_population_counts_zero_both_ways(self):
+        facts = [
+            {"path": "a.py", "vf_ms": MS[0], "vt_ms": VALID_TIME_FOREVER_MS},
+            {"path": "b.py", "vf_ms": MS[1], "vt_ms": MS[2]},
+        ]
+        assert count_unmappable_module_path_facts(facts, self._ts_positions()) == (0, 0)
+
+    def test_an_unmappable_valid_from_is_counted(self):
+        facts = [{"path": "a.py", "vf_ms": 1, "vt_ms": VALID_TIME_FOREVER_MS}]
+        unmappable_vf, unmappable_vt = count_unmappable_module_path_facts(
+            facts, self._ts_positions()
+        )
+        assert (unmappable_vf, unmappable_vt) == (1, 0)
+
+    def test_an_unmappable_valid_to_is_counted(self):
+        facts = [{"path": "a.py", "vf_ms": MS[0], "vt_ms": 1}]
+        unmappable_vf, unmappable_vt = count_unmappable_module_path_facts(
+            facts, self._ts_positions()
+        )
+        assert (unmappable_vf, unmappable_vt) == (0, 1)
+
+    def test_the_open_sentinel_is_never_counted_as_an_unmappable_valid_to(self):
+        # VALID_TIME_FOREVER_MS does not correspond to any commit's date, so
+        # inverting it directly would always fail -- the sentinel must be
+        # excluded from the valid-to check the same way sweep()'s own
+        # unmappable_vt does for :depends-on edges.
+        facts = [{"path": "a.py", "vf_ms": MS[0], "vt_ms": VALID_TIME_FOREVER_MS}]
+        assert count_unmappable_module_path_facts(facts, self._ts_positions()) == (0, 0)
+
+    def test_each_unmappable_fact_is_counted_independently(self):
+        facts = [
+            {"path": "a.py", "vf_ms": 1, "vt_ms": VALID_TIME_FOREVER_MS},
+            {"path": "b.py", "vf_ms": 1, "vt_ms": VALID_TIME_FOREVER_MS},
+            {"path": "c.py", "vf_ms": MS[0], "vt_ms": 1},
+        ]
+        assert count_unmappable_module_path_facts(facts, self._ts_positions()) == (2, 1)
 
 
 class TestPositionExactLiveEdges:
