@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import json
 import os
 import resource
@@ -31,24 +32,73 @@ _STATUS_QUERY = "[:find (count ?e) :where [?e :entity-type :type/commit]]"
 async def _poll_during_ingestion(
     ingest_task: "asyncio.Task[None]",
     poll_interval: float,
-) -> tuple[list[float], list[float]]:
-    """Poll ingest_status and a cheap query at poll_interval while ingest_task
-    runs. Returns (status_latencies, query_latencies) in seconds."""
+    duty_factor: float = 10.0,
+) -> tuple[list[float], list[float], list[float]]:
+    """Poll ingest_status and a graph query while ingest_task runs.
+
+    Returns (status_latencies, query_latencies, poll_offsets); latencies in
+    seconds, offsets in seconds since polling began.
+
+    #242: both halves of this are load-bearing.
+
+    The handlers run on a dedicated single-worker executor rather than inline,
+    because handle_minigraf_query is synchronous -- calling it on the event
+    loop stalls the _run_ingestion coroutine, the process-pool result
+    collection, and every write_executor completion. Two full-history runs
+    were killed at 3h54m and 36m on code measured at +3% before this was
+    understood.
+
+    Off-loop alone is NOT sufficient. handle_minigraf_query acquires
+    _db_native_lock (mcp_server._db_execute), and _STATUS_QUERY counts every
+    :type/commit entity, so its cost grows for the whole run -- a ~1s scan
+    every 0.5s would still serialize against every ingestion write from
+    another thread. The adaptive interval is what bounds the instrument's
+    share of that lock: at duty_factor=10 the poller holds it for at most
+    ~9% of the run however large the scan grows.
+
+    _STATUS_QUERY is deliberately unchanged, so the recorded latency series
+    stays comparable to the entries already in benchmark.md.
+
+    A dedicated executor, rather than the loop default, keeps the poll off any
+    thread the ingestion may want.
+
+    Known limitation: a cancelled run still waits on an in-flight poll thread
+    at executor shutdown. The previous implementation blocked the event loop
+    outright, so this is strictly better, but it is not zero.
+    """
     import mcp_server
 
+    loop = asyncio.get_running_loop()
     status_latencies: list[float] = []
     query_latencies: list[float] = []
-    while not ingest_task.done():
-        t0 = time.perf_counter()
-        mcp_server.handle_minigraf_ingest_status()
-        status_latencies.append(time.perf_counter() - t0)
+    poll_offsets: list[float] = []
+    started = time.perf_counter()
 
-        t0 = time.perf_counter()
-        mcp_server.handle_minigraf_query(_STATUS_QUERY)
-        query_latencies.append(time.perf_counter() - t0)
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="bench-poll"
+    ) as poll_executor:
+        while not ingest_task.done():
+            poll_offsets.append(time.perf_counter() - started)
 
-        await asyncio.sleep(poll_interval)
-    return status_latencies, query_latencies
+            t0 = time.perf_counter()
+            await loop.run_in_executor(
+                poll_executor, mcp_server.handle_minigraf_ingest_status
+            )
+            status_duration = time.perf_counter() - t0
+            status_latencies.append(status_duration)
+
+            t0 = time.perf_counter()
+            await loop.run_in_executor(
+                poll_executor, mcp_server.handle_minigraf_query, _STATUS_QUERY
+            )
+            query_duration = time.perf_counter() - t0
+            query_latencies.append(query_duration)
+
+            await asyncio.sleep(
+                max(poll_interval, duty_factor * (status_duration + query_duration))
+            )
+
+    return status_latencies, query_latencies, poll_offsets
 
 
 async def run_ingestion_benchmark(
@@ -80,7 +130,9 @@ async def run_ingestion_benchmark(
     start = time.perf_counter()
     ingest_task = asyncio.create_task(mcp_server._run_ingestion(repo_path, resolved_branch))
     try:
-        status_latencies, query_latencies = await _poll_during_ingestion(ingest_task, poll_interval)
+        status_latencies, query_latencies, poll_offsets = await _poll_during_ingestion(
+            ingest_task, poll_interval
+        )
         await ingest_task
     except BaseException:
         if not ingest_task.done():

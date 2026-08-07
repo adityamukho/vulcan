@@ -91,3 +91,75 @@ class TestCompareIgnore:
         graph_path = tmp_path / "bench.graph"
         metrics = await run_ingestion_benchmark(str(git_repo), "HEAD", graph_path, poll_interval=0.05)
         assert "ignore_comparison" not in metrics
+
+
+import asyncio
+import time as _time
+
+from evals.at_scale.run_ingestion_benchmark import _poll_during_ingestion
+
+
+class TestPollerDoesNotStarveTheEventLoop:
+    """#242: the poll must not block the event loop, and its share of
+    _db_native_lock must stay bounded as the polled query grows."""
+
+    @pytest.mark.asyncio
+    async def test_event_loop_stays_responsive_while_poll_query_blocks(self, monkeypatch):
+        import mcp_server
+
+        monkeypatch.setattr(mcp_server, "handle_minigraf_ingest_status", lambda: None)
+        monkeypatch.setattr(mcp_server, "handle_minigraf_query", lambda _q: _time.sleep(0.05))
+
+        ticks: list[float] = []
+
+        async def heartbeat(stop: asyncio.Event) -> None:
+            while not stop.is_set():
+                ticks.append(_time.perf_counter())
+                await asyncio.sleep(0.01)
+
+        stop = asyncio.Event()
+        ingest_task = asyncio.create_task(asyncio.sleep(0.6))
+        hb = asyncio.create_task(heartbeat(stop))
+        await _poll_during_ingestion(ingest_task, poll_interval=0.0, duty_factor=0.0)
+        await ingest_task
+        stop.set()
+        await hb
+
+        # A free 0.6s loop ticking every 10ms yields ~60 ticks. With the poll
+        # blocking the loop for 50ms per iteration it yields ~12 (one per poll).
+        # 30 sits well clear of both.
+        assert len(ticks) >= 30, f"event loop was starved: only {len(ticks)} ticks"
+
+    @pytest.mark.asyncio
+    async def test_interval_backs_off_when_the_polled_query_is_slow(self, monkeypatch):
+        import mcp_server
+
+        monkeypatch.setattr(mcp_server, "handle_minigraf_ingest_status", lambda: None)
+        monkeypatch.setattr(mcp_server, "handle_minigraf_query", lambda _q: _time.sleep(0.05))
+
+        ingest_task = asyncio.create_task(asyncio.sleep(1.1))
+        _status, query_latencies, _offsets = await _poll_during_ingestion(
+            ingest_task, poll_interval=0.0, duty_factor=10.0
+        )
+        await ingest_task
+
+        # duty_factor=10 against a 50ms query forces a ~500ms sleep, so a 1.1s
+        # run admits about 2-3 polls. Without the backoff it would poll
+        # continuously and record ~20.
+        assert len(query_latencies) <= 5, f"interval did not back off: {len(query_latencies)} polls"
+
+    @pytest.mark.asyncio
+    async def test_returns_poll_offsets_aligned_with_samples(self, monkeypatch):
+        import mcp_server
+
+        monkeypatch.setattr(mcp_server, "handle_minigraf_ingest_status", lambda: None)
+        monkeypatch.setattr(mcp_server, "handle_minigraf_query", lambda _q: None)
+
+        ingest_task = asyncio.create_task(asyncio.sleep(0.2))
+        status_latencies, query_latencies, poll_offsets = await _poll_during_ingestion(
+            ingest_task, poll_interval=0.02, duty_factor=10.0
+        )
+        await ingest_task
+
+        assert len(poll_offsets) == len(status_latencies) == len(query_latencies)
+        assert poll_offsets == sorted(poll_offsets)
