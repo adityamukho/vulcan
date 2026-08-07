@@ -43,7 +43,15 @@ class TestRunIngestionBenchmark:
             "repo_path", "branch", "commits_ingested", "wall_clock_seconds",
             "throughput_per_minute", "peak_rss_kb", "graph_size_bytes",
             "index_size_bytes", "status_latency", "query_latency", "final_status",
+            "poll_count", "poll_duty_fraction", "poll_offsets",
         }
+
+    @pytest.mark.asyncio
+    async def test_poll_duty_fraction_is_a_bounded_fraction(self, git_repo, tmp_path):
+        graph_path = tmp_path / "bench.graph"
+        metrics = await run_ingestion_benchmark(str(git_repo), "HEAD", graph_path, poll_interval=0.05)
+        assert metrics["poll_count"] == len(metrics["poll_offsets"])
+        assert 0.0 <= metrics["poll_duty_fraction"] <= 1.0
 
     @pytest.mark.asyncio
     async def test_ingests_all_commits(self, git_repo, tmp_path):

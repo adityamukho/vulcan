@@ -9,6 +9,7 @@ SAMPLE_METRICS = {
     "status_latency": {"min": 0.001, "p50": 0.002, "p99": 0.004, "max": 0.005},
     "query_latency": {"min": 0.002, "p50": 0.003, "p99": 0.006, "max": 0.008},
     "final_status": "complete",
+    "poll_count": 5, "poll_duty_fraction": 0.042,
 }
 
 

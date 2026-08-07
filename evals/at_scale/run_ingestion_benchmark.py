@@ -106,6 +106,7 @@ async def run_ingestion_benchmark(
     branch: Optional[str],
     graph_path: Path,
     poll_interval: float = 0.5,
+    duty_factor: float = 10.0,
     compare_ignore: bool = False,
 ) -> dict[str, Any]:
     """Run a full git ingestion against repo_path into an isolated graph at
@@ -131,7 +132,7 @@ async def run_ingestion_benchmark(
     ingest_task = asyncio.create_task(mcp_server._run_ingestion(repo_path, resolved_branch))
     try:
         status_latencies, query_latencies, poll_offsets = await _poll_during_ingestion(
-            ingest_task, poll_interval
+            ingest_task, poll_interval, duty_factor
         )
         await ingest_task
     except BaseException:
@@ -143,6 +144,9 @@ async def run_ingestion_benchmark(
                 pass
         raise
     wall_clock = time.perf_counter() - start
+
+    poll_seconds = sum(status_latencies) + sum(query_latencies)
+    poll_duty_fraction = (poll_seconds / wall_clock) if wall_clock > 0 else 0.0
 
     commits_ingested = mcp_server._ingest_progress["processed"]
     final_status = mcp_server._ingest_progress["status"]
@@ -164,6 +168,9 @@ async def run_ingestion_benchmark(
         "status_latency": latency_stats(status_latencies),
         "query_latency": latency_stats(query_latencies),
         "final_status": final_status,
+        "poll_count": len(poll_offsets),
+        "poll_duty_fraction": poll_duty_fraction,
+        "poll_offsets": poll_offsets,
     }
 
     if compare_ignore:
@@ -204,6 +211,11 @@ def main() -> int:
     parser.add_argument("--repo-path", default=".")
     parser.add_argument("--branch", default=None)
     parser.add_argument("--poll-interval", type=float, default=0.5)
+    parser.add_argument(
+        "--poll-duty-factor", type=float, default=10.0,
+        help="Sleep max(poll_interval, N * last_poll_duration) between polls, "
+             "bounding the instrument's share of _db_native_lock (#242).",
+    )
     parser.add_argument("--compare-ignore", action="store_true")
     args = parser.parse_args()
 
@@ -212,7 +224,12 @@ def main() -> int:
         graph_path = Path(tmpdir) / "bench.graph"
         metrics = asyncio.run(
             run_ingestion_benchmark(
-                args.repo_path, args.branch, graph_path, args.poll_interval, args.compare_ignore
+                args.repo_path,
+                args.branch,
+                graph_path,
+                poll_interval=args.poll_interval,
+                duty_factor=args.poll_duty_factor,
+                compare_ignore=args.compare_ignore,
             )
         )
 

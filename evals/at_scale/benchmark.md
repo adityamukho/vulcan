@@ -19,6 +19,16 @@ An earlier version of this note incorrectly claimed no such mechanism existed an
 shipped entries 5-6 as a weaker two-query valid-time-bracket workaround instead;
 that was wrong and has been corrected here.
 
+> **2026-08-07 — poller overhead in entries before this date (#242).** Every
+> ingestion entry recorded before 2026-08-07 was measured by a harness whose
+> in-flight poller ran a blocking, cost-growing graph query on the event loop
+> every 0.5s, starving the ingestion it measured. Entry-to-entry comparisons
+> remain valid — both sides carry the same instrument — but the absolute
+> wall-clock figures, including the 78.87s forward-only baseline and the
+> 1,600.55s post-#236 figure, overstate real ingestion cost by an unquantified
+> margin. Entries from 2026-08-07 onward carry a "Poll duty cycle" row; treat
+> its absence as "unmeasured, assume inflated".
+
 ## Ingestion Run — 20260719T074053Z
 
 - Repo: `.` @ `HEAD`

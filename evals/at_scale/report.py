@@ -53,6 +53,8 @@ def append_ingestion_report(metrics: dict[str, Any], report_path: Path) -> None:
         f"{metrics['query_latency']['p50']*1000:.1f}ms / "
         f"{metrics['query_latency']['p99']*1000:.1f}ms / "
         f"{metrics['query_latency']['max']*1000:.1f}ms |",
+        f"| Poll duty cycle (#242) | {metrics['poll_duty_fraction']*100:.2f}% "
+        f"over {metrics['poll_count']} polls |",
     ]
     if "ignore_comparison" in metrics:
         comp = metrics["ignore_comparison"]
