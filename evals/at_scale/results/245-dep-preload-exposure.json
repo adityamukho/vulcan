@@ -1,0 +1,173 @@
+{
+  "repo_path": "/tmp/claude-1000/-home-aditya-Work-AMC-Minigraf-temporal-reasoning/a14e01bb-ebe0-4f07-b3d1-9318d0c0c0be/scratchpad/master-checkout",
+  "commits": 610,
+  "dep_edges_total": 358,
+  "measured_dep_edges_total": 298,
+  "affected_positions": [
+    118,
+    119,
+    120,
+    121,
+    122,
+    123,
+    124,
+    125,
+    126,
+    127,
+    128
+  ],
+  "misclassifying_positions": [
+    {
+      "position": 118,
+      "commit": "24d8460b83606a85972adf3fb6e5c45e89925449",
+      "date": "2026-04-26T12:57:34Z",
+      "wrongly_included": [],
+      "wrongly_excluded": [
+        [
+          ":module/tests-conftest-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-conftest-py",
+          ":module/tempfile"
+        ]
+      ]
+    },
+    {
+      "position": 119,
+      "commit": "3ef8a3e7a69bdf58c379d062f6739b7c476bf2fb",
+      "date": "2026-04-26T12:58:03Z",
+      "wrongly_included": [],
+      "wrongly_excluded": [
+        [
+          ":module/tests-conftest-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-conftest-py",
+          ":module/tempfile"
+        ]
+      ]
+    },
+    {
+      "position": 120,
+      "commit": "3d56441394e0c2bae1c30b7c4ed9c8e26cf642ae",
+      "date": "2026-04-26T13:00:10Z",
+      "wrongly_included": [],
+      "wrongly_excluded": [
+        [
+          ":module/tests-conftest-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-conftest-py",
+          ":module/tempfile"
+        ]
+      ]
+    },
+    {
+      "position": 121,
+      "commit": "c1ccc9af9ad97850d520ef0471017891d6013cca",
+      "date": "2026-05-02T13:12:41Z",
+      "wrongly_included": [],
+      "wrongly_excluded": [
+        [
+          ":module/tests-conftest-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-conftest-py",
+          ":module/tempfile"
+        ]
+      ]
+    },
+    {
+      "position": 122,
+      "commit": "ead40c4c97bd705604ad622991aeb44a23c33923",
+      "date": "2026-05-02T13:13:10Z",
+      "wrongly_included": [],
+      "wrongly_excluded": [
+        [
+          ":module/tests-conftest-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-conftest-py",
+          ":module/tempfile"
+        ]
+      ]
+    },
+    {
+      "position": 123,
+      "commit": "3ba7a507db064474bbc2a61b6f9db522e9808b73",
+      "date": "2026-05-02T13:13:20Z",
+      "wrongly_included": [],
+      "wrongly_excluded": [
+        [
+          ":module/tests-conftest-py",
+          ":module/os"
+        ],
+        [
+          ":module/tests-conftest-py",
+          ":module/tempfile"
+        ]
+      ]
+    }
+  ],
+  "actual_dep_counts_by_position": [
+    {
+      "position": 118,
+      "actual_count": 36
+    },
+    {
+      "position": 119,
+      "actual_count": 36
+    },
+    {
+      "position": 120,
+      "actual_count": 36
+    },
+    {
+      "position": 121,
+      "actual_count": 36
+    },
+    {
+      "position": 122,
+      "actual_count": 36
+    },
+    {
+      "position": 123,
+      "actual_count": 36
+    },
+    {
+      "position": 124,
+      "actual_count": 38
+    },
+    {
+      "position": 125,
+      "actual_count": 36
+    },
+    {
+      "position": 126,
+      "actual_count": 36
+    },
+    {
+      "position": 127,
+      "actual_count": 36
+    },
+    {
+      "position": 128,
+      "actual_count": 36
+    }
+  ],
+  "preload_deps_empty_everywhere": false,
+  "wrongly_included_total_position_weighted": 0,
+  "wrongly_excluded_total_position_weighted": 12,
+  "wrongly_included_distinct_edges": 0,
+  "wrongly_excluded_distinct_edges": 2,
+  "timestamp_collisions": 0,
+  "unmappable_valid_from_facts": 0,
+  "unmappable_valid_to_facts": 0,
+  "gitlink_events": 0,
+  "ingest_status": "complete"
+}
