@@ -153,6 +153,25 @@ class TestPositionExactLiveEdges:
         )
         assert live == set()
 
+    def test_a_closed_edge_is_live_before_its_close_and_excluded_at_and_after_it(self):
+        # Neither of the two tests above ever gives vt_ms < VALID_TIME_FOREVER_MS,
+        # so nothing exercises that comparison's False branch (the actual
+        # invert_ms_to_positions(vt_ms, ...) call) without this. #245 review
+        # round, Important finding 3.
+        ts_positions = {
+            "2026-01-01T00:00:00Z": [1],  # introduction
+            "2026-01-03T00:00:00Z": [3],  # close
+        }
+        edges = [
+            {"src": ":module/a-py", "dep": ":module/b-py", "vf_ms": 1767225600000, "vt_ms": 1767398400000},
+        ]
+        file_entities = {"a.py": []}
+
+        assert position_exact_live_edges(edges, ts_positions, file_entities, w=2) == {
+            (":module/a-py", ":module/b-py")
+        }
+        assert position_exact_live_edges(edges, ts_positions, file_entities, w=3) == set()
+
 
 @pytest.fixture
 def git_repo(tmp_path):
@@ -206,3 +225,44 @@ class TestGitlinkEventCount:
 
     def test_counts_a_real_gitlink_event(self, repo_with_submodule):
         assert gitlink_event_count(str(repo_with_submodule)) >= 1
+
+
+from evals.at_scale.probe_dep_preload_exposure import _ingest_into
+
+
+class TestIngestIntoSurfacesStatus:
+    """#245 review round, CRITICAL finding: mcp_server._run_ingestion swallows
+    every exception internally (mcp_server.py:10212-10220), sets
+    _ingest_progress["status"] to "error" (or "stopped" on a short-circuited
+    run, mcp_server.py:10205-10208), and returns NORMALLY -- it never raises.
+    Without surfacing that status, main() has no way to tell a failed or
+    partial ingestion from a complete one, and its own `_db is not None`
+    fallback would silently sweep whatever partial graph is left behind."""
+
+    @pytest.mark.asyncio
+    async def test_surfaces_a_non_complete_status_without_raising(self, tmp_path, monkeypatch):
+        import mcp_server
+
+        async def fake_run_ingestion(_repo_path, _branch):
+            # Mirrors _run_ingestion's own swallowed-exception terminal state:
+            # returns normally, having set status to something other than
+            # "complete".
+            mcp_server._ingest_progress["status"] = "error"
+            mcp_server._ingest_progress["error"] = "simulated failure"
+            mcp_server._db = None
+
+        monkeypatch.setattr(mcp_server, "_run_ingestion", fake_run_ingestion)
+
+        graph_path = tmp_path / "probe.graph"
+        branch, status = await _ingest_into(str(tmp_path), "main", graph_path)
+
+        assert branch == "main"
+        assert status == "error"
+
+    @pytest.mark.asyncio
+    async def test_surfaces_complete_status_on_a_real_successful_ingestion(self, git_repo, tmp_path):
+        graph_path = tmp_path / "probe.graph"
+        branch, status = await _ingest_into(str(git_repo), "HEAD", graph_path)
+
+        assert branch == "HEAD"
+        assert status == "complete"
