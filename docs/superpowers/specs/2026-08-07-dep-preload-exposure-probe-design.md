@@ -49,7 +49,15 @@ Out of scope, explicitly:
 - Closing #245. The measurement is the deliverable; the decision it feeds is a
   separate spec → plan cycle.
 
-`Closes #242` is correct and intended.
+**Revised 2026-08-07: #242 is NOT closed by this work either.** An earlier version
+of this spec said `Closes #242` was correct and intended. It is not. #242's own
+acceptance criterion is a `poll_duty_fraction` row in a real `benchmark.md`
+entry, and no such entry exists — the probe deliberately bypasses
+`run_ingestion_benchmark` entirely, so the fixed poller has never driven a
+full-history ingestion. Its evidence is ablation-proven unit tests on a
+2-commit fixture plus the lock-share arithmetic, which is good but is not the
+stated criterion. #242 closes on one green at-scale nightly carrying a duty
+row. Every commit message and the PR body therefore use `Refs #242`.
 
 ## Findings that shape the design
 
