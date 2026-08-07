@@ -111,3 +111,98 @@ class TestEdgeLiveAt:
 
     def test_unmappable_introduction_is_not_live_anywhere(self):
         assert edge_live_at([], None, 0) is False
+
+
+import subprocess as _subprocess
+
+import pytest
+
+from evals.at_scale.probe_dep_preload_exposure import (
+    gitlink_event_count,
+    position_exact_live_edges,
+)
+
+
+class TestPositionExactLiveEdges:
+    """The oracle restricts to edges whose SOURCE MODULE is present in
+    file_entities at W, mirroring _preload_known_deps' own ident_to_file
+    filter (mcp_server.py:7526-7535, 7558-7560). That narrowing is already
+    position-correct after #238, so isolating it out leaves the :depends-on
+    bound as the only variable under measurement -- which is exactly #245's
+    residual class."""
+
+    def _edges(self):
+        return [
+            # live from position 1 onward, source module present
+            {"src": ":module/a-py", "dep": ":module/b-py", "vf_ms": 1767225600000, "vt_ms": (1 << 63) - 1},
+            # source module absent from file_entities -- must be excluded
+            {"src": ":module/gone-py", "dep": ":module/b-py", "vf_ms": 1767225600000, "vt_ms": (1 << 63) - 1},
+        ]
+
+    def test_excludes_edges_whose_source_module_is_not_a_live_file_entity(self):
+        ts_positions = {"2026-01-01T00:00:00Z": [1]}
+        live = position_exact_live_edges(
+            self._edges(), ts_positions, file_entities={"a.py": []}, w=2
+        )
+        assert live == {(":module/a-py", ":module/b-py")}
+
+    def test_excludes_edges_introduced_above_the_position(self):
+        ts_positions = {"2026-01-01T00:00:00Z": [1]}
+        live = position_exact_live_edges(
+            self._edges(), ts_positions, file_entities={"a.py": []}, w=0
+        )
+        assert live == set()
+
+
+@pytest.fixture
+def git_repo(tmp_path):
+    """Minimal git repo with two commits (mirrors tests/test_mcp_server.py's fixture)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+    (repo / "auth.py").write_text("def login(): pass\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "add auth"], cwd=repo, check=True, capture_output=True)
+    (repo / "models.py").write_text("class User: pass\n")
+    _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "add models"], cwd=repo, check=True, capture_output=True)
+    return repo
+
+
+@pytest.fixture
+def repo_with_submodule(tmp_path):
+    """A repo carrying a real gitlink entry, so gitlink_event_count has
+    something to find."""
+    inner = tmp_path / "inner"
+    inner.mkdir()
+    _subprocess.run(["git", "init"], cwd=inner, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=inner, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=inner, check=True, capture_output=True)
+    (inner / "x.py").write_text("x = 1\n")
+    _subprocess.run(["git", "add", "."], cwd=inner, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "inner"], cwd=inner, check=True, capture_output=True)
+
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    _subprocess.run(["git", "init"], cwd=outer, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=outer, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=outer, check=True, capture_output=True)
+    (outer / "main.py").write_text("y = 2\n")
+    _subprocess.run(["git", "add", "."], cwd=outer, check=True, capture_output=True)
+    _subprocess.run(["git", "commit", "-m", "outer"], cwd=outer, check=True, capture_output=True)
+    _subprocess.run(
+        ["git", "-c", "protocol.file.allow=always", "submodule", "add", str(inner), "sub"],
+        cwd=outer, check=True, capture_output=True,
+    )
+    _subprocess.run(["git", "commit", "-m", "add sub"], cwd=outer, check=True, capture_output=True)
+    return outer
+
+
+class TestGitlinkEventCount:
+    def test_counts_zero_for_a_repo_without_submodules(self, git_repo):
+        assert gitlink_event_count(str(git_repo)) == 0
+
+    def test_counts_a_real_gitlink_event(self, repo_with_submodule):
+        assert gitlink_event_count(str(repo_with_submodule)) >= 1
