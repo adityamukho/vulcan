@@ -10361,20 +10361,25 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # write_executor is already shut down by the inner finally above by the
         # time we get here (it runs on any exit from that try, including this
         # exception propagating through it) — nothing left to clean up.
-        #
-        # The checkpoint policy is a separate story: it is installed just
-        # after write_executor is created, several statements above the
-        # `try` that owns the finally clearing it (see that finally's own
-        # comment). A failure in that gap -- e.g. _frontier_load's one-time
-        # migration -- lands here without ever passing through the finally
-        # above, so this is the only place left to clear it. Idempotent with
-        # the finally's own clear on every path that does reach it (#241).
-        _ingest_checkpoint_policy = None
         _ingest_progress["phase"] = None
         _ingest_progress["status"] = "error"
         _ingest_progress["error"] = str(e)
         _ingest_progress["error_at"] = _now_utc_ms()
         _db = None
+    finally:
+        # The checkpoint policy is a separate story from write_executor
+        # above: it is installed just after write_executor is created,
+        # several statements above the `try` that owns the finally clearing
+        # it in the normal case (see that finally's own comment). A failure
+        # in that gap -- e.g. _frontier_load's one-time migration -- skips
+        # that inner finally entirely. A `finally` here (rather than another
+        # `except Exception`) is required, not just belt-and-suspenders:
+        # `except Exception` does not catch BaseException-rooted control
+        # flow (asyncio.CancelledError, KeyboardInterrupt, SystemExit), so a
+        # cancellation landing in that same gap would still leak the policy
+        # with only an `except Exception` clear. Idempotent with the inner
+        # finally's own clear on every path that reaches it (#241).
+        _ingest_checkpoint_policy = None
 
 
 async def handle_minigraf_ingest_git(

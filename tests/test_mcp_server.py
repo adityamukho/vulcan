@@ -20138,3 +20138,33 @@ class TestCheckpointPolicyLifecycle:
             "policy leaked past a run that failed before the write-scope "
             "try/finally was even entered"
         )
+
+    @pytest.mark.asyncio
+    async def test_policy_is_cleared_when_a_cancellation_hits_the_same_gap(
+        self, git_repo, monkeypatch,
+    ):
+        """asyncio.CancelledError (and KeyboardInterrupt/SystemExit) derive
+        from BaseException, not Exception, so an `except Exception` clear in
+        the pre-write-scope gap (see the sibling test above) would silently
+        fail to catch a cancellation landing there -- the policy clear must
+        live in a `finally`, which runs regardless of exception type.
+        _run_ingestion does not itself swallow CancelledError, so it
+        propagates out and pytest.raises must observe it."""
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+            "error_at": None, "phase": None,
+        }
+
+        def boom(*a, **k):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(mcp_server, "_frontier_load", boom)
+        with pytest.raises(asyncio.CancelledError):
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        assert mcp_server._ingest_checkpoint_policy is None, (
+            "policy leaked past a BaseException-rooted cancellation that hit "
+            "the same pre-write-scope gap as the RuntimeError case above"
+        )
