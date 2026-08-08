@@ -289,7 +289,98 @@ Stating this explicitly because two successive confident mechanisms were
 demolished by measurement during #235 within hours. The penalty is recorded
 here as an observation, not explained.
 
+## Resolved: keep the uniform gate — no measurable win from narrowing to Stage B
+
+**Added 2026-08-08, after landing `--checkpoint-mode` on
+`profile_forward_reconcile_attribution.py` (#241 Task 5) and running the
+four-leg ablation the plan promised.** Same 330-commit slice at
+`82aa7e6c0353b52da5932f7ecbabdc7e42f6e418`, `--no-profile`, one leg at a time,
+against branch HEAD (dedup + the shipped duty policy both already live, unlike
+the legs in "How much is on the critical path" above, which predate both).
+
+| leg | wall s | ckpt n | ckpt s | `_db_execute` s | `_retract` s | Stage A s | Stage B s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `normal` (discarded — see caveat) | 150.4 | 52 | 7.3 | 67.4 | 10.5 | 75.2 | 75.2 |
+| `normal-repeat` | 139.6 | 50 | 6.5 | 61.9 | 9.4 | 73.6 | 66.0 |
+| `normal-clean` | 139.4 | 52 | 6.6 | 61.9 | 9.1 | 73.1 | 66.3 |
+| `duty` (no flag, shipped default) | 141.5 | 52 | 6.8 | 62.6 | 8.8 | 74.7 | 66.8 |
+| `stage-b-only` | 141.7 | 346 | 43.4 | 63.3 | 9.4 | 74.7 | 67.0 |
+
+**Caveat on the discarded `normal` leg.** Its first run hit one genuine
+mid-run write failure — `[_run_ingestion] skipping commit 295073c4...: write
+failed: msg='Page 7737 out of bounds (total pages: 7737)'` — which
+`_run_ingestion`'s per-commit try/except (its own documented "fail only the
+one commit" contract) caught and isolated correctly: the run still completed
+(`status=complete`, 330/330 commits attempted), leaving 7 entities
+provisional for Stage B to report and move on from. It did not corrupt
+anything or silently swallow the failure. But it did cost real wall clock —
+Stage B alone grew from ~66 s (every clean run) to 75.2 s, accounting for
+essentially all of the 10.8 s gap to `normal-repeat` — so this run is not a
+clean noise sample and is excluded from the spread below. It did not
+reproduce on an immediate repeat (`normal-repeat`) or on any of the other
+three legs. Given the "measurement hygiene" load samples taken around it
+(load average climbed to 2.54 with a Brave tab at 29% CPU right as it
+finished, versus 0.3–1.3 for every other leg), a resource-contention-induced
+timing hazard is the leading explanation, but it is not confirmed, and
+whether checkpoint deferral widens whatever race window this is remains
+unknown. **This is flagged as a follow-up below — it is a possible
+correctness concern independent of the uniform-vs-Stage-B-only question this
+section resolves**, and is not itself evidence for or against either gate
+shape (it did not recur under `stage-b-only` or `duty`, both of which also
+defer checkpoints).
+
+**The noise floor.** `normal-repeat`, `normal-clean`, and `duty` are three
+independent runs of the *identical* configuration — no flag, or
+`--checkpoint-mode normal` (its default), changes nothing about how
+`mcp_server.py` behaves, so `duty` is as much a repeat of `normal` as
+`normal-repeat` is. Their wall clocks (139.4, 139.6, 141.5) span **2.1 s, a
+1.5% spread** — tighter than the ±4% this spec's earlier legs recorded
+against pre-Task-1/2/4 code, but still the yardstick every delta below must
+clear.
+
+**`stage-b-only` clears none of it.** 141.7 s sits 0.2 s above the top of the
+baseline cluster (`duty` at 141.5 s) and 1.6 s above its mean (140.2 s) —
+both smaller than the cluster's own 2.1 s internal spread. `_db_execute`
+(63.3 s) and `_retract` (9.4 s) are likewise inside the baseline band, not
+below it: the "other DB work slowing" penalty this section was opened to
+investigate does not appear at `duty = 0.05`'s actual operating point. It was
+only ever observed on `every25`/`noop`, which suppress far more aggressively
+(26 and 0 checkpoints against 330+ commits) than the shipped duty policy does
+(50–52) — the two are not the same regime, and this ablation does not
+speak to what happens at that far end.
+
+**The clearest signal is in the checkpoint columns, not the wall clock.**
+`stage-b-only` ran **346 checkpoints totaling 43.4 s** — 6.6x the count and
+6.4x the seconds of `duty`'s 52 checkpoints / 6.8 s, because it lets Stage A
+checkpoint on every commit, ungated. That 36.6 s of *additional* checkpoint
+work bought back essentially nothing: total wall clock differs by 0.2 s. This
+is finding 4 confirmed directly, not inferred: Stage A's checkpoints really
+are close to free, hidden behind the parse pool, whether the duty policy
+gates them (`duty`) or not (`stage-b-only`) — so narrowing the gate away from
+Stage A neither costs nor buys anything measurable.
+
+**Decision: keep the uniform gate.** Per this document's own rule — no
+difference is meaningful unless it exceeds the measured spread — `stage-b-only`
+is statistically indistinguishable from `duty`. The uniform gate is already
+shipped, is simpler than a phase-aware one, and this ablation is the
+counterfactual leg the plan required before believing otherwise. No
+production code changed as a result (`mcp_server.py`'s gate stays uniform
+across both stages, exactly as Task 4 landed it).
+
 ## Follow-ups
+
+- **Investigate the one-off `Page N out of bounds (total pages: N)` write
+  failure** hit by the discarded `normal` leg above (commit
+  `295073c4eacd091c959ae7fc36100fcdd1dc24dc`, #241 Task 5). Did not reproduce
+  across four other full-slice runs on the same branch, so it is not
+  confirmed to be caused by this spec's checkpoint deferral — but it also
+  cannot be ruled out, since a wider gap between checkpoints is exactly the
+  kind of change that would widen a pre-existing race window (e.g. around
+  `_run_ingestion`'s per-commit `_db = None` / reopen cycle racing a
+  same-file checkpoint on another handle). `_run_ingestion`'s own per-commit
+  isolation caught it correctly and the run completed, so this is not an
+  emergency, but it is new information this task's stress-scale run surfaced
+  that the 963-test suite's small fixtures cannot exercise.
 
 - Amend `benchmark.md`'s 20260803T095104Z entry. It attributes 33.6% to
   `_db_execute (query)` and leaves 28.3% unattributed to "process-pool
