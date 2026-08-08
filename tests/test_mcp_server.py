@@ -19864,6 +19864,44 @@ class TestCheckpointPolicy:
             with pytest.raises(ValueError):
                 mcp_server._CheckpointPolicy(bad)
 
+    def test_summary_reports_checkpoints_suppressed_total_seconds_and_duty(
+        self, real_db, monkeypatch,
+    ):
+        """#241 Task 6: summary() is the snapshot _run_ingestion publishes
+        into _ingest_progress just before it discards the policy, since the
+        policy's own counters do not survive the run. Uses the FakeClock so
+        every figure is exact, not just approximately right."""
+        clock = _FakeClock()
+        policy = self._policy(monkeypatch, clock, duty=0.05, cost=0.1)
+        policy.maybe(real_db)   # first call always fires: checkpoints=1, total=0.1s
+        clock.advance(1.9)      # wait = 0.1 * (1/0.05 - 1) = 1.9s -> exactly elapsed
+        policy.maybe(real_db)   # checkpoints=2, total=0.2s
+        clock.advance(0.5)      # short of the next 1.9s window
+        policy.maybe(real_db)   # suppressed=1
+
+        summary = policy.summary()
+        assert summary["checkpoints"] == 2
+        assert summary["suppressed"] == 1
+        assert summary["total_seconds"] == pytest.approx(0.2)
+        assert summary["elapsed_seconds"] == pytest.approx(clock.t)
+        assert summary["realised_duty"] == pytest.approx(0.2 / clock.t)
+
+    def test_summary_before_any_checkpoint_has_no_ceremony(self, monkeypatch):
+        """A summary taken before the first checkpoint (e.g. a run that fails
+        before entering the write scope, #241 Task 6) must report clean
+        zeros, not divide by zero or raise."""
+        import mcp_server
+        clock = _FakeClock()
+        policy = mcp_server._CheckpointPolicy(0.05, clock=clock)
+        summary = policy.summary()
+        assert summary == {
+            "checkpoints": 0,
+            "suppressed": 0,
+            "total_seconds": 0.0,
+            "elapsed_seconds": 0.0,
+            "realised_duty": 0.0,
+        }
+
 
 class TestDbCheckpointGated:
     def test_checkpoints_every_call_with_no_policy_installed(self, real_db, monkeypatch):
@@ -20168,3 +20206,147 @@ class TestCheckpointPolicyLifecycle:
             "policy leaked past a BaseException-rooted cancellation that hit "
             "the same pre-write-scope gap as the RuntimeError case above"
         )
+
+
+class TestCheckpointDutySummaryPublication:
+    """#241 Task 6: _run_ingestion clears _ingest_checkpoint_policy to None
+    at two sites (the inner finally that also shuts down write_executor, and
+    the outer finally that is idempotent with it) -- see that finally's own
+    comment for why both exist. Both must publish _CheckpointPolicy.summary()
+    into _ingest_progress["checkpoint_summary"] BEFORE the clear, since the
+    policy holding the counters is gone the instant the assignment lands and
+    nothing after that point could otherwise read them. This mirrors Task 3's
+    TestFinalCheckpointOnEveryTerminalPath and Task 4's
+    TestCheckpointPolicyLifecycle, one integration test per terminal path
+    those tasks established: normal completion, shutdown mid-run, a Stage B
+    failure (all three land in the INNER finally), and a pre-write-scope
+    failure (lands in the OUTER finally only, since it never enters the inner
+    try at all).
+
+    Every assertion below is ablation-proof by construction: on unmodified
+    Task 1-5 code, _ingest_progress has no "checkpoint_summary" key at all,
+    since nothing ever wrote one -- there is no way for these tests to pass
+    vacuously against that code.
+    """
+
+    def _fresh_progress(self):
+        return {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+            "error_at": None, "phase": None,
+        }
+
+    def _assert_self_consistent(self, summary, wall_clock=None):
+        assert summary["checkpoints"] >= 0
+        assert summary["suppressed"] >= 0
+        assert summary["total_seconds"] >= 0.0
+        assert summary["elapsed_seconds"] >= 0.0
+        if summary["elapsed_seconds"] > 0:
+            assert summary["realised_duty"] == pytest.approx(
+                summary["total_seconds"] / summary["elapsed_seconds"]
+            ), "realised_duty must equal total_seconds / elapsed_seconds"
+        else:
+            assert summary["realised_duty"] == 0.0
+        if wall_clock is not None:
+            # elapsed_seconds is measured from policy construction (a few
+            # statements into the run) to the clearing finally (a few
+            # statements before the run returns), so it must never exceed
+            # the run's own wall clock measured from outside it. Both use
+            # CPython's CLOCK_MONOTONIC on Linux (time.monotonic and
+            # time.perf_counter), so they are directly comparable; the
+            # epsilon covers the setup/teardown slivers outside that window
+            # plus timer-resolution noise.
+            assert summary["elapsed_seconds"] <= wall_clock + 0.5
+
+    @pytest.mark.asyncio
+    async def test_summary_is_published_after_a_completed_run(self, git_repo, monkeypatch):
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = self._fresh_progress()
+
+        started = time.monotonic()
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        wall_clock = time.monotonic() - started
+
+        assert mcp_server._ingest_progress["status"] == "complete"
+        summary = mcp_server._ingest_progress.get("checkpoint_summary")
+        assert summary is not None, "a completed run must publish its checkpoint duty summary"
+        assert summary["checkpoints"] >= 1, "a completed run must have checkpointed at least once"
+        self._assert_self_consistent(summary, wall_clock)
+
+    @pytest.mark.asyncio
+    async def test_summary_survives_shutdown_mid_run(self, git_repo, monkeypatch):
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = self._fresh_progress()
+
+        original_sleep = asyncio.sleep
+
+        async def patched_sleep(t):
+            mcp_server._shutdown_requested.set()
+            await original_sleep(t)
+
+        started = time.monotonic()
+        try:
+            with patch("mcp_server.asyncio.sleep", patched_sleep):
+                await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        finally:
+            mcp_server._shutdown_requested.clear()
+        wall_clock = time.monotonic() - started
+
+        assert mcp_server._ingest_progress["status"] == "stopped"
+        summary = mcp_server._ingest_progress.get("checkpoint_summary")
+        assert summary is not None, "an interrupted run must still publish its summary"
+        assert summary["checkpoints"] >= 1, (
+            "the unconditional final checkpoint (#241 Task 3) means an "
+            "interrupted run still has at least one checkpoint to report"
+        )
+        self._assert_self_consistent(summary, wall_clock)
+
+    @pytest.mark.asyncio
+    async def test_summary_survives_a_stage_b_failure(self, git_repo, monkeypatch):
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = self._fresh_progress()
+
+        def boom(*a, **k):
+            raise RuntimeError("injected Stage B failure")
+
+        monkeypatch.setattr(mcp_server, "_correction_sweep_apply", boom)
+        started = time.monotonic()
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        wall_clock = time.monotonic() - started
+
+        summary = mcp_server._ingest_progress.get("checkpoint_summary")
+        assert summary is not None, "a Stage B failure must still publish a summary"
+        assert summary["checkpoints"] >= 1
+        self._assert_self_consistent(summary, wall_clock)
+
+    @pytest.mark.asyncio
+    async def test_summary_survives_a_pre_write_scope_failure(self, git_repo, monkeypatch):
+        """Mirrors TestCheckpointPolicyLifecycle's
+        test_policy_is_cleared_when_the_run_fails_before_the_write_scope: a
+        failure in _frontier_load skips the inner finally entirely and lands
+        in the outer one, so this is the only test that exercises the OUTER
+        finally's publish. The policy exists (constructed a few lines above
+        _frontier_load) but has never checkpointed, so the summary is a
+        legitimate all-zeros snapshot, not a missing one."""
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = self._fresh_progress()
+
+        def boom(*a, **k):
+            raise RuntimeError("injected pre-write-scope failure")
+
+        monkeypatch.setattr(mcp_server, "_frontier_load", boom)
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "error"
+        summary = mcp_server._ingest_progress.get("checkpoint_summary")
+        assert summary is not None, (
+            "the outer finally must publish too -- this failure never "
+            "reaches the inner one"
+        )
+        assert summary["checkpoints"] == 0, "no checkpoint ever ran before the injected failure"
+        assert summary["total_seconds"] == 0.0
+        assert summary["realised_duty"] == 0.0

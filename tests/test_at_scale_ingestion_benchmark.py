@@ -43,8 +43,26 @@ class TestRunIngestionBenchmark:
             "repo_path", "branch", "commits_ingested", "wall_clock_seconds",
             "throughput_per_minute", "peak_rss_kb", "graph_size_bytes",
             "index_size_bytes", "status_latency", "query_latency", "final_status",
-            "poll_count", "poll_duty_fraction", "poll_offsets",
+            "poll_count", "poll_duty_fraction", "poll_offsets", "checkpoint_summary",
         }
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_summary_is_present_and_self_consistent(self, git_repo, tmp_path):
+        """#241 Task 6: the benchmark's acceptance criterion is a run that
+        reports realised checkpoint duty, not just poll duty. mcp_server
+        publishes this into _ingest_progress["checkpoint_summary"] just
+        before _run_ingestion discards the policy that held the counters;
+        the harness must carry it through into its own returned metrics."""
+        graph_path = tmp_path / "bench.graph"
+        metrics = await run_ingestion_benchmark(str(git_repo), "HEAD", graph_path, poll_interval=0.05)
+        summary = metrics["checkpoint_summary"]
+        assert summary is not None
+        assert summary["checkpoints"] >= 1
+        assert summary["total_seconds"] >= 0.0
+        if summary["elapsed_seconds"] > 0:
+            assert summary["realised_duty"] == pytest.approx(
+                summary["total_seconds"] / summary["elapsed_seconds"]
+            )
 
     # test_poll_duty_fraction_is_a_bounded_fraction was DELETED here (final
     # whole-branch review). Both of its assertions were tautologies:

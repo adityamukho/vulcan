@@ -3361,10 +3361,12 @@ class _CheckpointPolicy:
             raise ValueError(f"checkpoint duty must be in (0, 1], got {duty!r}")
         self._duty = duty
         self._clock = clock
+        self._created_at = clock()
         self._last_duration: Optional[float] = None
         self._last_finished_at = 0.0
         self.checkpoints = 0
         self.suppressed = 0
+        self.total_seconds = 0.0
 
     def _budget_elapsed(self) -> bool:
         if self._last_duration is None:
@@ -3388,6 +3390,34 @@ class _CheckpointPolicy:
         self._last_duration = finished - started
         self._last_finished_at = finished
         self.checkpoints += 1
+        self.total_seconds += self._last_duration
+
+    def summary(self) -> Dict[str, Any]:
+        """A small, JSON-safe snapshot of realised checkpoint duty (#241 Task
+        6), taken by the caller just before it discards this policy.
+
+        _run_ingestion clears _ingest_checkpoint_policy to None at its two
+        terminal-path finally sites (see their own comments for why there
+        are two) so a later interactive transact is never gated by a stale
+        run's budget -- which means this object and its counters are gone
+        the instant that happens. _ingest_progress is the channel that
+        already survives past a finished run, so the caller publishes this
+        dict there before clearing the policy, not after.
+
+        `elapsed_seconds` is measured from this policy's construction, which
+        is a few statements into _run_ingestion, to whenever this is called,
+        which is a few statements before the run returns -- close enough to
+        the run's own wall clock to report a meaningful duty fraction
+        without threading a second timer through the caller.
+        """
+        elapsed = max(self._clock() - self._created_at, 0.0)
+        return {
+            "checkpoints": self.checkpoints,
+            "suppressed": self.suppressed,
+            "total_seconds": self.total_seconds,
+            "elapsed_seconds": elapsed,
+            "realised_duty": (self.total_seconds / elapsed) if elapsed > 0 else 0.0,
+        }
 
 
 def _db_checkpoint_gated(db: Any) -> bool:
@@ -10352,6 +10382,17 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             else:
                 _ingest_progress["status"] = "stopped"
         finally:
+            # Publish realised checkpoint duty into _ingest_progress BEFORE
+            # discarding the policy below -- its counters do not survive
+            # past this point, and _ingest_progress is the established
+            # channel for run metadata that does (#241 Task 6). Guarded on
+            # `is not None` so this is a no-op if the outer finally's own
+            # guarded publish (below) already ran first on some exit path
+            # that reaches both -- summary() is a pure read, so writing it
+            # twice would be harmless anyway, but the guard keeps one
+            # obvious writer per policy lifetime.
+            if _ingest_checkpoint_policy is not None:
+                _ingest_progress["checkpoint_summary"] = _ingest_checkpoint_policy.summary()
             # Never let a finished run's budget gate a later interactive
             # transact (#241).
             _ingest_checkpoint_policy = None
@@ -10379,6 +10420,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # cancellation landing in that same gap would still leak the policy
         # with only an `except Exception` clear. Idempotent with the inner
         # finally's own clear on every path that reaches it (#241).
+        #
+        # A failure in the pre-write-scope gap (e.g. _frontier_load's
+        # migration) never reaches the inner finally at all, so THIS is the
+        # only place that publishes the summary for that path -- guarded the
+        # same way, and for the same reason (#241 Task 6).
+        if _ingest_checkpoint_policy is not None:
+            _ingest_progress["checkpoint_summary"] = _ingest_checkpoint_policy.summary()
         _ingest_checkpoint_policy = None
 
 

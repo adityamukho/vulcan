@@ -10,6 +10,10 @@ SAMPLE_METRICS = {
     "query_latency": {"min": 0.002, "p50": 0.003, "p99": 0.006, "max": 0.008},
     "final_status": "complete",
     "poll_count": 5, "poll_duty_fraction": 0.042,
+    "checkpoint_summary": {
+        "checkpoints": 52, "suppressed": 480, "total_seconds": 6.8,
+        "elapsed_seconds": 141.5, "realised_duty": 0.0481,
+    },
 }
 
 
@@ -69,6 +73,29 @@ class TestAppendIngestionReport:
         append_ingestion_report(pre_fix, report_path)
         text = report_path.read_text()
         assert "Poll duty cycle (#242)" in text
+        assert "not measured" in text
+
+    def test_checkpoint_duty_cycle_row_renders_with_formatted_values(self, tmp_path):
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(SAMPLE_METRICS, report_path)
+        text = report_path.read_text()
+        assert "Checkpoint duty cycle (#241)" in text
+        assert "4.81%" in text  # realised_duty=0.0481 -> 4.81%
+        assert "52 checkpoints" in text
+        assert "6.80s" in text  # total_seconds=6.8
+
+    def test_checkpoint_duty_cycle_row_still_renders_for_a_pre_fix_result(self, tmp_path):
+        # Mirrors the poll-duty precedent immediately above: a result JSON
+        # written before #241 landed has no "checkpoint_summary" key at all.
+        # Re-rendering one must not raise, and must say the row is
+        # unmeasured rather than silently omitting it (#241 Task 6).
+        pre_fix = {
+            k: v for k, v in SAMPLE_METRICS.items() if k != "checkpoint_summary"
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(pre_fix, report_path)
+        text = report_path.read_text()
+        assert "Checkpoint duty cycle (#241)" in text
         assert "not measured" in text
 
 
