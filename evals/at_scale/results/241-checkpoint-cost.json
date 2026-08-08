@@ -1,0 +1,38 @@
+{
+  "probe": "241-checkpoint-cost",
+  "scaling": [
+    {
+      "plateau_facts": 5000,
+      "graph_mb": 1.57,
+      "ckpt_after_1_fact_ms": 7.21,
+      "ckpt_after_5000_facts_ms": 19.23,
+      "ratio_batch_over_1": 2.666
+    },
+    {
+      "plateau_facts": 20000,
+      "graph_mb": 6.29,
+      "ckpt_after_1_fact_ms": 33.47,
+      "ckpt_after_5000_facts_ms": 41.87,
+      "ratio_batch_over_1": 1.251
+    },
+    {
+      "plateau_facts": 50000,
+      "graph_mb": 15.73,
+      "ckpt_after_1_fact_ms": 79.88,
+      "ckpt_after_5000_facts_ms": 87.04,
+      "ratio_batch_over_1": 1.09
+    }
+  ],
+  "durability": {
+    "child_exit_code": 9,
+    "child_died_via_exit9": true,
+    "child_stderr": "",
+    "graph_bytes_after_hard_kill": 24576,
+    "wal_bytes_after_hard_kill": 201,
+    "reopen_ms": 0.14,
+    "recovered_checkpointed_fact": true,
+    "recovered_uncheckpointed_fact": true,
+    "recovered_uncheckpointed_watermark": true,
+    "all_three_recovered": true
+  }
+}
