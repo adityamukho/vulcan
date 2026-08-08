@@ -306,24 +306,44 @@ the legs in "How much is on the critical path" above, which predate both).
 | `duty` (no flag, shipped default) | 141.5 | 52 | 6.8 | 62.6 | 8.8 | 74.7 | 66.8 |
 | `stage-b-only` | 141.7 | 346 | 43.4 | 63.3 | 9.4 | 74.7 | 67.0 |
 
+Load samples (8-core box), immediately before/after each of the four
+**counted** legs (the discarded `normal` run's own load spike is covered in
+the caveat immediately below, since it is the point of that caveat):
+
+| leg | load avg before (1/5/15 min) | load avg after | top non-self process after |
+|---|---|---|---|
+| `normal-repeat` | 0.91, 1.09, 0.86 | 1.42, 1.35, 1.01 | brave ~2% |
+| `normal-clean` | 0.27, 0.95, 0.89 | 1.33, 1.22, 1.01 | brave 91.8% (spiked right at the tail end) |
+| `duty` | 0.71, 1.15, 1.04 | 1.26, 1.26, 1.10 | brave ~2% |
+| `stage-b-only` | 0.93, 1.14, 0.99 | 1.32, 1.30, 1.08 | brave ~2% |
+
 **Caveat on the discarded `normal` leg.** Its first run hit one genuine
 mid-run write failure — `[_run_ingestion] skipping commit 295073c4...: write
 failed: msg='Page 7737 out of bounds (total pages: 7737)'` — which
-`_run_ingestion`'s per-commit try/except (its own documented "fail only the
-one commit" contract) caught and isolated correctly: the run still completed
-(`status=complete`, 330/330 commits attempted), leaving 7 entities
-provisional for Stage B to report and move on from. It did not corrupt
-anything or silently swallow the failure. But it did cost real wall clock —
-Stage B alone grew from ~66 s (every clean run) to 75.2 s, accounting for
-essentially all of the 10.8 s gap to `normal-repeat` — so this run is not a
-clean noise sample and is excluded from the spread below. It did not
-reproduce on an immediate repeat (`normal-repeat`) or on any of the other
-three legs. Given the "measurement hygiene" load samples taken around it
-(load average climbed to 2.54 with a Brave tab at 29% CPU right as it
-finished, versus 0.3–1.3 for every other leg), a resource-contention-induced
-timing hazard is the leading explanation, but it is not confirmed, and
-whether checkpoint deferral widens whatever race window this is remains
-unknown. **This is flagged as a follow-up below — it is a possible
+`_run_ingestion`'s per-commit try/except (`mcp_server.py:10168-10186`, its own
+documented "fail only the one commit" contract) is confirmed by reading that
+code to catch, log, and continue to the next commit rather than aborting or
+raising. The run went on to report `status=complete`, 330/330 commits
+attempted, with Stage B logging 7 entities left provisional. What that
+confirms: the failure was isolated to one commit at the time it happened, and
+the run did not crash or silently swallow the exception. What it does **not**
+confirm: whether those 7 provisional entities were ever actually reconciled
+by Stage B to a correct final state, or whether they remained permanently
+provisional — no query was run against the resulting graph to check either
+way. So the accurate claim is *no data loss observed in run status; final-state
+reconciliation was not independently verified*, not "nothing was corrupted."
+Separately, it did cost real wall clock — Stage B alone grew from ~66 s
+(every clean run) to 75.2 s, accounting for essentially all of the 10.8 s gap
+to `normal-repeat` — so this run is not a clean noise sample and is excluded
+from the spread below. It did not reproduce on an immediate repeat
+(`normal-repeat`) or on any of the other three legs. Load average climbed to
+2.54 with a Brave tab at 29% CPU right as this run finished, versus 0.3–1.3
+for every other counted leg (table above) — but `normal-clean`'s own load
+spiked *harder* (Brave at 91.8%, over 3x the discarded run's 29.3%) with
+**zero** resulting anomaly, which argues against a simple "load causes it"
+story and should constrain whatever hypothesis a follow-up investigation
+starts from. Whether checkpoint deferral widens whatever race window this is
+remains unknown. **This is flagged as a follow-up below — it is a possible
 correctness concern independent of the uniform-vs-Stage-B-only question this
 section resolves**, and is not itself evidence for or against either gate
 shape (it did not recur under `stage-b-only` or `duty`, both of which also
@@ -333,10 +353,15 @@ defer checkpoints).
 independent runs of the *identical* configuration — no flag, or
 `--checkpoint-mode normal` (its default), changes nothing about how
 `mcp_server.py` behaves, so `duty` is as much a repeat of `normal` as
-`normal-repeat` is. Their wall clocks (139.4, 139.6, 141.5) span **2.1 s, a
-1.5% spread** — tighter than the ±4% this spec's earlier legs recorded
-against pre-Task-1/2/4 code, but still the yardstick every delta below must
-clear.
+`normal-repeat` is; `0.05` is already the shipped default duty, so "run
+normal" and "run duty" are the same code path on branch HEAD. Put plainly:
+this ablation is really **three samples of one baseline configuration plus
+one variant leg (`stage-b-only`)**, not four independently-configured legs —
+which is a stronger noise-floor estimate than a single normal/normal-repeat
+pair would give, not a weaker one. Their wall clocks (139.4, 139.6, 141.5)
+span **2.1 s, a 1.5% spread** — tighter than the ±4% this spec's earlier legs
+recorded against pre-Task-1/2/4 code, but still the yardstick every delta
+below must clear.
 
 **`stage-b-only` clears none of it.** 141.7 s sits 0.2 s above the top of the
 baseline cluster (`duty` at 141.5 s) and 1.6 s above its mean (140.2 s) —
@@ -377,10 +402,19 @@ across both stages, exactly as Task 4 landed it).
   cannot be ruled out, since a wider gap between checkpoints is exactly the
   kind of change that would widen a pre-existing race window (e.g. around
   `_run_ingestion`'s per-commit `_db = None` / reopen cycle racing a
-  same-file checkpoint on another handle). `_run_ingestion`'s own per-commit
-  isolation caught it correctly and the run completed, so this is not an
-  emergency, but it is new information this task's stress-scale run surfaced
-  that the 963-test suite's small fixtures cannot exercise.
+  same-file checkpoint on another handle). `_run_ingestion`'s per-commit
+  isolation (`mcp_server.py:10168-10186`) is confirmed to catch, log, and
+  continue rather than crash — but whether the 7 entities left provisional
+  by that run were ever correctly reconciled by Stage B was never checked
+  against the resulting graph; treat that as unverified, not as "fine",
+  until someone queries it. A simple load-causation story is also weaker
+  than it first looks: `normal-clean`, one of the three clean baseline runs,
+  saw a *larger* CPU spike (Brave at 91.8%, vs. the failing run's 29.3%)
+  with no resulting anomaly at all — so elevated load alone is not
+  sufficient to trigger this, whatever the real trigger is. This is not an
+  emergency — the isolation mechanism did its job at the level it's
+  responsible for — but it is new information this task's stress-scale run
+  surfaced that the 963-test suite's small fixtures cannot exercise.
 
 - Amend `benchmark.md`'s 20260803T095104Z entry. It attributes 33.6% to
   `_db_execute (query)` and leaves 28.3% unattributed to "process-pool
