@@ -19881,10 +19881,15 @@ class TestDbCheckpointGated:
 
 class TestGatedWrapperIsInertWithoutAPolicy:
     @pytest.mark.asyncio
-    async def test_ingestion_checkpoint_count_is_unchanged(self, git_repo, monkeypatch):
-        """Task 1 is pure plumbing: routing ingestion through
-        _db_checkpoint_gated with no policy installed must not change how
-        many checkpoints a run performs (#241)."""
+    async def test_policy_is_none_after_a_completed_run(self, git_repo, monkeypatch):
+        """Originally named test_ingestion_checkpoint_count_is_unchanged, back
+        when Task 1 was pure plumbing and no policy was ever installed during
+        a run. Since Task 4, _run_ingestion installs a real _CheckpointPolicy
+        for the run's duration, so the checkpoint COUNT is no longer pinned
+        here -- that is now the whole point of #241, and is covered by
+        TestCheckpointPolicyLifecycle instead. What is still meaningful, and
+        still asserted below: the policy must be gone once the run reports
+        complete, and a completed run must still checkpoint at least once."""
         import mcp_server
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
@@ -20046,4 +20051,90 @@ class TestStageBDoesNotDoubleCheckpoint:
         assert ("_forward_apply", False) in seen, (
             "the Stage A forward pass must still checkpoint; a gate that "
             f"suppressed both would pass the assertion above vacuously. Saw: {seen}"
+        )
+
+
+class TestCheckpointPolicyLifecycle:
+    @pytest.mark.asyncio
+    async def test_policy_is_installed_during_and_cleared_after_a_run(
+        self, git_repo, monkeypatch,
+    ):
+        """A stale budget must never gate a later interactive transact."""
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+            "error_at": None, "phase": None,
+        }
+        observed = []
+        real = mcp_server._db_checkpoint_gated
+        monkeypatch.setattr(
+            mcp_server, "_db_checkpoint_gated",
+            lambda db: (observed.append(mcp_server._ingest_checkpoint_policy), real(db))[1],
+        )
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        assert observed, "no gated checkpoint ran"
+        assert all(p is not None for p in observed), "policy missing mid-run"
+        assert mcp_server._ingest_checkpoint_policy is None, "policy leaked past the run"
+
+    @pytest.mark.asyncio
+    async def test_policy_is_cleared_even_when_the_run_fails(self, git_repo, monkeypatch):
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+            "error_at": None, "phase": None,
+        }
+
+        def boom(*a, **k):
+            raise RuntimeError("injected failure")
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", boom)
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        assert mcp_server._ingest_checkpoint_policy is None
+
+    def test_duty_is_read_from_the_environment(self, monkeypatch):
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_CHECKPOINT_DUTY", "0.25")
+        assert mcp_server._checkpoint_duty_from_env() == 0.25
+
+    def test_invalid_duty_in_the_environment_falls_back_to_the_default(self, monkeypatch):
+        """A typo in an env var must not crash or silently disable
+        checkpointing."""
+        import mcp_server
+        for bad in ("nonsense", "0", "-1", "5"):
+            monkeypatch.setenv("MINIGRAF_INGEST_CHECKPOINT_DUTY", bad)
+            assert mcp_server._checkpoint_duty_from_env() == mcp_server._DEFAULT_CHECKPOINT_DUTY
+
+    @pytest.mark.asyncio
+    async def test_policy_is_cleared_when_the_run_fails_before_the_write_scope(
+        self, git_repo, monkeypatch,
+    ):
+        """The policy is installed right after write_executor is created, but
+        the try/finally that clears it (write_executor.shutdown(wait=True))
+        is nested one level deeper and only opens later, around Stage A/B.
+        Code in between -- e.g. _frontier_load's one-time migration -- runs
+        in that gap: a failure there must skip the inner finally entirely and
+        land straight in _run_ingestion's outer `except Exception`, so the
+        clear must ALSO happen there or this exact failure leaks the budget
+        into the next interactive transact (#241)."""
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None,
+            "error_at": None, "phase": None,
+        }
+
+        def boom(*a, **k):
+            raise RuntimeError("injected pre-write-scope failure")
+
+        monkeypatch.setattr(mcp_server, "_frontier_load", boom)
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        assert mcp_server._ingest_progress["status"] == "error"
+        assert mcp_server._ingest_checkpoint_policy is None, (
+            "policy leaked past a run that failed before the write-scope "
+            "try/finally was even entered"
         )

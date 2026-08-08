@@ -3296,6 +3296,35 @@ def _db_checkpoint(db: Any) -> None:
 
 _ingest_checkpoint_policy: Optional["_CheckpointPolicy"] = None
 
+_DEFAULT_CHECKPOINT_DUTY = 0.05
+
+
+def _checkpoint_duty_from_env() -> float:
+    """Read MINIGRAF_INGEST_CHECKPOINT_DUTY, falling back to the default on
+    anything unparseable or out of range. A typo must not crash ingestion or
+    silently switch checkpointing off (#241)."""
+    raw = os.environ.get("MINIGRAF_INGEST_CHECKPOINT_DUTY")
+    if raw is None:
+        return _DEFAULT_CHECKPOINT_DUTY
+    try:
+        value = float(raw)
+    except ValueError:
+        print(
+            f"[_run_ingestion] ignoring unparseable "
+            f"MINIGRAF_INGEST_CHECKPOINT_DUTY={raw!r}; "
+            f"using {_DEFAULT_CHECKPOINT_DUTY}",
+            file=sys.stderr,
+        )
+        return _DEFAULT_CHECKPOINT_DUTY
+    if not 0.0 < value <= 1.0:
+        print(
+            f"[_run_ingestion] MINIGRAF_INGEST_CHECKPOINT_DUTY={value} out of "
+            f"(0, 1]; using {_DEFAULT_CHECKPOINT_DUTY}",
+            file=sys.stderr,
+        )
+        return _DEFAULT_CHECKPOINT_DUTY
+    return value
+
 
 class _CheckpointPolicy:
     """Decides when an ingestion write batch is compacted to disk.
@@ -9883,7 +9912,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     Ordinary exceptions (bad git ref, unreadable blob, unsupported syntax)
     are unaffected and still fail only the one commit as before.
     """
-    global _db, _ingest_progress
+    global _db, _ingest_progress, _ingest_checkpoint_policy
     # Safe to clear unconditionally: handle_minigraf_ingest_git refuses to start a
     # new run while one is already active, so no in-flight shutdown signal is ever
     # stomped on here; main()'s finally block re-sets the flag on exit regardless,
@@ -9986,6 +10015,11 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # isn't shut down itself until the outer `finally` further down, after
         # the extraction pool's own shutdown has already been submitted to it.
         write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+        # Hold checkpointing to a fixed fraction of wall clock rather than
+        # once per commit. See _CheckpointPolicy for why the per-commit
+        # cadence was super-linear and why deferring is safe (#241).
+        _ingest_checkpoint_policy = _CheckpointPolicy(_checkpoint_duty_from_env())
 
         # Single fact-index write connection for the whole ingestion run,
         # opened on write_executor's one worker thread and never touched from
@@ -10318,12 +10352,24 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             else:
                 _ingest_progress["status"] = "stopped"
         finally:
+            # Never let a finished run's budget gate a later interactive
+            # transact (#241).
+            _ingest_checkpoint_policy = None
             write_executor.shutdown(wait=True)
 
     except Exception as e:
         # write_executor is already shut down by the inner finally above by the
         # time we get here (it runs on any exit from that try, including this
         # exception propagating through it) — nothing left to clean up.
+        #
+        # The checkpoint policy is a separate story: it is installed just
+        # after write_executor is created, several statements above the
+        # `try` that owns the finally clearing it (see that finally's own
+        # comment). A failure in that gap -- e.g. _frontier_load's one-time
+        # migration -- lands here without ever passing through the finally
+        # above, so this is the only place left to clear it. Idempotent with
+        # the finally's own clear on every path that does reach it (#241).
+        _ingest_checkpoint_policy = None
         _ingest_progress["phase"] = None
         _ingest_progress["status"] = "error"
         _ingest_progress["error"] = str(e)
