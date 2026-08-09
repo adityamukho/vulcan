@@ -210,6 +210,48 @@ The remaining 20.3x is therefore still above the design spec's "same order as
 the baseline" bar, but it is no longer an unexplained gap: it has a named,
 measured, filed successor (#239).
 
+### Correction (2026-08-08, #241): `_db_checkpoint` was never named, and the attribution above cannot be reconciled
+
+**Added while landing #241's checkpoint duty-cycle budget, after a four-leg
+ablation (see `docs/superpowers/specs/2026-08-07-db-checkpoint-cadence-design.md`,
+"Resolved" section) put `_db_checkpoint` at ~51% of wall clock on the same
+kind of at-scale run this entry describes.** In the style of the revision
+sections in `docs/superpowers/specs/2026-07-31-reverse-walk-write-amplification-design.md`:
+the numbers above are **not rewritten**, because they cannot be independently
+re-derived — this note records why, and what should not be trusted from them
+going forward.
+
+- **The attribution cannot be reconciled from surviving artifacts.** The
+  33.6% / 28.3% breakdown above came from an ad-hoc harness that lived in
+  `.superpowers/sdd/2026-08-03-fact-index-delete-by-rowid/`, which no longer
+  exists — confirmed by directory listing, not assumed. No committed
+  profiler from that era ran cProfile at all: `evals/at_scale/results/ingestion-20260803T095104Z.json`,
+  the one surviving artifact from that run, carries only wall-clock,
+  throughput, RSS, graph/index size, and latency percentiles — no per-call
+  breakdown of any kind. There is no path from what survives back to how
+  33.6% or 28.3% were computed.
+- **The `_db_execute` figure predates #242** and therefore carries the old
+  poller's query overhead: `_poll_during_ingestion`'s pre-fix form issued a
+  blocking, cost-growing graph query on the event loop every 0.5s regardless
+  of that query's own cost, serializing against `_db_native_lock` for a
+  share of the run this file's own 2026-08-07 note already flags as
+  unquantified. Whatever fraction of that 33.6% / 523.02s was this
+  contention rather than genuine query cost is not separable after the fact.
+- **`_db_checkpoint` was never named in the breakdown at all**, despite the
+  #241 ablation putting it at ~51.6% of wall clock on a comparably-shaped
+  run (330-commit slice, `normal2` baseline: 95.9s of 185.7s). The 28.3%
+  bucket labeled "process-pool `_extract_commit`, orchestration, thread
+  hops" was therefore far too small to be a residual once checkpointing is
+  accounted for — the true unattributed-or-mislabeled share was closer to
+  half the run, not under a third.
+- **#239's 33.6% priority rests on this entry**, and this correction does
+  **not** resolve that. `_db_execute` may still be the right thing to fix
+  next, or it may not be, once the same run is re-measured with
+  `_db_checkpoint` correctly named and post-#242 query costs isolated from
+  poller contention — but that re-measurement is explicitly **out of scope
+  for this branch** (see the design spec's "Follow-ups"). Flagged here so
+  whoever next picks up #239 does not treat 33.6% as settled.
+
 ## No Ingestion Run — fix-235-two-value-introduced-by
 
 **No acceptance-gate run was completed on this branch, and this entry is not
@@ -287,3 +329,174 @@ should be re-run once #242 (below) is fixed.
 | Status-query latency (min/p50/p99/max) | 0.1ms / 0.4ms / 10.7ms / 32.2ms |
 | Graph-query latency (min/p50/p99/max) | 0.7ms / 29.7ms / 2006.9ms / 2270.6ms |
 | Poll duty cycle (#242) | 8.65% over 864 polls |
+
+## Ingestion Run — 20260808T102652Z
+
+- Repo: `.` @ `master`
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 629 |
+| Final status | complete |
+| Wall-clock | 1455.75s |
+| Throughput | 25.9 commits/min |
+| Peak RSS | 752092 KB |
+| Graph size | 210333696 bytes |
+| Fact-index size | 86487040 bytes |
+| Status-query latency (min/p50/p99/max) | 0.1ms / 0.3ms / 4.7ms / 30.7ms |
+| Graph-query latency (min/p50/p99/max) | 0.7ms / 15.0ms / 1043.9ms / 1379.4ms |
+| Poll duty cycle (#242) | 6.31% over 1076 polls |
+| Checkpoint duty cycle (#241) | 4.58% over 98 checkpoints (66.52s total, 845 suppressed) |
+
+This is the at-scale acceptance run for **#241** (the checkpoint duty-cycle
+budget; design/plan under `docs/superpowers/specs/2026-08-07-db-checkpoint-cadence-design.md`,
+branch `perf-241-checkpoint-cadence` at `0eef8b6`, which carries the full
+Task 1-6 stack: the gated wrapper, the Stage B dedup, the final checkpoint on
+every terminal path, and this task's realised-duty statistics).
+
+**Load sampling for this specific run is incomplete, and that gap is
+disclosed rather than papered over.** The run that produced these numbers
+was started under this task, but the interactive shell that launched it was
+torn down before it finished; a completed run was recovered from a detached
+relaunch (`ingestion-20260808T102652Z.json`, completing at 15:56:52 IST /
+10:26:52 UTC after the recorded 1455.75s wall clock, i.e. starting ~15:32:26
+IST). The last `uptime` this session captured before that start, at 15:31:06
+IST — about 80s earlier, before the detached relaunch — read `load average:
+3.43, 2.47, 1.50` (1/5/15 min), with no single non-self process above ~3% CPU
+at that moment. **No sample close to the actual 15:56:52 IST completion was
+taken** — the run continued outside this session's active polling, and nothing
+recorded between then and this report being written (next day) is
+representative enough to report as an "after" figure. This is a real gap
+against the "sample load before and after" instruction, not satisfied by
+substituting a stale reading; recorded here as missing rather than invented.
+This machine is a shared development workstation, not a dedicated bench rig,
+and was not necessarily idle throughout — the pre-run sample above already
+shows load above 3, one contributor being an unrelated full test-suite run
+in this same session shortly before.
+
+**Ingested ref, for the record.** `_default_git_branch` pins ingestion to the
+repo's stable `main`/`master` branch regardless of what is checked out (#130),
+and no `--branch` was passed, so this run walked literal `master` at 629
+commits — three ahead of the comparison run below, since three more commits
+landed on master between the two measurements. The *code* that ran the
+ingestion is this branch's checkout (`mcp_server.py` at `0eef8b6`, with the
+full checkpoint-cadence stack), not master's own pre-#241 `mcp_server.py` --
+"Repo: `.` @ `master`" describes the commit history that was ingested, not
+the code that ingested it.
+
+**Comparison baseline: `ingestion-20260807T125753Z.json` (626 commits,
+3009.61s, complete), same machine, same repo, three commits earlier on
+master, already recorded above as this file's immediately preceding entry.**
+That run predates every commit on this branch (`perf-241-checkpoint-cadence`
+branches from master `68ddb9d`, which already contains the commit recording
+that entry) and its `branch` field is literally `HEAD`, which at the time it
+was taken coincided with master's tip — it is the honest "before" state:
+same hardware, same repo, post-#242 poller fix on both sides, adjacent commit
+counts. The CI run cited in the design/plan docs (31182651935: 629 commits,
+2323.0s, poll duty 8.56%) is **different hardware** and kept here only for
+continuity; it is directional, not the number this entry's speedup is
+computed against.
+
+- **Per-commit wall clock: 4.808 s/commit -> 2.314 s/commit, a 2.08x speedup
+  (-51.9%).** (3009.61/626 = 4.8077 vs 1455.75/629 = 2.3144.) Raw wall clock
+  also fell in absolute terms (3009.61s -> 1455.75s, -1553.86s) despite this
+  run doing very slightly more work (629 vs 626 commits).
+- **Realised checkpoint duty: 4.58%, under the 5% budget**, over 98
+  checkpoints totaling 66.52s of the run's 1452.27s policy-tracked window
+  (845 further calls suppressed). This is the number #241's acceptance
+  criterion asked for and the number the design's budget arithmetic
+  predicts: close to, and safely under, the configured `duty=0.05`.
+  **Caveat on completeness:** this total excludes the mandatory unconditional
+  final checkpoint(s) `mcp_server.py:10340` and `:10358` (Task 3), which call
+  `_db_checkpoint` directly rather than going through the policy specifically
+  so they can never be suppressed — by the design's own framing this is
+  "policy.checkpoints", not "every checkpoint in the run". At this run's
+  ~210MB final graph size the ~4.9ms/MB scaling law bounds each omitted call
+  at roughly ~1s, negligible against the measured 66.52s and the 1455.75s
+  wall clock, but it is a real, if small, gap in what this row accounts for.
+
+**The measured win is larger than the design spec's ablation predicted, and
+that needs reconciling rather than quietly accepting.** The design spec's
+"How much is on the critical path" section (the `normal2`/`noop` legs, pre-
+dedup, pre-duty code, 330-commit slice) put the *recoverable ceiling* for
+suppressing checkpoints entirely at ~24.2% of wall clock — suppressing
+recovered 44.9s of a 185.7s baseline. This run's per-commit time fell 51.9%
+-- more than double that ceiling. Worked with actual arithmetic, not
+asserted:
+
+- The design spec's own call-count decomposition (`902 calls = 225 forward +
+  225 reverse + 225x2 Stage B(duplicated) + 2` for a 450-commit slice, and
+  the identical ratio for the 330-commit slice's 662) gives, for N commits
+  under the **pre-dedup** cadence (forward + reverse + 2x Stage B + 2):
+  `K_old = 2N + 2`. For this run's N=629, `K_old = 1260`. The **post-dedup**
+  form (`1.5N + 2 = 945.5`) predicts 946 against this run's own measured 98 +
+  845 = **943** gated attempts — a 0.3% match, which is good evidence the
+  scaling assumption is sound enough to extrapolate from.
+- The design spec's scaling probe gives **~4.9 ms per MB** of graph size,
+  flat in dirty bytes. Approximating checkpoints as evenly spaced across a
+  graph growing ~linearly from 0 to this run's final 210.33 MB, the average
+  outstanding size is ~105.17 MB, so each checkpoint costs an estimated
+  ~515 ms at this run's scale. `K_old x 515ms = 1260 x 0.5153s ~= 649.3s` of
+  estimated old-cadence checkpoint cost, against the here real, measured
+  66.52s — an estimated **~582.8s** reduction.
+- Against the measured **1553.86s** total wall-clock reduction, that is
+  **~37.5%** — confirming the *direction* of the graph-size-scaling
+  hypothesis (checkpoint cost is O(graph size), so its cost fraction is
+  necessarily larger on a 210MB run than on whatever smaller graph the
+  330-commit ablation slice reached, and the realised win should exceed that
+  slice's ceiling) but **not closing the gap to 51.9%**. Using the design
+  spec's own cross-check anchor instead of the nominal rate (it recorded a
+  126MB graph costing 690ms/checkpoint against the model's 617ms prediction,
+  a ~12% undershoot, i.e. the nominal rate is a soft floor) raises the
+  estimate to ~725.7s old-cadence cost, ~659.1s reduction, **~42.4%** of the
+  total saving. Neither reaches half.
+- **~58-62% of the observed 1553.86s reduction (roughly 895-971s) is
+  therefore left unexplained by the checkpoint-cost mechanism under this
+  model, and is reported as unexplained rather than attributed.** Candidate,
+  non-exclusive, unmeasured contributors: the ~4.9ms/MB rate was fit at
+  <=16.5MB and linearly extrapolated ~13x to this run's scale, and the
+  126MB/690ms anchor already shows real cost undershooting the linear model
+  in the same direction, so per-checkpoint cost may be more super-linear at
+  full scale than either estimate captures; the two compared runs were taken
+  a day apart on a shared, non-dedicated development machine whose load this
+  session's own samples show swinging between 0.27 and 3.89, and neither
+  run's filesystem-cache state was captured; and no controlled same-day,
+  same-machine, old-code-vs-new-code back-to-back A/B was run to isolate the
+  checkpoint change from ordinary run-to-run variance or from other code
+  differences between master `68ddb9d` and this branch's HEAD (e.g. Task 3's
+  unconditional final checkpoint itself running on every path now, where
+  before it may not have on an interrupted run). **The -51.9%/commit figure
+  is the real, honestly measured headline result. The ~37-42%
+  checkpoint-attributable estimate above is a partial, order-of-magnitude
+  sanity check on direction, not a full accounting of the remaining ~58-62%,
+  which should not be attributed to this change without a same-day
+  controlled A/B that was not performed here.**
+
+**The flaky `Page N out of bounds` write failure (Task 5's follow-up)
+recurred.** One commit was skipped: `[_run_ingestion] skipping commit
+a1c4a5f777643c9f78238d1c86347c318db14f92 (...): write failed: msg='Page 280
+out of bounds (total pages: 280)'`, caught and isolated by the per-commit
+write try/except exactly as designed (`mcp_server.py:10198-10218` as of this
+branch's HEAD — shifted from the `:10168-10186` the design spec and Task 5
+cite, since this task's own earlier commit on this branch added lines above
+it; same block, same behaviour) — the run proceeded and still reported
+`status=complete`, 629/629 commits attempted.
+Stage B's correction sweep separately logged **8 entities left
+provisional/unreconciled** at the end of the run (3 with ambiguous
+`:introduced-by` values, 5 left provisional against `:commit/26565abdf1f7`).
+As in Task 5's occurrence, no query was run against the resulting graph to
+check whether those 8 entities were ever correctly reconciled, so this is
+*no data loss observed in run status; final-state reconciliation not
+independently verified*, not "nothing was corrupted" — and, also as in Task
+5, causation between the write failure and checkpoint deferral remains
+unestablished, not ruled out. This is the second observed occurrence on this
+branch; still not reproduced on demand, still tracked as a follow-up, not
+addressed by this task.
+
+**Do not read the graph-query p99 change (2006.9ms -> 1043.9ms) as a clean
+2x latency win.** Both runs are post-#242, so this comparison is more
+defensible than one crossing the 2026-08-07 poller-fix boundary — but the
+two runs recorded different poll counts (864 vs 1076), so they sampled the
+query-cost curve at different densities, and the checkpoint-cadence change
+this task measures does not itself touch query latency. Treat this figure as
+directional at best, not as a measured effect of anything this branch did.
