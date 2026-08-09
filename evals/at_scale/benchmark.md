@@ -40,6 +40,18 @@ that was wrong and has been corrected here.
 > biased **low** relative to every earlier entry. Wall-clock comparisons
 > overstate the old runs; percentile comparisons understate the new ones. Do not
 > read a p99 drop across 2026-08-07 as a speedup.
+>
+> **Cross-day full-history wall-clock is not reliable to better than tens of
+> percent on this hardware (#241).** `20260807T125753Z` (626 commits,
+> 3009.61s) and `20260809T042507Z` (629 commits, 1888.43s) both ingest the
+> same `master` history, on the same machine, running the same pre-#241
+> `mcp_server.py` — nothing in the code changed between them — yet disagree by
+> ~59% per commit (4.808 s/commit vs 3.002 s/commit) purely from being taken
+> two days apart. The `20260808T102652Z` / `20260809T042507Z` entries below
+> show what a same-day, same-machine pair looks like instead (-22.9%, not
+> the -51.9% the cross-day pair implied). Treat any entry-to-entry wall-clock
+> comparison that spans different days on this box as **directional only**;
+> a same-day A/B is required before trusting the magnitude of a percentage.
 
 ## Ingestion Run — 20260719T074053Z
 
@@ -397,12 +409,17 @@ counts. The CI run cited in the design/plan docs (31182651935: 629 commits,
 continuity; it is directional, not the number this entry's speedup is
 computed against.
 
-- **Per-commit wall clock: 4.808 s/commit -> 2.314 s/commit, a 2.08x speedup
-  (-51.9%; see the reconciliation below: only ~39-42% of this is
-  attributable to #241).** (3009.61/626 = 4.8077 vs 1455.75/629 = 2.3144.)
-  Raw wall clock also fell in absolute terms (3009.61s -> 1455.75s,
-  -1553.86s) despite this run doing very slightly more work (629 vs 626
-  commits).
+- **Per-commit wall clock, same-day controlled A/B (629 vs 629 commits,
+  resolved 2026-08-09 — see the reconciliation below): 3.002 s/commit ->
+  2.314 s/commit, a -22.9% reduction.** (1888.43/629 = 3.0023 vs
+  1455.75/629 = 2.3144; (1888.43-1455.75)/1888.43 = 22.91%.) This entry
+  originally led with a cross-day comparison against `20260807T125753Z`
+  (4.808 s/commit -> 2.314 s/commit, -51.9%, of which only ~39-42% could be
+  attributed at the time). That figure is **kept below, not deleted** — it
+  is now understood to have been inflated by a stale cross-day baseline, not
+  by an unexplained mechanism. Raw wall clock: same-day, 1888.43s -> 1455.75s
+  (-432.68s); cross-day (as originally reported), 3009.61s -> 1455.75s
+  (-1553.86s).
 - **Realised checkpoint duty: 4.58%, under the 5% budget**, over 98
   checkpoints totaling 66.52s of the run's 1452.27s policy-tracked window
   (845 further calls suppressed). This is the number #241's acceptance
@@ -421,8 +438,33 @@ computed against.
   at roughly ~1.1s, negligible against the measured 66.52s and the 1455.75s
   wall clock, but it is a real, if small, gap in what this row accounts for.
 
-**The measured win is larger than the design spec's ablation predicted, and
-that needs reconciling rather than quietly accepting.** The design spec's
+**Resolved (2026-08-09): a same-day, same-machine A/B closes the gap — the
+cross-day baseline was inflated, not the checkpoint-cadence win overstated.**
+`ingestion-20260809T042507Z.json` (entry below) reruns the identical
+629-commit `master` history on this same machine, this same day, in a
+detached worktree checked out to master `68ddb9d`'s own pre-#241
+`mcp_server.py` (verified: no `_CheckpointPolicy`, no `checkpoint_summary` in
+its output) — the "same-day controlled A/B" the paragraphs below say was
+missing. It completed in **1888.43s** against this branch's **1455.75s** on
+the same 629 commits: **3.002 s/commit -> 2.314 s/commit, a controlled
+-22.9%** (1888.43/629 = 3.0023, 1455.75/629 = 2.3144,
+(1888.43-1455.75)/1888.43 = 22.91%). That lands within ~1.6 points of both
+the design spec's controlled 330-commit slice (185.7s -> 140.2s, -24.5%) and
+its ablation-predicted `noop` ceiling (185.7s -> 140.8s, -24.2%) — three
+independent measurements agreeing to within noise. **The mechanism delivers
+what the ablation predicted.** The -51.9% headline was a real, honestly
+measured cross-day number, but the cross-day baseline it used
+(`20260807T125753Z`, 3009.61s, 626 commits) was itself ~59% slower per
+commit than master is on this same hardware today (4.808 vs 3.002 s/commit)
+for reasons unrelated to #241 — see the reconciliation attempt immediately
+below, kept for the record with its resolution threaded through it rather
+than rewritten.
+
+**The paragraphs immediately below are the original reconciliation attempt,
+written before the same-day A/B existed — retained rather than deleted or
+silently rewritten, per this branch's own standard for measurement
+corrections (see the 20260808T102652Z-adjacent correction to the
+20260803T095104Z entry above).** The design spec's
 "How much is on the critical path" section (the `normal2`/`noop` legs, pre-
 dedup, pre-duty code, 330-commit slice) put the *recoverable ceiling* for
 suppressing checkpoints entirely at ~24.2% of wall clock — suppressing
@@ -480,19 +522,29 @@ asserted:
   which should not be attributed to this change without a same-day
   controlled A/B that was not performed here.**
 
-  **A same-day controlled A/B does exist, though — in the design spec, not
-  this run.** Its "How much is on the critical path" ablation held everything
-  but `_db_checkpoint` fixed: same 330-commit slice at `82aa7e6c`, same
-  machine, same harness, master `68ddb9d`'s checkpoint-every-commit baseline
-  (`normal2`, 185.7s) against a leg with checkpointing suppressed entirely
-  (`noop`, 140.8s) — a controlled **-24.2%**. That lands almost exactly on
-  this branch's own duty-gated `every25` leg's predicted ceiling (-21.1%) and
-  is the number to trust for "what does removing checkpoint cost alone buy,
-  with everything else held constant." Read alongside it, this run's
-  uncontrolled -51.9% looks like cross-day variance plus a ~1.7x larger graph
-  (210MB vs whatever the 330-commit slice reached) compounding the
-  graph-size-linear cost, rather than the checkpoint-cadence change
-  delivering roughly double its own controlled effect.
+  **Superseded: that same-day controlled A/B has now been performed** (see
+  the "Resolved (2026-08-09)" note above and the `20260809T042507Z` entry
+  below). It measures a controlled -22.9%, not -51.9%, which is within ~1.6
+  points of both this section's own ~39-42% attribution estimates and the
+  design spec's ablation ceiling below. There is no large residual left to
+  attribute: the ~58-61%/894-944s "unexplained" figure above was a property
+  of comparing against an inflated cross-day baseline, not evidence of a
+  second, unidentified mechanism. It is retained above as the historical
+  reconciliation attempt, not as a current estimate of what remains
+  unexplained.
+
+  **A same-day controlled A/B also already existed at smaller scale, in the
+  design spec, not this run.** Its "How much is on the critical path" ablation
+  held everything but `_db_checkpoint` fixed: same 330-commit slice at
+  `82aa7e6c`, same machine, same harness, master `68ddb9d`'s
+  checkpoint-every-commit baseline (`normal2`, 185.7s) against a leg with
+  checkpointing suppressed entirely (`noop`, 140.8s) — a controlled
+  **-24.2%**. That lands almost exactly on this branch's own duty-gated
+  `every25` leg's predicted ceiling (-21.1%). The `20260809T042507Z` /
+  `20260808T102652Z` pair above extends this same kind of comparison from a
+  330-commit slice to the full 629-commit run this entry is about, and gets
+  the same answer within noise: -22.9% against this slice's -24.2%, not the
+  cross-day pair's -51.9%.
 
 **The flaky `Page N out of bounds` write failure (Task 5's follow-up)
 recurred.** One commit was skipped: `[_run_ingestion] skipping commit
@@ -546,3 +598,58 @@ mechanism above (cheaper checkpoints -> less time a poll's query waits on
 consumed), which would make it a second-order consequence of #241 rather
 than a wholly separate confound, but that chain is not independently verified
 here and is reported as a candidate, not a settled attribution.
+
+**Reframed after the same-day A/B (2026-08-09):** this 168.4s figure was
+computed against the cross-day comparison baseline (`20260807T125753Z`) and
+is best read as one measured, named contributor to *why* that cross-day
+comparison overstated the win (-51.9% vs the same-day, controlled -22.9%),
+not as an unresolved gap inside an otherwise-unexplained result. It is not
+recomputed against the same-day pair here — the same-day control run's own
+poll duty (8.43% over 693 polls) sits close to the cross-day baseline's
+8.65%, well above this branch's 6.31%, so some version of the same
+lock-contention effect plausibly still contributes a smaller amount to the
+same-day -22.9%, but quantifying that was not part of this correction and is
+left for whoever next revisits poll/checkpoint lock interaction.
+
+## Ingestion Run — 20260809T042507Z
+
+- Repo: `.` @ `master` (`68ddb9d`, full history, detached worktree)
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 629 |
+| Final status | complete |
+| Wall-clock | 1888.43s |
+| Throughput | 20.0 commits/min |
+| Peak RSS | 605140 KB |
+| Graph size | 211824640 bytes |
+| Fact-index size | 86999040 bytes |
+| Status-query latency (min/p50/p99/max) | 0.1ms / 0.3ms / 10.5ms / 29.6ms |
+| Graph-query latency (min/p50/p99/max) | 0.8ms / 21.3ms / 1122.8ms / 1249.7ms |
+| Poll duty cycle (#242) | 8.43% over 693 polls |
+
+**This is a control run of master `68ddb9d`, not a release measurement.**
+It carries no checkpoint-cadence row because it ran none of #241's code: it
+was launched in a detached worktree checked out to master's own commit
+`68ddb9d`, prior to any commit on `perf-241-checkpoint-cadence` — verified
+directly rather than assumed, by inspecting that worktree's `mcp_server.py`
+for `_CheckpointPolicy` (absent) and by inspecting this run's own result
+JSON for a `checkpoint_summary` field (also absent, unlike the
+`20260808T102652Z` entry above). Its sole purpose is to supply the same-day,
+same-machine "before" half of a controlled A/B against that entry: same
+machine, same day (2026-08-09), same input (`master`'s history through the
+same tip, 629 commits both sides — three more than `20260807T125753Z`
+walked, since `20260808T102652Z` and this run were both taken after those
+three additional commits landed). Result file:
+`evals/at_scale/results/ingestion-20260809T042507Z.json`.
+
+See the "Resolved (2026-08-09)" note under the `20260808T102652Z` entry
+above for the resulting comparison: **1888.43s here vs 1455.75s there on the
+same 629 commits, a controlled -22.9% per-commit reduction (3.002 s/commit
+-> 2.314 s/commit)**, agreeing within ~1.6 points of both the design spec's
+controlled 330-commit slice (-24.5%) and its ablation-predicted `noop`
+ceiling (-24.2%). This resolves the "no same-day A/B" gap that entry's own
+reconciliation flagged, and supersedes that entry's cross-day-derived
+-51.9%/"~58-61% unexplained" framing as the number to trust for the size of
+#241's effect — without deleting either figure, per this branch's own
+standard for measurement corrections.

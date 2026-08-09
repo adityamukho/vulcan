@@ -404,6 +404,27 @@ counterfactual leg the plan required before believing otherwise. No
 production code changed as a result (`mcp_server.py`'s gate stays uniform
 across both stages, exactly as Task 4 landed it).
 
+## Resolved: the full-history acceptance run's cross-day residual was a stale baseline, not a second mechanism
+
+**Added 2026-08-09.** `evals/at_scale/benchmark.md`'s `20260808T102652Z`
+acceptance entry compared its 629-commit run against a baseline taken a day
+earlier (`20260807T125753Z`) and measured -51.9% per commit, of which its own
+reconciliation could attribute only ~39-42% to this spec's checkpoint-cost
+model, leaving ~58-61% flagged unexplained with "no same-day A/B" named as
+the confound. That gap is now closed. A same-day, same-machine control run
+of master `68ddb9d` (`ingestion-20260809T042507Z.json`, detached worktree,
+verified to run master's own pre-#241 `mcp_server.py`) ingested the same
+629-commit history in 1888.43s against the branch's 1455.75s — a controlled
+**-22.9%** (3.002 s/commit -> 2.314 s/commit). That agrees within ~1.6
+points with both this document's controlled 330-commit slice (185.7s ->
+140.2s, -24.5%) and its `noop`-leg ablation ceiling (185.7s -> 140.8s,
+-24.2%) — three independent measurements landing within noise of each other.
+The mechanism this spec identified delivers what the ablation predicted; the
+larger cross-day figure was an artifact of the 2026-08-07 baseline running
+~59% slower per commit than master does on this same hardware today, for
+reasons unrelated to checkpointing. Full arithmetic and the retained,
+uncorrected original reconciliation live in `benchmark.md`, not here.
+
 ## Follow-ups
 
 - **Investigate the one-off `Page N out of bounds (total pages: N)` write
