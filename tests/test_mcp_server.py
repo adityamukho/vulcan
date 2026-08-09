@@ -20394,3 +20394,78 @@ class TestCheckpointDutySummaryPublication:
         assert summary["checkpoints"] == 0, "no checkpoint ever ran before the injected failure"
         assert summary["total_seconds"] == 0.0
         assert summary["realised_duty"] == 0.0
+
+
+class TestSingleHandlePerProcess:
+    """#253/#251: two live MiniGrafDb handles on one file must be impossible.
+
+    `_db = None` is this module's "release the graph file lock" idiom, but it
+    only releases when it drops the LAST reference. Any local `db` still on a
+    stack keeps the handle alive -- _run_ingestion holds one across the awaits
+    in its per-commit loop, and a concurrent call_tool's `finally: _db = None`
+    clears the global underneath it. The next open then creates a SECOND handle.
+
+    Each FileBackend caches its own FileHeader.page_count, allocates new pages
+    from it, and bounds-checks read_page against it, so two handles diverge and
+    corrupt each other. That is the source of the flaky
+    "Page N out of bounds (total pages: M)" (project-minigraf/minigraf#304).
+    Driving this interleaving for 40 rounds against minigraf 1.2.1 produces
+    "Page 130 out of bounds (total pages: 113)" on the first round, then
+    'Serde Deserialization Error' and
+    'stream_all_entries: expected leaf page at page_id=68' on later ones.
+
+    _db_native_lock cannot prevent this -- the two handles are distinct Rust
+    objects with distinct internal mutexes -- and enforcing it in Python was
+    tried and rejected (see the module comment in mcp_server.py). The fix is in
+    minigraf's FileLock::acquire, which treated a lock held by our own PID as
+    stale and deleted it.
+    """
+
+    @pytest.mark.xfail(
+        reason="needs the minigraf#304 FileLock fix; pinned minigraf 1.2.1 "
+               "silently steals a lock held by our own PID. Remove this marker "
+               "when the minigraf dependency is bumped.",
+        strict=False,
+    )
+    def test_second_open_in_same_process_is_refused(self, tmp_path):
+        """A second open while a handle is live must fail loudly, not succeed."""
+        from minigraf import MiniGrafDb
+
+        path = str(tmp_path / "t.graph")
+        first = MiniGrafDb.open(path)
+        try:
+            with pytest.raises(Exception) as exc_info:
+                MiniGrafDb.open(path)
+            assert "already open in this process" in str(exc_info.value), exc_info.value
+        finally:
+            del first
+
+    def test_release_idiom_does_not_drop_a_handle_others_still_hold(self, tmp_path, monkeypatch):
+        """Pins the precondition that makes the above reachable.
+
+        This is the half we control: `_db = None` does not destroy the handle
+        while another caller still references it, so `_db is None` is NOT
+        evidence that the graph file lock was released.
+        """
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._db = None
+        mcp_server._graph_path = ""
+
+        held = mcp_server._open_db_at(graph)          # _run_ingestion's local `db`
+        mcp_server._db = None                          # call_tool's finally
+        assert mcp_server._db is None
+
+        # The handle is still fully usable, which is exactly the problem: the
+        # lock is still held, so the next open is a second handle, not a reopen.
+        raw = mcp_server._db_execute(held, "(query [:find ?e :where [?e :ident ?v]])")
+        assert "out of bounds" not in raw
+        assert os.path.exists(graph + ".lock"), (
+            "_db = None released the lock even though a reference is still held "
+            "-- if this ever becomes true, the #253 interleaving is gone"
+        )
+
+        del held
+        mcp_server._db = None

@@ -67,7 +67,53 @@ _db: Optional[MiniGrafDb] = None
 # call/checkpoint on the same (or a handle open concurrently with another's
 # in-flight write) can observe a torn header or a mid-write index, producing
 # silently wrong query results or a transient "Header checksum mismatch" (#110).
+#
+# It serializes calls into ONE handle. It does not, and cannot, stop a second
+# handle being opened on the same file — those are distinct Rust objects with
+# distinct internal mutexes. See the single-handle invariant below.
 _db_native_lock = threading.Lock()
+
+# THE SINGLE-HANDLE INVARIANT (#253, #251, project-minigraf/minigraf#304)
+#
+# Everything below assumes at most one live MiniGrafDb handle per process.
+# Nothing in this module enforces that, and until the minigraf#304 fix nothing
+# in minigraf did either.
+#
+# `_db = None` is this module's "release the graph file lock" idiom, but it
+# only releases when it drops the LAST reference. Any local `db` still on a
+# stack keeps the handle — and its lock — alive: _run_ingestion holds one
+# across the awaits in its per-commit loop, and a concurrent call_tool's
+# `finally: _db = None` clears the global underneath it.
+#
+# The next MiniGrafDb.open() then does NOT fail. minigraf's FileLock::acquire
+# (src/storage/backend/file.rs) removes the lock file and retries whenever the
+# holder PID equals our own:
+#
+#     if pid == our_pid || !Self::is_process_alive(pid) {
+#         let _ = std::fs::remove_file(&lock_path);
+#         return Self::acquire(db_path);
+#     }
+#
+# So we silently get two live handles on one file. Each FileBackend caches its
+# own FileHeader.page_count, allocates new pages from it, and bounds-checks
+# read_page against it — which is exactly where the flaky
+# "Page N out of bounds (total pages: M)" comes from (#253, #251,
+# project-minigraf/minigraf#304). Worse, whichever handle drops first runs
+# FileLock::drop, deleting the lock file that by then belongs to the survivor,
+# leaving a live handle with no lock at all and letting other *processes* in.
+#
+# The minigraf#304 fix makes FileLock::acquire steal only a DEAD holder's lock,
+# so the second open now fails loudly with "Database is locked by another
+# process" instead of silently corrupting. That converts this from data
+# corruption into a lock error on the retry path — the right trade, but it does
+# not make the interleaving above correct. Clearing _db while another caller
+# still holds the handle is still a bug here; it is now merely a visible one.
+#
+# Enforcing the invariant in Python was tried and rejected (#253): a weakref
+# guard that reuses the still-live handle instead of opening a second one fixes
+# the corruption but changes handle LIFETIME, resurrecting handles whose backing
+# file is gone — it segfaulted the suite reproducibly. The durable local fix is
+# an explicit lease/refcount protocol replacing the `_db = None` idiom.
 
 # Track graph path and last-known mtime so we can detect external modifications.
 # minigraf's Drop impl writes to the file even for read-only handles, which
@@ -2991,11 +3037,23 @@ def _open_db_at(path: str, *, force: bool = True) -> MiniGrafDb:
     both observe _db as None (e.g. the ingestion preload thread and an
     _ensure_db_async() caller racing during the "starting" phase, before
     _run_ingestion flips status to "running") each call MiniGrafDb.open() on
-    the same path from this same process. The second open collides with the
-    first handle's still-held lock file and surfaces as "Database is locked
-    by another process", with the lock file's own PID equal to *our* PID
-    (#107). force=True (the default) is for callers that need a genuine
-    reopen regardless of any existing handle, e.g. _refresh_if_stale().
+    the same path from this same process (#107). force=True (the default) is
+    for callers that need a genuine reopen regardless of any existing handle,
+    e.g. _refresh_if_stale().
+
+    #107 recorded that second open as surfacing loudly — "Database is locked by
+    another process", with the lock file's PID equal to *our* PID. As of
+    minigraf 1.2.1 that is NOT what happens, and assuming it did is what let
+    #253/#251 hide: FileLock::acquire treats a lock held by our own PID as
+    stale, deletes it, and opens anyway. The second handle is created silently
+    and the two corrupt each other.
+
+    NOTE: neither branch below can currently detect a handle that is live but
+    no longer reachable through _db — see the module comment on the
+    single-handle invariant. Guarding that in Python was tried and rejected
+    (#253): reusing a still-referenced handle changes its lifetime, which
+    resurrects handles whose backing file is gone. The enforcement belongs in
+    minigraf's FileLock, where the fix is one condition.
     """
     global _db, _graph_path, _db_mtime
     with _db_native_lock:

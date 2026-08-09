@@ -46,6 +46,17 @@ process that opens the graph. See #241.
 The fact index is bi-temporal: it includes historical (retracted/superseded) facts
 alongside current ones, labeled with their validity window.
 
+**Single-handle invariant.** At most one live `MiniGrafDb` handle may exist per
+process. Two handles on one file each cache their own `page_count` and corrupt
+each other — the flaky `Page N out of bounds (total pages: M)` (#251, #253,
+project-minigraf/minigraf#304). `mcp_server.py` does not enforce this: `_db =
+None` is its "release the lock" idiom, but it only releases when it drops the
+LAST reference, and a local `db` on a stack (e.g. `_run_ingestion`'s per-commit
+handle, held across awaits) keeps the handle alive while a concurrent
+`call_tool`'s `finally` clears the global. Before touching DB lifecycle, read the
+invariant comment above `_db_native_lock`. Enforcing it in Python by reusing the
+live handle was tried and rejected — it changes handle lifetime and segfaults.
+
 ## Claude Code Plugin Publishing
 
 The plugin is published via a stub architecture — `install.py` handles all registration automatically.
