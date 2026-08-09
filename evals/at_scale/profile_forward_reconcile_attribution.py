@@ -69,6 +69,22 @@ def _parse_args() -> argparse.Namespace:
                    help="Stop Stage A cleanly (via _shutdown_requested) after this many "
                         "seconds. 0 = run to completion. A capped run SKIPS Stage B -- "
                         "compare capped runs on the progress timeline, not on wall clock.")
+    p.add_argument("--checkpoint-mode", choices=["normal", "noop", "every-N", "stage-b-only"],
+                   default="normal",
+                   help="Override ingestion checkpoint cadence for the #241 decision "
+                        "ablation. normal (default): no override at all -- exactly today's "
+                        "behaviour, whatever mcp_server.py's own gating does (on this branch "
+                        "that is the shipped MINIGRAF_INGEST_CHECKPOINT_DUTY duty-cycle "
+                        "policy). noop: suppress every ingestion checkpoint. every-N: let "
+                        "only every --checkpoint-every-n-th checkpoint attempt actually run. "
+                        "stage-b-only: keep the shipped duty policy's budget in force ONLY "
+                        "while m._ingest_progress['phase'] == 'sweeping' (Stage B); every "
+                        "other phase always checkpoints, ungated, as if Task 4 had never "
+                        "widened the gate to Stage A. See _install_checkpoint_mode_override "
+                        "for exactly what each mode monkeypatches.")
+    p.add_argument("--checkpoint-every-n", type=int, default=25,
+                   help="N for --checkpoint-mode every-N (default 25, matching the design "
+                        "spec's original every25 ablation leg).")
     return p.parse_args()
 
 
@@ -145,6 +161,98 @@ ATTRIBUTE_CALLER = {"_transact", "_retract"}
 for _n in WRAPPED:
     if hasattr(m, _n):
         _wrap(_n, attribute_caller=_n in ATTRIBUTE_CALLER)
+        # Pre-seed so a mode that drives a wrapped call site's REAL count to
+        # zero (--checkpoint-mode noop, or every-N on a run too short to hit
+        # N attempts) reports 0 in call_counts/call_seconds, not a missing
+        # key -- a consumer reading call_counts["_db_checkpoint"] should
+        # never have to guard against it being absent.
+        counts.setdefault(_n, 0)
+        timings.setdefault(_n, 0.0)
+
+
+def _install_checkpoint_mode_override() -> None:
+    """Install --checkpoint-mode's override, if any, on top of the counting
+    wrappers installed above (#241 Task 5's decision ablation).
+
+    'normal' installs nothing at all -- the harness runs exactly as it did
+    before this flag existed, so entries recorded with no flag stay
+    byte-identical and comparable to entries recorded with
+    --checkpoint-mode normal (the default) or with the flag simply omitted.
+
+    Every other mode monkeypatches m._db_checkpoint and/or
+    m._db_checkpoint_gated to the ALREADY-wrapped versions above, so the
+    call counts and seconds these modes report still come from the same
+    counting wrapper 'normal' uses -- what changes is only whether/when the
+    real checkpoint underneath ever runs.
+
+    'noop' and 'every-N' patch the LOW-LEVEL m._db_checkpoint, the exact
+    patch point the original hand-worktree ablation used (design spec
+    provenance: "one git worktree per leg patched only at _db_checkpoint").
+    Every ingestion checkpoint funnels through it -- both call sites gated
+    via m._db_checkpoint_gated (through _CheckpointPolicy.force()) and the
+    unconditional final checkpoint on every terminal path (Task 3) -- so
+    these two modes suppress uniformly across both stages, matching the
+    spec's noop/every25 legs. The shipped duty-cycle policy (Task 4) stays
+    installed and keeps calling _db_checkpoint_gated -> policy.maybe() at
+    every site; with the underlying checkpoint made near-free, the policy's
+    own budget math sees a near-zero last duration and so rarely if ever
+    suppresses on its own -- nearly every gated attempt reaches this
+    override, which is what actually decides whether real work happens.
+    That is a deliberate difference from the pre-Task-4 code these modes
+    were first measured against, not a bug: the two modes are not being
+    used to reproduce old absolute call counts, only the uniform-suppression
+    SHAPE, on top of whatever cadence today's code would otherwise pick.
+
+    'stage-b-only' patches m._db_checkpoint_gated instead, and narrows
+    rather than replaces: while m._ingest_progress['phase'] == 'sweeping'
+    (Stage B) it defers to the real, unmodified _db_checkpoint_gated --
+    same policy object, same budget math as 'duty'. Every other phase
+    (Stage A's 'converging', or no phase yet) always checkpoints, via the
+    counted m._db_checkpoint, exactly as sites did before Task 4 gated them.
+    The unconditional final checkpoint is untouched either way -- it calls
+    m._db_checkpoint directly, never m._db_checkpoint_gated.
+    """
+    mode = ARGS.checkpoint_mode
+    if mode == "normal":
+        return
+
+    if mode == "noop":
+        def _noop_checkpoint(db):
+            return None
+        m._db_checkpoint = _noop_checkpoint
+        return
+
+    if mode == "every-N":
+        n = ARGS.checkpoint_every_n
+        if n < 1:
+            raise ValueError(f"--checkpoint-every-n must be >= 1, got {n}")
+        real_checkpoint = m._db_checkpoint
+        state = {"attempts": 0}
+
+        def _every_n_checkpoint(db):
+            state["attempts"] += 1
+            if state["attempts"] % n != 0:
+                return None
+            return real_checkpoint(db)
+        m._db_checkpoint = _every_n_checkpoint
+        return
+
+    if mode == "stage-b-only":
+        real_checkpoint = m._db_checkpoint
+        real_checkpoint_gated = m._db_checkpoint_gated
+
+        def _stage_b_only_gate(db):
+            if m._ingest_progress.get("phase") == "sweeping":
+                return real_checkpoint_gated(db)
+            real_checkpoint(db)
+            return True
+        m._db_checkpoint_gated = _stage_b_only_gate
+        return
+
+    raise ValueError(f"unknown --checkpoint-mode: {mode!r}")  # pragma: no cover - argparse guards this
+
+
+_install_checkpoint_mode_override()
 
 # --------------------------------------------------------------------------
 # Layer 2: cProfile on every thread.
@@ -286,6 +394,8 @@ def main() -> int:
         "repo": os.path.abspath(ARGS.repo),
         "ref": ARGS.ref,
         "slice_commits": n_commits,
+        "checkpoint_mode": ARGS.checkpoint_mode,
+        "checkpoint_every_n": ARGS.checkpoint_every_n if ARGS.checkpoint_mode == "every-N" else None,
         "profiled": not ARGS.no_profile,
         "graph_size_bytes": os.path.getsize(GRAPH_PATH) if os.path.exists(GRAPH_PATH) else 0,
         "index_size_bytes": (

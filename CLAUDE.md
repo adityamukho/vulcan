@@ -35,6 +35,14 @@ Memory retrieval index: `<graph_path>.fts.sqlite3` alongside the graph file.
 
 Override: `MINIGRAF_INDEX_PATH=/custom/path`
 
+Ingestion checkpoint budget: `MINIGRAF_INGEST_CHECKPOINT_DUTY` (default `0.05`).
+
+`db.checkpoint()` is full WAL-to-graph compaction, so it costs O(graph size)
+regardless of how much was written since the last one. Ingestion holds it to
+this fraction of wall clock instead of running it once per commit. Writes are
+durable via `<graph_path>.wal` without it; a larger WAL only slows the next
+process that opens the graph. See #241.
+
 The fact index is bi-temporal: it includes historical (retracted/superseded) facts
 alongside current ones, labeled with their validity window.
 

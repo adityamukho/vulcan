@@ -159,6 +159,11 @@ async def run_ingestion_benchmark(
 
     commits_ingested = mcp_server._ingest_progress["processed"]
     final_status = mcp_server._ingest_progress["status"]
+    # Published by _run_ingestion's two policy-clearing finally blocks just
+    # before _ingest_checkpoint_policy is discarded (#241 Task 6) -- the
+    # policy itself does not survive the run, so this dict is the only
+    # surviving source for realised checkpoint duty.
+    checkpoint_summary = mcp_server._ingest_progress.get("checkpoint_summary")
     peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
     index_path = fact_index.index_path_for(str(graph_path))
@@ -180,6 +185,7 @@ async def run_ingestion_benchmark(
         "poll_count": len(poll_offsets),
         "poll_duty_fraction": poll_duty_fraction,
         "poll_offsets": poll_offsets,
+        "checkpoint_summary": checkpoint_summary,
     }
 
     if compare_ignore:

@@ -44,6 +44,26 @@ def _poll_duty_row(metrics: dict[str, Any]) -> str:
     )
 
 
+def _checkpoint_duty_row(metrics: dict[str, Any]) -> str:
+    """The "Checkpoint duty cycle" row (#241), rendered the same defensive
+    way _poll_duty_row is: metrics from a pre-#241 run (or a run that failed
+    before _run_ingestion ever installed a policy) simply lack
+    'checkpoint_summary', and re-rendering that JSON must not raise.
+    """
+    summary = metrics.get("checkpoint_summary")
+    if summary is None:
+        return (
+            "| Checkpoint duty cycle (#241) | not measured "
+            "(pre-2026-08-08 harness; assume once-per-commit cadence) |"
+        )
+    return (
+        f"| Checkpoint duty cycle (#241) | {summary['realised_duty']*100:.2f}% "
+        f"over {summary['checkpoints']} checkpoints "
+        f"({summary['total_seconds']:.2f}s total, "
+        f"{summary['suppressed']} suppressed) |"
+    )
+
+
 def append_ingestion_report(metrics: dict[str, Any], report_path: Path) -> None:
     """Append a dated ingestion-run section to report_path, creating it with
     the shared header first if it doesn't exist yet."""
@@ -76,6 +96,7 @@ def append_ingestion_report(metrics: dict[str, Any], report_path: Path) -> None:
         f"{metrics['query_latency']['p99']*1000:.1f}ms / "
         f"{metrics['query_latency']['max']*1000:.1f}ms |",
         _poll_duty_row(metrics),
+        _checkpoint_duty_row(metrics),
     ]
     if "ignore_comparison" in metrics:
         comp = metrics["ignore_comparison"]

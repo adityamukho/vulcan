@@ -3294,6 +3294,147 @@ def _db_checkpoint(db: Any) -> None:
         db.checkpoint()
 
 
+_ingest_checkpoint_policy: Optional["_CheckpointPolicy"] = None
+
+_DEFAULT_CHECKPOINT_DUTY = 0.05
+
+
+def _checkpoint_duty_from_env() -> float:
+    """Read MINIGRAF_INGEST_CHECKPOINT_DUTY, falling back to the default on
+    anything unparseable or out of range. A typo must not crash ingestion or
+    silently switch checkpointing off (#241)."""
+    raw = os.environ.get("MINIGRAF_INGEST_CHECKPOINT_DUTY")
+    if raw is None:
+        return _DEFAULT_CHECKPOINT_DUTY
+    try:
+        value = float(raw)
+    except ValueError:
+        print(
+            f"[_run_ingestion] ignoring unparseable "
+            f"MINIGRAF_INGEST_CHECKPOINT_DUTY={raw!r}; "
+            f"using {_DEFAULT_CHECKPOINT_DUTY}",
+            file=sys.stderr,
+        )
+        return _DEFAULT_CHECKPOINT_DUTY
+    if not 0.0 < value <= 1.0:
+        print(
+            f"[_run_ingestion] MINIGRAF_INGEST_CHECKPOINT_DUTY={value} out of "
+            f"(0, 1]; using {_DEFAULT_CHECKPOINT_DUTY}",
+            file=sys.stderr,
+        )
+        return _DEFAULT_CHECKPOINT_DUTY
+    return value
+
+
+class _CheckpointPolicy:
+    """Decides when an ingestion write batch is compacted to disk.
+
+    db.checkpoint() is O(graph size) WAL compaction that is FLAT in dirty
+    bytes -- measured at ~5.1 ms/MB, a checkpoint after one fact costing
+    roughly the same as one after 5,000, converging tightly only once
+    per-checkpoint cost dominates the graph size (#241). Running it once per
+    commit therefore costs N_commits x avg_graph_size, super-linear in
+    history length, and was ~51% of at-scale ingestion wall clock.
+
+    It is NOT a durability boundary. minigraf appends every transact to
+    <graph>.wal, and writes survive a hard kill with no checkpoint at all;
+    the handle also compacts on clean close. Deferring a checkpoint trades
+    REOPEN LATENCY (~45 ms per MB of outstanding WAL, paid once by the next
+    process to open the graph), never data integrity.
+
+    The gate holds checkpointing to `duty` of wall clock: after a checkpoint
+    costing d seconds the next is suppressed until d * (1/duty - 1) seconds
+    have passed, since d / (d + W) <= duty exactly when W >= d * (1/duty - 1).
+    Because the wait scales with d, the FRACTION stays fixed as the graph
+    grows -- that is what removes the super-linear term rather than dividing
+    it by a constant. Same self-scaling shape as #242's ingestion poller,
+    which held 8.56% duty on CI against 8.65% locally on 23%-slower hardware.
+
+    Thread confinement: every ingestion checkpoint site runs on
+    _run_ingestion's single-worker write_executor, so this object's mutable
+    state is confined to one thread and needs no lock of its own beyond the
+    _db_native_lock that _db_checkpoint already takes. Do not call it from
+    another thread without adding one.
+    """
+
+    def __init__(self, duty: float, clock: "Callable[[], float]" = time.monotonic) -> None:
+        if not 0.0 < duty <= 1.0:
+            raise ValueError(f"checkpoint duty must be in (0, 1], got {duty!r}")
+        self._duty = duty
+        self._clock = clock
+        self._created_at = clock()
+        self._last_duration: Optional[float] = None
+        self._last_finished_at = 0.0
+        self.checkpoints = 0
+        self.suppressed = 0
+        self.total_seconds = 0.0
+
+    def _budget_elapsed(self) -> bool:
+        if self._last_duration is None:
+            return True  # nothing measured yet; checkpoint once to seed d
+        wait = self._last_duration * (1.0 / self._duty - 1.0)
+        return self._clock() - self._last_finished_at >= wait
+
+    def maybe(self, db: Any) -> bool:
+        """Checkpoint if the budget allows. Returns whether it did."""
+        if not self._budget_elapsed():
+            self.suppressed += 1
+            return False
+        self.force(db)
+        return True
+
+    def force(self, db: Any) -> None:
+        """Checkpoint regardless of budget, and re-measure d."""
+        started = self._clock()
+        _db_checkpoint(db)
+        finished = self._clock()
+        self._last_duration = finished - started
+        self._last_finished_at = finished
+        self.checkpoints += 1
+        self.total_seconds += self._last_duration
+
+    def summary(self) -> Dict[str, Any]:
+        """A small, JSON-safe snapshot of realised checkpoint duty (#241 Task
+        6), taken by the caller just before it discards this policy.
+
+        _run_ingestion clears _ingest_checkpoint_policy to None at its two
+        terminal-path finally sites (see their own comments for why there
+        are two) so a later interactive transact is never gated by a stale
+        run's budget -- which means this object and its counters are gone
+        the instant that happens. _ingest_progress is the channel that
+        already survives past a finished run, so the caller publishes this
+        dict there before clearing the policy, not after.
+
+        `elapsed_seconds` is measured from this policy's construction, which
+        is a few statements into _run_ingestion, to whenever this is called,
+        which is a few statements before the run returns -- close enough to
+        the run's own wall clock to report a meaningful duty fraction
+        without threading a second timer through the caller.
+        """
+        elapsed = max(self._clock() - self._created_at, 0.0)
+        return {
+            "checkpoints": self.checkpoints,
+            "suppressed": self.suppressed,
+            "total_seconds": self.total_seconds,
+            "elapsed_seconds": elapsed,
+            "realised_duty": (self.total_seconds / elapsed) if elapsed > 0 else 0.0,
+        }
+
+
+def _db_checkpoint_gated(db: Any) -> bool:
+    """Checkpoint unless the active ingestion policy says the budget is spent.
+
+    With no ingestion in flight the policy is None and this is exactly
+    _db_checkpoint(db), so the interactive write path is unchanged (#241).
+    Returns whether a checkpoint actually ran.
+    """
+    policy = _ingest_checkpoint_policy
+    if policy is None:
+        _db_checkpoint(db)
+        return True
+    return policy.maybe(db)
+
+
 def _checkpoint_after_write(db: Any, tool_name: str, result: Dict[str, Any]) -> None:
     """Checkpoint after a transact/retract that has already applied its graph
     and fact-index write. A checkpoint failure here must not flip an
@@ -8461,7 +8602,7 @@ def _reverse_apply(
         _transact(db, "[" + " ".join(triples) + "]", superseded_ts, index_con=index_con)
 
     _frontier_persist_claim(db, linearization, pos, from_low=False, commit_ts_iso=commit_ts_iso, index_con=index_con)
-    _db_checkpoint(db)
+    _db_checkpoint_gated(db)
     return commit_hash
 
 
@@ -9111,7 +9252,14 @@ def _forward_apply(
         # folds its own region in later (Task 9); this watermark must not be
         # advanced past the forward frontier before that happens.
         _lineage_confirmed_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
-    _db_checkpoint(db)
+    # Stage B's lifecycle pass is followed immediately by
+    # _correction_sweep_through_update and a checkpoint in _run_ingestion's
+    # sweep loop, so checkpointing here would be a pure duplicate -- and it
+    # fires BEFORE the watermark advances, so a crash between the two
+    # re-processes the commit either way. Measured at 25% of all ingestion
+    # checkpoints and 10.3% of wall clock (#241).
+    if not lifecycle_only:
+        _db_checkpoint_gated(db)
     _commit_index_writer_safe(index_con)
 
 
@@ -9505,7 +9653,7 @@ def _correction_sweep_apply(
 
     if update_watermark:
         _correction_sweep_through_update(db, commit_hash, commit_ts_iso, index_con=index_con)
-        _db_checkpoint(db)
+        _db_checkpoint_gated(db)
     return skipped_events
 
 
@@ -9795,7 +9943,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     Ordinary exceptions (bad git ref, unreadable blob, unsupported syntax)
     are unaffected and still fail only the one commit as before.
     """
-    global _db, _ingest_progress
+    global _db, _ingest_progress, _ingest_checkpoint_policy
     # Safe to clear unconditionally: handle_minigraf_ingest_git refuses to start a
     # new run while one is already active, so no in-flight shutdown signal is ever
     # stomped on here; main()'s finally block re-sets the flag on exit regardless,
@@ -9899,16 +10047,25 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # the extraction pool's own shutdown has already been submitted to it.
         write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
+        # Hold checkpointing to a fixed fraction of wall clock rather than
+        # once per commit. See _CheckpointPolicy for why the per-commit
+        # cadence was super-linear and why deferring is safe (#241).
+        _ingest_checkpoint_policy = _CheckpointPolicy(_checkpoint_duty_from_env())
+
         # Single fact-index write connection for the whole ingestion run,
         # opened on write_executor's one worker thread and never touched from
         # any other thread thereafter (sqlite3 connections are thread-affine
         # by default) -- every use below is itself routed through
         # write_executor, so all access stays on the thread that created it.
-        # Committed once per source-commit (matching the existing
-        # _db_checkpoint(db) cadence just below), not once per triple: large
+        # Committed once per source-commit, not once per triple: large
         # repositories can cross 1M facts well before ingestion completes,
         # and per-triple commits would be dominated by fsync overhead at
-        # that scale.
+        # that scale. This is a deliberate asymmetry with the graph
+        # checkpoint below: the fact-index sqlite commit stays per-commit,
+        # while the graph checkpoint is now duty-gated rather than
+        # per-commit (#241) -- the two are unrelated costs (sqlite commit
+        # vs minigraf WAL compaction) and only the latter was found to be
+        # super-linear in graph size.
         index_path = fact_index.index_path_for(_graph_path or _get_graph_path())
         index_con = await loop.run_in_executor(write_executor, _open_index_writer_safe, index_path)
 
@@ -10135,7 +10292,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     write_executor, _correction_sweep_through_update,
                                     db, sweep_hash, sweep_ts, index_con,
                                 )
-                                await loop.run_in_executor(write_executor, _db_checkpoint, db)
+                                await loop.run_in_executor(write_executor, _db_checkpoint_gated, db)
                             except concurrent.futures.process.BrokenProcessPool:
                                 raise
                             except Exception as e:
@@ -10166,7 +10323,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 write_executor, _lineage_confirmed_through_update,
                                 db, linearization[-1], commit_metadata[-1][1], index_con,
                             )
-                            await loop.run_in_executor(write_executor, _db_checkpoint, db)
+                            await loop.run_in_executor(write_executor, _db_checkpoint_gated, db)
                     finally:
                         _db = None
                         db = None
@@ -10181,10 +10338,37 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         await loop.run_in_executor(
                             write_executor, _last_run_write, db, last_hash, now, _ingest_progress["processed"], index_con
                         )
-                        await loop.run_in_executor(write_executor, _db_checkpoint, db)
+                        # No checkpoint here: the unconditional final
+                        # checkpoint in the outer finally below (#241)
+                        # already covers this path. A checkpoint here would
+                        # be a full ungated compaction immediately followed
+                        # by _db = None, a reopen, and another compaction
+                        # with nothing dirty in between -- the same
+                        # structural duplicate #241 removed from Stage B.
                     finally:
                         _db = None
             finally:
+                # Compact the WAL on EVERY terminal path, not just
+                # completed_all. Under the duty-cycle cadence an interrupted
+                # run can leave a whole run's writes outstanding in
+                # <graph>.wal, and the next process to open the graph pays
+                # the replay (~45 ms/MB). Nothing is lost if this fails --
+                # the WAL is already durable -- so a failure here must never
+                # mask the real error that brought us into this finally
+                # (same rule as _checkpoint_after_write, #176). Deliberately
+                # calls _db_checkpoint directly, not _db_checkpoint_gated:
+                # this one must never be suppressed. (The completed_all path
+                # used to run its own redundant checkpoint immediately
+                # before falling into this finally -- removed, since this
+                # one already covers it; see the comment left at its old
+                # call site.)
+                try:
+                    final_db = await _ensure_db_async()
+                    await loop.run_in_executor(write_executor, _db_checkpoint, final_db)
+                except Exception as e:
+                    print(f"[_run_ingestion] final checkpoint failed: {e}", file=sys.stderr)
+                finally:
+                    _db = None
                 # ProcessPoolExecutor.shutdown(wait=True) blocks joining the
                 # worker OS processes — measured ~90ms even for a pool that
                 # never did any real work, entirely from process-exit
@@ -10207,17 +10391,56 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             else:
                 _ingest_progress["status"] = "stopped"
         finally:
+            # Publish realised checkpoint duty into _ingest_progress BEFORE
+            # discarding the policy below -- its counters do not survive
+            # past this point, and _ingest_progress is the established
+            # channel for run metadata that does (#241 Task 6). Guarded on
+            # `is not None` so this is a no-op if the outer finally's own
+            # guarded publish (below) already ran first on some exit path
+            # that reaches both -- summary() is a pure read, so writing it
+            # twice would be harmless anyway, but the guard keeps one
+            # obvious writer per policy lifetime.
+            if _ingest_checkpoint_policy is not None:
+                _ingest_progress["checkpoint_summary"] = _ingest_checkpoint_policy.summary()
+            # Never let a finished run's budget gate a later interactive
+            # transact (#241).
+            _ingest_checkpoint_policy = None
             write_executor.shutdown(wait=True)
 
     except Exception as e:
-        # write_executor is already shut down by the inner finally above by the
-        # time we get here (it runs on any exit from that try, including this
-        # exception propagating through it) — nothing left to clean up.
+        # write_executor is shut down by the inner finally above on the
+        # normal exit paths from that try. That is NOT guaranteed if
+        # _open_index_writer_safe or _frontier_load (both called before the
+        # inner try even starts) raises: this except is reachable with
+        # write_executor never shut down, leaking it. Not fixed here --
+        # out of scope for #241, and doing so needs an unbound-name guard
+        # since write_executor may not exist yet at that point either.
         _ingest_progress["phase"] = None
         _ingest_progress["status"] = "error"
         _ingest_progress["error"] = str(e)
         _ingest_progress["error_at"] = _now_utc_ms()
         _db = None
+    finally:
+        # The checkpoint policy is a separate story from write_executor
+        # above: it is installed just after write_executor is created,
+        # several statements above the `try` that owns the finally clearing
+        # it in the normal case (see that finally's own comment). A failure
+        # in that gap -- e.g. _frontier_load's one-time migration -- skips
+        # that inner finally entirely. A `finally` here (rather than another
+        # `except Exception`) is required, not just belt-and-suspenders:
+        # `except Exception` does not catch BaseException-rooted control
+        # flow (asyncio.CancelledError, KeyboardInterrupt, SystemExit), so a
+        # cancellation landing in that same gap would still leak the policy
+        # with only an `except Exception` clear. Idempotent with the inner
+        # finally's own clear on every path that reaches it (#241).
+        #
+        # A failure in the pre-write-scope gap (e.g. _frontier_load's
+        # migration) never reaches the inner finally at all, so THIS is the
+        # only place that publishes the summary for that path -- guarded the
+        # same way, and for the same reason (#241 Task 6).
+        if _ingest_checkpoint_policy is not None:
+            _ingest_progress["checkpoint_summary"] = _ingest_checkpoint_policy.summary()
+        _ingest_checkpoint_policy = None
 
 
 async def handle_minigraf_ingest_git(
