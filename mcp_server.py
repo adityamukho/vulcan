@@ -3330,10 +3330,11 @@ class _CheckpointPolicy:
     """Decides when an ingestion write batch is compacted to disk.
 
     db.checkpoint() is O(graph size) WAL compaction that is FLAT in dirty
-    bytes -- measured at ~4.9 ms/MB, a checkpoint after one fact costing the
-    same as one after 5,000 (#241). Running it once per commit therefore
-    costs N_commits x avg_graph_size, super-linear in history length, and was
-    ~51% of at-scale ingestion wall clock.
+    bytes -- measured at ~5.1 ms/MB, a checkpoint after one fact costing
+    roughly the same as one after 5,000, converging tightly only once
+    per-checkpoint cost dominates the graph size (#241). Running it once per
+    commit therefore costs N_commits x avg_graph_size, super-linear in
+    history length, and was ~51% of at-scale ingestion wall clock.
 
     It is NOT a durability boundary. minigraf appends every transact to
     <graph>.wal, and writes survive a hard kill with no checkpoint at all;
@@ -10056,11 +10057,15 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # any other thread thereafter (sqlite3 connections are thread-affine
         # by default) -- every use below is itself routed through
         # write_executor, so all access stays on the thread that created it.
-        # Committed once per source-commit (matching the existing
-        # _db_checkpoint(db) cadence just below), not once per triple: large
+        # Committed once per source-commit, not once per triple: large
         # repositories can cross 1M facts well before ingestion completes,
         # and per-triple commits would be dominated by fsync overhead at
-        # that scale.
+        # that scale. This is a deliberate asymmetry with the graph
+        # checkpoint below: the fact-index sqlite commit stays per-commit,
+        # while the graph checkpoint is now duty-gated rather than
+        # per-commit (#241) -- the two are unrelated costs (sqlite commit
+        # vs minigraf WAL compaction) and only the latter was found to be
+        # super-linear in graph size.
         index_path = fact_index.index_path_for(_graph_path or _get_graph_path())
         index_con = await loop.run_in_executor(write_executor, _open_index_writer_safe, index_path)
 
@@ -10333,11 +10338,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         await loop.run_in_executor(
                             write_executor, _last_run_write, db, last_hash, now, _ingest_progress["processed"], index_con
                         )
-                        # Redundant with the unconditional final checkpoint in
-                        # the outer finally below (#241) -- that one now
-                        # covers this path too. Left in place: harmless, and
-                        # removing it only widens this change's diff.
-                        await loop.run_in_executor(write_executor, _db_checkpoint, db)
+                        # No checkpoint here: the unconditional final
+                        # checkpoint in the outer finally below (#241)
+                        # already covers this path. A checkpoint here would
+                        # be a full ungated compaction immediately followed
+                        # by _db = None, a reopen, and another compaction
+                        # with nothing dirty in between -- the same
+                        # structural duplicate #241 removed from Stage B.
                     finally:
                         _db = None
             finally:
@@ -10350,9 +10357,11 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # mask the real error that brought us into this finally
                 # (same rule as _checkpoint_after_write, #176). Deliberately
                 # calls _db_checkpoint directly, not _db_checkpoint_gated:
-                # this one must never be suppressed. (The completed_all
-                # checkpoint further down is now redundant with this one for
-                # that path -- left in place, see its own comment.)
+                # this one must never be suppressed. (The completed_all path
+                # used to run its own redundant checkpoint immediately
+                # before falling into this finally -- removed, since this
+                # one already covers it; see the comment left at its old
+                # call site.)
                 try:
                     final_db = await _ensure_db_async()
                     await loop.run_in_executor(write_executor, _db_checkpoint, final_db)
@@ -10399,9 +10408,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             write_executor.shutdown(wait=True)
 
     except Exception as e:
-        # write_executor is already shut down by the inner finally above by the
-        # time we get here (it runs on any exit from that try, including this
-        # exception propagating through it) — nothing left to clean up.
+        # write_executor is shut down by the inner finally above on the
+        # normal exit paths from that try. That is NOT guaranteed if
+        # _open_index_writer_safe or _frontier_load (both called before the
+        # inner try even starts) raises: this except is reachable with
+        # write_executor never shut down, leaking it. Not fixed here --
+        # out of scope for #241, and doing so needs an unbound-name guard
+        # since write_executor may not exist yet at that point either.
         _ingest_progress["phase"] = None
         _ingest_progress["status"] = "error"
         _ingest_progress["error"] = str(e)

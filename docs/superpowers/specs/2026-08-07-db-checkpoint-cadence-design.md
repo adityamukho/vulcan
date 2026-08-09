@@ -35,15 +35,27 @@ versus after a 5,000-fact batch:
 
 | facts | graph MB | ckpt after **1** fact | ckpt after **5,000** facts |
 |---:|---:|---:|---:|
-| 5,000 | 1.7 | 7.2 ms | 10.3 ms |
-| 20,000 | 6.6 | 33.1 ms | 37.6 ms |
-| 50,000 | 16.5 | **80.8 ms** | **82.0 ms** |
+| 5,000 | 1.57 | 7.21 ms | 19.23 ms |
+| 20,000 | 6.29 | 33.47 ms | 41.87 ms |
+| 50,000 | 15.73 | **79.88 ms** | **87.04 ms** |
 
-~4.9 ms per MB of graph file. The two right-hand columns agreeing is the whole
-finding: a checkpoint costs the same whether it is flushing one fact or five
-thousand.
+(Numbers as recorded in the committed probe artifact,
+`evals/at_scale/results/241-checkpoint-cost.json`.)
 
-Extrapolated to the at-scale graph at 126 MB this predicts ~617 ms, which
+~5.1 ms per MB of graph file (fit from the 1-fact column: (79.88 - 7.21) /
+(15.73 - 1.57) MB). The two right-hand columns converging is the finding, but
+that convergence is **asymptotic in graph size, not tight at every plateau** —
+at 5,000 facts the batch column runs 2.67x the single-fact one (the batch's
+own write cost is not yet swamped by checkpoint cost), narrowing to 1.25x at
+20,000 and 1.09x at 50,000 as per-checkpoint cost comes to dominate the two
+writes' own cost. It is only once that domination is complete that "flushing
+one fact costs the same as flushing five thousand" holds tightly; the
+underlying claim — checkpoint cost is a function of graph size, not dirty
+bytes — is unaffected, since even the outlying 5,000-fact ratio is far below
+what a dirty-bytes-proportional cost would produce (a 5,000x multiplier, not
+2.67x).
+
+Extrapolated to the at-scale graph at 126 MB this predicts ~643 ms, which
 reproduces the 0.69 s per-call average recorded in #241 from an independent
 harness. Total checkpoint cost across a run is therefore
 `N_commits x avg_graph_size` — quadratic in history length. **That is the

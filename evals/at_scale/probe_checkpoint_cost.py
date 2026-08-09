@@ -10,10 +10,13 @@ of findings" (docs/superpowers/specs/2026-08-07-db-checkpoint-cadence-design.md)
    from that same baseline: once after writing a single fact, once after
    writing a 5,000-fact batch. If checkpoint cost depended on dirty bytes,
    the batch column would dwarf the single-fact column as the batch grows;
-   if it depends only on total graph size, the two columns stay close (the
-   design doc's own run put them within ~10-30% of each other at every
-   plateau, narrowing as the graph grows and per-checkpoint cost comes to
-   dominate the two writes' own cost).
+   if it depends only on total graph size, the two columns converge as the
+   graph grows (the design doc's own run, from this probe's committed
+   results/241-checkpoint-cost.json: the batch column runs 2.67x the
+   single-fact one at 5,000 facts, narrowing to 1.25x at 20,000 and 1.09x at
+   50,000 as per-checkpoint cost comes to dominate the two writes' own cost).
+   Even the widest ratio is far below what a dirty-bytes-proportional cost
+   would produce (a ~5,000x multiplier at the 5,000-fact plateau, not 2.67x).
 
 2. DURABILITY -- checkpoint() is NOT a durability boundary. A real child
    PROCESS (not a thread, not os.fork() inside this interpreter -- see
@@ -63,7 +66,7 @@ import tempfile
 import time
 from pathlib import Path
 
-REPO = "/home/aditya/Work/AMC/Minigraf/temporal_reasoning"
+REPO = str(Path(__file__).resolve().parents[2])
 sys.path.insert(0, REPO)
 
 TS = "2026-01-01T00:00:00Z"

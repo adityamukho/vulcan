@@ -19957,12 +19957,24 @@ class TestFinalCheckpointOnEveryTerminalPath:
 
     A naive `len(calls) > 0` is not ablation-proof here: today's per-commit
     cadence checkpoints throughout every path regardless of this fix, so
-    that assertion passes against both old and new code. Instead, every
-    test below installs a _CheckpointPolicy with duty=1e-6 so every gated
-    mid-run checkpoint beyond the very first (which always fires -- it has
-    no measured duration yet and must seed one) is suppressed. Only a
+    that assertion passes against both old and new code. Instead, every test
+    below monkeypatches `_checkpoint_duty_from_env` to return 1e-6, so every
+    gated mid-run checkpoint beyond the very first (which always fires -- it
+    has no measured duration yet and must seed one) is suppressed. Only a
     genuinely unconditional final checkpoint can then grow the count after
     the interruption/failure point.
+
+    This must patch `_checkpoint_duty_from_env`, not install a
+    `_CheckpointPolicy` instance directly on `mcp_server._ingest_checkpoint_policy`
+    -- `_run_ingestion` unconditionally overwrites that global with
+    `_CheckpointPolicy(_checkpoint_duty_from_env())` right after creating
+    write_executor, before any commit is processed, discarding whatever was
+    installed there beforehand. An earlier version of this suite patched the
+    global directly; the patch was silently discarded every run, and two of
+    the three tests below still failed against pre-fix code anyway, by
+    accident (see each test's docstring for why) rather than because the
+    intended ablation mechanism worked. Patching the function that
+    `_run_ingestion` calls survives that overwrite.
     """
 
     def _fresh_progress(self):
@@ -19984,11 +19996,23 @@ class TestFinalCheckpointOnEveryTerminalPath:
 
     @pytest.mark.asyncio
     async def test_completed_run_checkpoints_at_the_end(self, git_repo, monkeypatch):
+        """SMOKE TEST, not a regression test for this class's terminal-path
+        claim -- verified by ablation (revert the outer `finally`'s
+        unconditional checkpoint back to living inside `if completed_all:`,
+        matching pre-#241-Task-3 code): this test still PASSES against that
+        reverted code, because a `completed_all` run already gets a
+        checkpoint from the `if completed_all:` path regardless of whether
+        the terminal-path checkpoint is gated on completion or not. It
+        cannot tell the two apart. What it does verify: a fully successful
+        run ends with `status == "complete"` and at least one checkpoint
+        fired somewhere -- which the sibling tests below (that inject a
+        shutdown or a Stage B failure) do meaningfully distinguish, per
+        their own docstrings' recorded ablation evidence."""
         import mcp_server
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = self._fresh_progress()
         calls = self._count_checkpoints(monkeypatch)
-        monkeypatch.setattr(mcp_server, "_ingest_checkpoint_policy", mcp_server._CheckpointPolicy(duty=1e-6))
+        monkeypatch.setattr(mcp_server, "_checkpoint_duty_from_env", lambda: 1e-6)
 
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
@@ -20002,12 +20026,23 @@ class TestFinalCheckpointOnEveryTerminalPath:
         after the first commit's write lands, so exactly one gated checkpoint
         (the policy's mandatory first-call seed) has already happened by the
         time we capture the "before" count -- growth past that point can only
-        come from the unconditional final checkpoint."""
+        come from the unconditional final checkpoint.
+
+        Ablation-verified against pre-#241-Task-3 code (the final checkpoint
+        restored to living inside `if completed_all:`, matching commit
+        3e394f8's own diff reverted): this test correctly FAILS there, since
+        the loop breaks out on the shutdown flag before any further commit
+        (and its checkpoint) is processed, so `completed_all` is False and
+        the old code's completed_all-only checkpoint never runs either --
+        by accident, in the sense that the failure is caused by the run
+        simply stopping, not by the duty=1e-6 suppression this test
+        installs (which would only matter for a run long enough to hit its
+        gate more than once)."""
         import mcp_server
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = self._fresh_progress()
         calls = self._count_checkpoints(monkeypatch)
-        monkeypatch.setattr(mcp_server, "_ingest_checkpoint_policy", mcp_server._CheckpointPolicy(duty=1e-6))
+        monkeypatch.setattr(mcp_server, "_checkpoint_duty_from_env", lambda: 1e-6)
 
         original_sleep = asyncio.sleep
         pre_shutdown_calls = None
@@ -20035,12 +20070,21 @@ class TestFinalCheckpointOnEveryTerminalPath:
         if-completed_all block entirely. Captures the checkpoint count at the
         instant the injected failure fires (Stage A's own seed checkpoint has
         already happened by then), so growth past that point can only come
-        from the unconditional final checkpoint."""
+        from the unconditional final checkpoint.
+
+        Ablation-verified against pre-#241-Task-3 code (the final checkpoint
+        restored to living inside `if completed_all:`, matching commit
+        3e394f8's own diff reverted): this test correctly FAILS there, since
+        the raised exception skips straight past the if-completed_all block
+        (which never runs its own checkpoint either in that state), so no
+        further checkpoint fires at all -- again by accident, in the sense
+        that the failure is caused by the remaining checkpoint sites being
+        unreachable, not by the duty=1e-6 suppression this test installs."""
         import mcp_server
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = self._fresh_progress()
         calls = self._count_checkpoints(monkeypatch)
-        monkeypatch.setattr(mcp_server, "_ingest_checkpoint_policy", mcp_server._CheckpointPolicy(duty=1e-6))
+        monkeypatch.setattr(mcp_server, "_checkpoint_duty_from_env", lambda: 1e-6)
 
         pre_failure_calls = None
 

@@ -398,21 +398,27 @@ continuity; it is directional, not the number this entry's speedup is
 computed against.
 
 - **Per-commit wall clock: 4.808 s/commit -> 2.314 s/commit, a 2.08x speedup
-  (-51.9%).** (3009.61/626 = 4.8077 vs 1455.75/629 = 2.3144.) Raw wall clock
-  also fell in absolute terms (3009.61s -> 1455.75s, -1553.86s) despite this
-  run doing very slightly more work (629 vs 626 commits).
+  (-51.9%; see the reconciliation below: only ~39-42% of this is
+  attributable to #241).** (3009.61/626 = 4.8077 vs 1455.75/629 = 2.3144.)
+  Raw wall clock also fell in absolute terms (3009.61s -> 1455.75s,
+  -1553.86s) despite this run doing very slightly more work (629 vs 626
+  commits).
 - **Realised checkpoint duty: 4.58%, under the 5% budget**, over 98
   checkpoints totaling 66.52s of the run's 1452.27s policy-tracked window
   (845 further calls suppressed). This is the number #241's acceptance
   criterion asked for and the number the design's budget arithmetic
   predicts: close to, and safely under, the configured `duty=0.05`.
   **Caveat on completeness:** this total excludes the mandatory unconditional
-  final checkpoint(s) `mcp_server.py:10340` and `:10358` (Task 3), which call
+  final checkpoint(s) `mcp_server.py:10340` and `:10358` as they stood at this
+  run's commit (`0eef8b6`) — Task 3's outer unconditional checkpoint plus a
+  since-removed duplicate on the `completed_all` path, which this fix wave's
+  own review found structurally identical to the Stage B duplicate Task 2
+  removed and deleted (current HEAD keeps only the outer one). Both call
   `_db_checkpoint` directly rather than going through the policy specifically
   so they can never be suppressed — by the design's own framing this is
   "policy.checkpoints", not "every checkpoint in the run". At this run's
-  ~210MB final graph size the ~4.9ms/MB scaling law bounds each omitted call
-  at roughly ~1s, negligible against the measured 66.52s and the 1455.75s
+  ~210MB final graph size the ~5.1ms/MB scaling law bounds each omitted call
+  at roughly ~1.1s, negligible against the measured 66.52s and the 1455.75s
   wall clock, but it is a real, if small, gap in what this row accounts for.
 
 **The measured win is larger than the design spec's ablation predicted, and
@@ -432,29 +438,31 @@ asserted:
   form (`1.5N + 2 = 945.5`) predicts 946 against this run's own measured 98 +
   845 = **943** gated attempts — a 0.3% match, which is good evidence the
   scaling assumption is sound enough to extrapolate from.
-- The design spec's scaling probe gives **~4.9 ms per MB** of graph size,
+- The design spec's scaling probe gives **~5.1 ms per MB** of graph size
+  (corrected from an earlier ~4.9 ms/MB fit that used the wrong batch-column
+  numbers — see the design spec's "Cost is linear in graph size" section),
   flat in dirty bytes. Approximating checkpoints as evenly spaced across a
   graph growing ~linearly from 0 to this run's final 210.33 MB, the average
   outstanding size is ~105.17 MB, so each checkpoint costs an estimated
-  ~515 ms at this run's scale. `K_old x 515ms = 1260 x 0.5153s ~= 649.3s` of
+  ~536 ms at this run's scale. `K_old x 536ms = 1260 x 0.5364s ~= 675.9s` of
   estimated old-cadence checkpoint cost, against the here real, measured
-  66.52s — an estimated **~582.8s** reduction.
+  66.52s — an estimated **~609.4s** reduction.
 - Against the measured **1553.86s** total wall-clock reduction, that is
-  **~37.5%** — confirming the *direction* of the graph-size-scaling
+  **~39.2%** — confirming the *direction* of the graph-size-scaling
   hypothesis (checkpoint cost is O(graph size), so its cost fraction is
   necessarily larger on a 210MB run than on whatever smaller graph the
   330-commit ablation slice reached, and the realised win should exceed that
   slice's ceiling) but **not closing the gap to 51.9%**. Using the design
   spec's own cross-check anchor instead of the nominal rate (it recorded a
-  126MB graph costing 690ms/checkpoint against the model's 617ms prediction,
-  a ~12% undershoot, i.e. the nominal rate is a soft floor) raises the
-  estimate to ~725.7s old-cadence cost, ~659.1s reduction, **~42.4%** of the
+  126MB graph costing 690ms/checkpoint against the model's ~643ms prediction,
+  a ~7% undershoot, i.e. the nominal rate is a soft floor) raises the
+  estimate to ~725.9s old-cadence cost, ~659.4s reduction, **~42.4%** of the
   total saving. Neither reaches half.
-- **~58-62% of the observed 1553.86s reduction (roughly 895-971s) is
+- **~58-61% of the observed 1553.86s reduction (roughly 894-944s) is
   therefore left unexplained by the checkpoint-cost mechanism under this
   model, and is reported as unexplained rather than attributed.** Candidate,
-  non-exclusive, unmeasured contributors: the ~4.9ms/MB rate was fit at
-  <=16.5MB and linearly extrapolated ~13x to this run's scale, and the
+  non-exclusive, unmeasured contributors: the ~5.1ms/MB rate was fit at
+  <=15.73MB and linearly extrapolated ~13x to this run's scale, and the
   126MB/690ms anchor already shows real cost undershooting the linear model
   in the same direction, so per-checkpoint cost may be more super-linear at
   full scale than either estimate captures; the two compared runs were taken
@@ -466,11 +474,25 @@ asserted:
   differences between master `68ddb9d` and this branch's HEAD (e.g. Task 3's
   unconditional final checkpoint itself running on every path now, where
   before it may not have on an interrupted run). **The -51.9%/commit figure
-  is the real, honestly measured headline result. The ~37-42%
+  is the real, honestly measured observation. The ~39-42%
   checkpoint-attributable estimate above is a partial, order-of-magnitude
-  sanity check on direction, not a full accounting of the remaining ~58-62%,
+  sanity check on direction, not a full accounting of the remaining ~58-61%,
   which should not be attributed to this change without a same-day
   controlled A/B that was not performed here.**
+
+  **A same-day controlled A/B does exist, though — in the design spec, not
+  this run.** Its "How much is on the critical path" ablation held everything
+  but `_db_checkpoint` fixed: same 330-commit slice at `82aa7e6c`, same
+  machine, same harness, master `68ddb9d`'s checkpoint-every-commit baseline
+  (`normal2`, 185.7s) against a leg with checkpointing suppressed entirely
+  (`noop`, 140.8s) — a controlled **-24.2%**. That lands almost exactly on
+  this branch's own duty-gated `every25` leg's predicted ceiling (-21.1%) and
+  is the number to trust for "what does removing checkpoint cost alone buy,
+  with everything else held constant." Read alongside it, this run's
+  uncontrolled -51.9% looks like cross-day variance plus a ~1.7x larger graph
+  (210MB vs whatever the 330-commit slice reached) compounding the
+  graph-size-linear cost, rather than the checkpoint-cadence change
+  delivering roughly double its own controlled effect.
 
 **The flaky `Page N out of bounds` write failure (Task 5's follow-up)
 recurred.** One commit was skipped: `[_run_ingestion] skipping commit
@@ -497,6 +519,30 @@ addressed by this task.
 2x latency win.** Both runs are post-#242, so this comparison is more
 defensible than one crossing the 2026-08-07 poller-fix boundary — but the
 two runs recorded different poll counts (864 vs 1076), so they sampled the
-query-cost curve at different densities, and the checkpoint-cadence change
-this task measures does not itself touch query latency. Treat this figure as
-directional at best, not as a measured effect of anything this branch did.
+query-cost curve at different densities. And the checkpoint-cadence change
+this task measures is **not** latency-neutral here: `_db_execute` and
+`_db_checkpoint` both serialize on the same `_db_native_lock`
+(`mcp_server.py:3288` and `:3294`), so a poll's graph query can block behind
+an in-flight checkpoint. Removing ~1,160 checkpoints' worth of lock-holding
+(the pre-dedup `K_old ~= 1260` estimate above, at ~536ms each on this run's
+scale) necessarily reduces how often a poll's query queues behind one, which
+supplies a named mechanism for part of both the p99 drop and part of the
+unattributed wall-clock residual above. Treat the *magnitude* as directional
+at best — the differing poll density and sample size mean this is not a
+controlled measurement of the effect — but the *direction* is expected, not
+incidental.
+
+**A further confound sits inside the polling instrument itself.** The two
+runs' poll duty-cycle rows above give total poll-query time as duty x
+wall-clock: 8.65% x 3009.61s = 260.3s over 864 polls (mean 301ms/poll) for
+the comparison baseline, versus 6.31% x 1455.75s = 91.9s over 1076 polls
+(mean 85ms/poll) for this run — a **168.4s** difference. That is 10.8% of
+the observed 1553.86s wall-clock saving, sitting in the measurement
+instrument rather than in ingestion itself: fewer, cheaper polls this run
+means less time the ingestion loop spent yielding to a poller, independent
+of anything #241 changed. It is plausibly part of the same lock-contention
+mechanism above (cheaper checkpoints -> less time a poll's query waits on
+`_db_native_lock` -> a cheaper mean poll -> a smaller duty-cycle sleep budget
+consumed), which would make it a second-order consequence of #241 rather
+than a wholly separate confound, but that chain is not independently verified
+here and is reported as a candidate, not a settled attribution.
