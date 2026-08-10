@@ -67,7 +67,54 @@ _db: Optional[MiniGrafDb] = None
 # call/checkpoint on the same (or a handle open concurrently with another's
 # in-flight write) can observe a torn header or a mid-write index, producing
 # silently wrong query results or a transient "Header checksum mismatch" (#110).
+#
+# It serializes calls into ONE handle. It does not, and cannot, stop a second
+# handle being opened on the same file — those are distinct Rust objects with
+# distinct internal mutexes. See the single-handle invariant below.
 _db_native_lock = threading.Lock()
+
+# THE SINGLE-HANDLE INVARIANT (#253, #251, project-minigraf/minigraf#304)
+#
+# Everything below assumes at most one live MiniGrafDb handle per process.
+# Nothing in this module enforces that. minigraf did not either until 1.2.2
+# (project-minigraf/minigraf#304); this project now requires >= 1.2.3, so the
+# corruption path below is closed at the source rather than here.
+#
+# `_db = None` is this module's "release the graph file lock" idiom, but it
+# only releases when it drops the LAST reference. Any local `db` still on a
+# stack keeps the handle — and its lock — alive: _run_ingestion holds one
+# across the awaits in its per-commit loop, and a concurrent call_tool's
+# `finally: _db = None` clears the global underneath it.
+#
+# The next MiniGrafDb.open() then does NOT fail. minigraf's FileLock::acquire
+# (src/storage/backend/file.rs) removes the lock file and retries whenever the
+# holder PID equals our own:
+#
+#     if pid == our_pid || !Self::is_process_alive(pid) {
+#         let _ = std::fs::remove_file(&lock_path);
+#         return Self::acquire(db_path);
+#     }
+#
+# So we silently get two live handles on one file. Each FileBackend caches its
+# own FileHeader.page_count, allocates new pages from it, and bounds-checks
+# read_page against it — which is exactly where the flaky
+# "Page N out of bounds (total pages: M)" comes from (#253, #251,
+# project-minigraf/minigraf#304). Worse, whichever handle drops first runs
+# FileLock::drop, deleting the lock file that by then belongs to the survivor,
+# leaving a live handle with no lock at all and letting other *processes* in.
+#
+# Since minigraf 1.2.2, FileLock::acquire steals only a DEAD holder's lock, so
+# the second open fails loudly with "Database is already open in this process"
+# instead of silently corrupting. That converts this from data
+# corruption into a lock error on the retry path — the right trade, but it does
+# not make the interleaving above correct. Clearing _db while another caller
+# still holds the handle is still a bug here; it is now merely a visible one.
+#
+# Enforcing the invariant in Python was tried and rejected (#253): a weakref
+# guard that reuses the still-live handle instead of opening a second one fixes
+# the corruption but changes handle LIFETIME, resurrecting handles whose backing
+# file is gone — it segfaulted the suite reproducibly. The durable local fix is
+# an explicit lease/refcount protocol replacing the `_db = None` idiom.
 
 # Track graph path and last-known mtime so we can detect external modifications.
 # minigraf's Drop impl writes to the file even for read-only handles, which
@@ -2991,11 +3038,25 @@ def _open_db_at(path: str, *, force: bool = True) -> MiniGrafDb:
     both observe _db as None (e.g. the ingestion preload thread and an
     _ensure_db_async() caller racing during the "starting" phase, before
     _run_ingestion flips status to "running") each call MiniGrafDb.open() on
-    the same path from this same process. The second open collides with the
-    first handle's still-held lock file and surfaces as "Database is locked
-    by another process", with the lock file's own PID equal to *our* PID
-    (#107). force=True (the default) is for callers that need a genuine
-    reopen regardless of any existing handle, e.g. _refresh_if_stale().
+    the same path from this same process (#107). force=True (the default) is
+    for callers that need a genuine reopen regardless of any existing handle,
+    e.g. _refresh_if_stale().
+
+    #107 recorded that second open as surfacing loudly — "Database is locked by
+    another process", with the lock file's PID equal to *our* PID. That was not
+    true of minigraf 1.2.1 and earlier, and assuming it was is what let
+    #253/#251 hide: FileLock::acquire treated a lock held by our own PID as
+    stale, deleted it, and opened anyway, so the second handle was created
+    silently and the two corrupted each other. Fixed in minigraf 1.2.2
+    (project-minigraf/minigraf#304), which now raises "Database is already open
+    in this process".
+
+    NOTE: neither branch below can currently detect a handle that is live but
+    no longer reachable through _db — see the module comment on the
+    single-handle invariant. Guarding that in Python was tried and rejected
+    (#253): reusing a still-referenced handle changes its lifetime, which
+    resurrects handles whose backing file is gone. The enforcement belongs in
+    minigraf's FileLock, where the fix is one condition.
     """
     global _db, _graph_path, _db_mtime
     with _db_native_lock:
@@ -3051,7 +3112,26 @@ def _refresh_if_stale() -> None:
 
 
 def _is_lock_error(exc: Exception) -> bool:
-    return "locked" in str(exc).lower()
+    """True for the two "someone else has the graph" opens, both retryable.
+
+    minigraf raises two distinct messages, and only one contains "locked":
+
+      * "Database is locked by another process"       -- another PROCESS
+      * "Database is already open in this process"    -- another handle HERE
+        (project-minigraf/minigraf#304, minigraf >= 1.2.2)
+
+    The second must be matched too. It is transient in exactly the same way:
+    the other holder is usually a poller or a call_tool worker about to drop
+    its reference, so backing off and retrying is the right response. Matching
+    only "locked" made it fall through as a fatal non-lock error and abort the
+    caller on the first attempt, turning a momentary overlap into a failed
+    ingestion.
+
+    Retrying does NOT paper over the invariant: a genuinely leaked handle still
+    exhausts the retry budget and surfaces. It only absorbs the races.
+    """
+    msg = str(exc).lower()
+    return "locked" in msg or "already open in this process" in msg
 
 
 def _stale_lock_holder_pid(exc: Exception) -> Optional[int]:
@@ -10217,8 +10297,21 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             file=sys.stderr,
                         )
                     finally:
-                        _db = None  # release file lock between commits
-                        db = None   # drop local reference too — see note above
+                        # Order matters, and it is not cosmetic. Clearing _db
+                        # first leaves a window in which the global says "no
+                        # handle" while this frame's `db` still holds one --
+                        # and other OS THREADS (the ingestion status/query
+                        # poller, any call_tool worker) can call get_db() inside
+                        # it. They see _db is None, open a second handle on the
+                        # same file, and since minigraf 1.2.2 that raises
+                        # "Database is already open in this process"; before it
+                        # silently corrupted the graph, which is the #251
+                        # mechanism. No await separates these two statements,
+                        # so no other *coroutine* interleaves -- but threads do.
+                        # Dropping the local first makes the clearing of _db the
+                        # moment the handle is genuinely released.
+                        db = None   # drop local reference FIRST
+                        _db = None  # now this actually releases the file lock
 
                     _ingest_progress["processed"] += 1
                     await asyncio.sleep(0)  # yield to event loop
@@ -10307,6 +10400,18 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     f"[_run_ingestion] correction sweep aborted at {sweep_hash}: {e}",
                                     file=sys.stderr,
                                 )
+                                # Drop the traceback before leaving the loop.
+                                # It chains back through _WorkItem.run to the
+                                # frame that raised, and that frame's argument
+                                # tuple still holds `db` -- so the handle stays
+                                # alive no matter how carefully the finallys
+                                # below clear their locals. The outer finally's
+                                # final checkpoint then cannot open the graph
+                                # ("Database is already open in this process")
+                                # and an interrupted run silently skips its WAL
+                                # compaction. Only the message is used above, so
+                                # nothing is lost by dropping the traceback.
+                                e.__traceback__ = None
                                 completed_all = False
                                 break
                             await asyncio.sleep(0)  # yield to event loop
@@ -10325,8 +10430,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             )
                             await loop.run_in_executor(write_executor, _db_checkpoint_gated, db)
                     finally:
-                        _db = None
+                        # Local first, then the global -- see the per-commit
+                        # finally above for why the order is load-bearing.
                         db = None
+                        _db = None
 
                 # Call _ingest_tags and _last_run_write before closing index_con
                 # so they use the batched connection instead of opening new ones
@@ -10346,6 +10453,18 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         # with nothing dirty in between -- the same
                         # structural duplicate #241 removed from Stage B.
                     finally:
+                        # `db` must be cleared too, and before `_db`. This block
+                        # was the one release site that cleared only the global,
+                        # so the handle stayed alive in this coroutine's frame
+                        # all the way into the outer finally below -- whose
+                        # _ensure_db_async() then tried to open a SECOND handle
+                        # on the same file. Since minigraf 1.2.2 that raises and
+                        # the final WAL compaction is skipped; before it, it
+                        # silently produced the two divergent page tables of
+                        # #251. Confirmed by instrumenting the outer finally:
+                        # the sole live handle was reachable from this frame's
+                        # `db`.
+                        db = None
                         _db = None
             finally:
                 # Compact the WAL on EVERY terminal path, not just
@@ -10368,6 +10487,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 except Exception as e:
                     print(f"[_run_ingestion] final checkpoint failed: {e}", file=sys.stderr)
                 finally:
+                    # Clear the local before the global, as everywhere else in
+                    # this function: `final_db` outliving `_db = None` leaves a
+                    # live handle unreachable through the global, and the
+                    # ingestion status poller -- which runs on its own thread
+                    # and is still polling until this run returns -- then sees
+                    # _db is None and opens a second handle on the same file.
+                    final_db = None
                     _db = None
                 # ProcessPoolExecutor.shutdown(wait=True) blocks joining the
                 # worker OS processes — measured ~90ms even for a pool that

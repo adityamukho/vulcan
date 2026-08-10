@@ -6138,6 +6138,12 @@ class TestFrontierPersistClaim:
 
         mcp_server._frontier_persist_claim(db, linearization, 0, from_low=True, commit_ts_iso="2026-01-01T00:00:00Z")
         mcp_server._db_checkpoint(db)
+        # Both references, and the local first. Clearing only the global left
+        # this frame's `db` holding the handle, so the "genuine reopen" below
+        # was really a second handle on one file -- which minigraf now refuses
+        # outright (project-minigraf/minigraf#304) and used to let through as
+        # silent corruption. Dropping `db` first is what makes the reopen real.
+        del db
         mcp_server._db = None  # release lock, force a genuine reopen below
 
         mcp_server.open_db(str(tmp_path / "t.graph"))
@@ -11379,6 +11385,14 @@ class TestRunIngestionShutdown:
         stop_once = {"done": False}
 
         async def stop_after_first(t):
+            # Only the per-commit yield, `asyncio.sleep(0)`, marks a commit
+            # boundary. _ensure_db_async's lock-contention backoff also sleeps,
+            # with a non-zero delay, and tripping the shutdown on that would
+            # stop the run at an arbitrary point instead of after commit 1 --
+            # see the same guard in TestResumeWithInvertedAuthorDates.
+            if t:
+                await original_sleep(t)
+                return
             if not stop_once["done"]:
                 stop_once["done"] = True
                 mcp_server._shutdown_requested.set()
@@ -11397,6 +11411,14 @@ class TestRunIngestionShutdown:
         watermark = mcp_server._watermark_query(db)
         assert watermark, "run 1's watermark must be durably persisted for run 2 to resume from"
         assert mcp_server._count_commit_entities(db) == 1
+        # Hand the handle back before run 2. _run_ingestion owns the DB
+        # lifecycle -- it releases and reopens per commit -- so a handle still
+        # held in this frame makes its next open a second handle on one file.
+        # minigraf refuses that outright now (project-minigraf/minigraf#304);
+        # it used to be silent corruption. Production has no such frame; this
+        # is the test putting the process into a state the server never is.
+        del db
+        mcp_server._db = None
 
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -19684,6 +19706,18 @@ class TestResumeWithInvertedAuthorDates:
         sleep_calls = {"n": 0}
 
         async def stop_after_fourth(t):
+            # Count only the per-commit yield, `asyncio.sleep(0)`. Counting
+            # every sleep made this a proxy for "commits processed" that any
+            # other sleeper could perturb -- notably _ensure_db_async's
+            # lock-contention backoff, which sleeps with a non-zero delay. Once
+            # the same-process open became retryable (#253), a single retry
+            # under load consumed one of these counts and tripped the shutdown
+            # a commit early, so `processed` came out 3 instead of 4. That was
+            # a real failure on CI and invisible locally, because only a
+            # contended machine retries at all.
+            if t:
+                await original_sleep(t)
+                return
             sleep_calls["n"] += 1
             if sleep_calls["n"] == 4:
                 mcp_server._shutdown_requested.set()
@@ -20394,3 +20428,138 @@ class TestCheckpointDutySummaryPublication:
         assert summary["checkpoints"] == 0, "no checkpoint ever ran before the injected failure"
         assert summary["total_seconds"] == 0.0
         assert summary["realised_duty"] == 0.0
+
+
+class TestSingleHandlePerProcess:
+    """#253/#251: two live MiniGrafDb handles on one file must be impossible.
+
+    `_db = None` is this module's "release the graph file lock" idiom, but it
+    only releases when it drops the LAST reference. Any local `db` still on a
+    stack keeps the handle alive -- _run_ingestion holds one across the awaits
+    in its per-commit loop, and a concurrent call_tool's `finally: _db = None`
+    clears the global underneath it. The next open then creates a SECOND handle.
+
+    Each FileBackend caches its own FileHeader.page_count, allocates new pages
+    from it, and bounds-checks read_page against it, so two handles diverge and
+    corrupt each other. That is the source of the flaky
+    "Page N out of bounds (total pages: M)" (project-minigraf/minigraf#304).
+    Driving this interleaving for 40 rounds against minigraf 1.2.1 produces
+    "Page 130 out of bounds (total pages: 113)" on the first round, then
+    'Serde Deserialization Error' and
+    'stream_all_entries: expected leaf page at page_id=68' on later ones.
+
+    _db_native_lock cannot prevent this -- the two handles are distinct Rust
+    objects with distinct internal mutexes -- and enforcing it in Python was
+    tried and rejected (see the module comment in mcp_server.py). The fix is in
+    minigraf's FileLock::acquire, which treated a lock held by our own PID as
+    stale and deleted it.
+    """
+
+    def test_second_open_in_same_process_is_refused(self, tmp_path):
+        """A second open while a handle is live must fail loudly, not succeed."""
+        from minigraf import MiniGrafDb
+
+        path = str(tmp_path / "t.graph")
+        first = MiniGrafDb.open(path)
+        try:
+            with pytest.raises(Exception) as exc_info:
+                MiniGrafDb.open(path)
+            assert "already open in this process" in str(exc_info.value), exc_info.value
+        finally:
+            del first
+
+    def test_release_idiom_does_not_drop_a_handle_others_still_hold(self, tmp_path, monkeypatch):
+        """Pins the precondition that makes the above reachable.
+
+        This is the half we control: `_db = None` does not destroy the handle
+        while another caller still references it, so `_db is None` is NOT
+        evidence that the graph file lock was released.
+        """
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._db = None
+        mcp_server._graph_path = ""
+
+        held = mcp_server._open_db_at(graph)          # _run_ingestion's local `db`
+        mcp_server._db = None                          # call_tool's finally
+        assert mcp_server._db is None
+
+        # The handle is still fully usable, which is exactly the problem: the
+        # lock is still held, so the next open is a second handle, not a reopen.
+        raw = mcp_server._db_execute(held, "(query [:find ?e :where [?e :ident ?v]])")
+        assert "out of bounds" not in raw
+        assert os.path.exists(graph + ".lock"), (
+            "_db = None released the lock even though a reference is still held "
+            "-- if this ever becomes true, the #253 interleaving is gone"
+        )
+
+        del held
+        mcp_server._db = None
+
+
+class TestLockErrorRecognisesSameProcessOpen:
+    """#253: minigraf raises two distinct "someone else has the graph" messages
+    and only one contains the word "locked".
+
+    `_is_lock_error` gates the retry/backoff path in `_open_db_at_with_retry`,
+    `_open_db_at_with_extended_retry` and `_ensure_db_async`. Matching only
+    "locked" made the same-process message fall through as a fatal non-lock
+    error, aborting the caller on the first attempt instead of backing off --
+    which turned a momentary handle overlap into a failed ingestion.
+    """
+
+    def test_recognises_both_minigraf_lock_messages(self):
+        import mcp_server
+
+        cross_process = (
+            "Database is locked by another process (lock file: /tmp/x.graph.lock, "
+            "holder PID: 4242). If no other process is using this database, "
+            "delete the lock file manually."
+        )
+        same_process = (
+            "Database is already open in this process (lock file: /tmp/x.graph.lock, "
+            "holder PID: 4242 == our own). A second handle on one file would give "
+            "each its own page table and corrupt both — reuse the existing handle "
+            "instead."
+        )
+
+        assert mcp_server._is_lock_error(Exception(cross_process))
+        assert mcp_server._is_lock_error(Exception(same_process)), (
+            "the same-process message contains no 'locked', so matching that word "
+            "alone drops it onto the fatal path instead of the retry path"
+        )
+
+    def test_genuine_non_lock_errors_are_still_fatal(self):
+        """The widening must not swallow unrelated failures into the retry loop."""
+        import mcp_server
+
+        for msg in (
+            "Is a directory (os error 21)",
+            "Failed to read header from existing file (size=4096): bad magic",
+            "Page 130 out of bounds (total pages: 113)",
+        ):
+            assert not mcp_server._is_lock_error(Exception(msg)), msg
+
+    def test_real_same_process_open_is_classified_as_retryable(self, tmp_path):
+        """End-to-end against real minigraf, not a hand-written string.
+
+        Pins the classification to what minigraf actually raises, so a reworded
+        upstream message fails here rather than silently reverting the retry
+        path to fatal.
+        """
+        import mcp_server
+        from minigraf import MiniGrafDb
+
+        path = str(tmp_path / "t.graph")
+        first = MiniGrafDb.open(path)
+        try:
+            with pytest.raises(Exception) as exc_info:
+                MiniGrafDb.open(path)
+            assert mcp_server._is_lock_error(exc_info.value), (
+                f"minigraf's same-process open error is not classified as "
+                f"retryable: {exc_info.value}"
+            )
+        finally:
+            del first
