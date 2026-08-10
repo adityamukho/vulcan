@@ -49,7 +49,10 @@ alongside current ones, labeled with their validity window.
 **Single-handle invariant.** At most one live `MiniGrafDb` handle may exist per
 process. Two handles on one file each cache their own `page_count` and corrupt
 each other — the flaky `Page N out of bounds (total pages: M)` (#251, #253,
-project-minigraf/minigraf#304). `mcp_server.py` does not enforce this: `_db =
+project-minigraf/minigraf#304). minigraf enforces this as of 1.2.2 (hence the
+`minigraf>=1.2.3` floor): a second open now raises `Database is already open in
+this process` instead of silently succeeding. That makes the bug visible, not
+absent — `mcp_server.py` still does not enforce it: `_db =
 None` is its "release the lock" idiom, but it only releases when it drops the
 LAST reference, and a local `db` on a stack (e.g. `_run_ingestion`'s per-commit
 handle, held across awaits) keeps the handle alive while a concurrent

@@ -24,7 +24,16 @@ classifiers = [
 ]
 
 dependencies = [
-    "minigraf>=1.2.1",
+    # Floor is a correctness requirement, not a preference. Before the
+    # project-minigraf/minigraf#304 fix, FileLock::acquire treated a lock held
+    # by our own PID as stale and opened anyway, so a second handle on one file
+    # was created silently. Two handles each cache their own page_count and
+    # corrupt each other -- the flaky "Page N out of bounds" of #251/#253.
+    # mcp_server reaches that state through normal operation, so an older
+    # minigraf here means silent graph corruption under concurrent load.
+    # The core fix shipped in 1.2.2; 1.2.3 is the release this is verified
+    # against (1.2.2's Node binding was withdrawn for an unrelated gap).
+    "minigraf>=1.2.3",
     # Capped below 2.0: mcp 2.0.0 removed Server.list_tools, which
     # mcp_server.py registers its handlers through. With the bound open, CI
     # resolved 2.0.0 and every test that imports mcp_server errored at import

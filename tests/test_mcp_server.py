@@ -6138,6 +6138,12 @@ class TestFrontierPersistClaim:
 
         mcp_server._frontier_persist_claim(db, linearization, 0, from_low=True, commit_ts_iso="2026-01-01T00:00:00Z")
         mcp_server._db_checkpoint(db)
+        # Both references, and the local first. Clearing only the global left
+        # this frame's `db` holding the handle, so the "genuine reopen" below
+        # was really a second handle on one file -- which minigraf now refuses
+        # outright (project-minigraf/minigraf#304) and used to let through as
+        # silent corruption. Dropping `db` first is what makes the reopen real.
+        del db
         mcp_server._db = None  # release lock, force a genuine reopen below
 
         mcp_server.open_db(str(tmp_path / "t.graph"))
@@ -11397,6 +11403,14 @@ class TestRunIngestionShutdown:
         watermark = mcp_server._watermark_query(db)
         assert watermark, "run 1's watermark must be durably persisted for run 2 to resume from"
         assert mcp_server._count_commit_entities(db) == 1
+        # Hand the handle back before run 2. _run_ingestion owns the DB
+        # lifecycle -- it releases and reopens per commit -- so a handle still
+        # held in this frame makes its next open a second handle on one file.
+        # minigraf refuses that outright now (project-minigraf/minigraf#304);
+        # it used to be silent corruption. Production has no such frame; this
+        # is the test putting the process into a state the server never is.
+        del db
+        mcp_server._db = None
 
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -20421,12 +20435,6 @@ class TestSingleHandlePerProcess:
     stale and deleted it.
     """
 
-    @pytest.mark.xfail(
-        reason="needs the minigraf#304 FileLock fix; pinned minigraf 1.2.1 "
-               "silently steals a lock held by our own PID. Remove this marker "
-               "when the minigraf dependency is bumped.",
-        strict=False,
-    )
     def test_second_open_in_same_process_is_refused(self, tmp_path):
         """A second open while a handle is live must fail loudly, not succeed."""
         from minigraf import MiniGrafDb
@@ -20469,3 +20477,69 @@ class TestSingleHandlePerProcess:
 
         del held
         mcp_server._db = None
+
+
+class TestLockErrorRecognisesSameProcessOpen:
+    """#253: minigraf raises two distinct "someone else has the graph" messages
+    and only one contains the word "locked".
+
+    `_is_lock_error` gates the retry/backoff path in `_open_db_at_with_retry`,
+    `_open_db_at_with_extended_retry` and `_ensure_db_async`. Matching only
+    "locked" made the same-process message fall through as a fatal non-lock
+    error, aborting the caller on the first attempt instead of backing off --
+    which turned a momentary handle overlap into a failed ingestion.
+    """
+
+    def test_recognises_both_minigraf_lock_messages(self):
+        import mcp_server
+
+        cross_process = (
+            "Database is locked by another process (lock file: /tmp/x.graph.lock, "
+            "holder PID: 4242). If no other process is using this database, "
+            "delete the lock file manually."
+        )
+        same_process = (
+            "Database is already open in this process (lock file: /tmp/x.graph.lock, "
+            "holder PID: 4242 == our own). A second handle on one file would give "
+            "each its own page table and corrupt both — reuse the existing handle "
+            "instead."
+        )
+
+        assert mcp_server._is_lock_error(Exception(cross_process))
+        assert mcp_server._is_lock_error(Exception(same_process)), (
+            "the same-process message contains no 'locked', so matching that word "
+            "alone drops it onto the fatal path instead of the retry path"
+        )
+
+    def test_genuine_non_lock_errors_are_still_fatal(self):
+        """The widening must not swallow unrelated failures into the retry loop."""
+        import mcp_server
+
+        for msg in (
+            "Is a directory (os error 21)",
+            "Failed to read header from existing file (size=4096): bad magic",
+            "Page 130 out of bounds (total pages: 113)",
+        ):
+            assert not mcp_server._is_lock_error(Exception(msg)), msg
+
+    def test_real_same_process_open_is_classified_as_retryable(self, tmp_path):
+        """End-to-end against real minigraf, not a hand-written string.
+
+        Pins the classification to what minigraf actually raises, so a reworded
+        upstream message fails here rather than silently reverting the retry
+        path to fatal.
+        """
+        import mcp_server
+        from minigraf import MiniGrafDb
+
+        path = str(tmp_path / "t.graph")
+        first = MiniGrafDb.open(path)
+        try:
+            with pytest.raises(Exception) as exc_info:
+                MiniGrafDb.open(path)
+            assert mcp_server._is_lock_error(exc_info.value), (
+                f"minigraf's same-process open error is not classified as "
+                f"retryable: {exc_info.value}"
+            )
+        finally:
+            del first
