@@ -7689,6 +7689,126 @@ def _valid_time_window_clauses(valid_at_ms: Optional[int]) -> str:
     return f"[(<= ?vf {valid_at_ms})] [(> ?vt {valid_at_ms})]"
 
 
+def _epoch_ms_to_iso(ms: int) -> str:
+    """minigraf's epoch-ms valid-time scale back to millisecond-precision ISO.
+
+    Millisecond precision is load-bearing for the re-admission pass in
+    _preload_known_entities, which queries at ISO(vt - 1 ms). Verified against
+    minigraf's temporal.rs parse_timestamp: any string containing 'T' goes
+    through chrono's DateTime<Utc> parser, which accepts fractional seconds.
+    Pinned by test_valid_at_accepts_millisecond_precision.
+
+    Never pass _VALID_TIME_FOREVER_MS -- callers must test for the sentinel
+    first, as minigraf's own millis_to_timestamp_string documents.
+    """
+    return (
+        datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    )
+
+
+def _build_ts_positions(
+    commit_metadata: List[Tuple[str, str, str, str]]
+) -> Dict[str, List[int]]:
+    """Map each author-date instant to EVERY linearization position holding it.
+
+    A list, not a single position, and deliberately so: _git_commits formats
+    "%Y-%m-%dT%H:%M:%SZ" at second granularity, so distinct commits routinely
+    share an instant. Collapsing that to one position would silently pick a
+    winner; _position_of_valid_time resolves the ambiguity explicitly instead.
+    """
+    ts_positions: Dict[str, List[int]] = {}
+    for pos, (_hash, ts_iso, _author, _subject) in enumerate(commit_metadata):
+        ts_positions.setdefault(ts_iso, []).append(pos)
+    return ts_positions
+
+
+def _position_of_valid_time(
+    ms: int,
+    ts_positions: Dict[str, List[int]],
+    *,
+    end: str,
+    stats: Optional[Dict[str, int]] = None,
+) -> Optional[int]:
+    """Recover the linearization position a :db/valid-from or :db/valid-to
+    was written at (#238 close side, #245).
+
+    Every :depends-on, :pinned-commit and :ident valid-time is written from
+    commit_ts_iso, i.e. commit_metadata[pos][1], so it is always some commit's
+    author date and its position is recoverable WITHOUT a commit reference to
+    join to. Both issues state these sites admit no position filter; that is
+    true of joins and false of positions. The inversion needs full-history
+    commit_metadata at preload time, which is exactly what PR #246 made
+    available by moving build_linearization and _git_commits above the preload
+    block.
+
+    AMBIGUITY RESOLVES TOWARD WRONG-EXCLUSION AT BOTH ENDS. An ambiguous
+    introduction takes the LATEST colliding position (more likely to read as
+    above W); an ambiguous close takes the EARLIEST (more likely to read as at
+    or below W). Both land on exclusion, the direction #235's correction sweep
+    repairs, rather than on the unrecoverable inverted-interval direction.
+
+    THIS IS THE INVERSE OF evals/at_scale/probe_dep_preload_exposure.py's
+    edge_live_at, which takes min for an introduction and max for a close.
+    That is correct THERE and wrong HERE: a measurement must not understate
+    exposure, because a number rounded in our own favour would have argued for
+    closing #245; a fix must not risk the unrecoverable direction. DO NOT
+    refactor the two into a shared helper. Pinned by
+    test_collision_resolves_toward_exclusion_at_both_ends.
+
+    Returns None for an instant matching no commit -- a rewritten history, or
+    a fact dated by something other than a commit. Callers exclude on None.
+    """
+    if end not in ("intro", "close"):
+        raise ValueError(f"end must be 'intro' or 'close', got {end!r}")
+    ts_iso = (
+        datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    positions = ts_positions.get(ts_iso)
+    if not positions:
+        if stats is not None:
+            key = f"unmappable_{end}"
+            stats[key] = stats.get(key, 0) + 1
+        return None
+    if len(positions) > 1 and stats is not None:
+        stats["collisions"] = stats.get("collisions", 0) + 1
+    return max(positions) if end == "intro" else min(positions)
+
+
+def _fact_is_live_at_position(
+    vf_ms: int,
+    vt_ms: int,
+    watermark_pos: int,
+    ts_positions: Dict[str, List[int]],
+    stats: Optional[Dict[str, int]] = None,
+) -> bool:
+    """The membership rule for the forward walk's preload state (#238, #245):
+
+        live at W  <=>  intro_pos <= W  AND  (open OR close_pos > W)
+
+    Position alone. Date clauses in the callers' queries are prefilters for
+    row-count reduction and carry NO safety property -- see the spec's
+    "Why this is not the add-back union #238 forbids".
+
+    An unplaceable endpoint excludes, because the fact cannot be proven live
+    at W. That is the recoverable direction.
+    """
+    intro_pos = _position_of_valid_time(
+        vf_ms, ts_positions, end="intro", stats=stats
+    )
+    if intro_pos is None or intro_pos > watermark_pos:
+        return False
+    if vt_ms >= _VALID_TIME_FOREVER_MS:
+        return True
+    close_pos = _position_of_valid_time(
+        vt_ms, ts_positions, end="close", stats=stats
+    )
+    if close_pos is None:
+        return False
+    return close_pos > watermark_pos
+
+
 def _preload_known_deps(
     db: Any, file_entities: Dict[str, List[str]], valid_at_ms: Optional[int] = None
 ) -> tuple:

@@ -9921,6 +9921,213 @@ class TestPreloadKnownEntitiesPositionBound:
         assert ":module/below-w" not in entity_valid_from
 
 
+class TestValidTimePseudoAttributePredicates:
+    """Two backend behaviours the position-exact preload depends on that no
+    other code path exercises. Pinned so a minigraf bump that changes either
+    fails loudly instead of silently mis-filtering the whole preload.
+
+    Verified against minigraf's Rust source at ~/Work/AMC/Minigraf/minigraf
+    before this was written: `<=` is a real BinOp (query/datalog/parser.rs
+    "<=" => BinOp::Lte) and temporal.rs parse_timestamp routes any string
+    containing 'T' through chrono's DateTime<Utc> parser, which accepts
+    fractional seconds. These tests keep that true.
+    """
+
+    def test_upper_bound_on_valid_to_binds_and_excludes_the_sentinel(self, real_db):
+        """_preload_known_entities' phase 2 filters on `[(<= ?vt N)]`. Every
+        existing predicate on a pseudo-attribute comes from
+        _valid_time_window_clauses, which only ever emits `[(= ?vt FOREVER)]`
+        or the `[(<= ?vf N)] [(> ?vt N)]` pair -- an upper bound on ?vt alone
+        is a new shape. Still-open facts must fall out of it, because
+        i64::MAX <= N is false for any real timestamp."""
+        import json
+        import mcp_server
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-10T00:00:00Z"} '
+            '[[:module/closed :ident ":module/closed"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            '[[:module/open :ident ":module/open"]])'
+        )
+        cutoff = mcp_server._iso_to_epoch_ms("2026-05-01T00:00:00Z")
+        raw = mcp_server._db_execute(
+            real_db,
+            "(query [:find ?i ?vt :any-valid-time "
+            ":where [?e :ident ?i] "
+            "[?e :db/valid-from ?vf] [?e :db/valid-to ?vt] "
+            f"[(<= ?vt {cutoff})]])",
+        )
+        idents = {row[0] for row in json.loads(raw).get("results", [])}
+        assert idents == {":module/closed"}
+
+    def test_valid_at_accepts_millisecond_precision(self, real_db):
+        """The re-admission pass queries at ISO(vt - 1ms), which carries a
+        `.%f` field; every existing :valid-at caller passes a second-granular
+        commit date. A truncating or rejecting parser would move the
+        re-admission instant by a full second."""
+        import json
+        import mcp_server
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-10T00:00:00Z"} '
+            '[[:module/m :ident ":module/m"]])'
+        )
+        live = mcp_server._db_execute(
+            real_db,
+            '(query [:find ?i :valid-at "2026-04-09T23:59:59.999Z" '
+            ':where [?e :ident ?i]])',
+        )
+        assert [row[0] for row in json.loads(live).get("results", [])] == [":module/m"]
+        dead = mcp_server._db_execute(
+            real_db,
+            '(query [:find ?i :valid-at "2026-04-10T00:00:00.000Z" '
+            ':where [?e :ident ?i]])',
+        )
+        assert json.loads(dead).get("results", []) == []
+
+
+class TestPositionOfValidTime:
+    """#238/#245: recovering a linearization position from a fact's own
+    :db/valid-from / :db/valid-to."""
+
+    TS_POSITIONS = {
+        "2026-04-01T00:00:00Z": [0],
+        "2026-05-02T00:00:00Z": [1],
+        "2026-04-26T00:00:00Z": [2, 5],  # a deliberate collision
+    }
+
+    def test_unique_instant_maps_to_its_position(self):
+        import mcp_server
+        ms = mcp_server._iso_to_epoch_ms("2026-05-02T00:00:00Z")
+        assert mcp_server._position_of_valid_time(
+            ms, self.TS_POSITIONS, end="intro") == 1
+        assert mcp_server._position_of_valid_time(
+            ms, self.TS_POSITIONS, end="close") == 1
+
+    def test_collision_resolves_toward_exclusion_at_both_ends(self):
+        """THE test that stops a later refactor unifying this policy with
+        probe_dep_preload_exposure.edge_live_at's, which resolves the exact
+        opposite way (min intro, max close) and is correct to do so: a
+        measurement must not understate exposure, a fix must not risk the
+        unrecoverable direction. An ambiguous INTRODUCTION takes the LATEST
+        colliding position so it is more likely to read as above W; an
+        ambiguous CLOSE takes the EARLIEST so it is more likely to read as at
+        or below W. Both land on wrong-exclusion, which #235's sweep repairs."""
+        import mcp_server
+        ms = mcp_server._iso_to_epoch_ms("2026-04-26T00:00:00Z")
+        assert mcp_server._position_of_valid_time(
+            ms, self.TS_POSITIONS, end="intro") == 5
+        assert mcp_server._position_of_valid_time(
+            ms, self.TS_POSITIONS, end="close") == 2
+
+    def test_unmappable_instant_returns_none_and_counts(self):
+        import mcp_server
+        stats = {}
+        ms = mcp_server._iso_to_epoch_ms("2026-06-15T00:00:00Z")
+        assert mcp_server._position_of_valid_time(
+            ms, self.TS_POSITIONS, end="intro", stats=stats) is None
+        assert stats["unmappable_intro"] == 1
+
+    def test_collision_is_counted(self):
+        import mcp_server
+        stats = {}
+        ms = mcp_server._iso_to_epoch_ms("2026-04-26T00:00:00Z")
+        mcp_server._position_of_valid_time(
+            ms, self.TS_POSITIONS, end="close", stats=stats)
+        assert stats["collisions"] == 1
+
+    def test_unknown_end_raises(self):
+        """A typo must not silently pick the intro policy for a close."""
+        import mcp_server
+        import pytest
+        ms = mcp_server._iso_to_epoch_ms("2026-05-02T00:00:00Z")
+        with pytest.raises(ValueError):
+            mcp_server._position_of_valid_time(ms, self.TS_POSITIONS, end="closed")
+
+
+class TestFactIsLiveAtPosition:
+    """The membership rule, shared by all three position-filtered sites:
+    intro_pos <= W AND (open OR close_pos > W)."""
+
+    TS_POSITIONS = {
+        "2026-04-01T00:00:00Z": [0],
+        "2026-05-02T00:00:00Z": [1],
+        "2026-04-26T00:00:00Z": [2],
+    }
+    WATERMARK_POS = 1
+
+    def _ms(self, iso):
+        import mcp_server
+        return mcp_server._iso_to_epoch_ms(iso)
+
+    def test_open_fact_introduced_below_w_is_live(self):
+        import mcp_server
+        assert mcp_server._fact_is_live_at_position(
+            self._ms("2026-04-01T00:00:00Z"), mcp_server._VALID_TIME_FOREVER_MS,
+            self.WATERMARK_POS, self.TS_POSITIONS)
+
+    def test_open_fact_introduced_above_w_is_not_live(self):
+        """#238's DATA-LOSS direction: dated 2026-04-26, EARLIER than the
+        watermark's own 2026-05-02, but topologically above it."""
+        import mcp_server
+        assert not mcp_server._fact_is_live_at_position(
+            self._ms("2026-04-26T00:00:00Z"), mcp_server._VALID_TIME_FOREVER_MS,
+            self.WATERMARK_POS, self.TS_POSITIONS)
+
+    def test_fact_closed_above_w_is_still_live(self):
+        """The close-side residual: close DATE 2026-04-26 is below the
+        envelope, so a date bound drops it, but close POSITION 2 is above W."""
+        import mcp_server
+        assert mcp_server._fact_is_live_at_position(
+            self._ms("2026-04-01T00:00:00Z"), self._ms("2026-04-26T00:00:00Z"),
+            self.WATERMARK_POS, self.TS_POSITIONS)
+
+    def test_fact_closed_at_w_is_not_live(self):
+        import mcp_server
+        assert not mcp_server._fact_is_live_at_position(
+            self._ms("2026-04-01T00:00:00Z"), self._ms("2026-05-02T00:00:00Z"),
+            self.WATERMARK_POS, self.TS_POSITIONS)
+
+    def test_unmappable_close_excludes(self):
+        """Cannot place the close, so cannot prove the fact is still live.
+        Exclusion is the recoverable direction."""
+        import mcp_server
+        stats = {}
+        assert not mcp_server._fact_is_live_at_position(
+            self._ms("2026-04-01T00:00:00Z"), self._ms("2026-06-15T00:00:00Z"),
+            self.WATERMARK_POS, self.TS_POSITIONS, stats)
+        assert stats["unmappable_close"] == 1
+
+
+class TestEpochMsToIso:
+    def test_round_trips_a_commit_instant(self):
+        import mcp_server
+        ms = mcp_server._iso_to_epoch_ms("2026-04-26T00:00:00Z")
+        assert mcp_server._epoch_ms_to_iso(ms) == "2026-04-26T00:00:00.000Z"
+
+    def test_one_millisecond_before_an_instant(self):
+        """The re-admission pass's 'last instant this entity was live'."""
+        import mcp_server
+        ms = mcp_server._iso_to_epoch_ms("2026-04-26T00:00:00Z")
+        assert mcp_server._epoch_ms_to_iso(ms - 1) == "2026-04-25T23:59:59.999Z"
+
+
+class TestBuildTsPositions:
+    def test_groups_colliding_instants(self):
+        import mcp_server
+        metadata = [
+            ("a" * 40, "2026-04-01T00:00:00Z", "x@y", "s0"),
+            ("b" * 40, "2026-04-26T00:00:00Z", "x@y", "s1"),
+            ("c" * 40, "2026-04-26T00:00:00Z", "x@y", "s2"),
+        ]
+        assert mcp_server._build_ts_positions(metadata) == {
+            "2026-04-01T00:00:00Z": [0],
+            "2026-04-26T00:00:00Z": [1, 2],
+        }
+
+
 class TestPreloadProvisionalIdents:
     def test_empty_when_no_markers(self, real_db):
         import mcp_server
