@@ -7937,7 +7937,14 @@ def _preload_known_deps(
     return file_deps, dep_valid_from
 
 
-def _preload_pinned_commits(db: Any, valid_at_ms: Optional[int] = None) -> Dict[str, tuple]:
+def _preload_pinned_commits(
+    db: Any,
+    valid_at_ms: Optional[int] = None,
+    ts_positions: Optional[Dict[str, List[int]]] = None,
+    watermark_pos: Optional[int] = None,
+    t_hi_ms: Optional[int] = None,
+    stats: Optional[Dict[str, int]] = None,
+) -> Dict[str, tuple]:
     """Reload each external-dependency entity's current :pinned-commit value
     and the timestamp it was set at, mirroring _preload_known_deps's per-fact
     :any-valid-time pattern for :depends-on.
@@ -7947,12 +7954,18 @@ def _preload_pinned_commits(db: Any, valid_at_ms: Optional[int] = None) -> Dict[
     region, so a completed two-stream run can leave a bump recorded above the
     watermark (#222 phase 2d review, B1).
 
-    #238/#245: still ts(W), with no position clause, for the same reason
-    _preload_known_deps has none -- a :pinned-commit fact carries no commit
-    reference to derive a linearization position from. Retains #238's residual
-    in both directions: a bump recorded above the watermark can be closed
-    against the wrong prior SHA. Tracked as #245. Do not widen this to
-    _preload_known_entities' envelope without a position clause.
+    #238/#245: membership is decided by POSITION, exactly as
+    _preload_known_deps does and for the same reason -- a :pinned-commit fact
+    carries no commit reference, but its :db/valid-from / :db/valid-to are
+    always some commit's author date. See that function's docstring for the
+    prefilter's role and the degradation path.
+
+    UNMEASURABLE on the repository this was developed against: 0 gitlink
+    events in 610 commits, so that history produces no :pinned-commit facts at
+    all and the #245 exposure probe reports nothing here. This ships on the
+    argument that the mechanism is identical to :depends-on's, NOT on measured
+    field exposure. Unlike :depends-on this function has no ident_to_file
+    narrowing, so it lacks even that partial mitigation.
 
     Needed because :pinned-commit is bi-temporally closed and reopened on
     every bump (see _run_ingestion's gitlink handling) — without this, the
@@ -7963,6 +7976,15 @@ def _preload_pinned_commits(db: Any, valid_at_ms: Optional[int] = None) -> Dict[
     Returns {ident: (sha, valid_from_iso)}.
     """
     pinned: Dict[str, tuple] = {}
+    position_mode = (
+        watermark_pos is not None
+        and ts_positions is not None
+        and t_hi_ms is not None
+    )
+    window_clauses = (
+        f"[(<= ?vf {t_hi_ms})]" if position_mode
+        else _valid_time_window_clauses(valid_at_ms)
+    )
     try:
         # Bind the entity's :ident object, not the bare ?e subject variable —
         # same UUID-vs-ident pitfall _preload_known_deps guards against.
@@ -7972,23 +7994,23 @@ def _preload_pinned_commits(db: Any, valid_at_ms: Optional[int] = None) -> Dict[
         # to bind to the :pinned-commit fact, not the :ident fact.
         raw = _db_execute(
             db,
-            "(query [:find ?ei ?sha ?vf "
+            "(query [:find ?ei ?sha ?vf ?vt "
             ":any-valid-time "
             ":where [?e :ident ?ei] "
             "[?e :pinned-commit ?sha] "
             "[?e :db/valid-from ?vf] "
             "[?e :db/valid-to ?vt] "
-            f"{_valid_time_window_clauses(valid_at_ms)}])"
+            f"{window_clauses}])"
         )
         rows = json.loads(raw).get("results", [])
     except Exception:
         return pinned
-    for ident, sha, vf_ms in rows:
-        vf_iso = (
-            datetime.datetime.fromtimestamp(vf_ms / 1000, datetime.timezone.utc)
-            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        )
-        pinned[ident] = (sha, vf_iso)
+    for ident, sha, vf_ms, vt_ms in rows:
+        if position_mode and not _fact_is_live_at_position(
+            vf_ms, vt_ms, watermark_pos, ts_positions, stats
+        ):
+            continue
+        pinned[ident] = (sha, _epoch_ms_to_iso(vf_ms))
     return pinned
 
 

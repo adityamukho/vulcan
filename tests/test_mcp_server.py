@@ -10236,6 +10236,81 @@ class TestPreloadKnownDepsPositionBound:
         assert ":module/closed-above-w" not in deps  # the residual, unchanged
 
 
+class TestPreloadPinnedCommitsPositionBound:
+    """#245: :pinned-commit gets the same position rule as :depends-on.
+
+    Exposure is UNMEASURABLE on this repository -- 0 gitlink events in 610
+    commits, so real history produces no :pinned-commit facts and the probe
+    reports nothing for them. This fixture is synthetic, and the change ships
+    on the argument that the mechanism is identical, not on field evidence.
+
+    _preload_pinned_commits also has NO ident_to_file narrowing, so it lacks
+    even the partial mitigation that makes :depends-on's narrow figure small.
+
+    Same linearization as TestPreloadKnownDepsPositionBound.
+    """
+
+    TS_POSITIONS = {
+        "2026-04-01T00:00:00Z": [0],
+        "2026-05-02T00:00:00Z": [1],
+        "2026-04-26T00:00:00Z": [2],
+    }
+    WATERMARK_POS = 1
+
+    def _seed(self, real_db):
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            '[[:external-dependency/sub-open-below :ident '
+            '":external-dependency/sub-open-below"] '
+            '[:external-dependency/sub-open-below :pinned-commit "aaa111"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-26T00:00:00Z"} '
+            '[[:external-dependency/sub-open-above :ident '
+            '":external-dependency/sub-open-above"] '
+            '[:external-dependency/sub-open-above :pinned-commit "bbb222"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-26T00:00:00Z"} '
+            '[[:external-dependency/sub-closed-above :ident '
+            '":external-dependency/sub-closed-above"] '
+            '[:external-dependency/sub-closed-above :pinned-commit "ccc333"]])'
+        )
+
+    def _run(self, real_db):
+        import mcp_server
+        return mcp_server._preload_pinned_commits(
+            real_db,
+            ts_positions=self.TS_POSITIONS,
+            watermark_pos=self.WATERMARK_POS,
+            t_hi_ms=mcp_server._iso_to_epoch_ms("2026-05-02T00:00:00Z"),
+        )
+
+    def test_pin_closed_above_the_watermark_is_reloaded(self, real_db):
+        """Without it the server loses the prior SHA and closes the next bump
+        against the wrong one, exactly as the docstring describes."""
+        self._seed(real_db)
+        pinned = self._run(real_db)
+        assert pinned[":external-dependency/sub-closed-above"][0] == "ccc333"
+
+    def test_pin_set_above_the_watermark_is_excluded(self, real_db):
+        self._seed(real_db)
+        pinned = self._run(real_db)
+        assert ":external-dependency/sub-open-above" not in pinned
+
+    def test_open_pin_below_the_watermark_is_reloaded(self, real_db):
+        self._seed(real_db)
+        pinned = self._run(real_db)
+        assert pinned[":external-dependency/sub-open-below"][0] == "aaa111"
+
+    def test_position_args_omitted_restores_today_s_behaviour(self, real_db):
+        import mcp_server
+        self._seed(real_db)
+        pinned = mcp_server._preload_pinned_commits(real_db)
+        assert ":external-dependency/sub-open-above" in pinned
+
+
 class TestEpochMsToIso:
     def test_round_trips_a_commit_instant(self):
         import mcp_server
