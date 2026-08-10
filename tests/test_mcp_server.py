@@ -13232,7 +13232,8 @@ def _inverted_author_date_repo_with_deps(path):
     depends on which commits each stream claims, so the commit count must not
     move.
 
-        pos 0  c0  + dep_src.py (imports doomed) and doomed.py   @ 2026-04-01
+        pos 0  c0  + doomed.py (imports base) and dep_src.py
+                     (imports doomed)                            @ 2026-04-01
         pos 1  c1  mid.py                                        @ 2026-05-02  <- W
         pos 2  c2  late.py modified, dep_src.py touched          @ 2026-04-20
         pos 3  c3  late.py + late_fn, and DELETES doomed.py      @ 2026-04-26  <- above W, dated earlier
@@ -13249,16 +13250,30 @@ def _inverted_author_date_repo_with_deps(path):
     TestResumeWithInvertedAuthorDatesAndDeps' docstring for the three-run
     drive that does reach it, and for what was and was not measurable there.
 
-    dep_src.py is deliberately re-touched at c2 (a comment-only body edit that
-    leaves `import doomed` in place). c2 is the GAP commit run 2's forward walk
+    There are deliberately TWO :depends-on edges, one on each side of the
+    dropped module, because only one of them can show #245's harm:
+
+      doomed.py -> base.py    the dropped module is the edge's SOURCE. This is
+                              the edge that vanishes: _preload_known_deps
+                              resolves a row's file via
+                              ident_to_file[src_ident], built from
+                              file_entities, so an absent doomed.py takes every
+                              edge it owns with it -- #245's own "30
+                              misclassified edges ... before any diff was
+                              computed".
+      dep_src.py -> doomed.py the dropped module is the edge's TARGET. This one
+                              SURVIVES either way: dep_src.py is live at W, so
+                              ident_to_file resolves and the row is kept
+                              whatever happened to doomed.py. Kept as the
+                              negative control, and as the reason
+                              test_resumed_run_preserves_the_standing_dep_edge_valid_from
+                              has no ablation power.
+
+    dep_src.py is also re-touched at c2 (a comment-only body edit that leaves
+    `import doomed` in place). c2 is the GAP commit run 2's forward walk
     replays, and dep-edge diffing (`current_deps - previous_deps`) only runs
     for files that appear in a commit's own diff -- a dep edge whose source
-    file is never touched again after c0 is never re-diffed, so it cannot
-    exhibit #245's harm no matter what the preload does. Touching dep_src.py at
-    c2 is what puts the standing dep_src -> doomed edge in front of the
-    replayed diff. See TestResumeWithInvertedAuthorDatesAndDeps'
-    test_resumed_run_preserves_the_standing_dep_edge_valid_from for what the
-    replay is then expected not to do to it.
+    file is never touched again after c0 is never re-diffed at all.
     """
     path.mkdir(parents=True, exist_ok=True)
     _subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
@@ -13279,7 +13294,7 @@ def _inverted_author_date_repo_with_deps(path):
     commit(
         {"base.py": "def base_fn():\n    return 1\n",
          "late.py": "def helper_fn():\n    return 0\n",
-         "doomed.py": "def doomed_fn():\n    return 7\n",
+         "doomed.py": "import base\n\ndef doomed_fn():\n    return base.base_fn() + 7\n",
          "dep_src.py": "import doomed\n\ndef src_fn():\n    return doomed.doomed_fn()\n"},
         "2026-04-01T00:00:00Z", "2026-04-01T00:00:00Z", "c0 base+late+doomed+dep_src",
     )
@@ -20603,45 +20618,62 @@ class TestResumeWithInvertedAuthorDatesAndDeps:
     so a drift in the sleep accounting fails loudly instead of silently
     degrading these tests into a fresh-ingestion check.
 
-    ABLATION: NONE OF THESE THREE TESTS CAN FAIL WITHOUT THE PRODUCTION
-    CHANGE, and they are kept anyway, on the same precedent
-    TestResumeWithInvertedAuthorDates set for its own third test -- state the
-    absence of power, do not claim it, do not quietly delete the test.
+    WHAT THIS CLASS ASSERTS ON, AND WHY IT IS NOT THE GRAPH. The graph that
+    comes out of run 3 is byte-for-byte identical with and without the
+    production change -- verified over every :ident interval, every
+    :depends-on interval and every multi-valued :introduced-by, on this
+    fixture and on a variant where c4 re-adds doomed.py. That is structural,
+    not a weakness of the fixture: a close above W can only be written by
+    Stage B, Stage B requires the gap to be closed, and it sweeps the
+    frontier-high region ASCENDING. So by the time a close above W exists the
+    forward walk has nothing left to replay, and every commit any later run
+    still has to process sits ABOVE the close -- where a module deleted at
+    that close appears in no diff. The consumer that would misuse the dropped
+    state has, by construction, nothing left to consume. #245's projected harm
+    needs one more thing this pipeline cannot currently produce: a gap commit
+    BELOW a durable close.
 
-    What was measured, at run 3's preload, on the fixture below:
+    What does diverge, sharply, is the state run 3 resumes FROM, so that is
+    what the two load-bearing tests assert on -- captured by wrapping
+    _load_ingestion_preload_state during the real run, never by calling the
+    preload directly with hand-built arguments (which is what
+    TestPreloadKnownEntitiesCloseSide already does, and which cannot show that
+    _run_ingestion reaches the preload with the arguments that make the
+    position rule fire at all).
 
-        with the fix     entity_valid_from has :module/doomed-py and
-                         :function/doomed-py-doomed-fn; file_entities has the
-                         'doomed.py' key
-        without it       all three are absent -- exactly #245's
-                         "dropped out of file_entities" shape
+    ABLATION, per test, stated rather than claimed in aggregate:
 
-    So the preload state diverges sharply and the RESULTING GRAPH does not,
-    byte for byte, in either the fixture below or a variant where c4 re-adds
-    doomed.py. The reason is structural, not a weakness of this fixture: a
-    close above W can only be written by Stage B, Stage B requires the gap to
-    be closed, and it sweeps the frontier-high region ASCENDING. So every
-    commit a later run has left to process sits ABOVE the close, and a module
-    deleted at that close appears in no diff above it. The forward walk, which
-    is the consumer that would misuse the dropped state, has by construction
-    nothing left to replay by the time the close exists. #245's exposure
-    measurement is a preload-fidelity measurement, and the harm it projects
-    needs a fourth thing this pipeline does not currently produce: a gap
-    commit below a durable close.
+        readmits_the_module_closed_above_the_watermark   FAILS without the fix
+        keeps_the_dropped_modules_own_dep_edge           FAILS without the fix
+        preserves_the_standing_dep_edge_valid_from       cannot fail
+        writes_no_inverted_valid_interval                cannot fail
+        mints_no_duplicate_introduced_by                 cannot fail
 
-    These tests therefore pin the SHAPE (they prove the resume, the close
-    above W, and the envelope inversion are all real and reachable) and the
-    standing bi-temporal invariants across it. They are not evidence for the
-    close-side clause specifically. The evidence for that clause is
-    TestPreloadKnownEntitiesCloseSide's unit tests.
+    The three powerless ones are KEPT, on the precedent
+    TestResumeWithInvertedAuthorDates set for its own third test: state the
+    absence of power, do not claim it, do not quietly delete the test. They
+    pin the SHAPE -- that the resume, the close above W and the envelope
+    inversion are all real and reachable -- and the standing bi-temporal
+    invariants across it. Each one's own docstring says why it cannot fail.
     """
 
     _progress = TestResumeWithInvertedAuthorDates._progress
     _results = staticmethod(TestResumeWithInvertedAuthorDates._results)
 
     async def _run_resume_three(self, repo, graph, monkeypatch):
-        """Drives the three-run sequence this class's docstring describes and
-        returns the reopened, post-resume db.
+        """Drives the three-run sequence this class's docstring describes.
+
+        Returns (db, preload): the reopened post-resume db, and the preload
+        state RUN 3 ACTUALLY RESUMED FROM, captured by wrapping
+        _load_ingestion_preload_state for the duration of that run only.
+
+        The capture is a wrapper, not a re-derivation: calling the preload
+        directly with hand-built arguments is what
+        TestPreloadKnownEntitiesCloseSide already does, and it cannot show that
+        _run_ingestion reaches the preload with the arguments that make the
+        position rule fire. Everything here -- the watermark, the
+        linearization, hash_to_pos, ts_positions, the envelope -- is whatever
+        the real resumed run computed.
 
         Runs 1 and 2 are interrupted by the same sleep-count trick
         TestResumeWithInvertedAuthorDates._run_resume uses, including its
@@ -20661,13 +20693,39 @@ class TestResumeWithInvertedAuthorDatesAndDeps:
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
         mcp_server._graph_path = graph
         original_sleep = asyncio.sleep
+        captured = {}
+        original_load = mcp_server._load_ingestion_preload_state
 
-        async def drive(ratio, stop_after):
+        def capturing_load(*args, **kwargs):
+            state = original_load(*args, **kwargs)
+            # Positional unpack of _load_ingestion_preload_state's documented
+            # return tuple; named here so a change to its shape fails loudly
+            # in one place instead of silently shifting an index.
+            (
+                _watermark, _prior_ingested, entity_valid_from,
+                _entity_descriptions, _entity_introduced_by, file_entities,
+                file_deps, dep_valid_from, *_rest,
+            ) = state
+            captured["entity_valid_from"] = dict(entity_valid_from)
+            captured["file_entities"] = {
+                path: list(idents) for path, idents in file_entities.items()
+            }
+            captured["file_deps"] = {
+                path: set(deps) for path, deps in file_deps.items()
+            }
+            captured["dep_valid_from"] = dict(dep_valid_from)
+            return state
+
+        async def drive(ratio, stop_after, capture=False):
             monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", ratio)
             mcp_server._db = None
             mcp_server._ingest_progress = self._progress()
             if stop_after is None:
-                await mcp_server._run_ingestion(str(repo), "HEAD")
+                with patch.object(
+                    mcp_server, "_load_ingestion_preload_state",
+                    capturing_load if capture else original_load,
+                ):
+                    await mcp_server._run_ingestion(str(repo), "HEAD")
                 mcp_server._db = None
                 return
             calls = {"n": 0}
@@ -20727,11 +20785,15 @@ class TestResumeWithInvertedAuthorDatesAndDeps:
             # opens its own.
             del db
 
-        await drive(f"{10**6}:1", None)
+        await drive(f"{10**6}:1", None, capture=True)
         assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+        assert captured, (
+            "run 3 never called _load_ingestion_preload_state -- it did not "
+            "take the resume path at all"
+        )
 
         mcp_server._db = None
-        return MiniGrafDb.open(graph)
+        return MiniGrafDb.open(graph), captured
 
     @pytest.mark.asyncio
     async def test_resumed_run_preserves_the_standing_dep_edge_valid_from(
@@ -20743,20 +20805,30 @@ class TestResumeWithInvertedAuthorDatesAndDeps:
         `current_deps - previous_deps` treating a standing edge as new at the
         replayed gap commit and re-dating it.
 
-        NO ABLATION POWER, and the reason is specific enough to be worth
-        recording. _preload_known_deps drops an edge only when its SOURCE
-        module is missing from file_entities. The module dropped here is
-        doomed.py, which is this edge's TARGET; dep_src.py, its source, is
-        live at W in both versions, so the edge survives the preload either
-        way. An edge whose source is the dropped module would be the powerful
-        case -- and that case is unreachable end to end, because a module
-        deleted above W appears in no diff above the close, and by the time
-        the close exists the forward walk has no gap left to replay. See the
-        class docstring."""
+        NO ABLATION POWER -- verified, not assumed: it passes with
+        mcp_server.py reverted to master. Two independent reasons, both worth
+        recording.
+
+        The first is specific to this edge. _preload_known_deps drops a row
+        only when its SOURCE module is missing from file_entities. The module
+        dropped by the defect is doomed.py, which is this edge's TARGET;
+        dep_src.py, its source, is live at W either way, so the row survives
+        the preload with or without the fix. The edge that DOES vanish is
+        doomed.py -> base.py, and that one is asserted on directly by
+        test_resumed_preload_keeps_the_dropped_modules_own_dep_edge.
+
+        The second reason would defeat this test even with the source-side
+        edge, and is why the powerful assertions in this class are on preload
+        state rather than on the graph: no gap commit ever sits below a
+        durable close. A close above W can only be written by Stage B, Stage B
+        requires the gap to be closed, and it sweeps ASCENDING -- so by the
+        time the close exists, the forward walk has nothing left to replay and
+        every remaining commit sits above the close, where a deleted module
+        appears in no diff. See the class docstring."""
         import mcp_server
         repo = _inverted_author_date_repo_with_deps(tmp_path / "repo")
         graph = str(repo / "memory.graph")
-        db = await self._run_resume_three(repo, graph, monkeypatch)
+        db, _preload = await self._run_resume_three(repo, graph, monkeypatch)
 
         src = mcp_server._code_ident("module", "dep_src.py")
         rows = self._results(
@@ -20782,18 +20854,21 @@ class TestResumeWithInvertedAuthorDatesAndDeps:
         wrongly-preloaded entity produces when it is closed at a commit
         earlier than its own introduction.
 
-        NO ABLATION POWER on the close side. Its sibling of the same name in
-        TestResumeWithInvertedAuthorDates does have power, but against the
-        INTRODUCTION clause (over-inclusion), which is already on master and
-        is not what this branch changes. The close-side clause is a
+        NO ABLATION POWER on the close side -- verified, not assumed: it
+        passes with mcp_server.py reverted to master. Its sibling of the same
+        name in TestResumeWithInvertedAuthorDates does have power, but against
+        the INTRODUCTION clause (over-inclusion), which is already on master
+        and is not what this branch changes. The close-side clause is a
         re-ADMISSION: it can only make the preload larger, and a larger
         preload cannot produce an inverted interval by the route this checks.
-        Kept because the invariant is worth holding on a three-run resume as
-        well as a two-run one."""
+        The general reason no graph-level assertion in this class can have
+        power -- Stage B's ascending sweep leaves no gap commit below a
+        durable close -- is in the class docstring. Kept because the invariant
+        is worth holding on a three-run resume as well as a two-run one."""
         import mcp_server
         repo = _inverted_author_date_repo_with_deps(tmp_path / "repo")
         graph = str(repo / "memory.graph")
-        db = await self._run_resume_three(repo, graph, monkeypatch)
+        db, _preload = await self._run_resume_three(repo, graph, monkeypatch)
 
         rows = self._results(
             db,
@@ -20816,24 +20891,120 @@ class TestResumeWithInvertedAuthorDatesAndDeps:
         takes _build_code_triples' introduction branch on replay and gains a
         second live :introduced-by.
 
-        NO ABLATION POWER, for the reason that also defeats it in
-        TestResumeWithInvertedAuthorDates plus one more that is specific to
-        the close side. The branch it needs is _build_code_triples'
-        introduction branch, and the only work run 3 has left is Stage B,
-        whose _forward_apply(lifecycle_only=True) DISCARDS that output for
-        "A"/"M" files (it is called for its dict side effects only) and keeps
-        it solely for "R". So the excluded module cannot mint a second
-        :introduced-by here even when it is excluded. Kept because "no entity
-        holds two live :introduced-by values" is a standing #235 invariant and
-        this is a resume path it has not otherwise been checked on."""
+        NO ABLATION POWER -- verified, not assumed: it passes with
+        mcp_server.py reverted to master. Two reasons, the first being the one
+        that also defeats it in TestResumeWithInvertedAuthorDates.
+
+        The branch it needs is _build_code_triples' introduction branch, and
+        the only work run 3 has left is Stage B, whose
+        _forward_apply(lifecycle_only=True) DISCARDS that output for "A"/"M"
+        files (it is called for its dict side effects only) and keeps it
+        solely for "R". So the excluded module cannot mint a second
+        :introduced-by here even when it is excluded.
+
+        And Stage B is all that is left because its ascending sweep means no
+        gap commit ever sits below a durable close -- the class docstring's
+        structural argument, which is why the powerful assertions here are on
+        preload state instead. Kept because "no entity holds two live
+        :introduced-by values" is a standing #235 invariant and this is a
+        resume path it has not otherwise been checked on."""
         repo = _inverted_author_date_repo_with_deps(tmp_path / "repo")
         graph = str(repo / "memory.graph")
-        db = await self._run_resume_three(repo, graph, monkeypatch)
+        db, _preload = await self._run_resume_three(repo, graph, monkeypatch)
 
         rows = self._results(
             db, '(query [:find ?e (count ?c) :where [?e :introduced-by ?c]])'
         )
         assert [r for r in rows if int(r[1]) > 1] == []
+
+    @pytest.mark.asyncio
+    async def test_resumed_preload_readmits_the_module_closed_above_the_watermark(
+        self, tmp_path, monkeypatch
+    ):
+        """#238's close side, on the state a REAL resumed run resumed from.
+
+        doomed.py is introduced at c0 (position 0, at or below W = c2) and
+        closed at c3 (position 3, above W) with valid_to = 2026-04-26, which
+        is at or below the envelope T_hi(W) = 2026-05-02. Phase 1's
+        :valid-at T_hi(W) query therefore cannot see it, and the resumed walk
+        must still start from a state in which it is live -- it WAS live at W.
+
+        HAS ABLATION POWER: with mcp_server.py reverted to master, both the
+        file_entities key and the entity_valid_from entry are absent. That is
+        #245's "dropped out of file_entities" shape, measured on the real
+        three-run drive rather than on a direct call to the preload."""
+        import mcp_server
+        repo = _inverted_author_date_repo_with_deps(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        _db, preload = await self._run_resume_three(repo, graph, monkeypatch)
+
+        module = mcp_server._code_ident("module", "doomed.py")
+        assert "doomed.py" in preload["file_entities"], (
+            "doomed.py, live at the watermark and closed only ABOVE it, was "
+            "dropped from the resumed walk's file_entities because its close "
+            "DATE fell inside the envelope (#238 close side): "
+            f"{sorted(preload['file_entities'])}"
+        )
+        assert module in preload["file_entities"]["doomed.py"], (
+            f"{module} missing from its own file's entity list: "
+            f"{preload['file_entities']['doomed.py']}"
+        )
+        assert preload["entity_valid_from"].get(module) == "2026-04-01T00:00:00Z", (
+            f"{module} is absent from, or misdated in, entity_valid_from -- "
+            "the resumed walk would treat it as never introduced: "
+            f"{preload['entity_valid_from'].get(module)!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resumed_preload_keeps_the_dropped_modules_own_dep_edge(
+        self, tmp_path, monkeypatch
+    ):
+        """#245, on the state a REAL resumed run resumed from.
+
+        The edge doomed.py -> base.py is introduced at c0 and closed at c3
+        along with its source module, so it is live at W by position and dead
+        at W by date -- the same inversion, one level down. It is the edge
+        that #245's phrase "taking 30 misclassified :depends-on edges with
+        them before any diff was computed" refers to: _preload_known_deps
+        resolves each row through ident_to_file, which is built from
+        file_entities, so an absent doomed.py silently discards every edge it
+        owns regardless of what the :depends-on rows themselves say.
+
+        HAS ABLATION POWER: with mcp_server.py reverted to master, file_deps
+        has no 'doomed.py' key at all.
+
+        The sibling edge dep_src.py -> doomed.py is asserted here too, as a
+        NEGATIVE control: its source is live at W, so it survives in both
+        versions. It is the reason
+        test_resumed_run_preserves_the_standing_dep_edge_valid_from has no
+        power, and pinning it here keeps the fixture honest about which of the
+        two edges is load-bearing."""
+        import mcp_server
+        repo = _inverted_author_date_repo_with_deps(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        _db, preload = await self._run_resume_three(repo, graph, monkeypatch)
+
+        doomed = mcp_server._code_ident("module", "doomed.py")
+        base = mcp_server._code_ident("module", "base.py")
+
+        assert preload["file_deps"].get("doomed.py") == {base}, (
+            "the doomed.py -> base.py edge was dropped from the resumed "
+            "walk's file_deps: doomed.py is missing from file_entities, so "
+            "_preload_known_deps could not resolve the row's source file "
+            f"(#245). file_deps = {preload['file_deps']}"
+        )
+        assert preload["dep_valid_from"].get((doomed, base), "").startswith(
+            "2026-04-01"
+        ), (
+            "the dropped module's edge lost c0's :valid-from: "
+            f"{preload['dep_valid_from'].get((doomed, base))!r}"
+        )
+        # Negative control -- survives with and without the fix.
+        assert base != doomed
+        assert doomed in preload["file_deps"].get("dep_src.py", set()), (
+            "the target-side edge vanished, which no version of this code "
+            f"should do: {preload['file_deps']}"
+        )
 
 
 class _FakeClock:
