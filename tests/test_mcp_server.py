@@ -10532,6 +10532,30 @@ class TestPreloadKnownEntitiesCloseSide:
         assert ":module/intro-above-w" not in entity_valid_from
 
 
+class TestPreloadStateUnmappableAnnounce:
+    """An unplaceable :db/valid-from or :db/valid-to means the position
+    inversion's assumption is broken for that fact. Excluding is the
+    recoverable direction, but it must not be silent -- the same reasoning
+    _commit_date_query applies when a non-empty watermark has no :date."""
+
+    def test_unmappable_close_is_announced_on_stderr(self, real_db, capsys):
+        import mcp_server
+        ts_positions = {"2026-04-01T00:00:00Z": [0], "2026-05-02T00:00:00Z": [1]}
+        stats = {}
+        mcp_server._fact_is_live_at_position(
+            mcp_server._iso_to_epoch_ms("2026-04-01T00:00:00Z"),
+            mcp_server._iso_to_epoch_ms("2026-06-15T00:00:00Z"),
+            1, ts_positions, stats,
+        )
+        mcp_server._announce_unplaceable_facts(stats)
+        assert "unplaceable" in capsys.readouterr().err
+
+    def test_clean_stats_announce_nothing(self, real_db, capsys):
+        import mcp_server
+        mcp_server._announce_unplaceable_facts({"collisions": 3})
+        assert capsys.readouterr().err == ""
+
+
 class TestEpochMsToIso:
     def test_round_trips_a_commit_instant(self):
         import mcp_server
@@ -10847,7 +10871,9 @@ class TestRunIngestion:
         leaving the server permanently unable to connect."""
         import mcp_server
 
-        def slow_preload(db, repo_path, valid_at=None, hash_to_pos=None, watermark_pos=None):
+        def slow_preload(db, repo_path, valid_at=None, hash_to_pos=None,
+                         watermark_pos=None, ts_positions=None, t_hi_ms=None,
+                         stats=None):
             time.sleep(0.3)
             return {}, {}, {}, {}, {}
 

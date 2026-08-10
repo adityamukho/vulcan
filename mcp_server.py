@@ -7882,6 +7882,32 @@ def _fact_is_live_at_position(
     return close_pos > watermark_pos
 
 
+def _announce_unplaceable_facts(stats: Dict[str, int]) -> None:
+    """Report facts whose valid-time matched no commit in the linearization.
+
+    Not a hard failure: aborting an ingestion because one fact is unplaceable
+    is worse than excluding it, and the ordinary rewritten-history case is
+    already handled by watermark_pos falling to None, which disables position
+    filtering wholesale. But a silent exclusion here would look exactly like
+    the bug #245 fixed, so it is announced -- the same reasoning
+    _commit_date_query uses when a non-empty watermark has no :date.
+
+    Collisions are NOT announced: they are expected at second granularity and
+    are resolved deterministically toward exclusion.
+    """
+    intro = stats.get("unmappable_intro", 0)
+    close = stats.get("unmappable_close", 0)
+    if not intro and not close:
+        return
+    print(
+        f"[ingest] preload: {intro} unplaceable :db/valid-from and {close} "
+        "unplaceable :db/valid-to facts -- their instants match no commit in "
+        "this linearization, so they were excluded from the resume state "
+        "(#245). Expect duplicate introductions rather than data loss.",
+        file=sys.stderr,
+    )
+
+
 def _preload_known_deps(
     db: Any,
     file_entities: Dict[str, List[str]],
@@ -8228,9 +8254,25 @@ def _load_ingestion_preload_state(
     # empty state.
     resume_valid_at = _commit_date_query(db, watermark)
     resume_valid_at_ms = _iso_to_epoch_ms(resume_valid_at)
+    ts_positions = _build_ts_positions(commit_metadata)
+
+    # #238/#245: membership at all four sites is decided by POSITION.
+    #
+    # t_hi_ms is derived from _resume_envelope BEFORE entity_valid_at's
+    # fallback below, and stays None whenever watermark_pos is None. That
+    # guard is load-bearing: a watermark that exists but is absent from this
+    # linearization leaves resume_valid_at a real ts(W) while disabling the
+    # position filter, and letting that become t_hi_ms would hand the deps and
+    # pins queries a WIDENED prefilter with no position clause -- exactly the
+    # widening #245 forbids. With t_hi_ms None they keep the ts(W) date
+    # window, which is strictly no worse than today.
+    #
+    # resume_valid_at survives for _preload_unresolved_dep_idents only.
     entity_valid_at = _resume_envelope(commit_metadata, watermark_pos)
+    t_hi_ms = _iso_to_epoch_ms(entity_valid_at)
     if entity_valid_at is None:
         entity_valid_at = resume_valid_at
+    position_stats: Dict[str, int] = {}
     prior_ingested = _count_commit_entities(db)
     (
         entity_valid_from, entity_descriptions, entity_introduced_by,
@@ -8238,11 +8280,19 @@ def _load_ingestion_preload_state(
     ) = _preload_known_entities(
         db, repo_path, valid_at=entity_valid_at,
         hash_to_pos=hash_to_pos, watermark_pos=watermark_pos,
+        ts_positions=ts_positions, t_hi_ms=t_hi_ms, stats=position_stats,
     )
     file_deps, dep_valid_from = _preload_known_deps(
         db, file_entities, valid_at_ms=resume_valid_at_ms,
+        ts_positions=ts_positions, watermark_pos=watermark_pos,
+        t_hi_ms=t_hi_ms, stats=position_stats,
     )
-    pinned_commit_state = _preload_pinned_commits(db, valid_at_ms=resume_valid_at_ms)
+    pinned_commit_state = _preload_pinned_commits(
+        db, valid_at_ms=resume_valid_at_ms,
+        ts_positions=ts_positions, watermark_pos=watermark_pos,
+        t_hi_ms=t_hi_ms, stats=position_stats,
+    )
+    _announce_unplaceable_facts(position_stats)
     field_class_ident = _preload_field_class_idents(db)
     field_static_ident = _preload_field_static_idents(db)
     # Independent of _preload_known_entities' bound now (#238): the subtrahend
