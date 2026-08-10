@@ -10335,6 +10335,7 @@ class TestPreloadKnownEntitiesCloseSide:
         "2026-04-01T00:00:00Z": [0],
         "2026-05-02T00:00:00Z": [1],
         "2026-04-26T00:00:00Z": [2],
+        "2026-04-27T00:00:00Z": [3],
     }
 
     def _seed(self, real_db):
@@ -10426,13 +10427,25 @@ class TestPreloadKnownEntitiesCloseSide:
         assert ":module/closed-above-w" not in entity_valid_from
 
     def test_reintroduced_entity_keeps_its_current_values(self, real_db, tmp_path):
-        """An ident closed below W and re-introduced below W is live via phase
-        1. Phase 2 must not overwrite it with the historical interval."""
+        """An ident closed above W and re-introduced below W is live via phase
+        1. Phase 2 must not overwrite it with the historical interval.
+
+        The OLD interval closes at 2026-04-26T00:00:00Z -- position 2 in
+        TS_POSITIONS, ABOVE W (position 1) -- deliberately, not at some date
+        absent from TS_POSITIONS. An earlier version of this test closed the
+        OLD interval at 2026-04-20T00:00:00Z, which isn't in TS_POSITIONS at
+        all: _position_of_valid_time returned None for it, so
+        _fact_is_live_at_position excluded the OLD interval before either
+        dedup guard ran, and the test passed even with both guards deleted
+        (both the `if ident in entity_valid_from: continue` in the readmit-
+        collection loop, and the `and ident not in entity_valid_from` in the
+        re-admission accept lambda) -- a vacuous regression test, caught by
+        ablation."""
         import mcp_server
         self._seed(real_db)
         real_db.execute(
             '(transact {:valid-from "2026-04-01T00:00:00Z" '
-            ':valid-to "2026-04-20T00:00:00Z"} '
+            ':valid-to "2026-04-26T00:00:00Z"} '
             '[[:module/recycled :entity-type :type/module] '
             '[:module/recycled :ident ":module/recycled"] '
             '[:module/recycled :path "recycled.py"] '
@@ -10449,6 +10462,74 @@ class TestPreloadKnownEntitiesCloseSide:
         )
         _vf, descriptions, _ib, _fe, _sp = self._run(real_db, tmp_path)
         assert descriptions[":module/recycled"] == "NEW"
+
+    def test_two_distinct_closing_instants_readmit_independently(self, real_db, tmp_path):
+        """The re-admission loop runs one _collect pass per distinct closing
+        instant, and the accept lambda must bind close_ms per-iteration via a
+        default argument (`lambda ident, _c=close_ms: ...`), not a bare free
+        variable.
+
+        A single closing instant can't distinguish the two: with only one
+        re-admission pass there is nothing for a wrong group to leak from.
+        This seeds a SECOND entity, closed-above-w-2, closing at a distinct
+        instant (2026-04-27, position 3) above W, alongside closed-above-w's
+        existing close at 2026-04-26 (position 2) -- two re-admission passes.
+        Both entities must come back with their OWN description/path, not
+        just be present: closed-above-w-2's :ident window (04-01 to 04-27)
+        is also live at 2026-04-26's re-admission instant (2026-04-25
+        23:59:59.999), so a wrong-group leak would surface as one entity's
+        row overwriting the other's, not as an absence."""
+        self._seed(real_db)
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-27T00:00:00Z"} '
+            '[[:module/closed-above-w-2 :entity-type :type/module] '
+            '[:module/closed-above-w-2 :ident ":module/closed-above-w-2"] '
+            '[:module/closed-above-w-2 :path "phobos.py"] '
+            '[:module/closed-above-w-2 :description "phobos.py"] '
+            '[:module/closed-above-w-2 :introduced-by :commit/c0]])'
+        )
+        _vf, descriptions, _ib, file_entities, _sp = self._run(real_db, tmp_path)
+        assert descriptions[":module/closed-above-w"] == "vulcan.py"
+        assert ":module/closed-above-w" in file_entities["vulcan.py"]
+        assert descriptions[":module/closed-above-w-2"] == "phobos.py"
+        assert ":module/closed-above-w-2" in file_entities["phobos.py"]
+
+    def test_introduction_above_watermark_excludes_even_when_ident_window_is_live(
+        self, real_db, tmp_path
+    ):
+        """Both gates apply, independently, to every re-admitted row.
+
+        The readmit-collection loop's _fact_is_live_at_position check only
+        inspects the :ident fact's OWN :db/valid-from/:db/valid-to -- it has
+        no way to see :introduced-by at all. _collect's own :introduced-by
+        position clause is what actually gates introduction, on phase 1 AND
+        every re-admission pass alike.
+
+        This entity's :ident window opens at c0's date (position 0, <= W) and
+        closes at c2's date (position 2, > W) -- exactly the shape that
+        clears the readmit-collection gate and gets a re-admission pass
+        scheduled. But its :introduced-by points at c2 itself (position 2,
+        > W): a case _fact_is_live_at_position cannot see, since it never
+        looks at :introduced-by. Only _collect's own watermark clause catches
+        it. It must stay excluded."""
+        self._seed(real_db)
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            f'[[:commit/c2 :hash "{self.LINEARIZATION[2]}"] '
+            '[:commit/c2 :date "2026-04-26T00:00:00Z"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-26T00:00:00Z"} '
+            '[[:module/intro-above-w :entity-type :type/module] '
+            '[:module/intro-above-w :ident ":module/intro-above-w"] '
+            '[:module/intro-above-w :path "ghost.py"] '
+            '[:module/intro-above-w :description "ghost.py"] '
+            '[:module/intro-above-w :introduced-by :commit/c2]])'
+        )
+        entity_valid_from, *_ = self._run(real_db, tmp_path)
+        assert ":module/intro-above-w" not in entity_valid_from
 
 
 class TestEpochMsToIso:
