@@ -13225,6 +13225,89 @@ def _inverted_author_date_repo(path):
     return path
 
 
+def _inverted_author_date_repo_with_deps(path):
+    """_inverted_author_date_repo plus the two shapes #245 and #238's close
+    side need, added to the EXISTING five commits rather than as new ones --
+    TestResumeWithInvertedAuthorDates._run_resume asserts processed == 4 and
+    depends on which commits each stream claims, so the commit count must not
+    move.
+
+        pos 0  c0  + dep_src.py (imports doomed) and doomed.py   @ 2026-04-01
+        pos 1  c1  mid.py                                        @ 2026-05-02  <- W
+        pos 2  c2  late.py modified, dep_src.py touched          @ 2026-04-20
+        pos 3  c3  late.py + late_fn, and DELETES doomed.py      @ 2026-04-26  <- above W, dated earlier
+        pos 4  c4  base.py + base_fn2                            @ 2026-04-27
+
+    doomed.py's module entity CLOSES at c3: close position 3 is above W, while
+    the close DATE 2026-04-26 is below the envelope T_hi(W) = 2026-05-02. That
+    is exactly the four-modules-deleted-by-df6b8be shape #238's close-side
+    residual was measured on.
+
+    That close is NOT reachable in the two-run drive _run_resume performs --
+    Stage B is the only writer of a close above the watermark and is gated on
+    `completed_all`, so an interrupted run never reaches it. See
+    TestResumeWithInvertedAuthorDatesAndDeps' docstring for the three-run
+    drive that does reach it, and for what was and was not measurable there.
+
+    dep_src.py is deliberately re-touched at c2 (a comment-only body edit that
+    leaves `import doomed` in place). c2 is the GAP commit run 2's forward walk
+    replays, and dep-edge diffing (`current_deps - previous_deps`) only runs
+    for files that appear in a commit's own diff -- a dep edge whose source
+    file is never touched again after c0 is never re-diffed, so it cannot
+    exhibit #245's harm no matter what the preload does. Touching dep_src.py at
+    c2 is what puts the standing dep_src -> doomed edge in front of the
+    replayed diff. See TestResumeWithInvertedAuthorDatesAndDeps'
+    test_resumed_run_preserves_the_standing_dep_edge_valid_from for what the
+    replay is then expected not to do to it.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    _subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=path,
+                    check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=path,
+                    check=True, capture_output=True)
+
+    def commit(files, author_date, committer_date, msg):
+        for filename, body in files.items():
+            (path / filename).write_text(body)
+        _subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
+        env = {**os.environ,
+               "GIT_AUTHOR_DATE": author_date, "GIT_COMMITTER_DATE": committer_date}
+        _subprocess.run(["git", "commit", "-m", msg], cwd=path,
+                        check=True, capture_output=True, env=env)
+
+    commit(
+        {"base.py": "def base_fn():\n    return 1\n",
+         "late.py": "def helper_fn():\n    return 0\n",
+         "doomed.py": "def doomed_fn():\n    return 7\n",
+         "dep_src.py": "import doomed\n\ndef src_fn():\n    return doomed.doomed_fn()\n"},
+        "2026-04-01T00:00:00Z", "2026-04-01T00:00:00Z", "c0 base+late+doomed+dep_src",
+    )
+    commit(
+        {"mid.py": "def mid_fn():\n    return 2\n"},
+        "2026-05-02T00:00:00Z", "2026-05-03T00:00:00Z", "c1 mid",
+    )
+    commit(
+        {"late.py": "def helper_fn():\n    return 99\n",
+         "dep_src.py": "import doomed\n\ndef src_fn():\n    # touched at c2\n"
+                       "    return doomed.doomed_fn()\n"},
+        "2026-04-20T00:00:00Z", "2026-05-04T00:00:00Z", "c2 late-mod-helper",
+    )
+    # The commit() helper only writes files; the deletion has to be staged
+    # explicitly before c3's commit call runs `git add .`.
+    _subprocess.run(["git", "rm", "doomed.py"], cwd=path,
+                    check=True, capture_output=True)
+    commit(
+        {"late.py": "def helper_fn():\n    return 99\n\ndef late_fn():\n    return 3\n"},
+        "2026-04-26T00:00:00Z", "2026-05-05T00:00:00Z", "c3 late-add-late_fn+rm-doomed",
+    )
+    commit(
+        {"base.py": "def base_fn():\n    return 1\n\ndef base_fn2():\n    return 4\n"},
+        "2026-04-27T00:00:00Z", "2026-05-06T00:00:00Z", "c4 base-add-base_fn2",
+    )
+    return path
+
+
 class TestClosedEntityLifecyclePurge:
     """Real-backend regression tests for the closed-entity lifecycle purge.
 
@@ -20477,6 +20560,280 @@ class TestResumeWithInvertedAuthorDates:
         )
         inverted = [(i, vf, vt) for i, vf, vt in rows if vt is not None and vt < vf]
         assert inverted == [], f"inverted valid intervals on :ident facts: {inverted}"
+
+
+class TestResumeWithInvertedAuthorDatesAndDeps:
+    """#238's close side and #245, end-to-end on a resumed run.
+
+    Sibling of TestResumeWithInvertedAuthorDates, which covers the
+    INTRODUCTION side. Read that class's docstring first -- the run-1 stream
+    ratio, the sleep-count stop point, and why a forward-only resume cannot
+    reach this class of bug at all are all explained there and all apply here.
+
+    Both defects here are wrong-EXCLUSION: doomed.py closes ABOVE the
+    watermark with a date BELOW the envelope, so a date-bounded preload cannot
+    see it at W and drops it -- and with it, out of file_entities, every
+    :depends-on edge that names it as source, "before any diff was computed"
+    (#245's own phrasing for the shape its probe measured).
+
+    WHY THIS NEEDS THREE RUNS, NOT TWO (the Step 2 investigation this test was
+    required to do before asserting anything). TestResumeWithInvertedAuthorDates'
+    two-run drive cannot produce this precondition. Run 1 is interrupted, and
+    Stage B -- the ONLY writer of a close above the forward watermark -- is
+    gated on `if completed_all:` in _run_ingestion, so an interrupted run never
+    reaches it. The reverse stream writes provisional INTRODUCTIONS only; it
+    applies no lifecycle. Measured directly: after run 1 of the two-run drive
+    against this fixture, :module/doomed-py's :ident is still open-ended
+    (valid-to = the FOREVER sentinel), so there is nothing above W for the
+    close side of the preload to be right or wrong about. The third run exists
+    solely to get a close durably above W:
+
+        run 1  interrupted after 4 commits  -> fwd {c0,c1} (W = c1), rev {c4,c3},
+                                               gap {c2}
+        run 2  interrupted after 2 yields   -> Stage A claims c2 (W = c2), then
+                                               Stage B sweeps c3, which applies
+                                               c3's deletion of doomed.py and
+                                               closes it at 2026-04-26 -- above
+                                               W (position 3 > 2) and below the
+                                               envelope T_hi(W) = 2026-05-02
+        run 3  the resume under test        -> its preload is the first one that
+                                               sees the close
+
+    _run_resume_three asserts that shape between runs rather than trusting it,
+    so a drift in the sleep accounting fails loudly instead of silently
+    degrading these tests into a fresh-ingestion check.
+
+    ABLATION: NONE OF THESE THREE TESTS CAN FAIL WITHOUT THE PRODUCTION
+    CHANGE, and they are kept anyway, on the same precedent
+    TestResumeWithInvertedAuthorDates set for its own third test -- state the
+    absence of power, do not claim it, do not quietly delete the test.
+
+    What was measured, at run 3's preload, on the fixture below:
+
+        with the fix     entity_valid_from has :module/doomed-py and
+                         :function/doomed-py-doomed-fn; file_entities has the
+                         'doomed.py' key
+        without it       all three are absent -- exactly #245's
+                         "dropped out of file_entities" shape
+
+    So the preload state diverges sharply and the RESULTING GRAPH does not,
+    byte for byte, in either the fixture below or a variant where c4 re-adds
+    doomed.py. The reason is structural, not a weakness of this fixture: a
+    close above W can only be written by Stage B, Stage B requires the gap to
+    be closed, and it sweeps the frontier-high region ASCENDING. So every
+    commit a later run has left to process sits ABOVE the close, and a module
+    deleted at that close appears in no diff above it. The forward walk, which
+    is the consumer that would misuse the dropped state, has by construction
+    nothing left to replay by the time the close exists. #245's exposure
+    measurement is a preload-fidelity measurement, and the harm it projects
+    needs a fourth thing this pipeline does not currently produce: a gap
+    commit below a durable close.
+
+    These tests therefore pin the SHAPE (they prove the resume, the close
+    above W, and the envelope inversion are all real and reachable) and the
+    standing bi-temporal invariants across it. They are not evidence for the
+    close-side clause specifically. The evidence for that clause is
+    TestPreloadKnownEntitiesCloseSide's unit tests.
+    """
+
+    _progress = TestResumeWithInvertedAuthorDates._progress
+    _results = staticmethod(TestResumeWithInvertedAuthorDates._results)
+
+    async def _run_resume_three(self, repo, graph, monkeypatch):
+        """Drives the three-run sequence this class's docstring describes and
+        returns the reopened, post-resume db.
+
+        Runs 1 and 2 are interrupted by the same sleep-count trick
+        TestResumeWithInvertedAuthorDates._run_resume uses, including its
+        `if t: await original_sleep(t); return` guard -- without it
+        _ensure_db_async's lock-contention backoff consumes a count and the
+        run stops one step early, which was a real CI-only failure on this
+        fixture.
+
+        Run 2's two counted yields are NOT two pipeline commits: the first is
+        Stage A's single gap commit (c2) and the second is Stage B's first
+        swept commit (c3). Both stages yield through the same
+        `await asyncio.sleep(0)`.
+        """
+        import mcp_server
+        from minigraf import MiniGrafDb
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._graph_path = graph
+        original_sleep = asyncio.sleep
+
+        async def drive(ratio, stop_after):
+            monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", ratio)
+            mcp_server._db = None
+            mcp_server._ingest_progress = self._progress()
+            if stop_after is None:
+                await mcp_server._run_ingestion(str(repo), "HEAD")
+                mcp_server._db = None
+                return
+            calls = {"n": 0}
+
+            async def stop_after_nth(t):
+                # See _run_resume's stop_after_fourth for why non-zero sleeps
+                # must not be counted.
+                if t:
+                    await original_sleep(t)
+                    return
+                calls["n"] += 1
+                if calls["n"] == stop_after:
+                    mcp_server._shutdown_requested.set()
+                await original_sleep(t)
+
+            with patch("mcp_server.asyncio.sleep", stop_after_nth):
+                await mcp_server._run_ingestion(str(repo), "HEAD")
+            mcp_server._db = None
+
+        await drive("2:1000000", 4)
+        assert mcp_server._ingest_progress["status"] == "stopped"
+        assert mcp_server._ingest_progress["processed"] == 4
+
+        await drive(f"{10**6}:1", 2)
+        assert mcp_server._ingest_progress["status"] == "stopped"
+
+        # The precondition, asserted rather than assumed -- this is the state
+        # the two-run drive provably cannot reach, and every claim these tests
+        # make about the close side rests on it.
+        doomed = mcp_server._code_ident("module", "doomed.py")
+        db = MiniGrafDb.open(graph)
+        try:
+            rows = self._results(
+                db,
+                '(query [:find ?vf ?vt :any-valid-time '
+                f':where [?e :ident "{doomed}"] '
+                '[?e :db/valid-from ?vf] [?e :db/valid-to ?vt]])',
+            )
+            closed = [
+                (vf, vt) for vf, vt in rows
+                if int(vt) < mcp_server._VALID_TIME_FOREVER_MS
+            ]
+            assert closed == [(
+                mcp_server._iso_to_epoch_ms("2026-04-01T00:00:00Z"),
+                mcp_server._iso_to_epoch_ms("2026-04-26T00:00:00Z"),
+            )], (
+                f"run 2 did not leave {doomed} closed at c3's instant, so run "
+                f"3's preload has no close above the watermark to get wrong: "
+                f"{rows}"
+            )
+            watermark = self._results(
+                db, '(query [:find ?h :where [:ingestion/watermark :hash ?h]])'
+            )
+            assert watermark, "no watermark after run 2"
+        finally:
+            # Single-handle invariant: this handle must be gone before run 3
+            # opens its own.
+            del db
+
+        await drive(f"{10**6}:1", None)
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+
+        mcp_server._db = None
+        return MiniGrafDb.open(graph)
+
+    @pytest.mark.asyncio
+    async def test_resumed_run_preserves_the_standing_dep_edge_valid_from(
+        self, tmp_path, monkeypatch
+    ):
+        """#245's projected harm, asserted on :valid-from rather than on edge
+        existence -- the edge exists in both the broken and the fixed graph.
+        What the defect would destroy is WHEN it was introduced:
+        `current_deps - previous_deps` treating a standing edge as new at the
+        replayed gap commit and re-dating it.
+
+        NO ABLATION POWER, and the reason is specific enough to be worth
+        recording. _preload_known_deps drops an edge only when its SOURCE
+        module is missing from file_entities. The module dropped here is
+        doomed.py, which is this edge's TARGET; dep_src.py, its source, is
+        live at W in both versions, so the edge survives the preload either
+        way. An edge whose source is the dropped module would be the powerful
+        case -- and that case is unreachable end to end, because a module
+        deleted above W appears in no diff above the close, and by the time
+        the close exists the forward walk has no gap left to replay. See the
+        class docstring."""
+        import mcp_server
+        repo = _inverted_author_date_repo_with_deps(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        db = await self._run_resume_three(repo, graph, monkeypatch)
+
+        src = mcp_server._code_ident("module", "dep_src.py")
+        rows = self._results(
+            db,
+            '(query [:find ?vf :any-valid-time '
+            f':where [?e :ident "{src}"] '
+            '[?e :depends-on ?dep] '
+            '[?e :db/valid-from ?vf] [?e :db/valid-to ?vt]])',
+        )
+        assert rows, "the dep_src -> doomed edge vanished entirely"
+        earliest = min(int(r[0]) for r in rows)
+        assert earliest == mcp_server._iso_to_epoch_ms("2026-04-01T00:00:00Z"), (
+            "the standing :depends-on edge was re-introduced at the replayed "
+            f"gap commit instead of keeping c0's :valid-from (#245): {rows}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resumed_run_writes_no_inverted_valid_interval(
+        self, tmp_path, monkeypatch
+    ):
+        """The general corruption signature both issues produce. A fact whose
+        window closes BEFORE it opens is unrecoverable, and it is what a
+        wrongly-preloaded entity produces when it is closed at a commit
+        earlier than its own introduction.
+
+        NO ABLATION POWER on the close side. Its sibling of the same name in
+        TestResumeWithInvertedAuthorDates does have power, but against the
+        INTRODUCTION clause (over-inclusion), which is already on master and
+        is not what this branch changes. The close-side clause is a
+        re-ADMISSION: it can only make the preload larger, and a larger
+        preload cannot produce an inverted interval by the route this checks.
+        Kept because the invariant is worth holding on a three-run resume as
+        well as a two-run one."""
+        import mcp_server
+        repo = _inverted_author_date_repo_with_deps(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        db = await self._run_resume_three(repo, graph, monkeypatch)
+
+        rows = self._results(
+            db,
+            '(query [:find ?i ?vf ?vt :any-valid-time '
+            ':where [?e :ident ?i] '
+            '[?e :db/valid-from ?vf] [?e :db/valid-to ?vt]])',
+        )
+        inverted = [
+            r for r in rows
+            if int(r[2]) < mcp_server._VALID_TIME_FOREVER_MS
+            and int(r[2]) < int(r[1])
+        ]
+        assert inverted == [], f"inverted valid intervals written: {inverted}"
+
+    @pytest.mark.asyncio
+    async def test_resumed_run_mints_no_duplicate_introduced_by(
+        self, tmp_path, monkeypatch
+    ):
+        """The wrong-EXCLUSION consequence: a module missing from the preload
+        takes _build_code_triples' introduction branch on replay and gains a
+        second live :introduced-by.
+
+        NO ABLATION POWER, for the reason that also defeats it in
+        TestResumeWithInvertedAuthorDates plus one more that is specific to
+        the close side. The branch it needs is _build_code_triples'
+        introduction branch, and the only work run 3 has left is Stage B,
+        whose _forward_apply(lifecycle_only=True) DISCARDS that output for
+        "A"/"M" files (it is called for its dict side effects only) and keeps
+        it solely for "R". So the excluded module cannot mint a second
+        :introduced-by here even when it is excluded. Kept because "no entity
+        holds two live :introduced-by values" is a standing #235 invariant and
+        this is a resume path it has not otherwise been checked on."""
+        repo = _inverted_author_date_repo_with_deps(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        db = await self._run_resume_three(repo, graph, monkeypatch)
+
+        rows = self._results(
+            db, '(query [:find ?e (count ?c) :where [?e :introduced-by ?c]])'
+        )
+        assert [r for r in rows if int(r[1]) > 1] == []
 
 
 class _FakeClock:
