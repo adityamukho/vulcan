@@ -7359,7 +7359,7 @@ def _preload_known_entities(
     dict for body-change detection, so a from-the-future description makes a
     real change compare equal and go unrecorded. Membership is position-exact;
     values are not. UNMEASURED -- the #245 exposure probe measured membership
-    only -- and tracked as its own issue.
+    only -- and tracked as #257.
 
     _preload_known_deps and _preload_pinned_commits are position-filtered the
     same way (#245). This function's close side is what made their exposure
