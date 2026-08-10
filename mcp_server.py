@@ -7302,6 +7302,9 @@ def _preload_known_entities(
     valid_at: Optional[str] = None,
     hash_to_pos: Optional[Dict[str, int]] = None,
     watermark_pos: Optional[int] = None,
+    ts_positions: Optional[Dict[str, List[int]]] = None,
+    t_hi_ms: Optional[int] = None,
+    stats: Optional[Dict[str, int]] = None,
 ) -> tuple:
     """Load all existing module/function/class/external-dependency idents from
     the DB, and pre-seed file_entities with all currently tracked files in the
@@ -7330,19 +7333,20 @@ def _preload_known_entities(
     [?c :hash ?hash] -> hash_to_pos[?hash]. So watermark_pos closes the
     unrecoverable direction exactly, with no fact-model change (#238).
 
-    The close END is not recoverable at all -- _ingest_close records a close
-    as valid_to = commit_ts_iso and holds no reference to the closing commit.
-    valid_at therefore stays, but is DEMOTED: it no longer carries the safety
-    property, only "how widely do we re-admit entities closed above the
-    watermark". Callers pass the monotone envelope T_hi(W) = max(ts[0..W])
-    rather than ts(W), the widest value that still excludes every close at or
-    below W (a close at position p <= W has valid_to = ts[p] <= T_hi(W), and
-    :valid-at's half-open semantics require valid_at < valid_to).
+    The close END is recovered too, as of #245's work, but by a different
+    route: _ingest_close holds no reference to the closing commit, yet it
+    records valid_to = commit_ts_iso, so the closing POSITION comes from
+    inverting that instant against commit_metadata (_fact_is_live_at_position).
+    An earlier version of this docstring called the close end "not recoverable
+    at all"; that was true of joins and false of inversion.
 
-    This is a REPLACEMENT of the old ts(W) bound, not a union with it. Read
-    #238 before changing it: widening the date bound alone is the "add-back"
-    that looks like a fix and isn't, and
-    test_the_envelope_alone_does_not_close_the_hole pins exactly that.
+    valid_at survives as phase 1's bound and is fed the monotone envelope
+    T_hi(W) = max(ts[0..W]). It no longer carries a safety property in either
+    direction: phase 2 below re-admits the entities it drops, gated on
+    position. Passing ts_positions/t_hi_ms is what enables phase 2 --
+    test_readmission_is_position_gated_not_date_gated pins that the
+    re-admission comes from the position rule and not from a widened date
+    bound, which is the "add-back union" #238 forbids.
 
     Residual, deliberately accepted: an entity introduced at or below W,
     deleted or renamed above W with a close date earlier than T_hi(W), where a
@@ -7350,10 +7354,11 @@ def _preload_known_entities(
     replay mints a duplicate :introduced-by -- the recoverable direction, left
     to #235's sweep.
 
-    :depends-on and :pinned-commit carry no commit reference of any kind, so
-    _preload_known_deps and _preload_pinned_commits get no position clause and
-    stay at ts(W). Tracked as #245; do NOT widen them to the envelope without
-    one, which would make their data-loss direction worse.
+    _preload_known_deps and _preload_pinned_commits are position-filtered the
+    same way (#245). This function's close side is what made their exposure
+    look 16x smaller than it is: four modules deleted above the watermark with
+    an inverted close date dropped out of file_entities, taking 30
+    misclassified :depends-on edges with them before any diff was computed.
 
     Passing all three as None restores the pre-#222 behaviour exactly, which
     is what a fresh graph (no watermark) wants.
@@ -7395,80 +7400,148 @@ def _preload_known_entities(
     except Exception:
         pass
 
-    # Every clause of the query below is bounded by this one keyword, the
-    # :introduced-by -> :date join included: a commit above the watermark has
-    # a :date fact whose own valid-from is later than valid_at, so the join
-    # simply finds nothing for it.
-    valid_at_clause = f':valid-at "{_edn_escape(valid_at)}" ' if valid_at else ""
+    def _collect(valid_at_str: Optional[str], accept) -> None:
+        """Run the structural preload query at one instant and fold accepted
+        rows into the shared output dicts.
 
-    for entity_type in ("module", "function", "class", "variable", "field", "external-dependency"):
-        path_attr = "path" if entity_type in ("module", "external-dependency") else "file"
-        try:
-            raw = _db_execute(
-                db,
-                f'(query [:find ?ident ?path ?desc ?date ?hash '
-                f'{valid_at_clause}'
-                f':where [?e :entity-type :type/{entity_type}] '
-                f'[?e :ident ?ident] '
-                f'[?e :{path_attr} ?path] '
-                f'[?e :description ?desc] '
-                f'[?e :introduced-by ?c] '
-                f'[?c :date ?date] '
-                f'[?c :hash ?hash]])',
+        accept(ident) -> bool selects rows; the introduction position clause
+        is applied here, so it governs phase 1 and every re-admission pass
+        alike.
+        """
+        valid_at_clause = (
+            f':valid-at "{_edn_escape(valid_at_str)}" ' if valid_at_str else ""
+        )
+        for entity_type in (
+            "module", "function", "class", "variable", "field",
+            "external-dependency",
+        ):
+            path_attr = (
+                "path" if entity_type in ("module", "external-dependency")
+                else "file"
             )
-            rows = json.loads(raw).get("results", [])
-            for ident, path, desc, date, hash_ in rows:
-                # #238: the resume bound, POSITION-indexed. This clause is
-                # CONJUNCTIVE over every row -- that is what makes the widened
-                # valid_at envelope safe, and it is the distinction #238
-                # insists on. Wrong-INCLUSION (the unrecoverable direction) is
-                # caused solely by the introduction end, which this closes
-                # exactly; the date bound above only governs how widely
-                # entities closed ABOVE the watermark are re-admitted. Never
-                # turn this into an "add-back" branch beside the date bound --
-                # that re-admits the benign direction and leaves data loss
-                # wide open.
-                #
-                # pos is None means the introducing commit is not in this
-                # linearization (a rewritten or foreign history): exclude,
-                # which is the benign direction.
-                if watermark_pos is not None:
-                    pos = hash_to_pos.get(hash_) if hash_to_pos is not None else None
-                    if pos is None or pos > watermark_pos:
+            try:
+                raw = _db_execute(
+                    db,
+                    f'(query [:find ?ident ?path ?desc ?date ?hash '
+                    f'{valid_at_clause}'
+                    f':where [?e :entity-type :type/{entity_type}] '
+                    f'[?e :ident ?ident] '
+                    f'[?e :{path_attr} ?path] '
+                    f'[?e :description ?desc] '
+                    f'[?e :introduced-by ?c] '
+                    f'[?c :date ?date] '
+                    f'[?c :hash ?hash]])',
+                )
+                rows = json.loads(raw).get("results", [])
+                for ident, path, desc, date, hash_ in rows:
+                    if not accept(ident):
                         continue
-                entity_valid_from[ident] = date
-                entity_descriptions[ident] = desc
-                # Reconstructed from ?hash, not read off a bound ?c, and
-                # deliberately so (final-review Finding 3): ?c is a SUBJECT
-                # variable here ([?e :introduced-by ?c] [?c :date ?date]
-                # [?c :hash ?hash]), and binding a subject variable in :find
-                # position returns minigraf's internal UUID, not the keyword
-                # ident string -- the same reason _preload_known_deps binds
-                # ?srci instead of ?src and _preload_pinned_commits binds ?ei
-                # instead of ?e (see their docstrings, and #141's root-cause
-                # note at _rebuild_index_from_graph). Verified empirically
-                # for ?c specifically, not just assumed by analogy: adding
-                # ?c to this query's :find list returns a UUID like
-                # "bd5e9774-8fbd-5ec4-81e8-7310073fa5c3", never
-                # ":commit/abc123456789". Reconstructing via f":commit/
-                # {hash_[:12]}" is therefore correct AND necessary, not a
-                # missed opportunity to simplify -- it must stay byte-for-
-                # byte identical to the commit_ident both write sites
-                # (mcp_server.py, the forward-walk and _forward_apply commit
-                # triples) build the same way, since this value becomes the
-                # :introduced-by retract value at close time (#231) and a
-                # silent mismatch would make that retract a no-op.
-                # test_entity_introduced_by_matches_commit_write_site pins
-                # this against the real write sites, not just this format
-                # string in isolation.
-                entity_introduced_by[ident] = f":commit/{hash_[:12]}"
-                file_entities.setdefault(path, [])
-                if ident not in file_entities[path]:
-                    file_entities[path].append(ident)
-                if entity_type == "external-dependency":
-                    submodule_paths[ident] = path
-        except Exception:
-            pass
+                    # #238: the resume bound, POSITION-indexed. CONJUNCTIVE
+                    # over every row, in every pass. Wrong-INCLUSION (the
+                    # unrecoverable direction) is caused solely by the
+                    # introduction end, which this closes exactly. Never turn
+                    # this into an "add-back" branch beside a date bound.
+                    #
+                    # pos is None means the introducing commit is not in this
+                    # linearization (a rewritten or foreign history): exclude,
+                    # which is the benign direction.
+                    if watermark_pos is not None:
+                        pos = (
+                            hash_to_pos.get(hash_)
+                            if hash_to_pos is not None else None
+                        )
+                        if pos is None or pos > watermark_pos:
+                            continue
+                    entity_valid_from[ident] = date
+                    entity_descriptions[ident] = desc
+                    # Reconstructed from ?hash, not read off a bound ?c:
+                    # ?c is a SUBJECT variable here, and binding a subject in
+                    # :find position returns minigraf's internal UUID, not the
+                    # keyword ident string -- verified empirically for ?c
+                    # specifically (adding it to :find returns a UUID like
+                    # "bd5e9774-8fbd-5ec4-81e8-7310073fa5c3"), the same reason
+                    # _preload_known_deps binds ?srci and
+                    # _preload_pinned_commits binds ?ei. This value becomes
+                    # the :introduced-by retract value at close time (#231),
+                    # so it must stay byte-for-byte identical to the
+                    # commit_ident both write sites build;
+                    # test_entity_introduced_by_matches_commit_write_site
+                    # pins that against the real write sites.
+                    entity_introduced_by[ident] = f":commit/{hash_[:12]}"
+                    file_entities.setdefault(path, [])
+                    if ident not in file_entities[path]:
+                        file_entities[path].append(ident)
+                    if entity_type == "external-dependency":
+                        submodule_paths[ident] = path
+            except Exception:
+                pass
+
+    # Phase 1: everything live at the envelope.
+    _collect(valid_at, lambda ident: True)
+
+    # Phase 2 (#238 close side, #245): entities phase 1 missed because their
+    # close DATE fell at or below the envelope while their close POSITION sits
+    # above the watermark.
+    #
+    # `[(<= ?vt t_hi_ms)]` is NOT a sound bound in isolation -- a close above W
+    # can carry an arbitrarily early date, which is the defect. It is sound
+    # only as the COMPLEMENT of phase 1: an entity missing from a
+    # :valid-at T_hi(W) query has either vt <= T_hi(W) or vf > T_hi(W), and
+    # vf > T_hi(W) implies intro_pos > W (every position at or below W has a
+    # date at or below the envelope) and is correctly excluded. Never lift
+    # this clause into a standalone query.
+    #
+    # Only :ident's own window is bound here, not :path or :description:
+    # :ident is written once per entity lifetime, so this is roughly one
+    # interval per entity, while :description is rewritten on every body edit
+    # and would explode the row count under :any-valid-time.
+    position_mode = (
+        watermark_pos is not None
+        and ts_positions is not None
+        and t_hi_ms is not None
+    )
+    if position_mode:
+        readmit: Dict[str, int] = {}
+        for entity_type in (
+            "module", "function", "class", "variable", "field",
+            "external-dependency",
+        ):
+            try:
+                raw = _db_execute(
+                    db,
+                    f'(query [:find ?ident ?vf ?vt :any-valid-time '
+                    f':where [?e :entity-type :type/{entity_type}] '
+                    f'[?e :ident ?ident] '
+                    f'[?e :db/valid-from ?vf] '
+                    f'[?e :db/valid-to ?vt] '
+                    f'[(<= ?vt {t_hi_ms})]])',
+                )
+                for ident, vf_ms, vt_ms in json.loads(raw).get("results", []):
+                    if ident in entity_valid_from:
+                        continue
+                    # vf here is the INTERVAL's own start, used for interval
+                    # selection among an ident's several lifetimes. The
+                    # AUTHORITATIVE introduction gate is _collect's
+                    # :introduced-by position clause, applied independently to
+                    # every re-admitted row below. Both gates apply.
+                    if not _fact_is_live_at_position(
+                        vf_ms, vt_ms, watermark_pos, ts_positions, stats
+                    ):
+                        continue
+                    readmit[ident] = vt_ms
+            except Exception:
+                pass
+
+        # One re-admission pass per DISTINCT closing instant, at the last
+        # instant those entities were live. On the repository this was
+        # developed against that is a single extra query, for df6b8be.
+        for close_ms in sorted(set(readmit.values())):
+            _collect(
+                _epoch_ms_to_iso(close_ms - 1),
+                lambda ident, _c=close_ms: (
+                    readmit.get(ident) == _c and ident not in entity_valid_from
+                ),
+            )
 
     return (
         entity_valid_from, entity_descriptions, entity_introduced_by,

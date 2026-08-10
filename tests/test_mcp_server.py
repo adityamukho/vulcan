@@ -10311,6 +10311,146 @@ class TestPreloadPinnedCommitsPositionBound:
         assert ":external-dependency/sub-open-above" in pinned
 
 
+class TestPreloadKnownEntitiesCloseSide:
+    """#238's close-side residual, and the reason #245's observable loss was
+    2 edges rather than 32.
+
+    PR #246 made _preload_known_entities position-correct on its INTRODUCTION
+    side only; its close side stayed a T_hi(W) date bound with the identical
+    author-date inversion. On this repository the four modules deleted by
+    df6b8be at position 124 (vulcan.py plus three test modules) have a close
+    DATE below the envelope but a close POSITION above W, so they vanish from
+    file_entities at positions 118-123 and take 30 misclassified :depends-on
+    edges out of both sides of the diff before it is computed.
+
+    Same linearization as TestPreloadKnownEntitiesPositionBound:
+    0 = c0 @ 2026-04-01, 1 = c1 (WATERMARK) @ 2026-05-02, 2 = c2 @ 2026-04-26.
+    """
+
+    LINEARIZATION = ["c0" * 20, "c1" * 20, "c2" * 20]
+    HASH_TO_POS = {h: i for i, h in enumerate(LINEARIZATION)}
+    WATERMARK_POS = 1
+    T_HI = "2026-05-02T00:00:00Z"
+    TS_POSITIONS = {
+        "2026-04-01T00:00:00Z": [0],
+        "2026-05-02T00:00:00Z": [1],
+        "2026-04-26T00:00:00Z": [2],
+    }
+
+    def _seed(self, real_db):
+        """c0's commit facts stay open so the :introduced-by -> :date -> :hash
+        join still resolves at the re-admission instant.
+
+        closed_above_w: introduced at c0, CLOSED at c2's date. Close date
+            2026-04-26 < T_hi 2026-05-02, so a :valid-at T_hi query misses it,
+            but its close POSITION 2 is above W: still live at W. The
+            vulcan.py shape.
+        closed_below_w: introduced at c0, closed at c1's date, i.e. exactly at
+            the envelope. Close position 1 <= W: genuinely dead at W.
+        """
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            f'[[:commit/c0 :hash "{self.LINEARIZATION[0]}"] '
+            '[:commit/c0 :date "2026-04-01T00:00:00Z"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-26T00:00:00Z"} '
+            '[[:module/closed-above-w :entity-type :type/module] '
+            '[:module/closed-above-w :ident ":module/closed-above-w"] '
+            '[:module/closed-above-w :path "vulcan.py"] '
+            '[:module/closed-above-w :description "vulcan.py"] '
+            '[:module/closed-above-w :introduced-by :commit/c0]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-05-02T00:00:00Z"} '
+            '[[:module/closed-below-w :entity-type :type/module] '
+            '[:module/closed-below-w :ident ":module/closed-below-w"] '
+            '[:module/closed-below-w :path "gone.py"] '
+            '[:module/closed-below-w :description "gone.py"] '
+            '[:module/closed-below-w :introduced-by :commit/c0]])'
+        )
+
+    def _run(self, real_db, tmp_path):
+        import mcp_server
+        return mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+            hash_to_pos=self.HASH_TO_POS, watermark_pos=self.WATERMARK_POS,
+            ts_positions=self.TS_POSITIONS,
+            t_hi_ms=mcp_server._iso_to_epoch_ms(self.T_HI),
+        )
+
+    def test_entity_closed_above_the_watermark_is_readmitted(self, real_db, tmp_path):
+        """Fails on master: the T_hi(W) date bound drops it."""
+        self._seed(real_db)
+        entity_valid_from, *_ = self._run(real_db, tmp_path)
+        assert ":module/closed-above-w" in entity_valid_from
+
+    def test_readmitted_entity_carries_its_path_and_description(self, real_db, tmp_path):
+        """The re-admission pass must produce full rows, not bare idents --
+        file_entities is what _preload_known_deps' ident_to_file narrows
+        against, and it is where the 30 edges were lost."""
+        self._seed(real_db)
+        _vf, descriptions, _ib, file_entities, _sp = self._run(real_db, tmp_path)
+        assert descriptions[":module/closed-above-w"] == "vulcan.py"
+        assert ":module/closed-above-w" in file_entities["vulcan.py"]
+
+    def test_readmitted_entity_carries_its_introducing_commit(self, real_db, tmp_path):
+        """#231's retract value must survive re-admission."""
+        self._seed(real_db)
+        _vf, _d, entity_introduced_by, _fe, _sp = self._run(real_db, tmp_path)
+        assert entity_introduced_by[":module/closed-above-w"] == (
+            f":commit/{self.LINEARIZATION[0][:12]}"
+        )
+
+    def test_entity_closed_at_or_below_the_watermark_stays_excluded(
+        self, real_db, tmp_path
+    ):
+        """Re-admission must not become an unconditional add-back."""
+        self._seed(real_db)
+        entity_valid_from, *_ = self._run(real_db, tmp_path)
+        assert ":module/closed-below-w" not in entity_valid_from
+
+    def test_readmission_is_position_gated_not_date_gated(self, real_db, tmp_path):
+        """The close-side twin of test_the_envelope_alone_does_not_close_the
+        _hole. Without ts_positions/t_hi_ms there is no phase 2 at all, so the
+        entity stays lost -- proving re-admission comes from the position
+        rule and not from a widened date bound."""
+        import mcp_server
+        self._seed(real_db)
+        entity_valid_from, *_ = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+            hash_to_pos=self.HASH_TO_POS, watermark_pos=self.WATERMARK_POS,
+        )
+        assert ":module/closed-above-w" not in entity_valid_from
+
+    def test_reintroduced_entity_keeps_its_current_values(self, real_db, tmp_path):
+        """An ident closed below W and re-introduced below W is live via phase
+        1. Phase 2 must not overwrite it with the historical interval."""
+        import mcp_server
+        self._seed(real_db)
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-20T00:00:00Z"} '
+            '[[:module/recycled :entity-type :type/module] '
+            '[:module/recycled :ident ":module/recycled"] '
+            '[:module/recycled :path "recycled.py"] '
+            '[:module/recycled :description "OLD"] '
+            '[:module/recycled :introduced-by :commit/c0]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-26T00:00:00Z"} '
+            '[[:module/recycled :entity-type :type/module] '
+            '[:module/recycled :ident ":module/recycled"] '
+            '[:module/recycled :path "recycled.py"] '
+            '[:module/recycled :description "NEW"] '
+            '[:module/recycled :introduced-by :commit/c0]])'
+        )
+        _vf, descriptions, _ib, _fe, _sp = self._run(real_db, tmp_path)
+        assert descriptions[":module/recycled"] == "NEW"
+
+
 class TestEpochMsToIso:
     def test_round_trips_a_commit_instant(self):
         import mcp_server
