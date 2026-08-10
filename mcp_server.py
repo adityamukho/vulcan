@@ -7348,11 +7348,18 @@ def _preload_known_entities(
     re-admission comes from the position rule and not from a widened date
     bound, which is the "add-back union" #238 forbids.
 
-    Residual, deliberately accepted: an entity introduced at or below W,
-    deleted or renamed above W with a close date earlier than T_hi(W), where a
-    prior run's Stage B already applied that deletion. It is excluded, so
-    replay mints a duplicate :introduced-by -- the recoverable direction, left
-    to #235's sweep.
+    Residual, and it is no longer about membership: phase 2 re-admits exactly
+    the entity this paragraph used to describe as excluded (introduced at or
+    below W, deleted or renamed above W, close date earlier than T_hi(W)).
+    Membership is position-exact in BOTH directions now.
+
+    What survives is VALUES. entity_descriptions still carries whichever
+    :description version was live at DATE T_hi(W), which can be a version
+    written above W with an inverted author date. The forward walk uses this
+    dict for body-change detection, so a from-the-future description makes a
+    real change compare equal and go unrecorded. Membership is position-exact;
+    values are not. UNMEASURED -- the #245 exposure probe measured membership
+    only -- and tracked as its own issue.
 
     _preload_known_deps and _preload_pinned_commits are position-filtered the
     same way (#245). This function's close side is what made their exposure
