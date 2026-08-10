@@ -7810,7 +7810,13 @@ def _fact_is_live_at_position(
 
 
 def _preload_known_deps(
-    db: Any, file_entities: Dict[str, List[str]], valid_at_ms: Optional[int] = None
+    db: Any,
+    file_entities: Dict[str, List[str]],
+    valid_at_ms: Optional[int] = None,
+    ts_positions: Optional[Dict[str, List[int]]] = None,
+    watermark_pos: Optional[int] = None,
+    t_hi_ms: Optional[int] = None,
+    stats: Optional[Dict[str, int]] = None,
 ) -> tuple:
     """Reload file_deps/dep_valid_from from durable :depends-on facts.
 
@@ -7828,15 +7834,26 @@ def _preload_known_deps(
     [valid_from, valid_to) containing valid_at_ms, which is exactly
     :valid-at's own half-open semantics.
 
-    #238/#245: this bound is still ts(W), NOT the monotone envelope
-    _preload_known_entities now takes, and it has no position clause. A
-    :depends-on fact carries no commit reference of any kind -- its
-    introduction timestamp comes from its own :db/valid-from -- so there is
-    nothing to join to a :hash and no position to filter on. Widening it to
-    the envelope WITHOUT a position clause would make its data-loss direction
-    worse, which is exactly the union #238 forbids. It therefore retains
-    #238's residual in both directions. Tracked as #245; do not "fix" this by
-    widening the bound.
+    #238/#245: membership is now decided by POSITION, not by date. A
+    :depends-on fact carries no commit reference, but its :db/valid-from and
+    :db/valid-to are always some commit's author date (every write site dates
+    them from commit_ts_iso), so _fact_is_live_at_position recovers both
+    endpoints' positions by inverting the timestamp. #245's own text says
+    these sites "admit no position filter"; that is true of JOINS and false of
+    POSITIONS, and the inversion only became available once PR #246 moved the
+    full-history commit_metadata above the preload block.
+
+    The `[(<= ?vf t_hi_ms)]` clause is a PREFILTER for row-count reduction and
+    carries no safety property: a fact introduced at position p <= W has
+    vf = ts[p] <= T_hi(W), so it drops only rows the position rule would drop
+    anyway. There is deliberately NO clause on ?vt -- a close above W can
+    carry an arbitrarily early date, which is the whole defect.
+    Widening the prefilter without the position filter is the "add-back union"
+    #238 forbids; test_the_prefilter_alone_does_not_close_the_hole pins that.
+
+    position_mode off (no watermark, or a watermark absent from this
+    linearization) restores today's ts(W) date window exactly, which is
+    narrower than open-facts-only and therefore the safer degradation.
 
     Mirrors _preload_known_entities, but :depends-on facts have no
     :introduced-by-style companion edge to a commit's :date, so the
@@ -7865,6 +7882,16 @@ def _preload_known_deps(
         _code_ident("module", file_path): file_path for file_path in file_entities
     }
 
+    position_mode = (
+        watermark_pos is not None
+        and ts_positions is not None
+        and t_hi_ms is not None
+    )
+    window_clauses = (
+        f"[(<= ?vf {t_hi_ms})]" if position_mode
+        else _valid_time_window_clauses(valid_at_ms)
+    )
+
     try:
         # Bind the source module's :ident object (the canonical ":module/…"
         # string _code_ident produces), not the bare ?src subject variable —
@@ -7883,26 +7910,27 @@ def _preload_known_deps(
         # attribute clauses preserves the correct binding.
         raw = _db_execute(
             db,
-            "(query [:find ?srci ?dep ?vf "
+            "(query [:find ?srci ?dep ?vf ?vt "
             ":any-valid-time "
             ":where [?src :ident ?srci] "
             "[?src :depends-on ?dep] "
             "[?src :db/valid-from ?vf] "
             "[?src :db/valid-to ?vt] "
-            f"{_valid_time_window_clauses(valid_at_ms)}])"
+            f"{window_clauses}])"
         )
         rows = json.loads(raw).get("results", [])
     except Exception:
         return file_deps, dep_valid_from
 
-    for src_ident, dep_ident, vf_ms in rows:
+    for src_ident, dep_ident, vf_ms, vt_ms in rows:
         file_path = ident_to_file.get(src_ident)
         if file_path is None:
             continue
-        vf_iso = (
-            datetime.datetime.fromtimestamp(vf_ms / 1000, datetime.timezone.utc)
-            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        )
+        if position_mode and not _fact_is_live_at_position(
+            vf_ms, vt_ms, watermark_pos, ts_positions, stats
+        ):
+            continue
+        vf_iso = _epoch_ms_to_iso(vf_ms)
         file_deps.setdefault(file_path, set()).add(dep_ident)
         dep_valid_from[(src_ident, dep_ident)] = vf_iso
 

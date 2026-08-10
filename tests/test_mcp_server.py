@@ -10101,6 +10101,141 @@ class TestFactIsLiveAtPosition:
         assert stats["unmappable_close"] == 1
 
 
+class TestPreloadKnownDepsPositionBound:
+    """#245: :depends-on membership must be decided by position, not by the
+    watermark commit's own author date.
+
+    Measured on this repository at an affected position: the ts(W) bound
+    wrongly excludes 32 of 68 genuinely live edges (47%), all in the
+    wrong-exclusion direction, once #238's close-side residual is removed.
+    Wrong inclusion is 0 in both framings.
+
+    Linearization: 0 = c0 @ 2026-04-01, 1 = c1 (WATERMARK) @ 2026-05-02,
+    2 = c2 @ 2026-04-26 -- above the watermark but dated EARLIER, the
+    side-branch inversion.
+    """
+
+    TS_POSITIONS = {
+        "2026-04-01T00:00:00Z": [0],
+        "2026-05-02T00:00:00Z": [1],
+        "2026-04-26T00:00:00Z": [2],
+    }
+    WATERMARK_POS = 1
+
+    def _t_hi_ms(self):
+        import mcp_server
+        return mcp_server._iso_to_epoch_ms("2026-05-02T00:00:00Z")
+
+    def _seed(self, real_db):
+        """Four edges out of one module, one per quadrant of the rule."""
+        import mcp_server
+        src = mcp_server._code_ident("module", "mod_a.py")
+        real_db.execute(
+            f'(transact [[{src} :entity-type :type/module] '
+            f'[{src} :ident "{src}"]])'
+        )
+        # open, introduced at c0 (pos 0 <= W): live.
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            f'[[{src} :depends-on :module/open-below-w]])'
+        )
+        # open, introduced at c2 (pos 2 > W): NOT live. Today's ts(W) bound
+        # admits it, because c2's date is earlier than the watermark's.
+        real_db.execute(
+            '(transact {:valid-from "2026-04-26T00:00:00Z"} '
+            f'[[{src} :depends-on :module/open-above-w]])'
+        )
+        # closed at c2 (pos 2 > W): still live at W. Today's bound drops it,
+        # because the close DATE is below the envelope. This is the 47%.
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-26T00:00:00Z"} '
+            f'[[{src} :depends-on :module/closed-above-w]])'
+        )
+        # closed at c1 (pos 1 <= W): genuinely dead at W.
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-05-02T00:00:00Z"} '
+            f'[[{src} :depends-on :module/closed-below-w]])'
+        )
+        return src
+
+    def _run(self, real_db):
+        import mcp_server
+        file_deps, dep_valid_from = mcp_server._preload_known_deps(
+            real_db, {"mod_a.py": []},
+            ts_positions=self.TS_POSITIONS,
+            watermark_pos=self.WATERMARK_POS,
+            t_hi_ms=self._t_hi_ms(),
+        )
+        return file_deps.get("mod_a.py", set()), dep_valid_from
+
+    def test_edge_closed_above_the_watermark_is_reloaded(self, real_db):
+        """#245's measured direction. Excluded, the forward walk treats an
+        already-standing dependency as newly introduced and overwrites its
+        true :valid-from."""
+        self._seed(real_db)
+        deps, _ = self._run(real_db)
+        assert ":module/closed-above-w" in deps
+
+    def test_edge_introduced_above_the_watermark_is_excluded(self, real_db):
+        """The data-loss direction: present in the preload but absent from the
+        earlier commit's resolved imports on replay, so it is closed at that
+        earlier commit -- an inverted valid interval on the edge."""
+        self._seed(real_db)
+        deps, _ = self._run(real_db)
+        assert ":module/open-above-w" not in deps
+
+    def test_edge_closed_at_or_below_the_watermark_is_excluded(self, real_db):
+        self._seed(real_db)
+        deps, _ = self._run(real_db)
+        assert ":module/closed-below-w" not in deps
+
+    def test_open_edge_below_the_watermark_is_reloaded(self, real_db):
+        self._seed(real_db)
+        deps, _ = self._run(real_db)
+        assert ":module/open-below-w" in deps
+
+    def test_valid_from_is_the_edge_s_own_introduction(self, real_db):
+        """dep_valid_from must still carry the edge's true :valid-from, which
+        is what removed-dependency detection compares against."""
+        src = self._seed(real_db)
+        _, dep_valid_from = self._run(real_db)
+        assert dep_valid_from[(src, ":module/closed-above-w")].startswith(
+            "2026-04-01T00:00:00"
+        )
+
+    def test_the_prefilter_alone_does_not_close_the_hole(self, real_db):
+        """The close-side twin of
+        TestPreloadKnownEntitiesPositionBound.test_the_envelope_alone_does_not
+        _close_the_hole. Widening the date clause to `[(<= ?vf T_hi)]` WITHOUT
+        the position filter re-admits the above-W edge -- the 'add-back union'
+        #238 forbids. Position mode is off here because watermark_pos is None,
+        so this call exercises exactly that shape."""
+        import mcp_server
+        self._seed(real_db)
+        file_deps, _ = mcp_server._preload_known_deps(
+            real_db, {"mod_a.py": []},
+            ts_positions=self.TS_POSITIONS,
+            watermark_pos=None,
+            t_hi_ms=self._t_hi_ms(),
+        )
+        assert ":module/open-above-w" in file_deps.get("mod_a.py", set())
+
+    def test_position_args_omitted_restores_today_s_behaviour(self, real_db):
+        """The degraded path: a watermark absent from this linearization keeps
+        the ts(W) date window rather than dropping to open-facts-only."""
+        import mcp_server
+        self._seed(real_db)
+        file_deps, _ = mcp_server._preload_known_deps(
+            real_db, {"mod_a.py": []},
+            valid_at_ms=mcp_server._iso_to_epoch_ms("2026-05-02T00:00:00Z"),
+        )
+        deps = file_deps.get("mod_a.py", set())
+        assert ":module/open-above-w" in deps       # the residual, unchanged
+        assert ":module/closed-above-w" not in deps  # the residual, unchanged
+
+
 class TestEpochMsToIso:
     def test_round_trips_a_commit_instant(self):
         import mcp_server
