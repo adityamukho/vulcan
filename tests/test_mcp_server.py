@@ -11385,6 +11385,14 @@ class TestRunIngestionShutdown:
         stop_once = {"done": False}
 
         async def stop_after_first(t):
+            # Only the per-commit yield, `asyncio.sleep(0)`, marks a commit
+            # boundary. _ensure_db_async's lock-contention backoff also sleeps,
+            # with a non-zero delay, and tripping the shutdown on that would
+            # stop the run at an arbitrary point instead of after commit 1 --
+            # see the same guard in TestResumeWithInvertedAuthorDates.
+            if t:
+                await original_sleep(t)
+                return
             if not stop_once["done"]:
                 stop_once["done"] = True
                 mcp_server._shutdown_requested.set()
@@ -19698,6 +19706,18 @@ class TestResumeWithInvertedAuthorDates:
         sleep_calls = {"n": 0}
 
         async def stop_after_fourth(t):
+            # Count only the per-commit yield, `asyncio.sleep(0)`. Counting
+            # every sleep made this a proxy for "commits processed" that any
+            # other sleeper could perturb -- notably _ensure_db_async's
+            # lock-contention backoff, which sleeps with a non-zero delay. Once
+            # the same-process open became retryable (#253), a single retry
+            # under load consumed one of these counts and tripped the shutdown
+            # a commit early, so `processed` came out 3 instead of 4. That was
+            # a real failure on CI and invisible locally, because only a
+            # contended machine retries at all.
+            if t:
+                await original_sleep(t)
+                return
             sleep_calls["n"] += 1
             if sleep_calls["n"] == 4:
                 mcp_server._shutdown_requested.set()
