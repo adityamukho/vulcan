@@ -8309,7 +8309,10 @@ def _load_ingestion_preload_state(
     # widening #245 forbids. With t_hi_ms None they keep the ts(W) date
     # window, which is strictly no worse than today.
     #
-    # resume_valid_at survives for _preload_unresolved_dep_idents only.
+    # resume_valid_at (the ISO string) survives for _preload_unresolved_dep_idents
+    # only. resume_valid_at_ms (derived above) is different: it remains the
+    # degraded-path bound for _preload_known_deps and _preload_pinned_commits,
+    # used whenever position_mode is off in either.
     entity_valid_at = _resume_envelope(commit_metadata, watermark_pos)
     t_hi_ms = _iso_to_epoch_ms(entity_valid_at)
     assert watermark_pos is not None or t_hi_ms is None, (
