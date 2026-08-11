@@ -14,15 +14,16 @@ nothing and does not belong here.
 import pytest
 
 from evals.at_scale.probe_ident_collision_census import (
+    RULES,
+    SHAPES,
     EntityInput,
+    classify_shapes,
     current_ident,
     group_by_ident,
     offenders,
     raw_value,
-)
-from evals.at_scale.probe_ident_collision_census import (  # noqa: E402
-    SHAPES,
-    classify_shapes,
+    score_all_rules,
+    score_rule,
 )
 
 
@@ -178,13 +179,6 @@ class TestClassifyShapes:
     def test_every_emitted_label_is_declared_in_SHAPES(self):
         members = [_fn("a/b.py", "_foo"), _fn("a/b.py", "foo")]
         assert classify_shapes(members) <= set(SHAPES)
-
-
-from evals.at_scale.probe_ident_collision_census import (  # noqa: E402
-    RULES,
-    score_all_rules,
-    score_rule,
-)
 
 
 def _known_collision_inputs():
