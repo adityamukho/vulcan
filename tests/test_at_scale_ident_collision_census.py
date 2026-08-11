@@ -138,6 +138,36 @@ class TestClassifyShapes:
         ]
         assert "cross-producer" in classify_shapes(members)
 
+    def test_private_pascal_case_beside_public_snake_case_is_leading_underscore(self):
+        """_Config/config and _Handler/handler are ordinary Python and they DO
+        collide (both -> :function/a-b-py-foo for _Foo/foo). An exact-case
+        _strip_private comparison drops them into "other", which is reserved
+        for UNPREDICTED families -- hiding a predicted one.
+
+        Counterfactual: with _strip_private compared exact-case, this pair
+        yields {"other"} and this test fails.
+        """
+        members = [_fn("a/b.py", "_Foo"), _fn("a/b.py", "foo")]
+        assert current_ident(members[0]) == current_ident(members[1])
+        assert "leading-underscore" in classify_shapes(members)
+
+    def test_a_producer_only_difference_is_not_a_case_collision(self):
+        """Two inputs whose raw values are byte-identical differ only in
+        producer -- exactly the cross-producer collision this audit exists to
+        find. Labelling them "case-only" asserts a case difference that is not
+        there.
+
+        Counterfactual: without the `a_raw != b_raw` guard, casefold equality
+        holds trivially and "case-only" is emitted.
+        """
+        members = [
+            EntityInput("module", "code", "vendor/x", None),
+            EntityInput("module", "gitlink", "vendor/x", None),
+        ]
+        shapes = classify_shapes(members)
+        assert "cross-producer" in shapes
+        assert "case-only" not in shapes
+
     def test_an_unclassifiable_pair_falls_through_to_other(self):
         """'other' is the interesting bucket -- it is where a collision nobody
         predicted shows up. It must be reachable, not vestigial.

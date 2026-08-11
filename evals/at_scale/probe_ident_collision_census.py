@@ -132,15 +132,47 @@ def _strip_private(name: Optional[str]) -> str:
 
 
 def _pair_shapes(a: EntityInput, b: EntityInput) -> Set[str]:
+    """Every collision family this pair belongs to.
+
+    The checks are INDEPENDENT, not an elif chain. A pair can belong to more
+    than one family and the caller returns a set, so making them exclusive
+    would silently drop the second label -- and, worse, would let the winner
+    depend on check order rather than on the data.
+
+    Each check also carries an inequality guard. Without one, "case-only"
+    fires on two inputs whose raw values are byte-identical (a pair differing
+    only in producer -- exactly the cross-producer collision this audit exists
+    to find), asserting a case difference that is not there.
+    """
     shapes: Set[str] = set()
     if a.producer != b.producer:
         shapes.add("cross-producer")
     a_raw, b_raw = raw_value(a), raw_value(b)
-    if a_raw.casefold() == b_raw.casefold():
+    if a_raw != b_raw and a_raw.casefold() == b_raw.casefold():
         shapes.add("case-only")
-    elif a.file_path == b.file_path and _strip_private(a.name) == _strip_private(b.name):
+    # casefold on BOTH sides, so a private PascalCase helper beside a public
+    # snake_case one (_Config/config, _Handler/handler -- ordinary Python) is
+    # still recognised as the underscore family. An exact-case comparison here
+    # drops those into "other", which is reserved for UNPREDICTED families and
+    # so would hide a predicted one.
+    #
+    # The guard compares NAME casefold, not exact name, and requires that
+    # comparison to be UNEQUAL -- i.e. that the pair is not already
+    # explainable by case alone. Without it, a pair with no underscore at
+    # all (Foo/foo) also satisfies the stripped-casefold equality below,
+    # since stripping is a no-op when there is nothing to strip, and
+    # leading-underscore would fire on top of a plain case-only pair. That
+    # is the same false-positive shape as Finding 1, just on the other
+    # check.
+    a_name_cf = (a.name or "").casefold()
+    b_name_cf = (b.name or "").casefold()
+    if (
+        a_name_cf != b_name_cf
+        and a.file_path == b.file_path
+        and _strip_private(a.name).casefold() == _strip_private(b.name).casefold()
+    ):
         shapes.add("leading-underscore")
-    elif a.file_path != b.file_path or (a.name is None) != (b.name is None):
+    if a.file_path != b.file_path or (a.name is None) != (b.name is None):
         # The two inputs put the path/name boundary in different places, so
         # the ident cannot say where the path ended -- the collision family
         # _code_ident's docstring already anticipates.
@@ -151,9 +183,9 @@ def _pair_shapes(a: EntityInput, b: EntityInput) -> Set[str]:
 def classify_shapes(members: Sequence[EntityInput]) -> Set[str]:
     """Label an offender by every collision family present among its inputs.
 
-    An offender may carry more than one label (a cross-producer collision is
-    usually also something else), so this returns a set rather than picking a
-    single winner. "other" is emitted only when nothing else applied: it is
+    An offender may carry more than one label -- the per-pair checks are
+    independent, not exclusive, so a cross-producer collision is usually also
+    something else. "other" is emitted only when nothing else applied: it is
     where an unpredicted collision family would surface, and collapsing it
     into any named label would hide exactly the finding worth having.
     """
