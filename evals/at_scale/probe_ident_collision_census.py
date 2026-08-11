@@ -30,10 +30,22 @@ See docs/superpowers/specs/2026-08-11-ident-collision-audit-design.md.
 
 from __future__ import annotations
 
+import hashlib
+import re
 import sys
 from itertools import combinations
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set
+from typing import (
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 _REPO_ROOT = Path(__file__).parent.parent.parent.resolve()
 if str(_REPO_ROOT) not in sys.path:
@@ -195,3 +207,119 @@ def classify_shapes(members: Sequence[EntityInput]) -> Set[str]:
     if not shapes - {"cross-producer"}:
         shapes.add("other")
     return shapes
+
+
+def _slug_current(value: str) -> str:
+    """_canonical_ident's slug, verbatim (mcp_server.py:4097-4098)."""
+    slug = re.sub(r"[^a-z0-9-]", "-", value.lower())
+    return re.sub(r"-+", "-", slug).strip("-")
+
+
+def _slug_keep_underscore(value: str) -> str:
+    """R1: '_' joins the allowed charset, so a private marker survives."""
+    slug = re.sub(r"[^a-z0-9_-]", "-", value.lower())
+    return re.sub(r"-+", "-", slug).strip("-")
+
+
+def _slug_no_collapse(value: str) -> str:
+    """R2: hyphen runs are preserved, so separator arity carries the marker
+    ('py---commit' against 'py--commit')."""
+    return re.sub(r"[^a-z0-9-]", "-", value.lower()).strip("-")
+
+
+def _slug_keep_underscore_no_collapse(value: str) -> str:
+    """R3: R1 and R2 together."""
+    return re.sub(r"[^a-z0-9_-]", "-", value.lower()).strip("-")
+
+
+def _ident_from_slug(slug_fn: Callable[[str], str]) -> Callable[[EntityInput], str]:
+    def ident(inp: EntityInput) -> str:
+        return f":{inp.entity_type}/{slug_fn(raw_value(inp))}"
+
+    return ident
+
+
+def _ident_hash_suffix(inp: EntityInput) -> str:
+    """R4: the current slug plus 8 hex of sha256 over the RAW value.
+
+    Hashing the raw value, before lowercasing, is what separates a case-only
+    collision as well -- the slug alone cannot.
+    """
+    value = raw_value(inp)
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    return f":{inp.entity_type}/{_slug_current(value)}-{digest}"
+
+
+def _ident_independent_parts(inp: EntityInput) -> str:
+    """R5, the CONTROL. Slugs file_path and name separately and joins them
+    with a fixed token.
+
+    This is expected to FAIL. _slug_current strips leading hyphens, so a name
+    of "_commit" reduces to "commit" exactly as "commit" does, and the pair
+    still collides. R5 exists so score_all_rules has a known-negative: if it
+    ever reports zero residual on a history with leading-underscore pairs, the
+    scorer is wrong and every other row it produced is suspect.
+    """
+    path_slug = _slug_current(inp.file_path)
+    if inp.name is None:
+        return f":{inp.entity_type}/{path_slug}"
+    return f":{inp.entity_type}/{path_slug}--{_slug_current(inp.name)}"
+
+
+RULES: Dict[str, Tuple[str, Callable[[EntityInput], str]]] = {
+    "R1": (
+        "keep underscores: charset becomes [^a-z0-9_-]",
+        _ident_from_slug(_slug_keep_underscore),
+    ),
+    "R2": (
+        "no hyphen collapse: drop re.sub(r'-+', '-', slug)",
+        _ident_from_slug(_slug_no_collapse),
+    ),
+    "R3": (
+        "R1 + R2: keep underscores and drop the collapse",
+        _ident_from_slug(_slug_keep_underscore_no_collapse),
+    ),
+    "R4": (
+        "hash suffix: current slug + '-' + sha256(raw value)[:8]",
+        _ident_hash_suffix,
+    ),
+    "R5": (
+        "CONTROL, expected to still collide: slug file_path and name "
+        "independently, join with '--'",
+        _ident_independent_parts,
+    ),
+}
+
+
+def score_rule(
+    inputs: Sequence[EntityInput],
+    ident_fn: Callable[[EntityInput], str],
+    baseline_groups: Dict[str, List[EntityInput]],
+) -> Dict[str, int]:
+    """Residual collisions and rename cost for one candidate rule.
+
+    renames counts BASELINE idents, not inputs: a baseline ident is renamed
+    when any input in its group maps somewhere other than that same ident.
+    Rename cost is not a footnote to residual -- every change to derivation
+    renames entities in every existing graph, and that cost is what decides
+    forward-fix against migration.
+    """
+    residual = len(offenders(group_by_ident(inputs, ident_fn)))
+    renames = sum(
+        1
+        for ident, members in baseline_groups.items()
+        if any(ident_fn(member) != ident for member in members)
+    )
+    return {"residual": residual, "renames": renames}
+
+
+def score_all_rules(
+    inputs: Sequence[EntityInput],
+    baseline_groups: Dict[str, List[EntityInput]],
+) -> Dict[str, Dict]:
+    scored = {}
+    for rule_id, (description, ident_fn) in RULES.items():
+        row = score_rule(inputs, ident_fn, baseline_groups)
+        row["description"] = description
+        scored[rule_id] = row
+    return scored

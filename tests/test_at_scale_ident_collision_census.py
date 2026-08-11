@@ -178,3 +178,83 @@ class TestClassifyShapes:
     def test_every_emitted_label_is_declared_in_SHAPES(self):
         members = [_fn("a/b.py", "_foo"), _fn("a/b.py", "foo")]
         assert classify_shapes(members) <= set(SHAPES)
+
+
+from evals.at_scale.probe_ident_collision_census import (  # noqa: E402
+    RULES,
+    score_all_rules,
+    score_rule,
+)
+
+
+def _known_collision_inputs():
+    inputs = []
+    for file_path, private, public in KNOWN_COLLISIONS:
+        inputs.append(_fn(file_path, private))
+        inputs.append(_fn(file_path, public))
+    return inputs
+
+
+class TestCandidateRules:
+    @pytest.mark.parametrize("rule_id", ["R1", "R2", "R3", "R4"])
+    def test_separating_rules_leave_no_residual(self, rule_id):
+        inputs = _known_collision_inputs()
+        _, ident_fn = RULES[rule_id]
+        assert offenders(group_by_ident(inputs, ident_fn)) == {}
+
+    def test_R5_still_collides_and_is_the_scorer_s_known_negative(self):
+        """R5 slugs path and name independently, so strip("-") still eats the
+        leading underscore and _commit/commit both reduce to "commit". R5 is
+        in the table precisely BECAUSE it does not work: a scorer that reports
+        R5 clean is broken, and every other row it produced is suspect.
+        """
+        inputs = _known_collision_inputs()
+        _, ident_fn = RULES["R5"]
+        assert len(offenders(group_by_ident(inputs, ident_fn))) == 3
+
+    @pytest.mark.parametrize("rule_id", ["R1", "R2", "R3", "R4"])
+    def test_every_separating_rule_renames_something(self, rule_id):
+        """A rule that renames nothing cannot have changed derivation, so a
+        zero residual from it would be arithmetic rather than a finding.
+        """
+        inputs = _known_collision_inputs()
+        baseline = group_by_ident(inputs, current_ident)
+        _, ident_fn = RULES[rule_id]
+        assert score_rule(inputs, ident_fn, baseline)["renames"] > 0
+
+    def test_R4_renames_every_ident(self):
+        """Every ident gains a hash suffix, so the rename count equals the
+        baseline ident count. Counterfactual: a renames metric that counted
+        only COLLIDING idents would report 3, not 3-of-3 plus the rest.
+        """
+        inputs = _known_collision_inputs() + [_fn("z/z.py", "solo")]
+        baseline = group_by_ident(inputs, current_ident)
+        _, ident_fn = RULES["R4"]
+        scored = score_rule(inputs, ident_fn, baseline)
+        assert scored["renames"] == len(baseline)
+        assert scored["residual"] == 0
+
+    def test_R2_leaves_a_plain_module_ident_unrenamed(self):
+        """R2 only drops the hyphen collapse. A module input has no '::'
+        separator, so a path with no adjacent non-alphanumerics is untouched.
+        This is what makes R2's rename cost differ by entity type.
+        """
+        module = EntityInput("module", "code", "a/b.py", None)
+        _, ident_fn = RULES["R2"]
+        assert ident_fn(module) == current_ident(module)
+
+    def test_R1_does_rename_that_same_module_ident(self):
+        """The counterfactual for the test above: R1 changes the charset, so
+        an underscore anywhere in the path moves the ident even with no name.
+        """
+        module = EntityInput("module", "code", "a/b_c.py", None)
+        _, ident_fn = RULES["R1"]
+        assert ident_fn(module) != current_ident(module)
+
+    def test_score_all_rules_covers_every_declared_rule(self):
+        inputs = _known_collision_inputs()
+        baseline = group_by_ident(inputs, current_ident)
+        scored = score_all_rules(inputs, baseline)
+        assert set(scored) == set(RULES)
+        for row in scored.values():
+            assert set(row) == {"description", "residual", "renames"}
