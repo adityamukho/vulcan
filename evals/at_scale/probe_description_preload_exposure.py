@@ -199,3 +199,36 @@ def diff_descriptions(
         "preloaded_not_live": sorted(preloaded_not_live),
         "live_not_preloaded": sorted(live_not_preloaded),
     }
+
+
+def count_unmappable_description_facts(
+    facts: Sequence[Dict],
+    ts_positions: Dict[str, List[int]],
+) -> tuple:
+    """How many :description facts carry a vf_ms/vt_ms whose instant matches no
+    commit -- this probe's validity diagnostic.
+
+    Mirrors probe_dep_preload_exposure.count_unmappable_module_path_facts,
+    applied to :description. An unmappable vf silently drops the fact from the
+    oracle at every W (understating the finding); an unmappable non-sentinel vt
+    silently reads it as never-superseded (overstating it). Either way the
+    timestamp-to-position inversion the whole oracle rests on is broken for at
+    least one fact, so a nonzero count INVALIDATES the measurement rather than
+    adjusting it -- see main()'s exit gate.
+
+    The forever sentinel is an open fact, not a broken inversion, and is
+    excluded from the vt count. Most facts on a live graph are open; counting
+    them would fail every run.
+
+    Returns (unmappable_valid_from, unmappable_valid_to).
+    """
+    unmappable_vf = sum(
+        1 for f in facts
+        if not invert_ms_to_positions(f["vf_ms"], ts_positions)
+    )
+    unmappable_vt = sum(
+        1 for f in facts
+        if f["vt_ms"] < VALID_TIME_FOREVER_MS
+        and not invert_ms_to_positions(f["vt_ms"], ts_positions)
+    )
+    return unmappable_vf, unmappable_vt

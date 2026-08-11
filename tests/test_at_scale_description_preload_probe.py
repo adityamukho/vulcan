@@ -17,6 +17,7 @@ proves nothing about #257.
 from evals.at_scale.probe_description_preload_exposure import (
     ENTITY_TYPES,
     census_distinct_values,
+    count_unmappable_description_facts,
     diff_descriptions,
     position_correct_descriptions,
 )
@@ -187,3 +188,39 @@ class TestDiffDescriptions:
         assert result["live_not_preloaded"] == [":module/only-live"]
         assert result["value_mismatches"] == {}
         assert result["ambiguous_idents"] == []
+
+
+class TestCountUnmappableDescriptionFacts:
+    def test_an_unmappable_valid_from_is_counted(self):
+        """An unmappable introduction silently drops the fact from the oracle
+        at every W, understating the finding. It has to fail the run rather
+        than shrink it.
+        """
+        facts = [
+            {"entity_type": "module", "ident": ":module/a", "desc": "a",
+             "vf_ms": 1, "vt_ms": VALID_TIME_FOREVER_MS},
+        ]
+        assert count_unmappable_description_facts(
+            facts, build_ts_positions(META)
+        ) == (1, 0)
+
+    def test_an_unmappable_non_sentinel_valid_to_is_counted(self):
+        facts = [
+            {"entity_type": "module", "ident": ":module/a", "desc": "a",
+             "vf_ms": MS_JAN_01, "vt_ms": 7},
+        ]
+        assert count_unmappable_description_facts(
+            facts, build_ts_positions(META)
+        ) == (0, 1)
+
+    def test_the_forever_sentinel_is_not_an_unmappable_close(self):
+        """The sentinel is an open fact, not a broken inversion. Counting it
+        would fail every run on every graph, since most facts are open.
+        """
+        facts = [
+            {"entity_type": "module", "ident": ":module/a", "desc": "a",
+             "vf_ms": MS_JAN_01, "vt_ms": VALID_TIME_FOREVER_MS},
+        ]
+        assert count_unmappable_description_facts(
+            facts, build_ts_positions(META)
+        ) == (0, 0)
