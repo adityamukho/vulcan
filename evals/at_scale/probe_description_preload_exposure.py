@@ -50,8 +50,12 @@ from typing import Dict, List, Sequence
 
 from evals.at_scale.probe_dep_preload_exposure import (
     VALID_TIME_FOREVER_MS,
+    affected_positions,
+    build_ts_positions,
     edge_live_at,
+    gitlink_event_count,
     invert_ms_to_positions,
+    resume_envelopes,
 )
 
 # The entity types _preload_known_entities loads, in its own order
@@ -296,3 +300,143 @@ def load_description_facts(db) -> List[Dict]:
                 "vt_ms": int(vt),
             })
     return facts
+
+
+def sweep(
+    db,
+    repo_path: str,
+    linearization: List[str],
+    commit_metadata: Sequence,
+    branch: str = None,
+) -> Dict:
+    """Run Stage 1's census and Stage 2's per-position value diff, and assemble
+    the report.
+
+    ONE MODE. _preload_known_entities is always driven with its full
+    post-#238/#245 argument set -- valid_at, hash_to_pos, watermark_pos,
+    ts_positions, t_hi_ms -- because #257 is the residual in the SHIPPED code.
+    Passing a subset would silently turn position_mode off inside the function
+    (its gate is watermark_pos AND ts_positions AND t_hi_ms) and this sweep
+    would measure the pre-fix path while believing it measured the shipped one.
+
+    Calls the function under test rather than a restatement of what we believe
+    it does. On the #238 branch a reviewer and an implementer both simulated
+    the counterfactual with a date bound instead of the real position-filtered
+    one, which made an inadequate test look adequate and cost two fix rounds.
+
+    STAGE 1 MAY MAKE STAGE 2 MOOT, but Stage 2 runs regardless. A zero census
+    implies zero mismatches only through an argument about how :description is
+    written; Stage 2 checks the shipped query's actual output and rests on no
+    such argument. Two independent lines of evidence for the price of one
+    ingest.
+
+    provenance: repo_path alone was not enough to reproduce the first #245
+    artifact -- it named a scratch directory that no longer existed, with no
+    branch and no head SHA. branch and head_commit are recorded here so a
+    future run carries its own.
+    """
+    import subprocess
+
+    import mcp_server
+
+    if len(commit_metadata) != len(linearization):
+        raise ValueError(
+            f"commit_metadata has {len(commit_metadata)} entries but "
+            f"linearization has {len(linearization)}; a misaligned pair "
+            "mis-filters the entire sweep"
+        )
+    for i, ((meta_hash, _ts, _a, _s), lin_hash) in enumerate(
+        zip(commit_metadata, linearization)
+    ):
+        if meta_hash != lin_hash:
+            raise ValueError(
+                f"commit_metadata[{i}] is {meta_hash} but linearization[{i}] "
+                f"is {lin_hash}; the two must be positionally aligned"
+            )
+
+    hash_to_pos = {h: i for i, h in enumerate(linearization)}
+    ts_positions = build_ts_positions(commit_metadata)
+    envelopes = resume_envelopes(commit_metadata)
+    collisions = {ts: pos for ts, pos in ts_positions.items() if len(pos) > 1}
+
+    facts = load_description_facts(db)
+    census = census_distinct_values(facts)
+    unmappable_vf, unmappable_vt = count_unmappable_description_facts(
+        facts, ts_positions
+    )
+
+    positions = affected_positions(commit_metadata)
+    per_position = []
+    mismatch_distinct: set = set()
+    mismatch_weighted = 0
+    ambiguous_total = 0
+    preloaded_not_live_total = 0
+    live_not_preloaded_total = 0
+    preload_sizes = []
+
+    for w in positions:
+        (
+            _entity_valid_from, entity_descriptions, _entity_introduced_by,
+            _file_entities, _submodule_paths,
+        ) = mcp_server._preload_known_entities(
+            db, repo_path,
+            valid_at=envelopes[w],
+            hash_to_pos=hash_to_pos,
+            watermark_pos=w,
+            ts_positions=ts_positions,
+            t_hi_ms=mcp_server._iso_to_epoch_ms(envelopes[w]),
+        )
+        oracle = position_correct_descriptions(facts, ts_positions, w)
+        result = diff_descriptions(entity_descriptions, oracle)
+
+        preload_sizes.append(len(entity_descriptions))
+        mismatch_weighted += len(result["value_mismatches"])
+        mismatch_distinct.update(result["value_mismatches"])
+        ambiguous_total += len(result["ambiguous_idents"])
+        preloaded_not_live_total += len(result["preloaded_not_live"])
+        live_not_preloaded_total += len(result["live_not_preloaded"])
+
+        per_position.append({
+            "position": w,
+            "envelope": envelopes[w],
+            "preloaded_idents": len(entity_descriptions),
+            "oracle_idents": len(oracle),
+            "value_mismatches": result["value_mismatches"],
+            "ambiguous_idents": result["ambiguous_idents"],
+            "preloaded_not_live": len(result["preloaded_not_live"]),
+            "live_not_preloaded": len(result["live_not_preloaded"]),
+        })
+
+    head_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_path, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+    return {
+        "repo_path": repo_path,
+        "branch": branch,
+        "head_commit": head_commit,
+        "commits": len(commit_metadata),
+        "affected_positions": positions,
+        "misclassifying_positions": [
+            p["position"] for p in per_position if p["value_mismatches"]
+        ],
+        "description_facts_total": len(facts),
+        "census": census,
+        "census_idents_with_multiple_values": sum(
+            census[t]["idents_with_multiple_values"] for t in ENTITY_TYPES
+        ),
+        "value_mismatch_total_position_weighted": mismatch_weighted,
+        "value_mismatch_distinct_idents": len(mismatch_distinct),
+        "ambiguous_idents_total": ambiguous_total,
+        "preloaded_not_live_total": preloaded_not_live_total,
+        "live_not_preloaded_total": live_not_preloaded_total,
+        "unmappable_description_valid_from": unmappable_vf,
+        "unmappable_description_valid_to": unmappable_vt,
+        "timestamp_collisions": len(collisions),
+        "preload_descriptions_empty_everywhere": (
+            bool(preload_sizes) and all(n == 0 for n in preload_sizes)
+        ),
+        "gitlink_events": gitlink_event_count(repo_path),
+        "per_position": per_position,
+    }
