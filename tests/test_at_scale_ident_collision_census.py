@@ -20,6 +20,10 @@ from evals.at_scale.probe_ident_collision_census import (
     offenders,
     raw_value,
 )
+from evals.at_scale.probe_ident_collision_census import (  # noqa: E402
+    SHAPES,
+    classify_shapes,
+)
 
 
 # The three collisions #257's census actually found on this repository's
@@ -93,3 +97,54 @@ class TestGroupAndOffenders:
         """
         inputs = [_fn("a/b.py", "c")] * 400
         assert offenders(group_by_ident(inputs, current_ident)) == {}
+
+
+class TestClassifyShapes:
+    def test_private_public_pair_in_one_file_is_leading_underscore(self):
+        members = [_fn("a/b.py", "_foo"), _fn("a/b.py", "foo")]
+        assert "leading-underscore" in classify_shapes(members)
+
+    def test_private_public_field_on_one_class_is_leading_underscore(self):
+        """Fields arrive qualified as 'Cls.field', so the private marker sits
+        on the LAST dot-segment, not at the string's start. A classifier using
+        a bare lstrip('_') on the whole qualified name reports 'other' here.
+        """
+        members = [
+            EntityInput("field", "code", "a/b.py", "Cls._x"),
+            EntityInput("field", "code", "a/b.py", "Cls.x"),
+        ]
+        assert "leading-underscore" in classify_shapes(members)
+
+    def test_case_only_pair_is_not_labelled_leading_underscore(self):
+        """The labels must separate. A classifier returning a constant label
+        passes the two tests above and fails this one.
+        """
+        members = [_fn("a/b.py", "Foo"), _fn("a/b.py", "foo")]
+        shapes = classify_shapes(members)
+        assert "case-only" in shapes
+        assert "leading-underscore" not in shapes
+
+    def test_inputs_from_different_files_are_separator_vs_path(self):
+        """The path/name boundary fell differently on the two inputs -- the
+        case _code_ident's own docstring anticipates.
+        """
+        members = [_fn("a/b.py", "c"), _fn("a/b_py", "c")]
+        assert "separator-vs-path" in classify_shapes(members)
+
+    def test_import_and_in_tree_module_are_cross_producer(self):
+        members = [
+            EntityInput("module", "code", "a/b.py", None),
+            EntityInput("module", "import", "a.b.py", None),
+        ]
+        assert "cross-producer" in classify_shapes(members)
+
+    def test_an_unclassifiable_pair_falls_through_to_other(self):
+        """'other' is the interesting bucket -- it is where a collision nobody
+        predicted shows up. It must be reachable, not vestigial.
+        """
+        members = [_fn("a/b.py", "x-y"), _fn("a/b.py", "x.y")]
+        assert classify_shapes(members) == {"other"}
+
+    def test_every_emitted_label_is_declared_in_SHAPES(self):
+        members = [_fn("a/b.py", "_foo"), _fn("a/b.py", "foo")]
+        assert classify_shapes(members) <= set(SHAPES)

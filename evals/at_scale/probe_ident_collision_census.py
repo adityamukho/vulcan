@@ -31,8 +31,9 @@ See docs/superpowers/specs/2026-08-11-ident-collision-audit-design.md.
 from __future__ import annotations
 
 import sys
+from itertools import combinations
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, NamedTuple, Optional
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Sequence, Set
 
 _REPO_ROOT = Path(__file__).parent.parent.parent.resolve()
 if str(_REPO_ROOT) not in sys.path:
@@ -105,3 +106,60 @@ def offenders(
     return {
         ident: members for ident, members in groups.items() if len(members) > 1
     }
+
+
+SHAPES = (
+    "leading-underscore",
+    "case-only",
+    "separator-vs-path",
+    "cross-producer",
+    "other",
+)
+
+
+def _strip_private(name: Optional[str]) -> str:
+    """Drop leading underscores from the LAST dot-segment of a name.
+
+    Fields reach _code_ident qualified as "Cls.field" (mcp_server.py:7098), so
+    the private marker sits mid-string. A bare name.lstrip("_") would miss
+    "Cls._x" against "Cls.x" entirely.
+    """
+    if not name:
+        return ""
+    head, dot, last = name.rpartition(".")
+    stripped = last.lstrip("_")
+    return f"{head}{dot}{stripped}" if dot else stripped
+
+
+def _pair_shapes(a: EntityInput, b: EntityInput) -> Set[str]:
+    shapes: Set[str] = set()
+    if a.producer != b.producer:
+        shapes.add("cross-producer")
+    a_raw, b_raw = raw_value(a), raw_value(b)
+    if a_raw.casefold() == b_raw.casefold():
+        shapes.add("case-only")
+    elif a.file_path == b.file_path and _strip_private(a.name) == _strip_private(b.name):
+        shapes.add("leading-underscore")
+    elif a.file_path != b.file_path or (a.name is None) != (b.name is None):
+        # The two inputs put the path/name boundary in different places, so
+        # the ident cannot say where the path ended -- the collision family
+        # _code_ident's docstring already anticipates.
+        shapes.add("separator-vs-path")
+    return shapes
+
+
+def classify_shapes(members: Sequence[EntityInput]) -> Set[str]:
+    """Label an offender by every collision family present among its inputs.
+
+    An offender may carry more than one label (a cross-producer collision is
+    usually also something else), so this returns a set rather than picking a
+    single winner. "other" is emitted only when nothing else applied: it is
+    where an unpredicted collision family would surface, and collapsing it
+    into any named label would hide exactly the finding worth having.
+    """
+    shapes: Set[str] = set()
+    for a, b in combinations(members, 2):
+        shapes |= _pair_shapes(a, b)
+    if not shapes - {"cross-producer"}:
+        shapes.add("other")
+    return shapes
