@@ -475,8 +475,19 @@ def _pair_shapes(a: EntityInput, b: EntityInput) -> Set[str]:
     # still recognised as the underscore family. An exact-case comparison here
     # drops those into "other", which is reserved for UNPREDICTED families and
     # so would hide a predicted one.
+    #
+    # The guard compares NAME casefold, not exact name, and requires that
+    # comparison to be UNEQUAL -- i.e. that the pair is not already
+    # explainable by case alone. Without it, a pair with no underscore at
+    # all (Foo/foo) also satisfies the stripped-casefold equality below,
+    # since stripping is a no-op when there is nothing to strip, and
+    # leading-underscore would fire on top of a plain case-only pair. That
+    # is the same false-positive shape as the case-only guard, just on the
+    # other check.
+    a_name_cf = (a.name or "").casefold()
+    b_name_cf = (b.name or "").casefold()
     if (
-        a.name != b.name
+        a_name_cf != b_name_cf
         and a.file_path == b.file_path
         and _strip_private(a.name).casefold() == _strip_private(b.name).casefold()
     ):
