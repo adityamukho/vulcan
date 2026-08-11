@@ -162,9 +162,15 @@ class TestDiffDescriptions:
         to be wrong against. Letting such an ident fall through to the
         membership test would score it as a match whenever the preloaded value
         happened to be one of several -- inventing agreement out of ambiguity.
+
+        The fixture uses preloaded value "z" absent from the live set {"x", "y"}
+        to discriminate ordering: ambiguity must be checked BEFORE value
+        comparison, so the value mismatch never fires. If value comparison ran
+        first, the mismatch would be recorded and the ident would appear in
+        both value_mismatches and ambiguous_idents.
         """
         result = diff_descriptions(
-            {":module/a": "x"}, {":module/a": {"x", "y"}}
+            {":module/a": "z"}, {":module/a": {"x", "y"}}
         )
         assert result["ambiguous_idents"] == [":module/a"]
         assert result["value_mismatches"] == {}
