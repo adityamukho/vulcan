@@ -703,3 +703,98 @@ standard for measurement corrections.
    flat here across a 50x graph-size range and a 50x ident-population range.
    Whatever drives ingestion cost up with history, it is something other than
    these two queries, and fixing #239 will not touch it.
+
+## Description Preload Exposure Probe — 257-description-preload-exposure
+
+- Repo: `.` @ `master` (`8310f7d`, full history, 656 commits)
+- Script: `evals/at_scale/probe_description_preload_exposure.py`
+- Raw: `evals/at_scale/results/257-description-preload-exposure.json`
+- Question: does `_preload_known_entities`' date-bounded `:description`
+  seeding (`entity_descriptions[ident]` = whichever version was live at
+  `:valid-at T_hi(W)`) ever return a value a position-bounded query would
+  not? #257's stated mechanism.
+- Prediction, fixed in the design spec before any data existed: **census
+  zero, mismatches zero.**
+
+| Metric | Value |
+|---|---|
+| Exit code | 0 (valid measurement) |
+| `:description` facts (deduped) | 2737 |
+| Structurally affected watermarks (W) | 16 of 656 |
+| W actually mismatching | 0 |
+| **Stage 1 — census (idents with >1 distinct `:description` value)** | **3 total** |
+| &nbsp;&nbsp;module | 0 of 55 |
+| &nbsp;&nbsp;function | **3 of 2030** |
+| &nbsp;&nbsp;class | 0 of 284 |
+| &nbsp;&nbsp;variable | 0 of 227 |
+| &nbsp;&nbsp;field | 0 of 62 |
+| &nbsp;&nbsp;external-dependency | 0 of 76 |
+| Stage 2 — value mismatches, position-weighted | 0 |
+| Stage 2 — value mismatches, distinct idents | 0 |
+| Ambiguous idents (not the finding) | 15 |
+| Preloaded but not live (not the finding) | 0 |
+| Live but not preloaded (not the finding) | 677 |
+| Timestamp collisions | 0 |
+| Unmappable `:description` valid-from / valid-to | 0 / 0 |
+| Preload descriptions empty everywhere | False |
+| Gitlink events | 0 |
+
+**Verdict: the census half of the prediction is FALSIFIED; the mismatch half
+holds on this history.** This is Outcome 2 of the design spec's three-way
+read, not Outcome 1 — reported as a real finding, not folded into a
+close-oriented "prediction holds" framing.
+
+1. **Three `function` idents carry two distinct `:description` values each,
+   contradicting the spec's premise that description is a deterministic
+   function of ident for this type:**
+
+   | Ident | Values |
+   |---|---|
+   | `:function/tests-test-mcp-server-py-commit` | `_commit`, `commit` |
+   | `:function/tests-test-mcp-server-py-snapshot` | `_snapshot`, `snapshot` |
+   | `:function/evals-at-scale-profile-forward-reconcile-attribution-py-main` | `_main`, `main` |
+
+   Root cause, confirmed by reading `_canonical_ident` (`mcp_server.py:4090-4099`):
+   the slug step replaces every non-`[a-z0-9-]` character (including `_` and
+   the `::` name separator) with `-`, then collapses consecutive hyphens. A
+   name with a leading underscore (`_commit`) and its bare form (`commit`)
+   both slug to the identical `...-commit` suffix once the run of hyphens
+   from `::_` collapses — the ident scheme is underscore-blind at a name
+   boundary. `tests/test_mcp_server.py` defines many distinct local helper
+   functions named `commit`/`_commit` and `snapshot`/`_snapshot` nested
+   inside different test functions (confirmed by grep: 10+ occurrences of
+   `def _commit`/`def commit` alone), and `_code_ident` does not qualify by
+   enclosing scope — so unrelated nested functions across the file collide
+   onto one ident in addition to the underscore collapse. Either mechanism
+   alone would be enough to break the "description is a deterministic
+   function of ident" premise for `function`; here both are present.
+
+2. **Stage 2 (the shipped `_preload_known_entities` driven against a
+   position-correct oracle at all 16 structurally affected watermarks) found
+   zero value mismatches** — `W actually mismatching: 0`, both
+   position-weighted and distinct-ident mismatch counts are 0. The census
+   firing did not translate into an observed wrong value anywhere in this
+   repository's history: none of the 16 structurally affected watermarks
+   happened to straddle a window where the date-envelope-selected version of
+   `_commit`/`commit`, `_snapshot`/`snapshot`, or `_main`/`main` diverged from
+   the position-correct one. A census-nonzero, mismatch-zero result is
+   internally consistent (the census is necessary but not sufficient for a
+   mismatch — it also requires an affected watermark to land inside the
+   window the two competing versions bracket), not a contradiction.
+3. **The submodule `external-dependency` arm is UNMEASURABLE on this
+   history, not zero.** `gitlink events: 0` — this repository has no
+   `.gitmodules` changes, so the one entity type whose `:description` is
+   read from `.gitmodules` (`name or path`, independently variable from the
+   ident-bearing path) rather than derived from the ident never gets a
+   chance to exercise the mechanism. The `external-dependency` row above
+   (`0 of 76`) reflects an absence of opportunity, not an absence of risk.
+4. **Whether #257's per-attribute interval-inversion fix is justified is
+   left open, not answered, by this run.** The census result shows the
+   ident-determinism premise is false for at least three real idents in this
+   repository (for reasons unrelated to #257's stated `entity_descriptions`
+   mechanism — a slug-collision bug in `_code_ident`/`_canonical_ident`, not
+   a `:valid-at` date-vs-position bug), while the mechanism #257 actually
+   describes produced zero observed mismatches here. A single repository's
+   656 commits finding 0 of 16 affected watermarks landing on a divergent
+   window does not bound the risk on a larger or differently-shaped history;
+   it is one data point, not a proof of absence.
