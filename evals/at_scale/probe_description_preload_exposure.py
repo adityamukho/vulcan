@@ -48,6 +48,12 @@ from __future__ import annotations
 
 from typing import Dict, List, Sequence
 
+from evals.at_scale.probe_dep_preload_exposure import (
+    VALID_TIME_FOREVER_MS,
+    edge_live_at,
+    invert_ms_to_positions,
+)
+
 # The entity types _preload_known_entities loads, in its own order
 # (mcp_server.py:7429-7432). Mirrored rather than imported so these analysis
 # primitives stay importable without opening a graph, matching
@@ -98,3 +104,40 @@ def census_distinct_values(facts: Sequence[Dict]) -> Dict[str, Dict]:
             "offending_idents": offenders,
         }
     return report
+
+
+def position_correct_descriptions(
+    facts: Sequence[Dict],
+    ts_positions: Dict[str, List[int]],
+    w: int,
+) -> Dict[str, set]:
+    """Ident -> the set of DISTINCT :description values genuinely live at
+    position w.
+
+    Position-correct at BOTH ends. Each fact's own :db/valid-from and
+    :db/valid-to are inverted to positions and tested with edge_live_at; no
+    date bound appears anywhere. That second end is what separates this from
+    the shipped query: a version superseded at a position ABOVE w by a commit
+    whose author date falls BELOW T_hi(w) reads as already dead to any date
+    bound, and the superseding version reads as already live. Both are wrong
+    at w, and their combination is exactly #257.
+
+    Returns a SET per ident, not a single value, and never picks a winner
+    among several. edge_live_at's asymmetric collision policy exists to avoid
+    UNDERSTATING a membership answer; applied to a value it would fabricate
+    one. diff_descriptions counts a multi-member set as ambiguous instead.
+
+    Like everything else here this is a measurement device and NOT a candidate
+    fix -- it needs the whole history in hand, which a resuming forward walk
+    does not have.
+    """
+    live: Dict[str, set] = {}
+    for fact in facts:
+        vf_positions = invert_ms_to_positions(fact["vf_ms"], ts_positions)
+        vt_positions = (
+            None if fact["vt_ms"] >= VALID_TIME_FOREVER_MS
+            else invert_ms_to_positions(fact["vt_ms"], ts_positions)
+        )
+        if edge_live_at(vf_positions, vt_positions, w):
+            live.setdefault(fact["ident"], set()).add(fact["desc"])
+    return live

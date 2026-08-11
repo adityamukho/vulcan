@@ -17,6 +17,11 @@ proves nothing about #257.
 from evals.at_scale.probe_description_preload_exposure import (
     ENTITY_TYPES,
     census_distinct_values,
+    position_correct_descriptions,
+)
+from evals.at_scale.probe_dep_preload_exposure import (
+    VALID_TIME_FOREVER_MS,
+    build_ts_positions,
 )
 
 
@@ -63,3 +68,73 @@ class TestCensusDistinctValues:
         report = census_distinct_values([])
         assert set(report) == set(ENTITY_TYPES)
         assert all(report[t]["idents_total"] == 0 for t in ENTITY_TYPES)
+
+
+# Position 2 is INVERTED: it sits above position 1 but carries an earlier
+# author date (Jan 2 against Jan 5). That inversion is the whole of #257, and
+# it is the same fixture shape tests/test_at_scale_dep_preload_probe.py uses.
+#
+#   pos 0: 2026-01-01   T_hi(0) = 2026-01-01
+#   pos 1: 2026-01-05   T_hi(1) = 2026-01-05
+#   pos 2: 2026-01-02   T_hi(2) = 2026-01-05
+META = [
+    ("h0", "2026-01-01T00:00:00Z", "a@b.com", "s0"),
+    ("h1", "2026-01-05T00:00:00Z", "a@b.com", "s1"),
+    ("h2", "2026-01-02T00:00:00Z", "a@b.com", "s2"),
+]
+
+MS_JAN_01 = 1767225600000  # 2026-01-01T00:00:00Z
+MS_JAN_02 = 1767312000000  # 2026-01-02T00:00:00Z
+MS_JAN_05 = 1767571200000  # 2026-01-05T00:00:00Z
+
+
+class TestPositionCorrectDescriptions:
+    def test_a_version_written_above_w_with_an_earlier_date_is_not_live(self):
+        """THE #257 SHAPE, and the ablation that proves this test.
+
+        Entity :module/a carries "old" from position 0, superseded at position
+        2 by "new". Position 2 is above the watermark W=1 but dated Jan 2,
+        earlier than T_hi(1) = Jan 5.
+
+        A DATE-bounded query at T_hi(1) = Jan 5 answers {"new"}: "old" closed
+        at Jan 2 <= Jan 5 so it reads as already dead, and "new" opened at
+        Jan 2 <= Jan 5 so it reads as already live. Both readings are wrong at
+        position 1.
+
+        The position-correct answer is {"old"}. The two differ, which is what
+        makes this test evidence about #257 rather than a tautology.
+        """
+        facts = [
+            {"entity_type": "module", "ident": ":module/a", "desc": "old",
+             "vf_ms": MS_JAN_01, "vt_ms": MS_JAN_02},
+            {"entity_type": "module", "ident": ":module/a", "desc": "new",
+             "vf_ms": MS_JAN_02, "vt_ms": VALID_TIME_FOREVER_MS},
+        ]
+        live = position_correct_descriptions(facts, build_ts_positions(META), 1)
+        assert live == {":module/a": {"old"}}
+
+    def test_the_same_facts_at_the_higher_position_select_the_new_value(self):
+        """At W=2 the superseding version IS live. Without this the previous
+        test would also pass against an oracle that simply never advances.
+        """
+        facts = [
+            {"entity_type": "module", "ident": ":module/a", "desc": "old",
+             "vf_ms": MS_JAN_01, "vt_ms": MS_JAN_02},
+            {"entity_type": "module", "ident": ":module/a", "desc": "new",
+             "vf_ms": MS_JAN_02, "vt_ms": VALID_TIME_FOREVER_MS},
+        ]
+        live = position_correct_descriptions(facts, build_ts_positions(META), 2)
+        assert live == {":module/a": {"new"}}
+
+    def test_an_unmappable_introduction_is_never_live(self):
+        """edge_live_at treats an empty vf_positions as not live. Asserted here
+        so the oracle's behaviour on a broken inversion is pinned rather than
+        inherited silently -- the count of these is a validity gate, and a
+        fact that is both uncounted and silently live would corrupt the
+        finding.
+        """
+        facts = [
+            {"entity_type": "module", "ident": ":module/ghost", "desc": "g",
+             "vf_ms": 1, "vt_ms": VALID_TIME_FOREVER_MS},
+        ]
+        assert position_correct_descriptions(facts, build_ts_positions(META), 2) == {}
