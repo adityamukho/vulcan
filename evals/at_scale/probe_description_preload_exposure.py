@@ -440,3 +440,189 @@ def sweep(
         "gitlink_events": gitlink_event_count(repo_path),
         "per_position": per_position,
     }
+
+
+def main() -> int:
+    import argparse
+    import asyncio
+    import json
+    import sys
+    from pathlib import Path
+
+    repo_root = Path(__file__).parent.parent.parent.resolve()
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Measure #257's :description preload exposure against real history."
+        )
+    )
+    parser.add_argument("--repo-path", default=".")
+    parser.add_argument("--branch", default=None)
+    parser.add_argument("--json-out", "--output", dest="json_out", default=None)
+    parser.add_argument(
+        "--graph-path", default=None,
+        help=(
+            "Sweep an EXISTING graph instead of ingesting into a scratch one. "
+            "The graph's commit count must match the linearization length or "
+            "the run is refused -- a partial graph swept silently would "
+            "understate exposure. Exists because a ~30-minute ingest per "
+            "iteration is otherwise the entire cost of this measurement."
+        ),
+    )
+    args = parser.parse_args()
+
+    import frontier_registry
+    import mcp_server
+    from evals.at_scale.probe_dep_preload_exposure import _ingest_into
+
+    def _run_sweep(branch, ingest_status):
+        linearization = frontier_registry.build_linearization(
+            args.repo_path, branch
+        )
+        commit_metadata = mcp_server._git_commits(args.repo_path, None, branch)
+        # Single-handle invariant (CLAUDE.md): reuse the live handle when one
+        # exists. Opening a second on the same file raises as of minigraf
+        # 1.2.3, and used to corrupt the page table silently (#251/#253).
+        db = (
+            mcp_server._db if mcp_server._db is not None
+            else mcp_server.open_db(str(graph_path))
+        )
+        report = sweep(
+            db, args.repo_path, linearization, commit_metadata, branch=branch,
+        )
+        report["ingest_status"] = ingest_status
+        return report
+
+    if args.graph_path:
+        graph_path = Path(args.graph_path)
+        if not graph_path.exists():
+            print(f"No graph at {graph_path}. Refusing to sweep nothing.")
+            return 1
+        mcp_server._db = None
+        mcp_server._graph_path = None
+        mcp_server.open_db(str(graph_path))
+        branch = args.branch or mcp_server._default_git_branch(args.repo_path)
+        linearization = frontier_registry.build_linearization(
+            args.repo_path, branch
+        )
+        raw = mcp_server._db_execute(
+            mcp_server._db,
+            "(query [:find (count ?c) :where [?c :entity-type :type/commit]])",
+        )
+        rows = json.loads(raw).get("results", [])
+        ingested = int(rows[0][0]) if rows else 0
+        if ingested != len(linearization):
+            print(
+                f"Graph holds {ingested} commits but the linearization has "
+                f"{len(linearization)}. Refusing to sweep a partial graph -- "
+                "an incomplete ingestion understates exposure everywhere."
+            )
+            return 1
+        report = _run_sweep(branch, "pre-existing")
+    else:
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="minigraf-257-probe-") as tmpdir:
+            graph_path = Path(tmpdir) / "probe.graph"
+            branch, ingest_status = asyncio.run(
+                _ingest_into(args.repo_path, args.branch, graph_path)
+            )
+            # _run_ingestion never raises on failure -- it wraps its whole body
+            # in `except Exception`, sets status and returns normally. This
+            # status is the only signal that the graph underneath is whole.
+            if ingest_status != "complete":
+                error = mcp_server._ingest_progress.get("error")
+                print(
+                    f"Ingestion did not complete (status={ingest_status!r}"
+                    + (f", error={error!r}" if error else "")
+                    + "). Refusing to sweep a partial or failed graph."
+                )
+                return 1
+            report = _run_sweep(branch, ingest_status)
+
+    print(json.dumps(report, indent=2))
+    print()
+    print(f"repo:                              {report['repo_path']} @ {report['branch']}")
+    print(f"ingested head:                     {report['head_commit']}")
+    print(f"commits:                           {report['commits']}")
+    print(f":description facts (deduped):      {report['description_facts_total']}")
+    print(f"structurally affected W:           {len(report['affected_positions'])}")
+    print(f"W actually mismatching:            {len(report['misclassifying_positions'])}")
+    print()
+    print("STAGE 1 -- census (idents carrying >1 DISTINCT :description value)")
+    for entity_type in ENTITY_TYPES:
+        row = report["census"][entity_type]
+        print(
+            f"  {entity_type:<22} {row['idents_with_multiple_values']:>6} "
+            f"of {row['idents_total']}"
+        )
+    print(f"  TOTAL                  {report['census_idents_with_multiple_values']:>6}")
+    print()
+    print("STAGE 2 -- value diff against the position-correct oracle")
+    print(f"  mismatches, position-weighted:   {report['value_mismatch_total_position_weighted']}")
+    print(f"  mismatches, distinct idents:     {report['value_mismatch_distinct_idents']}")
+    print()
+    print("  (counted separately, NOT the finding:)")
+    print(f"  ambiguous idents:                {report['ambiguous_idents_total']}")
+    print(f"  preloaded but not live:          {report['preloaded_not_live_total']}")
+    print(f"  live but not preloaded:          {report['live_not_preloaded_total']}")
+    print()
+    print(f"preload empty at every W:          {report['preload_descriptions_empty_everywhere']}")
+    print(f"timestamp collisions:              {report['timestamp_collisions']}")
+    print(f"unmappable :description vf:        {report['unmappable_description_valid_from']}")
+    print(f"unmappable :description vt:        {report['unmappable_description_valid_to']}")
+    print(f"gitlink events:                    {report['gitlink_events']}")
+
+    # The exit code reflects measurement VALIDITY, not the finding. A nonzero
+    # mismatch count is the number #257 asks for and must never fail the run.
+    measurement_invalid = (
+        report["unmappable_description_valid_from"] > 0
+        or report["unmappable_description_valid_to"] > 0
+        or report["timestamp_collisions"] > 0
+    )
+    if measurement_invalid:
+        print()
+        print(
+            "INVALID MEASUREMENT. Either a :description fact carries a\n"
+            "valid-from/valid-to matching no commit -- so the timestamp-to-\n"
+            "position inversion the oracle rests on is broken -- or the history\n"
+            "has colliding timestamps. Collisions invalidate rather than widen:\n"
+            "the shipped _position_of_valid_time and this probe's edge_live_at\n"
+            "resolve a collision in OPPOSITE directions, so the comparison is\n"
+            "no longer meaningful. Do not adjust this gate to make a run pass."
+        )
+
+    if report["preload_descriptions_empty_everywhere"]:
+        print()
+        print(
+            "NOTE: _preload_known_entities returned zero descriptions at every\n"
+            "affected position. That may be a genuinely empty population, or it\n"
+            "may be _collect's per-type `except Exception: pass`\n"
+            "(mcp_server.py:7491-7492) swallowing a real query failure -- the\n"
+            "two are indistinguishable from the mismatch count alone. Check\n"
+            ":description facts above: nonzero there with zero here is the\n"
+            "signature of the latter."
+        )
+
+    if report["gitlink_events"] == 0:
+        print()
+        print(
+            "NOTE: zero gitlink events. Submodule external-dependency entities\n"
+            "are the ONE preloaded type whose :description is not a function of\n"
+            "its ident -- it is `name or path` read from .gitmodules, and the\n"
+            "name can change while the path, and so the ident, stays fixed. This\n"
+            "history produces none, so that arm is UNMEASURABLE here. That is\n"
+            "not the same as zero risk, and any close written for #257 has to\n"
+            "name it. #245 recorded :pinned-commit the same way."
+        )
+
+    if args.json_out:
+        Path(args.json_out).write_text(json.dumps(report, indent=2))
+        print(f"\nWrote {args.json_out}")
+    return 1 if measurement_invalid else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
