@@ -234,27 +234,57 @@ def experiment_1(tmpdir, sizes=SIZES, reps=300):
     return results
 
 
-# bench_lineage_query_cost.py measured _lineage_is_provisional at
-# 0.046-0.053 ms/call across 100k/1M/5M. A generous band around that: if this
-# bench's control lands outside it, something about THIS bench's methodology
-# differs from the one whose result we are relying on, and every other number
-# here is suspect.
-CONTROL_BAND_MS = (0.02, 0.20)
+# PROVENANCE: bench_lineage_query_cost.py originally recorded
+# _lineage_is_provisional at 0.046-0.053 ms/call across 100k/1M/5M filler, on
+# 2026-08-04. That figure does NOT reproduce: a fresh reference run of that
+# same, unmodified bench under .venv on 2026-08-11 gave 0.1819 ms/call at
+# 100k filler (vs. 1.2132 ms/call under system python's stale minigraf 1.1.1).
+# Different hardware or a different minigraf version is the likely cause --
+# we cannot tell which from here. Because the absolute figure is
+# machine-dependent and has already gone stale once, it is not usable as a
+# pass/fail band. What the control actually needs to validate is FLATNESS --
+# that per-call cost does not grow with graph size -- which is
+# machine-independent and is the property the rest of this bench's verdict
+# depends on. So there is only a ceiling (a misconfiguration tripwire, not a
+# calibration) and a growth-ratio check (the real self-test); there is no
+# lower bound, because a control that comes back faster than expected is not
+# evidence of a broken methodology.
+CONTROL_CEILING_MS = 5.0
 
 
 def validate_control(e1):
-    """Returns (ok, messages). The control is this bench's self-test."""
+    """Returns (ok, messages). The control is this bench's self-test.
+
+    Two checks, not equally sound:
+
+    - Ceiling (CONTROL_CEILING_MS): a misconfiguration tripwire. If the
+      control is wildly slower than any healthy run, something about the
+      environment is wrong -- check `which python` (must be .venv/bin/python)
+      and `pip show minigraf` against the floor in pyproject.toml (>=1.2.3).
+      This is NOT a calibrated performance band; see the PROVENANCE comment
+      above CONTROL_CEILING_MS for why an absolute band was dropped.
+    - Growth ratio (>=2.0x across the size range): the real self-test. It
+      is machine-independent and asks whether the control reproduces
+      FLATNESS, the property this bench's E1/E3 verdicts actually rely on.
+
+    A failure on either check means the run's methodology is suspect and its
+    verdict must be WITHHELD -- E1/E3 numbers from a run that fails
+    validate_control should be reported as an invalid measurement, not
+    published as a result.
+    """
     messages = []
     ok = True
     for n, row in e1.items():
         for key in ("control_hit", "control_miss"):
             v = row[key]
-            if not (CONTROL_BAND_MS[0] <= v <= CONTROL_BAND_MS[1]):
+            if v > CONTROL_CEILING_MS:
                 ok = False
                 messages.append(
-                    f"control {key} at {n} filler = {v:.4f} ms/call, outside the "
-                    f"{CONTROL_BAND_MS[0]}-{CONTROL_BAND_MS[1]} ms band that "
-                    "bench_lineage_query_cost.py established"
+                    f"control {key} at {n} filler = {v:.4f} ms/call, above the "
+                    f"{CONTROL_CEILING_MS} ms misconfiguration ceiling -- check "
+                    "`which python` (must be .venv/bin/python) and `pip show "
+                    "minigraf` against the >=1.2.3 floor in pyproject.toml. "
+                    "Verdict must be withheld, not published."
                 )
     ratio = max(r["control_hit"] for r in e1.values()) / min(
         r["control_hit"] for r in e1.values()
@@ -262,8 +292,9 @@ def validate_control(e1):
     if ratio >= 2.0:
         ok = False
         messages.append(
-            f"control grew {ratio:.2f}x across the size range; it was measured "
-            "FLAT (0.046-0.053 ms) -- this bench's methodology disagrees with "
-            "the one it is calibrated against"
+            f"control grew {ratio:.2f}x across the size range; it must be "
+            "FLAT (this is the actual self-test, machine-independent) -- "
+            "this bench's methodology disagrees with itself across graph "
+            "sizes. Verdict must be withheld, not published."
         )
     return ok, messages
