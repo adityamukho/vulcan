@@ -190,3 +190,80 @@ def pin_whole_relation_binds_idents(tmpdir):
     assert all(v == ":commit/c0" for v in rel.values()), rel
     del db
     print("pin: whole-relation query binds keyword idents, not UUIDs -- OK")
+
+
+def experiment_1(tmpdir, sizes=SIZES, reps=300):
+    """E1: per-call cost for all three queries, HIT and MISS, across a 50x
+    filler range.
+
+    HIT pool (:e/hit{i}) carries :ident + :introduced-by, and for the control
+    a lineage marker. MISS pool is the filler entities (:e/n{i}) -- they EXIST
+    but carry none of those attributes, which is the realistic miss shape
+    during ingestion.
+    """
+    results = {}
+    hit_idents = [f":e/hit{i}" for i in range(CANDIDATES_PER_COMMIT)]
+
+    print("=== E1: point-query cost, HIT vs MISS, vary graph size ===")
+    print(f"({reps} reps/cell, 1 asserted warmup before each timed loop)")
+    header = (f"{'filler':>10} {'is_live H':>10} {'is_live M':>10} "
+              f"{'intro H':>10} {'intro M':>10} {'ctrl H':>10} {'ctrl M':>10}")
+    print(header)
+
+    for n in sizes:
+        db, _ = fresh_db(tmpdir, f"e1_{n}")
+        populate_filler(db, n)
+        populate_lineage_entities(db, hit_idents)
+        add_lineage_markers(db, hit_idents)
+        miss_idents = [f":e/n{i}" for i in range(0, n, max(1, n // reps))]
+
+        row = {
+            "is_live_hit": timed(mcp_server._entity_ident_is_live, db, hit_idents, reps, True),
+            "is_live_miss": timed(mcp_server._entity_ident_is_live, db, miss_idents, reps, False),
+            "intro_by_hit": timed(mcp_server._entity_introduced_by_query, db, hit_idents, reps, True),
+            "intro_by_miss": timed(mcp_server._entity_introduced_by_query, db, miss_idents, reps, False),
+            "control_hit": timed(mcp_server._lineage_is_provisional, db, hit_idents, reps, True),
+            "control_miss": timed(mcp_server._lineage_is_provisional, db, miss_idents, reps, False),
+        }
+        results[n] = row
+        print(f"{n:>10} {row['is_live_hit']:>10.4f} {row['is_live_miss']:>10.4f} "
+              f"{row['intro_by_hit']:>10.4f} {row['intro_by_miss']:>10.4f} "
+              f"{row['control_hit']:>10.4f} {row['control_miss']:>10.4f}")
+        del db
+
+    return results
+
+
+# bench_lineage_query_cost.py measured _lineage_is_provisional at
+# 0.046-0.053 ms/call across 100k/1M/5M. A generous band around that: if this
+# bench's control lands outside it, something about THIS bench's methodology
+# differs from the one whose result we are relying on, and every other number
+# here is suspect.
+CONTROL_BAND_MS = (0.02, 0.20)
+
+
+def validate_control(e1):
+    """Returns (ok, messages). The control is this bench's self-test."""
+    messages = []
+    ok = True
+    for n, row in e1.items():
+        for key in ("control_hit", "control_miss"):
+            v = row[key]
+            if not (CONTROL_BAND_MS[0] <= v <= CONTROL_BAND_MS[1]):
+                ok = False
+                messages.append(
+                    f"control {key} at {n} filler = {v:.4f} ms/call, outside the "
+                    f"{CONTROL_BAND_MS[0]}-{CONTROL_BAND_MS[1]} ms band that "
+                    "bench_lineage_query_cost.py established"
+                )
+    ratio = max(r["control_hit"] for r in e1.values()) / min(
+        r["control_hit"] for r in e1.values()
+    )
+    if ratio >= 2.0:
+        ok = False
+        messages.append(
+            f"control grew {ratio:.2f}x across the size range; it was measured "
+            "FLAT (0.046-0.053 ms) -- this bench's methodology disagrees with "
+            "the one it is calibrated against"
+        )
+    return ok, messages
