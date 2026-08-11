@@ -14,6 +14,8 @@ asserted one. A test whose date-bounded and position-bounded answers agree
 proves nothing about #257.
 """
 
+import pytest
+
 from evals.at_scale.probe_description_preload_exposure import (
     ENTITY_TYPES,
     census_distinct_values,
@@ -225,9 +227,6 @@ class TestCountUnmappableDescriptionFacts:
         assert count_unmappable_description_facts(
             facts, build_ts_positions(META)
         ) == (0, 0)
-
-
-import pytest
 
 
 @pytest.fixture
