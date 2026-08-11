@@ -10206,12 +10206,20 @@ class TestPreloadKnownDepsPositionBound:
         )
 
     def test_the_prefilter_alone_does_not_close_the_hole(self, real_db):
-        """The close-side twin of
-        TestPreloadKnownEntitiesPositionBound.test_the_envelope_alone_does_not
-        _close_the_hole. Widening the date clause to `[(<= ?vf T_hi)]` WITHOUT
-        the position filter re-admits the above-W edge -- the 'add-back union'
-        #238 forbids. Position mode is off here because watermark_pos is None,
-        so this call exercises exactly that shape."""
+        """Misnamed: watermark_pos=None makes position_mode False, so this
+        does NOT exercise the widened prefilter `[(<= ?vf T_hi)]` -- it
+        exercises _valid_time_window_clauses(None), the off-mode fallback
+        `[(= ?vt FOREVER)]` (open-facts-only). It passes only because
+        open-above-w happens to be an open fact, so it survives that
+        fallback regardless of any position logic.
+
+        This test has NO power over the position filter or the prefilter it
+        was meant to isolate. test_edge_introduced_above_the_watermark_is_
+        excluded is the one that genuinely distinguishes fixed from broken
+        behaviour here -- confirmed to fail when the position filter is
+        deleted while the prefilter is kept. Kept anyway, undeleted, per the
+        precedent TestResumeWithInvertedAuthorDates sets for documenting a
+        powerless test rather than removing it."""
         import mcp_server
         self._seed(real_db)
         file_deps, _ = mcp_server._preload_known_deps(
@@ -10464,10 +10472,10 @@ class TestPreloadKnownEntitiesCloseSide:
         assert descriptions[":module/recycled"] == "NEW"
 
     def test_two_distinct_closing_instants_readmit_independently(self, real_db, tmp_path):
-        """The re-admission loop runs one _collect pass per distinct closing
-        instant, and the accept lambda must bind close_ms per-iteration via a
-        default argument (`lambda ident, _c=close_ms: ...`), not a bare free
-        variable.
+        """Pins that the re-admission loop's one-_collect-pass-per-distinct-
+        closing-instant design keeps two overlapping re-admission groups
+        separate, with no cross-group leakage -- genuine coverage this class
+        previously lacked.
 
         A single closing instant can't distinguish the two: with only one
         re-admission pass there is nothing for a wrong group to leak from.
@@ -10478,7 +10486,19 @@ class TestPreloadKnownEntitiesCloseSide:
         just be present: closed-above-w-2's :ident window (04-01 to 04-27)
         is also live at 2026-04-26's re-admission instant (2026-04-25
         23:59:59.999), so a wrong-group leak would surface as one entity's
-        row overwriting the other's, not as an absence."""
+        row overwriting the other's, not as an absence.
+
+        This test has NO power over whether the accept lambda binds close_ms
+        per-iteration via a default argument (`lambda ident, _c=close_ms:
+        ...`) versus a bare free variable -- confirmed by replacing the
+        default-argument bind with a bare closure and re-running: all 8
+        tests in this class still passed. That is expected: `_collect` is
+        invoked synchronously inside each loop iteration, so no lambda
+        outlives its iteration and late binding cannot bite. The `_c=
+        close_ms` default-argument bind is kept anyway as defensive style --
+        the bug it guards against becomes live if `_collect` is ever made
+        deferred or async, at which point the lambdas could outlive the loop
+        that created them."""
         self._seed(real_db)
         real_db.execute(
             '(transact {:valid-from "2026-04-01T00:00:00Z" '

@@ -7367,8 +7367,16 @@ def _preload_known_entities(
     an inverted close date dropped out of file_entities, taking 30
     misclassified :depends-on edges with them before any diff was computed.
 
-    Passing all three as None restores the pre-#222 behaviour exactly, which
-    is what a fresh graph (no watermark) wants.
+    Five optional position parameters now gate this function's behaviour, not
+    three. `valid_at=None` disables phase 1's bound outright (unbounded
+    query). `watermark_pos=None` forces `t_hi_ms` None too (see the assertion
+    in `_load_ingestion_preload_state`) and makes `position_mode` False,
+    which disables phase 2 entirely -- `hash_to_pos` and `ts_positions` then
+    go unused, since both are only read inside branches `watermark_pos is
+    not None` guards. So `valid_at=None, watermark_pos=None` (with
+    `hash_to_pos`/`ts_positions`/`t_hi_ms` following as a consequence, not
+    independently) is what actually restores the pre-#222 behaviour for a
+    fresh graph with no watermark.
 
     external-dependency entities share the module ident namespace and use the
     same "path" attribute as modules, so folding them into this same query
@@ -7542,7 +7550,28 @@ def _preload_known_entities(
         # One re-admission pass per DISTINCT closing instant, at the last
         # instant those entities were live. On the repository this was
         # developed against that is a single extra query, for df6b8be.
+        #
+        # Known uncovered hole (verified empirically against a real graph,
+        # deliberately left unfixed here): an entity whose :ident interval
+        # has valid_from at position W and valid_to ABOVE W but with an
+        # EARLIER date is collected into `readmit` above and judged live by
+        # _fact_is_live_at_position, but this pass's instant --
+        # ISO(close_ms - 1) -- precedes that entity's own valid_from, so
+        # _collect finds none of its facts and it is silently dropped.
+        # Reachable whenever an entity is introduced at a late-dated commit
+        # and deleted at an earlier-dated commit above it: the same
+        # author-date inversion #238 exists for, mirrored onto introduction
+        # instead of closing. Wrong-exclusion, therefore recoverable on a
+        # later resume, and out of scope for #238/#245 -- but undocumented
+        # before this comment.
         for close_ms in sorted(set(readmit.values())):
+            # _epoch_ms_to_iso forbids the _VALID_TIME_FOREVER_MS sentinel
+            # (see its own docstring) and this call sits outside any try, so
+            # an uncaught raise here would abort an entire ingestion. It is
+            # safe only because the `[(<= ?vt {t_hi_ms})]` clause in the
+            # query above already filters the sentinel out of `readmit`'s
+            # values at query level -- close_ms can never be the sentinel by
+            # the time it reaches this line.
             _collect(
                 _epoch_ms_to_iso(close_ms - 1),
                 lambda ident, _c=close_ms: (
@@ -8245,13 +8274,19 @@ def _load_ingestion_preload_state(
     hash_to_pos = {h: i for i, h in enumerate(linearization)}
     watermark_pos = hash_to_pos.get(watermark) if watermark is not None else None
 
-    # #238: two DIFFERENT bounds now, deliberately.
+    # #238/#245: two DIFFERENT bounds now, deliberately.
     #
-    # resume_valid_at is ts(W), the watermark commit's own :date. It is what
-    # :depends-on and :pinned-commit still use, because those facts carry no
-    # commit reference of any kind and so admit no position clause. Widening
-    # THEM to the envelope without one would make their data-loss direction
-    # worse -- exactly the union #238 forbids. Tracked as #245.
+    # resume_valid_at is ts(W), the watermark commit's own :date. As of #245,
+    # :depends-on and :pinned-commit are ALSO position-filtered -- both via
+    # the inversion of their own :db/valid-from/:db/valid-to, the same
+    # mechanism entities use, not by adopting the envelope as their date
+    # bound. resume_valid_at survives only for two callers:
+    # _preload_unresolved_dep_idents (position-unaware by design, see its own
+    # docstring), and as the degraded-path bound _preload_known_deps /
+    # _preload_pinned_commits fall back to when watermark_pos is None (see
+    # the t_hi_ms guard ~12 lines below). It is no longer true that deps/pins
+    # "admit no position clause" -- see how ts_positions/watermark_pos/
+    # t_hi_ms are threaded into both calls below.
     #
     # entity_valid_at is the monotone envelope T_hi(W) = max(ts[0..W]), which
     # is safe only because _preload_known_entities pairs it with the
@@ -8277,6 +8312,13 @@ def _load_ingestion_preload_state(
     # resume_valid_at survives for _preload_unresolved_dep_idents only.
     entity_valid_at = _resume_envelope(commit_metadata, watermark_pos)
     t_hi_ms = _iso_to_epoch_ms(entity_valid_at)
+    assert watermark_pos is not None or t_hi_ms is None, (
+        "t_hi_ms must stay None whenever watermark_pos is None -- callees "
+        "only read t_hi_ms inside their own position_mode branch, which "
+        "already requires watermark_pos is not None (#245); a non-None "
+        "t_hi_ms here would hand a widened prefilter to a callee with its "
+        "position filter off, exactly the 'add-back union' #238 forbids"
+    )
     if entity_valid_at is None:
         entity_valid_at = resume_valid_at
     position_stats: Dict[str, int] = {}
