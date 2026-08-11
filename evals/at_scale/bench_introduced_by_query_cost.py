@@ -298,3 +298,41 @@ def validate_control(e1):
             "sizes. Verdict must be withheld, not published."
         )
     return ok, messages
+
+
+def experiment_2(tmpdir, populations=IDENT_POPULATIONS, filler=1_000_000, reps=300):
+    """E2: per-call cost as a function of IDENT POPULATION, graph size fixed.
+
+    Distinct from E1's axis: filler facts grow the graph without adding a
+    single :ident or :introduced-by fact, so E1 varies "how much unrelated
+    data is there" while E2 varies "how many entities of the kind we query
+    are there". A query answered by a scan over :ident facts would look flat
+    in E1 and grow here.
+    """
+    results = {}
+    print("\n=== E2: point-query cost, vary IDENT POPULATION "
+          f"(filler fixed at {filler:,}) ===")
+    print(f"({reps} reps/cell, 1 asserted warmup before each timed loop)")
+    print(f"{'idents':>10} {'is_live H':>10} {'is_live M':>10} "
+          f"{'intro H':>10} {'intro M':>10}")
+
+    for pop in populations:
+        db, _ = fresh_db(tmpdir, f"e2_{pop}")
+        populate_filler(db, filler)
+        pop_idents = [f":e/hit{i}" for i in range(pop)]
+        populate_lineage_entities(db, pop_idents)
+        miss_idents = [f":e/n{i}" for i in range(0, filler, max(1, filler // reps))]
+
+        row = {
+            "is_live_hit": timed(mcp_server._entity_ident_is_live, db, pop_idents, reps, True),
+            "is_live_miss": timed(mcp_server._entity_ident_is_live, db, miss_idents, reps, False),
+            "intro_by_hit": timed(mcp_server._entity_introduced_by_query, db, pop_idents, reps, True),
+            "intro_by_miss": timed(mcp_server._entity_introduced_by_query, db, miss_idents, reps, False),
+            "population": pop,
+        }
+        results[pop] = row
+        print(f"{pop:>10} {row['is_live_hit']:>10.4f} {row['is_live_miss']:>10.4f} "
+              f"{row['intro_by_hit']:>10.4f} {row['intro_by_miss']:>10.4f}")
+        del db
+
+    return results
