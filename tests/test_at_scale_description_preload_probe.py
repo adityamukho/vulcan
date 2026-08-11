@@ -17,6 +17,7 @@ proves nothing about #257.
 from evals.at_scale.probe_description_preload_exposure import (
     ENTITY_TYPES,
     census_distinct_values,
+    diff_descriptions,
     position_correct_descriptions,
 )
 from evals.at_scale.probe_dep_preload_exposure import (
@@ -138,3 +139,45 @@ class TestPositionCorrectDescriptions:
              "vf_ms": 1, "vt_ms": VALID_TIME_FOREVER_MS},
         ]
         assert position_correct_descriptions(facts, build_ts_positions(META), 2) == {}
+
+
+class TestDiffDescriptions:
+    def test_a_preloaded_value_absent_from_the_live_set_is_a_mismatch(self):
+        """The finding itself. Both the preloaded value and the live set are
+        recorded, because a bare count would not say which direction the
+        preload erred in.
+        """
+        result = diff_descriptions({":module/a": "new"}, {":module/a": {"old"}})
+        assert result["value_mismatches"] == {
+            ":module/a": {"preloaded": "new", "live": ["old"]}
+        }
+        assert result["ambiguous_idents"] == []
+
+    def test_a_matching_value_is_not_a_mismatch(self):
+        result = diff_descriptions({":module/a": "old"}, {":module/a": {"old"}})
+        assert result["value_mismatches"] == {}
+
+    def test_an_ambiguous_live_set_is_counted_and_never_compared(self):
+        """When the oracle cannot name a single correct value there is nothing
+        to be wrong against. Letting such an ident fall through to the
+        membership test would score it as a match whenever the preloaded value
+        happened to be one of several -- inventing agreement out of ambiguity.
+        """
+        result = diff_descriptions(
+            {":module/a": "x"}, {":module/a": {"x", "y"}}
+        )
+        assert result["ambiguous_idents"] == [":module/a"]
+        assert result["value_mismatches"] == {}
+
+    def test_membership_disagreements_are_diagnostics_not_findings(self):
+        """#238 and #245 measured and fixed membership. Folding a membership
+        disagreement into #257's number would re-measure a closed issue and
+        inflate this one.
+        """
+        result = diff_descriptions(
+            {":module/only-preloaded": "p"}, {":module/only-live": {"l"}}
+        )
+        assert result["preloaded_not_live"] == [":module/only-preloaded"]
+        assert result["live_not_preloaded"] == [":module/only-live"]
+        assert result["value_mismatches"] == {}
+        assert result["ambiguous_idents"] == []

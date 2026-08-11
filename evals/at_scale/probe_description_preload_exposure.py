@@ -141,3 +141,61 @@ def position_correct_descriptions(
         if edge_live_at(vf_positions, vt_positions, w):
             live.setdefault(fact["ident"], set()).add(fact["desc"])
     return live
+
+
+def diff_descriptions(
+    actual: Dict[str, str],
+    oracle: Dict[str, set],
+) -> Dict:
+    """Compare the shipped preload's entity_descriptions against the
+    position-correct oracle at one position.
+
+    THREE quantities are separated deliberately, and only the first is #257's
+    finding:
+
+      value_mismatches -- the preloaded value is not among the values live at
+        this position. This is the exposure #257 asks about.
+
+      ambiguous_idents -- the oracle's live set has more than one member, so
+        no single correct value exists to compare against. Counted and
+        skipped, never resolved. Letting these fall through would score an
+        ident as matching whenever the preloaded value happened to be one of
+        several, inventing agreement out of ambiguity.
+
+      preloaded_not_live / live_not_preloaded -- MEMBERSHIP disagreements.
+        #238 and #245 measured and fixed membership; folding these into #257's
+        number would re-measure a closed issue and inflate this one. They are
+        reported because a large count here means the two sides are talking
+        about different entity populations and the value comparison covers
+        less than it appears to -- but they are not the finding.
+
+    Ordering matters: ambiguity is tested BEFORE the value comparison, so an
+    ambiguous ident contributes to neither the mismatch count nor the
+    membership counters.
+    """
+    value_mismatches: Dict[str, Dict] = {}
+    ambiguous: List[str] = []
+    preloaded_not_live: List[str] = []
+
+    for ident, preloaded_value in actual.items():
+        live_values = oracle.get(ident)
+        if not live_values:
+            preloaded_not_live.append(ident)
+            continue
+        if len(live_values) > 1:
+            ambiguous.append(ident)
+            continue
+        if preloaded_value not in live_values:
+            value_mismatches[ident] = {
+                "preloaded": preloaded_value,
+                "live": sorted(live_values),
+            }
+
+    live_not_preloaded = [ident for ident in oracle if ident not in actual]
+
+    return {
+        "value_mismatches": value_mismatches,
+        "ambiguous_idents": sorted(ambiguous),
+        "preloaded_not_live": sorted(preloaded_not_live),
+        "live_not_preloaded": sorted(live_not_preloaded),
+    }
