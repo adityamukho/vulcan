@@ -370,6 +370,36 @@ class TestClassifyShapes:
         ]
         assert "cross-producer" in classify_shapes(members)
 
+    def test_private_pascal_case_beside_public_snake_case_is_leading_underscore(self):
+        """_Config/config and _Handler/handler are ordinary Python and they DO
+        collide (both -> :function/a-b-py-foo for _Foo/foo). An exact-case
+        _strip_private comparison drops them into "other", which is reserved
+        for UNPREDICTED families -- hiding a predicted one.
+
+        Counterfactual: with _strip_private compared exact-case, this pair
+        yields {"other"} and this test fails.
+        """
+        members = [_fn("a/b.py", "_Foo"), _fn("a/b.py", "foo")]
+        assert current_ident(members[0]) == current_ident(members[1])
+        assert "leading-underscore" in classify_shapes(members)
+
+    def test_a_producer_only_difference_is_not_a_case_collision(self):
+        """Two inputs whose raw values are byte-identical differ only in
+        producer -- exactly the cross-producer collision this audit exists to
+        find. Labelling them "case-only" asserts a case difference that is not
+        there.
+
+        Counterfactual: without the `a_raw != b_raw` guard, casefold equality
+        holds trivially and "case-only" is emitted.
+        """
+        members = [
+            EntityInput("module", "code", "vendor/x", None),
+            EntityInput("module", "gitlink", "vendor/x", None),
+        ]
+        shapes = classify_shapes(members)
+        assert "cross-producer" in shapes
+        assert "case-only" not in shapes
+
     def test_an_unclassifiable_pair_falls_through_to_other(self):
         """'other' is the interesting bucket -- it is where a collision nobody
         predicted shows up. It must be reachable, not vestigial.
@@ -422,15 +452,36 @@ def _strip_private(name: Optional[str]) -> str:
 
 
 def _pair_shapes(a: EntityInput, b: EntityInput) -> Set[str]:
+    """Every collision family this pair belongs to.
+
+    The checks are INDEPENDENT, not an elif chain. A pair can belong to more
+    than one family and the caller returns a set, so making them exclusive
+    would silently drop the second label -- and, worse, would let the winner
+    depend on check order rather than on the data.
+
+    Each check also carries an inequality guard. Without one, "case-only"
+    fires on two inputs whose raw values are byte-identical (a pair differing
+    only in producer -- exactly the cross-producer collision this audit exists
+    to find), asserting a case difference that is not there.
+    """
     shapes: Set[str] = set()
     if a.producer != b.producer:
         shapes.add("cross-producer")
     a_raw, b_raw = raw_value(a), raw_value(b)
-    if a_raw.casefold() == b_raw.casefold():
+    if a_raw != b_raw and a_raw.casefold() == b_raw.casefold():
         shapes.add("case-only")
-    elif a.file_path == b.file_path and _strip_private(a.name) == _strip_private(b.name):
+    # casefold on BOTH sides, so a private PascalCase helper beside a public
+    # snake_case one (_Config/config, _Handler/handler -- ordinary Python) is
+    # still recognised as the underscore family. An exact-case comparison here
+    # drops those into "other", which is reserved for UNPREDICTED families and
+    # so would hide a predicted one.
+    if (
+        a.name != b.name
+        and a.file_path == b.file_path
+        and _strip_private(a.name).casefold() == _strip_private(b.name).casefold()
+    ):
         shapes.add("leading-underscore")
-    elif a.file_path != b.file_path or (a.name is None) != (b.name is None):
+    if a.file_path != b.file_path or (a.name is None) != (b.name is None):
         # The two inputs put the path/name boundary in different places, so
         # the ident cannot say where the path ended -- the collision family
         # _code_ident's docstring already anticipates.
@@ -455,9 +506,15 @@ def classify_shapes(members: Sequence[EntityInput]) -> Set[str]:
     return shapes
 ```
 
-Note the `elif` chain in `_pair_shapes`: `case-only` is checked before
-`leading-underscore` because `_Foo`/`foo` is genuinely both, and attributing it
-to case is the narrower claim.
+An earlier draft of this plan made these checks an `elif` chain, on the claim
+that `_Foo`/`foo` is "genuinely both case-only and leading-underscore" so the
+narrower label should win. **That premise is false and the chain is a defect.**
+Trace it: `a/b.py::_Foo`.casefold() is `a/b.py::_foo`, which does not equal
+`a/b.py::foo`, so `case-only` never fires on that pair at all; the extra
+underscore breaks the character correspondence `casefold` needs. Under
+exact-case `_strip_private`, `"Foo" != "foo"` kills `leading-underscore` too,
+and the pair lands in `"other"` despite genuinely colliding. Independent checks
+with casefolded `_strip_private` are what the code above does instead.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -465,13 +522,17 @@ to case is the narrower claim.
 .venv/bin/python -m pytest tests/test_at_scale_ident_collision_census.py -v
 ```
 
-Expected: 14 passed.
+Expected: 16 passed.
 
 - [ ] **Step 5: Prove the ablation**
 
-Temporarily replace `classify_shapes`' body with `return {"leading-underscore"}`. Re-run.
+Three degradations, each reverted before the next.
 
-Expected: `test_case_only_pair_is_not_labelled_leading_underscore` and `test_an_unclassifiable_pair_falls_through_to_other` FAIL. Separately, temporarily replace `_strip_private` with `return (name or "").lstrip("_")` and confirm `test_private_public_field_on_one_class_is_leading_underscore` FAILS. Revert both.
+1. Replace `classify_shapes`' body with `return {"leading-underscore"}`. Expected FAIL: `test_case_only_pair_is_not_labelled_leading_underscore`, `test_an_unclassifiable_pair_falls_through_to_other`, `test_inputs_from_different_files_are_separator_vs_path`, `test_import_and_in_tree_module_are_cross_producer`, `test_a_producer_only_difference_is_not_a_case_collision`. (A constant label cannot satisfy any of the label-specific assertions — count them all rather than stopping at the first two.)
+2. Replace `_strip_private` with `return (name or "").lstrip("_")`. Expected FAIL: `test_private_public_field_on_one_class_is_leading_underscore` only.
+3. Drop the `a_raw != b_raw` guard from the `case-only` check, and separately drop `.casefold()` from the `_strip_private` comparison. Expected FAIL: `test_a_producer_only_difference_is_not_a_case_collision` for the first, `test_private_pascal_case_beside_public_snake_case_is_leading_underscore` for the second.
+
+Degradation 3 is the one that matters most: it is the pair of defects an earlier draft of this plan actively mandated.
 
 - [ ] **Step 6: Commit**
 
