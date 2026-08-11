@@ -653,3 +653,53 @@ reconciliation flagged, and supersedes that entry's cross-day-derived
 -51.9%/"~58-61% unexplained" framing as the number to trust for the size of
 #241's effect — without deleting either figure, per this branch's own
 standard for measurement corrections.
+
+## Point-Query Cost Bench — 239-introduced-by-query-cost
+
+- Repo: `.` @ `bench-239-introduced-by-query-cost`
+- Script: `evals/at_scale/bench_introduced_by_query_cost.py`
+- Raw: `evals/at_scale/results/239-introduced-by-query-cost.json`
+- Question: is per-ident point-query cost constant in graph size? #239's fix
+  direction depends on the answer.
+
+| Metric | Value |
+|---|---|
+| Verdict | FLAT |
+| Threshold (fixed in the spec before any data) | 2.0x |
+| Worst growth | 1.11x on `filler:is_live_miss` |
+| Control reproduced | yes (ceiling 5.0 ms/call misconfiguration tripwire: OK; growth 1.14x < 2.0x flatness check: OK) |
+| `_entity_ident_is_live` HIT, 100k → 5M | 0.0544 → 0.0579 ms/call |
+| `_entity_ident_is_live` MISS, 100k → 5M | 0.0499 → 0.0556 ms/call |
+| `_entity_introduced_by_query` HIT, 100k → 5M | 0.0547 → 0.0602 ms/call |
+| `_entity_introduced_by_query` MISS, 100k → 5M | 0.0527 → 0.0584 ms/call |
+| Ident-population axis, worst growth | 1.11x |
+| Batch crossover N (vs 1265 candidates/commit) | 126–140 (5M → 100k filler) |
+| E4 real-scale point (~68 MB graph, 250k filler) | `_entity_introduced_by_query` HIT 0.0597 ms/call |
+
+**What this means for #239:**
+
+1. **Direction is settled.** All eight measured series are flat (worst growth
+   1.11x against a 2.0x threshold, fixed before any data existed) across both
+   a 50x filler range and a 50x ident-population range. The cost is CALL
+   COUNT, not per-call growth: a per-commit batch or write-through cache is
+   the right fix. The crossover sits at 126–140 point queries per batch call
+   against 1265 candidates/commit, so a per-commit batch pays for itself
+   roughly 9-10x over. A companion index (the #152/#236 pattern) is NOT
+   indicated here — that pattern applies when per-call cost grows, and it
+   does not.
+
+2. **The size of the prize is now in doubt.** #239's own D2 table records
+   `_entity_introduced_by_query` at 0.46 ms/call, and the whole query line
+   item at 523s / 33.6% of a 1,558s run. This bench measures the same call at
+   ~0.06 ms/call — about 7.7x lower. At that rate the same ~1.33M queries
+   cost roughly 80s, not 523s: the realistic ceiling on fixing #239 is
+   single-digit percent of a run, not a third of one. #239's headline figure
+   should be re-derived from this bench before anyone invests in building the
+   batch/cache fix.
+
+3. **The superlinear growth seen elsewhere is NOT these queries.** The #245
+   acceptance run's per-commit cost climbed 1.39 → 4.29 s/commit across ~520
+   commits, but `_entity_ident_is_live` and `_entity_introduced_by_query` are
+   flat here across a 50x graph-size range and a 50x ident-population range.
+   Whatever drives ingestion cost up with history, it is something other than
+   these two queries, and fixing #239 will not touch it.
