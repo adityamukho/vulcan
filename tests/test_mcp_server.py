@@ -10552,6 +10552,146 @@ class TestPreloadKnownEntitiesCloseSide:
         assert ":module/intro-above-w" not in entity_valid_from
 
 
+class TestPreloadKnownEntitiesDescriptionValueIsDateBounded:
+    """#257: membership is position-exact after #238/#245, VALUES are not.
+
+    _preload_known_entities decides WHICH entities to preload by position on
+    both ends now. It still seeds entity_descriptions from whichever
+    :description version was live at the DATE envelope T_hi(W). Author dates
+    are not monotonic in topological order, so a version written ABOVE the
+    watermark carrying an EARLIER date is the one that query returns.
+
+    THIS CLASS ESTABLISHES REACHABILITY, NOT FREQUENCY, and the distinction is
+    the whole reason it exists. The #257 exposure probe
+    (evals/at_scale/probe_description_preload_exposure.py) swept this
+    repository's 656-commit history and made 12,685 value comparisons without
+    ever comparing an ident that could exhibit the defect -- a mismatch
+    requires an ident carrying two distinct :description values, and this
+    history's only three such idents were ambiguous at every position where
+    they were live. So the probe's zero says nothing either way, and the open
+    question it could not answer is exactly the one below: given two values
+    AND an inverted date, does the shipped preload return the future one?
+
+    It does. That is what the xfail below pins.
+
+    Same linearization as TestPreloadKnownEntitiesCloseSide, and the inversion
+    is the same one: 0 = c0 @ 2026-04-01, 1 = c1 (WATERMARK) @ 2026-05-02,
+    2 = c2 @ 2026-04-26. Position 2 sits above the watermark but carries the
+    earlier date.
+
+    Why the entity's stable attributes are transacted OPEN while only
+    :description is windowed: if :ident/:path/:introduced-by were closed too,
+    the entity would drop out of phase 1's :valid-at T_hi query altogether and
+    this would become a MEMBERSHIP test, which #238/#245 already cover. Every
+    attribute except :description stays open precisely so the only variable
+    left is the value.
+    """
+
+    LINEARIZATION = ["c0" * 20, "c1" * 20, "c2" * 20]
+    HASH_TO_POS = {h: i for i, h in enumerate(LINEARIZATION)}
+    T_HI = "2026-05-02T00:00:00Z"
+    TS_POSITIONS = {
+        "2026-04-01T00:00:00Z": [0],
+        "2026-05-02T00:00:00Z": [1],
+        "2026-04-26T00:00:00Z": [2],
+    }
+    IDENT = ":module/inverted-desc"
+
+    def _seed(self, real_db):
+        """One entity, introduced at c0, whose :description is superseded at
+        c2 -- above the watermark, dated below the envelope.
+
+        The two :description windows abut at 2026-04-26: "old" is
+        [04-01, 04-26) and "new" is [04-26, forever). At the envelope
+        T_hi(1) = 2026-05-02 only "new" is live, which is the defect. At
+        POSITION 1 only "old" is live, because "new" is introduced at
+        position 2.
+        """
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            f'[[:commit/c0 :hash "{self.LINEARIZATION[0]}"] '
+            '[:commit/c0 :date "2026-04-01T00:00:00Z"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            f'[[{self.IDENT} :entity-type :type/module] '
+            f'[{self.IDENT} :ident "{self.IDENT}"] '
+            f'[{self.IDENT} :path "inverted.py"] '
+            f'[{self.IDENT} :introduced-by :commit/c0]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-26T00:00:00Z"} '
+            f'[[{self.IDENT} :description "old"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-26T00:00:00Z"} '
+            f'[[{self.IDENT} :description "new"]])'
+        )
+
+    def _run(self, real_db, tmp_path, watermark_pos):
+        import mcp_server
+        return mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+            hash_to_pos=self.HASH_TO_POS, watermark_pos=watermark_pos,
+            ts_positions=self.TS_POSITIONS,
+            t_hi_ms=mcp_server._iso_to_epoch_ms(self.T_HI),
+        )
+
+    def test_the_entity_is_preloaded_at_the_inverted_watermark(
+        self, real_db, tmp_path
+    ):
+        """Membership is intact -- this is a VALUE defect, not a membership
+        one, and without this the xfail below could be passing for the wrong
+        reason (an entity that never reaches the dict at all)."""
+        self._seed(real_db)
+        entity_valid_from, *_ = self._run(real_db, tmp_path, 1)
+        assert self.IDENT in entity_valid_from
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "#257: entity_descriptions is seeded at the DATE envelope T_hi(W), "
+            "so a version introduced above W with an earlier author date wins. "
+            "Remove this marker when #257 is fixed -- strict=True makes the "
+            "suite fail if it starts passing, which is the point."
+        ),
+    )
+    def test_preload_returns_the_position_live_description(
+        self, real_db, tmp_path
+    ):
+        """THE #257 DEFECT, pinned.
+
+        At W=1 the position-correct value is "old": "new" is introduced at
+        position 2, above the watermark. The shipped preload returns "new",
+        because at the envelope 2026-05-02 the "old" window ([04-01, 04-26))
+        has already closed and "new"'s has already opened -- both readings
+        wrong at position 1.
+
+        This is the assertion a position-correct preload would satisfy, which
+        is why it states "old" rather than characterising today's "new": the
+        test should express the contract, not the bug.
+        """
+        self._seed(real_db)
+        _vf, descriptions, *_ = self._run(real_db, tmp_path, 1)
+        assert descriptions[self.IDENT] == "old"
+
+    def test_the_superseding_value_is_returned_once_the_watermark_reaches_it(
+        self, real_db, tmp_path
+    ):
+        """The discriminator for the xfail above.
+
+        At W=2 "new" IS the position-correct answer, and the preload returns
+        it. Without this, the xfail could be an assertion that can never hold
+        under any watermark -- a broken fixture rather than a real defect.
+        Note the envelope is unchanged (T_hi(2) == T_hi(1) == 2026-05-02), so
+        the only thing that varies between the two tests is the position.
+        """
+        self._seed(real_db)
+        _vf, descriptions, *_ = self._run(real_db, tmp_path, 2)
+        assert descriptions[self.IDENT] == "new"
+
+
 class TestPreloadStateUnmappableAnnounce:
     """An unplaceable :db/valid-from or :db/valid-to means the position
     inversion's assumption is broken for that fact. Excluding is the
