@@ -7302,6 +7302,9 @@ def _preload_known_entities(
     valid_at: Optional[str] = None,
     hash_to_pos: Optional[Dict[str, int]] = None,
     watermark_pos: Optional[int] = None,
+    ts_positions: Optional[Dict[str, List[int]]] = None,
+    t_hi_ms: Optional[int] = None,
+    stats: Optional[Dict[str, int]] = None,
 ) -> tuple:
     """Load all existing module/function/class/external-dependency idents from
     the DB, and pre-seed file_entities with all currently tracked files in the
@@ -7330,33 +7333,50 @@ def _preload_known_entities(
     [?c :hash ?hash] -> hash_to_pos[?hash]. So watermark_pos closes the
     unrecoverable direction exactly, with no fact-model change (#238).
 
-    The close END is not recoverable at all -- _ingest_close records a close
-    as valid_to = commit_ts_iso and holds no reference to the closing commit.
-    valid_at therefore stays, but is DEMOTED: it no longer carries the safety
-    property, only "how widely do we re-admit entities closed above the
-    watermark". Callers pass the monotone envelope T_hi(W) = max(ts[0..W])
-    rather than ts(W), the widest value that still excludes every close at or
-    below W (a close at position p <= W has valid_to = ts[p] <= T_hi(W), and
-    :valid-at's half-open semantics require valid_at < valid_to).
+    The close END is recovered too, as of #245's work, but by a different
+    route: _ingest_close holds no reference to the closing commit, yet it
+    records valid_to = commit_ts_iso, so the closing POSITION comes from
+    inverting that instant against commit_metadata (_fact_is_live_at_position).
+    An earlier version of this docstring called the close end "not recoverable
+    at all"; that was true of joins and false of inversion.
 
-    This is a REPLACEMENT of the old ts(W) bound, not a union with it. Read
-    #238 before changing it: widening the date bound alone is the "add-back"
-    that looks like a fix and isn't, and
-    test_the_envelope_alone_does_not_close_the_hole pins exactly that.
+    valid_at survives as phase 1's bound and is fed the monotone envelope
+    T_hi(W) = max(ts[0..W]). It no longer carries a safety property in either
+    direction: phase 2 below re-admits the entities it drops, gated on
+    position. Passing ts_positions/t_hi_ms is what enables phase 2 --
+    test_readmission_is_position_gated_not_date_gated pins that the
+    re-admission comes from the position rule and not from a widened date
+    bound, which is the "add-back union" #238 forbids.
 
-    Residual, deliberately accepted: an entity introduced at or below W,
-    deleted or renamed above W with a close date earlier than T_hi(W), where a
-    prior run's Stage B already applied that deletion. It is excluded, so
-    replay mints a duplicate :introduced-by -- the recoverable direction, left
-    to #235's sweep.
+    Residual, and it is no longer about membership: phase 2 re-admits exactly
+    the entity this paragraph used to describe as excluded (introduced at or
+    below W, deleted or renamed above W, close date earlier than T_hi(W)).
+    Membership is position-exact in BOTH directions now.
 
-    :depends-on and :pinned-commit carry no commit reference of any kind, so
-    _preload_known_deps and _preload_pinned_commits get no position clause and
-    stay at ts(W). Tracked as #245; do NOT widen them to the envelope without
-    one, which would make their data-loss direction worse.
+    What survives is VALUES. entity_descriptions still carries whichever
+    :description version was live at DATE T_hi(W), which can be a version
+    written above W with an inverted author date. The forward walk uses this
+    dict for body-change detection, so a from-the-future description makes a
+    real change compare equal and go unrecorded. Membership is position-exact;
+    values are not. UNMEASURED -- the #245 exposure probe measured membership
+    only -- and tracked as #257.
 
-    Passing all three as None restores the pre-#222 behaviour exactly, which
-    is what a fresh graph (no watermark) wants.
+    _preload_known_deps and _preload_pinned_commits are position-filtered the
+    same way (#245). This function's close side is what made their exposure
+    look 16x smaller than it is: four modules deleted above the watermark with
+    an inverted close date dropped out of file_entities, taking 30
+    misclassified :depends-on edges with them before any diff was computed.
+
+    Five optional position parameters now gate this function's behaviour, not
+    three. `valid_at=None` disables phase 1's bound outright (unbounded
+    query). `watermark_pos=None` forces `t_hi_ms` None too (see the assertion
+    in `_load_ingestion_preload_state`) and makes `position_mode` False,
+    which disables phase 2 entirely -- `hash_to_pos` and `ts_positions` then
+    go unused, since both are only read inside branches `watermark_pos is
+    not None` guards. So `valid_at=None, watermark_pos=None` (with
+    `hash_to_pos`/`ts_positions`/`t_hi_ms` following as a consequence, not
+    independently) is what actually restores the pre-#222 behaviour for a
+    fresh graph with no watermark.
 
     external-dependency entities share the module ident namespace and use the
     same "path" attribute as modules, so folding them into this same query
@@ -7395,80 +7415,169 @@ def _preload_known_entities(
     except Exception:
         pass
 
-    # Every clause of the query below is bounded by this one keyword, the
-    # :introduced-by -> :date join included: a commit above the watermark has
-    # a :date fact whose own valid-from is later than valid_at, so the join
-    # simply finds nothing for it.
-    valid_at_clause = f':valid-at "{_edn_escape(valid_at)}" ' if valid_at else ""
+    def _collect(valid_at_str: Optional[str], accept) -> None:
+        """Run the structural preload query at one instant and fold accepted
+        rows into the shared output dicts.
 
-    for entity_type in ("module", "function", "class", "variable", "field", "external-dependency"):
-        path_attr = "path" if entity_type in ("module", "external-dependency") else "file"
-        try:
-            raw = _db_execute(
-                db,
-                f'(query [:find ?ident ?path ?desc ?date ?hash '
-                f'{valid_at_clause}'
-                f':where [?e :entity-type :type/{entity_type}] '
-                f'[?e :ident ?ident] '
-                f'[?e :{path_attr} ?path] '
-                f'[?e :description ?desc] '
-                f'[?e :introduced-by ?c] '
-                f'[?c :date ?date] '
-                f'[?c :hash ?hash]])',
+        accept(ident) -> bool selects rows; the introduction position clause
+        is applied here, so it governs phase 1 and every re-admission pass
+        alike.
+        """
+        valid_at_clause = (
+            f':valid-at "{_edn_escape(valid_at_str)}" ' if valid_at_str else ""
+        )
+        for entity_type in (
+            "module", "function", "class", "variable", "field",
+            "external-dependency",
+        ):
+            path_attr = (
+                "path" if entity_type in ("module", "external-dependency")
+                else "file"
             )
-            rows = json.loads(raw).get("results", [])
-            for ident, path, desc, date, hash_ in rows:
-                # #238: the resume bound, POSITION-indexed. This clause is
-                # CONJUNCTIVE over every row -- that is what makes the widened
-                # valid_at envelope safe, and it is the distinction #238
-                # insists on. Wrong-INCLUSION (the unrecoverable direction) is
-                # caused solely by the introduction end, which this closes
-                # exactly; the date bound above only governs how widely
-                # entities closed ABOVE the watermark are re-admitted. Never
-                # turn this into an "add-back" branch beside the date bound --
-                # that re-admits the benign direction and leaves data loss
-                # wide open.
-                #
-                # pos is None means the introducing commit is not in this
-                # linearization (a rewritten or foreign history): exclude,
-                # which is the benign direction.
-                if watermark_pos is not None:
-                    pos = hash_to_pos.get(hash_) if hash_to_pos is not None else None
-                    if pos is None or pos > watermark_pos:
+            try:
+                raw = _db_execute(
+                    db,
+                    f'(query [:find ?ident ?path ?desc ?date ?hash '
+                    f'{valid_at_clause}'
+                    f':where [?e :entity-type :type/{entity_type}] '
+                    f'[?e :ident ?ident] '
+                    f'[?e :{path_attr} ?path] '
+                    f'[?e :description ?desc] '
+                    f'[?e :introduced-by ?c] '
+                    f'[?c :date ?date] '
+                    f'[?c :hash ?hash]])',
+                )
+                rows = json.loads(raw).get("results", [])
+                for ident, path, desc, date, hash_ in rows:
+                    if not accept(ident):
                         continue
-                entity_valid_from[ident] = date
-                entity_descriptions[ident] = desc
-                # Reconstructed from ?hash, not read off a bound ?c, and
-                # deliberately so (final-review Finding 3): ?c is a SUBJECT
-                # variable here ([?e :introduced-by ?c] [?c :date ?date]
-                # [?c :hash ?hash]), and binding a subject variable in :find
-                # position returns minigraf's internal UUID, not the keyword
-                # ident string -- the same reason _preload_known_deps binds
-                # ?srci instead of ?src and _preload_pinned_commits binds ?ei
-                # instead of ?e (see their docstrings, and #141's root-cause
-                # note at _rebuild_index_from_graph). Verified empirically
-                # for ?c specifically, not just assumed by analogy: adding
-                # ?c to this query's :find list returns a UUID like
-                # "bd5e9774-8fbd-5ec4-81e8-7310073fa5c3", never
-                # ":commit/abc123456789". Reconstructing via f":commit/
-                # {hash_[:12]}" is therefore correct AND necessary, not a
-                # missed opportunity to simplify -- it must stay byte-for-
-                # byte identical to the commit_ident both write sites
-                # (mcp_server.py, the forward-walk and _forward_apply commit
-                # triples) build the same way, since this value becomes the
-                # :introduced-by retract value at close time (#231) and a
-                # silent mismatch would make that retract a no-op.
-                # test_entity_introduced_by_matches_commit_write_site pins
-                # this against the real write sites, not just this format
-                # string in isolation.
-                entity_introduced_by[ident] = f":commit/{hash_[:12]}"
-                file_entities.setdefault(path, [])
-                if ident not in file_entities[path]:
-                    file_entities[path].append(ident)
-                if entity_type == "external-dependency":
-                    submodule_paths[ident] = path
-        except Exception:
-            pass
+                    # #238: the resume bound, POSITION-indexed. CONJUNCTIVE
+                    # over every row, in every pass. Wrong-INCLUSION (the
+                    # unrecoverable direction) is caused solely by the
+                    # introduction end, which this closes exactly. Never turn
+                    # this into an "add-back" branch beside a date bound.
+                    #
+                    # pos is None means the introducing commit is not in this
+                    # linearization (a rewritten or foreign history): exclude,
+                    # which is the benign direction.
+                    if watermark_pos is not None:
+                        pos = (
+                            hash_to_pos.get(hash_)
+                            if hash_to_pos is not None else None
+                        )
+                        if pos is None or pos > watermark_pos:
+                            continue
+                    entity_valid_from[ident] = date
+                    entity_descriptions[ident] = desc
+                    # Reconstructed from ?hash, not read off a bound ?c:
+                    # ?c is a SUBJECT variable here, and binding a subject in
+                    # :find position returns minigraf's internal UUID, not the
+                    # keyword ident string -- verified empirically for ?c
+                    # specifically (adding it to :find returns a UUID like
+                    # "bd5e9774-8fbd-5ec4-81e8-7310073fa5c3"), the same reason
+                    # _preload_known_deps binds ?srci and
+                    # _preload_pinned_commits binds ?ei. This value becomes
+                    # the :introduced-by retract value at close time (#231),
+                    # so it must stay byte-for-byte identical to the
+                    # commit_ident both write sites build;
+                    # test_entity_introduced_by_matches_commit_write_site
+                    # pins that against the real write sites.
+                    entity_introduced_by[ident] = f":commit/{hash_[:12]}"
+                    file_entities.setdefault(path, [])
+                    if ident not in file_entities[path]:
+                        file_entities[path].append(ident)
+                    if entity_type == "external-dependency":
+                        submodule_paths[ident] = path
+            except Exception:
+                pass
+
+    # Phase 1: everything live at the envelope.
+    _collect(valid_at, lambda ident: True)
+
+    # Phase 2 (#238 close side, #245): entities phase 1 missed because their
+    # close DATE fell at or below the envelope while their close POSITION sits
+    # above the watermark.
+    #
+    # `[(<= ?vt t_hi_ms)]` is NOT a sound bound in isolation -- a close above W
+    # can carry an arbitrarily early date, which is the defect. It is sound
+    # only as the COMPLEMENT of phase 1: an entity missing from a
+    # :valid-at T_hi(W) query has either vt <= T_hi(W) or vf > T_hi(W), and
+    # vf > T_hi(W) implies intro_pos > W (every position at or below W has a
+    # date at or below the envelope) and is correctly excluded. Never lift
+    # this clause into a standalone query.
+    #
+    # Only :ident's own window is bound here, not :path or :description:
+    # :ident is written once per entity lifetime, so this is roughly one
+    # interval per entity, while :description is rewritten on every body edit
+    # and would explode the row count under :any-valid-time.
+    position_mode = (
+        watermark_pos is not None
+        and ts_positions is not None
+        and t_hi_ms is not None
+    )
+    if position_mode:
+        readmit: Dict[str, int] = {}
+        for entity_type in (
+            "module", "function", "class", "variable", "field",
+            "external-dependency",
+        ):
+            try:
+                raw = _db_execute(
+                    db,
+                    f'(query [:find ?ident ?vf ?vt :any-valid-time '
+                    f':where [?e :entity-type :type/{entity_type}] '
+                    f'[?e :ident ?ident] '
+                    f'[?e :db/valid-from ?vf] '
+                    f'[?e :db/valid-to ?vt] '
+                    f'[(<= ?vt {t_hi_ms})]])',
+                )
+                for ident, vf_ms, vt_ms in json.loads(raw).get("results", []):
+                    if ident in entity_valid_from:
+                        continue
+                    # vf here is the INTERVAL's own start, used for interval
+                    # selection among an ident's several lifetimes. The
+                    # AUTHORITATIVE introduction gate is _collect's
+                    # :introduced-by position clause, applied independently to
+                    # every re-admitted row below. Both gates apply.
+                    if not _fact_is_live_at_position(
+                        vf_ms, vt_ms, watermark_pos, ts_positions, stats
+                    ):
+                        continue
+                    readmit[ident] = vt_ms
+            except Exception:
+                pass
+
+        # One re-admission pass per DISTINCT closing instant, at the last
+        # instant those entities were live. On the repository this was
+        # developed against that is a single extra query, for df6b8be.
+        #
+        # Known uncovered hole (verified empirically against a real graph,
+        # deliberately left unfixed here): an entity whose :ident interval
+        # has valid_from at position W and valid_to ABOVE W but with an
+        # EARLIER date is collected into `readmit` above and judged live by
+        # _fact_is_live_at_position, but this pass's instant --
+        # ISO(close_ms - 1) -- precedes that entity's own valid_from, so
+        # _collect finds none of its facts and it is silently dropped.
+        # Reachable whenever an entity is introduced at a late-dated commit
+        # and deleted at an earlier-dated commit above it: the same
+        # author-date inversion #238 exists for, mirrored onto introduction
+        # instead of closing. Wrong-exclusion, therefore recoverable on a
+        # later resume, and out of scope for #238/#245 -- but undocumented
+        # before this comment.
+        for close_ms in sorted(set(readmit.values())):
+            # _epoch_ms_to_iso forbids the _VALID_TIME_FOREVER_MS sentinel
+            # (see its own docstring) and this call sits outside any try, so
+            # an uncaught raise here would abort an entire ingestion. It is
+            # safe only because the `[(<= ?vt {t_hi_ms})]` clause in the
+            # query above already filters the sentinel out of `readmit`'s
+            # values at query level -- close_ms can never be the sentinel by
+            # the time it reaches this line.
+            _collect(
+                _epoch_ms_to_iso(close_ms - 1),
+                lambda ident, _c=close_ms: (
+                    readmit.get(ident) == _c and ident not in entity_valid_from
+                ),
+            )
 
     return (
         entity_valid_from, entity_descriptions, entity_introduced_by,
@@ -7689,8 +7798,160 @@ def _valid_time_window_clauses(valid_at_ms: Optional[int]) -> str:
     return f"[(<= ?vf {valid_at_ms})] [(> ?vt {valid_at_ms})]"
 
 
+def _epoch_ms_to_iso(ms: int) -> str:
+    """minigraf's epoch-ms valid-time scale back to millisecond-precision ISO.
+
+    Millisecond precision is load-bearing for the re-admission pass in
+    _preload_known_entities, which queries at ISO(vt - 1 ms). Verified against
+    minigraf's temporal.rs parse_timestamp: any string containing 'T' goes
+    through chrono's DateTime<Utc> parser, which accepts fractional seconds.
+    Pinned by test_valid_at_accepts_millisecond_precision.
+
+    Never pass _VALID_TIME_FOREVER_MS -- callers must test for the sentinel
+    first, as minigraf's own millis_to_timestamp_string documents.
+    """
+    return (
+        datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    )
+
+
+def _build_ts_positions(
+    commit_metadata: List[Tuple[str, str, str, str]]
+) -> Dict[str, List[int]]:
+    """Map each author-date instant to EVERY linearization position holding it.
+
+    A list, not a single position, and deliberately so: _git_commits formats
+    "%Y-%m-%dT%H:%M:%SZ" at second granularity, so distinct commits routinely
+    share an instant. Collapsing that to one position would silently pick a
+    winner; _position_of_valid_time resolves the ambiguity explicitly instead.
+    """
+    ts_positions: Dict[str, List[int]] = {}
+    for pos, (_hash, ts_iso, _author, _subject) in enumerate(commit_metadata):
+        ts_positions.setdefault(ts_iso, []).append(pos)
+    return ts_positions
+
+
+def _position_of_valid_time(
+    ms: int,
+    ts_positions: Dict[str, List[int]],
+    *,
+    end: str,
+    stats: Optional[Dict[str, int]] = None,
+) -> Optional[int]:
+    """Recover the linearization position a :db/valid-from or :db/valid-to
+    was written at (#238 close side, #245).
+
+    Every :depends-on, :pinned-commit and :ident valid-time is written from
+    commit_ts_iso, i.e. commit_metadata[pos][1], so it is always some commit's
+    author date and its position is recoverable WITHOUT a commit reference to
+    join to. Both issues state these sites admit no position filter; that is
+    true of joins and false of positions. The inversion needs full-history
+    commit_metadata at preload time, which is exactly what PR #246 made
+    available by moving build_linearization and _git_commits above the preload
+    block.
+
+    AMBIGUITY RESOLVES TOWARD WRONG-EXCLUSION AT BOTH ENDS. An ambiguous
+    introduction takes the LATEST colliding position (more likely to read as
+    above W); an ambiguous close takes the EARLIEST (more likely to read as at
+    or below W). Both land on exclusion, the direction #235's correction sweep
+    repairs, rather than on the unrecoverable inverted-interval direction.
+
+    THIS IS THE INVERSE OF evals/at_scale/probe_dep_preload_exposure.py's
+    edge_live_at, which takes min for an introduction and max for a close.
+    That is correct THERE and wrong HERE: a measurement must not understate
+    exposure, because a number rounded in our own favour would have argued for
+    closing #245; a fix must not risk the unrecoverable direction. DO NOT
+    refactor the two into a shared helper. Pinned by
+    test_collision_resolves_toward_exclusion_at_both_ends.
+
+    Returns None for an instant matching no commit -- a rewritten history, or
+    a fact dated by something other than a commit. Callers exclude on None.
+    """
+    if end not in ("intro", "close"):
+        raise ValueError(f"end must be 'intro' or 'close', got {end!r}")
+    ts_iso = (
+        datetime.datetime.fromtimestamp(ms / 1000, datetime.timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    positions = ts_positions.get(ts_iso)
+    if not positions:
+        if stats is not None:
+            key = f"unmappable_{end}"
+            stats[key] = stats.get(key, 0) + 1
+        return None
+    if len(positions) > 1 and stats is not None:
+        stats["collisions"] = stats.get("collisions", 0) + 1
+    return max(positions) if end == "intro" else min(positions)
+
+
+def _fact_is_live_at_position(
+    vf_ms: int,
+    vt_ms: int,
+    watermark_pos: int,
+    ts_positions: Dict[str, List[int]],
+    stats: Optional[Dict[str, int]] = None,
+) -> bool:
+    """The membership rule for the forward walk's preload state (#238, #245):
+
+        live at W  <=>  intro_pos <= W  AND  (open OR close_pos > W)
+
+    Position alone. Date clauses in the callers' queries are prefilters for
+    row-count reduction and carry NO safety property -- see the spec's
+    "Why this is not the add-back union #238 forbids".
+
+    An unplaceable endpoint excludes, because the fact cannot be proven live
+    at W. That is the recoverable direction.
+    """
+    intro_pos = _position_of_valid_time(
+        vf_ms, ts_positions, end="intro", stats=stats
+    )
+    if intro_pos is None or intro_pos > watermark_pos:
+        return False
+    if vt_ms >= _VALID_TIME_FOREVER_MS:
+        return True
+    close_pos = _position_of_valid_time(
+        vt_ms, ts_positions, end="close", stats=stats
+    )
+    if close_pos is None:
+        return False
+    return close_pos > watermark_pos
+
+
+def _announce_unplaceable_facts(stats: Dict[str, int]) -> None:
+    """Report facts whose valid-time matched no commit in the linearization.
+
+    Not a hard failure: aborting an ingestion because one fact is unplaceable
+    is worse than excluding it, and the ordinary rewritten-history case is
+    already handled by watermark_pos falling to None, which disables position
+    filtering wholesale. But a silent exclusion here would look exactly like
+    the bug #245 fixed, so it is announced -- the same reasoning
+    _commit_date_query uses when a non-empty watermark has no :date.
+
+    Collisions are NOT announced: they are expected at second granularity and
+    are resolved deterministically toward exclusion.
+    """
+    intro = stats.get("unmappable_intro", 0)
+    close = stats.get("unmappable_close", 0)
+    if not intro and not close:
+        return
+    print(
+        f"[ingest] preload: {intro} unplaceable :db/valid-from and {close} "
+        "unplaceable :db/valid-to facts -- their instants match no commit in "
+        "this linearization, so they were excluded from the resume state "
+        "(#245). Expect duplicate introductions rather than data loss.",
+        file=sys.stderr,
+    )
+
+
 def _preload_known_deps(
-    db: Any, file_entities: Dict[str, List[str]], valid_at_ms: Optional[int] = None
+    db: Any,
+    file_entities: Dict[str, List[str]],
+    valid_at_ms: Optional[int] = None,
+    ts_positions: Optional[Dict[str, List[int]]] = None,
+    watermark_pos: Optional[int] = None,
+    t_hi_ms: Optional[int] = None,
+    stats: Optional[Dict[str, int]] = None,
 ) -> tuple:
     """Reload file_deps/dep_valid_from from durable :depends-on facts.
 
@@ -7708,15 +7969,26 @@ def _preload_known_deps(
     [valid_from, valid_to) containing valid_at_ms, which is exactly
     :valid-at's own half-open semantics.
 
-    #238/#245: this bound is still ts(W), NOT the monotone envelope
-    _preload_known_entities now takes, and it has no position clause. A
-    :depends-on fact carries no commit reference of any kind -- its
-    introduction timestamp comes from its own :db/valid-from -- so there is
-    nothing to join to a :hash and no position to filter on. Widening it to
-    the envelope WITHOUT a position clause would make its data-loss direction
-    worse, which is exactly the union #238 forbids. It therefore retains
-    #238's residual in both directions. Tracked as #245; do not "fix" this by
-    widening the bound.
+    #238/#245: membership is now decided by POSITION, not by date. A
+    :depends-on fact carries no commit reference, but its :db/valid-from and
+    :db/valid-to are always some commit's author date (every write site dates
+    them from commit_ts_iso), so _fact_is_live_at_position recovers both
+    endpoints' positions by inverting the timestamp. #245's own text says
+    these sites "admit no position filter"; that is true of JOINS and false of
+    POSITIONS, and the inversion only became available once PR #246 moved the
+    full-history commit_metadata above the preload block.
+
+    The `[(<= ?vf t_hi_ms)]` clause is a PREFILTER for row-count reduction and
+    carries no safety property: a fact introduced at position p <= W has
+    vf = ts[p] <= T_hi(W), so it drops only rows the position rule would drop
+    anyway. There is deliberately NO clause on ?vt -- a close above W can
+    carry an arbitrarily early date, which is the whole defect.
+    Widening the prefilter without the position filter is the "add-back union"
+    #238 forbids; test_the_prefilter_alone_does_not_close_the_hole pins that.
+
+    position_mode off (no watermark, or a watermark absent from this
+    linearization) restores today's ts(W) date window exactly, which is
+    narrower than open-facts-only and therefore the safer degradation.
 
     Mirrors _preload_known_entities, but :depends-on facts have no
     :introduced-by-style companion edge to a commit's :date, so the
@@ -7745,6 +8017,16 @@ def _preload_known_deps(
         _code_ident("module", file_path): file_path for file_path in file_entities
     }
 
+    position_mode = (
+        watermark_pos is not None
+        and ts_positions is not None
+        and t_hi_ms is not None
+    )
+    window_clauses = (
+        f"[(<= ?vf {t_hi_ms})]" if position_mode
+        else _valid_time_window_clauses(valid_at_ms)
+    )
+
     try:
         # Bind the source module's :ident object (the canonical ":module/…"
         # string _code_ident produces), not the bare ?src subject variable —
@@ -7763,33 +8045,41 @@ def _preload_known_deps(
         # attribute clauses preserves the correct binding.
         raw = _db_execute(
             db,
-            "(query [:find ?srci ?dep ?vf "
+            "(query [:find ?srci ?dep ?vf ?vt "
             ":any-valid-time "
             ":where [?src :ident ?srci] "
             "[?src :depends-on ?dep] "
             "[?src :db/valid-from ?vf] "
             "[?src :db/valid-to ?vt] "
-            f"{_valid_time_window_clauses(valid_at_ms)}])"
+            f"{window_clauses}])"
         )
         rows = json.loads(raw).get("results", [])
     except Exception:
         return file_deps, dep_valid_from
 
-    for src_ident, dep_ident, vf_ms in rows:
+    for src_ident, dep_ident, vf_ms, vt_ms in rows:
         file_path = ident_to_file.get(src_ident)
         if file_path is None:
             continue
-        vf_iso = (
-            datetime.datetime.fromtimestamp(vf_ms / 1000, datetime.timezone.utc)
-            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        )
+        if position_mode and not _fact_is_live_at_position(
+            vf_ms, vt_ms, watermark_pos, ts_positions, stats
+        ):
+            continue
+        vf_iso = _epoch_ms_to_iso(vf_ms)
         file_deps.setdefault(file_path, set()).add(dep_ident)
         dep_valid_from[(src_ident, dep_ident)] = vf_iso
 
     return file_deps, dep_valid_from
 
 
-def _preload_pinned_commits(db: Any, valid_at_ms: Optional[int] = None) -> Dict[str, tuple]:
+def _preload_pinned_commits(
+    db: Any,
+    valid_at_ms: Optional[int] = None,
+    ts_positions: Optional[Dict[str, List[int]]] = None,
+    watermark_pos: Optional[int] = None,
+    t_hi_ms: Optional[int] = None,
+    stats: Optional[Dict[str, int]] = None,
+) -> Dict[str, tuple]:
     """Reload each external-dependency entity's current :pinned-commit value
     and the timestamp it was set at, mirroring _preload_known_deps's per-fact
     :any-valid-time pattern for :depends-on.
@@ -7799,12 +8089,18 @@ def _preload_pinned_commits(db: Any, valid_at_ms: Optional[int] = None) -> Dict[
     region, so a completed two-stream run can leave a bump recorded above the
     watermark (#222 phase 2d review, B1).
 
-    #238/#245: still ts(W), with no position clause, for the same reason
-    _preload_known_deps has none -- a :pinned-commit fact carries no commit
-    reference to derive a linearization position from. Retains #238's residual
-    in both directions: a bump recorded above the watermark can be closed
-    against the wrong prior SHA. Tracked as #245. Do not widen this to
-    _preload_known_entities' envelope without a position clause.
+    #238/#245: membership is decided by POSITION, exactly as
+    _preload_known_deps does and for the same reason -- a :pinned-commit fact
+    carries no commit reference, but its :db/valid-from / :db/valid-to are
+    always some commit's author date. See that function's docstring for the
+    prefilter's role and the degradation path.
+
+    UNMEASURABLE on the repository this was developed against: 0 gitlink
+    events in 610 commits, so that history produces no :pinned-commit facts at
+    all and the #245 exposure probe reports nothing here. This ships on the
+    argument that the mechanism is identical to :depends-on's, NOT on measured
+    field exposure. Unlike :depends-on this function has no ident_to_file
+    narrowing, so it lacks even that partial mitigation.
 
     Needed because :pinned-commit is bi-temporally closed and reopened on
     every bump (see _run_ingestion's gitlink handling) — without this, the
@@ -7815,6 +8111,15 @@ def _preload_pinned_commits(db: Any, valid_at_ms: Optional[int] = None) -> Dict[
     Returns {ident: (sha, valid_from_iso)}.
     """
     pinned: Dict[str, tuple] = {}
+    position_mode = (
+        watermark_pos is not None
+        and ts_positions is not None
+        and t_hi_ms is not None
+    )
+    window_clauses = (
+        f"[(<= ?vf {t_hi_ms})]" if position_mode
+        else _valid_time_window_clauses(valid_at_ms)
+    )
     try:
         # Bind the entity's :ident object, not the bare ?e subject variable —
         # same UUID-vs-ident pitfall _preload_known_deps guards against.
@@ -7824,23 +8129,23 @@ def _preload_pinned_commits(db: Any, valid_at_ms: Optional[int] = None) -> Dict[
         # to bind to the :pinned-commit fact, not the :ident fact.
         raw = _db_execute(
             db,
-            "(query [:find ?ei ?sha ?vf "
+            "(query [:find ?ei ?sha ?vf ?vt "
             ":any-valid-time "
             ":where [?e :ident ?ei] "
             "[?e :pinned-commit ?sha] "
             "[?e :db/valid-from ?vf] "
             "[?e :db/valid-to ?vt] "
-            f"{_valid_time_window_clauses(valid_at_ms)}])"
+            f"{window_clauses}])"
         )
         rows = json.loads(raw).get("results", [])
     except Exception:
         return pinned
-    for ident, sha, vf_ms in rows:
-        vf_iso = (
-            datetime.datetime.fromtimestamp(vf_ms / 1000, datetime.timezone.utc)
-            .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        )
-        pinned[ident] = (sha, vf_iso)
+    for ident, sha, vf_ms, vt_ms in rows:
+        if position_mode and not _fact_is_live_at_position(
+            vf_ms, vt_ms, watermark_pos, ts_positions, stats
+        ):
+            continue
+        pinned[ident] = (sha, _epoch_ms_to_iso(vf_ms))
     return pinned
 
 
@@ -7969,13 +8274,19 @@ def _load_ingestion_preload_state(
     hash_to_pos = {h: i for i, h in enumerate(linearization)}
     watermark_pos = hash_to_pos.get(watermark) if watermark is not None else None
 
-    # #238: two DIFFERENT bounds now, deliberately.
+    # #238/#245: two DIFFERENT bounds now, deliberately.
     #
-    # resume_valid_at is ts(W), the watermark commit's own :date. It is what
-    # :depends-on and :pinned-commit still use, because those facts carry no
-    # commit reference of any kind and so admit no position clause. Widening
-    # THEM to the envelope without one would make their data-loss direction
-    # worse -- exactly the union #238 forbids. Tracked as #245.
+    # resume_valid_at is ts(W), the watermark commit's own :date. As of #245,
+    # :depends-on and :pinned-commit are ALSO position-filtered -- both via
+    # the inversion of their own :db/valid-from/:db/valid-to, the same
+    # mechanism entities use, not by adopting the envelope as their date
+    # bound. resume_valid_at survives only for two callers:
+    # _preload_unresolved_dep_idents (position-unaware by design, see its own
+    # docstring), and as the degraded-path bound _preload_known_deps /
+    # _preload_pinned_commits fall back to when watermark_pos is None (see
+    # the t_hi_ms guard ~12 lines below). It is no longer true that deps/pins
+    # "admit no position clause" -- see how ts_positions/watermark_pos/
+    # t_hi_ms are threaded into both calls below.
     #
     # entity_valid_at is the monotone envelope T_hi(W) = max(ts[0..W]), which
     # is safe only because _preload_known_entities pairs it with the
@@ -7985,9 +8296,35 @@ def _load_ingestion_preload_state(
     # empty state.
     resume_valid_at = _commit_date_query(db, watermark)
     resume_valid_at_ms = _iso_to_epoch_ms(resume_valid_at)
+    ts_positions = _build_ts_positions(commit_metadata)
+
+    # #238/#245: membership at all four sites is decided by POSITION.
+    #
+    # t_hi_ms is derived from _resume_envelope BEFORE entity_valid_at's
+    # fallback below, and stays None whenever watermark_pos is None. That
+    # guard is load-bearing: a watermark that exists but is absent from this
+    # linearization leaves resume_valid_at a real ts(W) while disabling the
+    # position filter, and letting that become t_hi_ms would hand the deps and
+    # pins queries a WIDENED prefilter with no position clause -- exactly the
+    # widening #245 forbids. With t_hi_ms None they keep the ts(W) date
+    # window, which is strictly no worse than today.
+    #
+    # resume_valid_at (the ISO string) survives for _preload_unresolved_dep_idents
+    # only. resume_valid_at_ms (derived above) is different: it remains the
+    # degraded-path bound for _preload_known_deps and _preload_pinned_commits,
+    # used whenever position_mode is off in either.
     entity_valid_at = _resume_envelope(commit_metadata, watermark_pos)
+    t_hi_ms = _iso_to_epoch_ms(entity_valid_at)
+    assert watermark_pos is not None or t_hi_ms is None, (
+        "t_hi_ms must stay None whenever watermark_pos is None -- callees "
+        "only read t_hi_ms inside their own position_mode branch, which "
+        "already requires watermark_pos is not None (#245); a non-None "
+        "t_hi_ms here would hand a widened prefilter to a callee with its "
+        "position filter off, exactly the 'add-back union' #238 forbids"
+    )
     if entity_valid_at is None:
         entity_valid_at = resume_valid_at
+    position_stats: Dict[str, int] = {}
     prior_ingested = _count_commit_entities(db)
     (
         entity_valid_from, entity_descriptions, entity_introduced_by,
@@ -7995,11 +8332,19 @@ def _load_ingestion_preload_state(
     ) = _preload_known_entities(
         db, repo_path, valid_at=entity_valid_at,
         hash_to_pos=hash_to_pos, watermark_pos=watermark_pos,
+        ts_positions=ts_positions, t_hi_ms=t_hi_ms, stats=position_stats,
     )
     file_deps, dep_valid_from = _preload_known_deps(
         db, file_entities, valid_at_ms=resume_valid_at_ms,
+        ts_positions=ts_positions, watermark_pos=watermark_pos,
+        t_hi_ms=t_hi_ms, stats=position_stats,
     )
-    pinned_commit_state = _preload_pinned_commits(db, valid_at_ms=resume_valid_at_ms)
+    pinned_commit_state = _preload_pinned_commits(
+        db, valid_at_ms=resume_valid_at_ms,
+        ts_positions=ts_positions, watermark_pos=watermark_pos,
+        t_hi_ms=t_hi_ms, stats=position_stats,
+    )
+    _announce_unplaceable_facts(position_stats)
     field_class_ident = _preload_field_class_idents(db)
     field_static_ident = _preload_field_static_idents(db)
     # Independent of _preload_known_entities' bound now (#238): the subtrahend

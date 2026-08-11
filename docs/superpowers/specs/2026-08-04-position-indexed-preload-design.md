@@ -331,3 +331,41 @@ calls the preload directly.
 `SKILL.md` needs no change — no query syntax, attribute or tool surface
 changes. `CLAUDE.md` likewise. The behavioural contract that changes is
 internal to ingestion and documented in the affected docstrings.
+
+## Revision — 2026-08-10
+
+**Two claims above are superseded by the #238/#245 close-side work done on
+this branch.**
+
+"Its **close position** is not recoverable at all," in [Why the bound is in
+valid-time today](#why-the-bound-is-in-valid-time-today) — true of joins,
+false of inversion. `_ingest_close` still holds no reference to the closing
+commit, but it does record `valid_to = commit_ts_iso`, and every commit's
+`:date` is already in `commit_metadata`. Inverting that instant — finding
+which position's timestamp equals `valid_to` — recovers the closing position
+exactly, no join and no fact-model change required. `_fact_is_live_at_position`
+is that inversion.
+
+The [`_preload_known_deps` and `_preload_pinned_commits`](#_preload_known_deps-and-_preload_pinned_commits)
+section, marked **Unchanged**, is also superseded: both are now
+position-filtered the same way `_preload_known_entities` is. The reasoning
+that blocked this — "`:depends-on` and `:pinned-commit` facts hold no commit
+reference of any kind, so no position clause is available for them" — held
+for the *introduction* side only; the close side's timestamp-inversion route
+does not need a commit reference on the fact at all, so it applies here too.
+
+There is an irony worth recording. The inversion is only possible because
+full-history `commit_metadata` is available at preload time — and that
+availability is exactly what this same spec's own [Call-order
+change in `_run_ingestion`](#call-order-change-in-_run_ingestion) section
+introduced, moving `build_linearization()` and the full-history `_git_commits`
+call above the preload block. The fix this revision records was unlocked by
+the very change that shipped alongside the claim that it was impossible.
+
+Consequently, [the surviving residual](#the-surviving-residual) — introduced
+at or below W, closed above W with an earlier close date, "accepted
+deliberately" — is now closed: membership is position-exact at all four
+preload sites in both directions. What remains open is a different, narrower
+defect — `entity_descriptions` still resolves *values* by date rather than
+position — filed and tracked separately (see `_preload_known_entities`'s
+docstring for the issue number).

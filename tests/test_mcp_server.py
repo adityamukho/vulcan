@@ -9921,6 +9921,688 @@ class TestPreloadKnownEntitiesPositionBound:
         assert ":module/below-w" not in entity_valid_from
 
 
+class TestValidTimePseudoAttributePredicates:
+    """Two backend behaviours the position-exact preload depends on that no
+    other code path exercises. Pinned so a minigraf bump that changes either
+    fails loudly instead of silently mis-filtering the whole preload.
+
+    Verified against minigraf's Rust source at ~/Work/AMC/Minigraf/minigraf
+    before this was written: `<=` is a real BinOp (query/datalog/parser.rs
+    "<=" => BinOp::Lte) and temporal.rs parse_timestamp routes any string
+    containing 'T' through chrono's DateTime<Utc> parser, which accepts
+    fractional seconds. These tests keep that true.
+    """
+
+    def test_upper_bound_on_valid_to_binds_and_excludes_the_sentinel(self, real_db):
+        """_preload_known_entities' phase 2 filters on `[(<= ?vt N)]`. Every
+        existing predicate on a pseudo-attribute comes from
+        _valid_time_window_clauses, which only ever emits `[(= ?vt FOREVER)]`
+        or the `[(<= ?vf N)] [(> ?vt N)]` pair -- an upper bound on ?vt alone
+        is a new shape. Still-open facts must fall out of it, because
+        i64::MAX <= N is false for any real timestamp."""
+        import json
+        import mcp_server
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-10T00:00:00Z"} '
+            '[[:module/closed :ident ":module/closed"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            '[[:module/open :ident ":module/open"]])'
+        )
+        cutoff = mcp_server._iso_to_epoch_ms("2026-05-01T00:00:00Z")
+        raw = mcp_server._db_execute(
+            real_db,
+            "(query [:find ?i ?vt :any-valid-time "
+            ":where [?e :ident ?i] "
+            "[?e :db/valid-from ?vf] [?e :db/valid-to ?vt] "
+            f"[(<= ?vt {cutoff})]])",
+        )
+        idents = {row[0] for row in json.loads(raw).get("results", [])}
+        assert idents == {":module/closed"}
+
+    def test_valid_at_accepts_millisecond_precision(self, real_db):
+        """The re-admission pass queries at ISO(vt - 1ms), which carries a
+        `.%f` field; every existing :valid-at caller passes a second-granular
+        commit date. A truncating or rejecting parser would move the
+        re-admission instant by a full second."""
+        import json
+        import mcp_server
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-10T00:00:00Z"} '
+            '[[:module/m :ident ":module/m"]])'
+        )
+        live = mcp_server._db_execute(
+            real_db,
+            '(query [:find ?i :valid-at "2026-04-09T23:59:59.999Z" '
+            ':where [?e :ident ?i]])',
+        )
+        assert [row[0] for row in json.loads(live).get("results", [])] == [":module/m"]
+        dead = mcp_server._db_execute(
+            real_db,
+            '(query [:find ?i :valid-at "2026-04-10T00:00:00.000Z" '
+            ':where [?e :ident ?i]])',
+        )
+        assert json.loads(dead).get("results", []) == []
+
+
+class TestPositionOfValidTime:
+    """#238/#245: recovering a linearization position from a fact's own
+    :db/valid-from / :db/valid-to."""
+
+    TS_POSITIONS = {
+        "2026-04-01T00:00:00Z": [0],
+        "2026-05-02T00:00:00Z": [1],
+        "2026-04-26T00:00:00Z": [2, 5],  # a deliberate collision
+    }
+
+    def test_unique_instant_maps_to_its_position(self):
+        import mcp_server
+        ms = mcp_server._iso_to_epoch_ms("2026-05-02T00:00:00Z")
+        assert mcp_server._position_of_valid_time(
+            ms, self.TS_POSITIONS, end="intro") == 1
+        assert mcp_server._position_of_valid_time(
+            ms, self.TS_POSITIONS, end="close") == 1
+
+    def test_collision_resolves_toward_exclusion_at_both_ends(self):
+        """THE test that stops a later refactor unifying this policy with
+        probe_dep_preload_exposure.edge_live_at's, which resolves the exact
+        opposite way (min intro, max close) and is correct to do so: a
+        measurement must not understate exposure, a fix must not risk the
+        unrecoverable direction. An ambiguous INTRODUCTION takes the LATEST
+        colliding position so it is more likely to read as above W; an
+        ambiguous CLOSE takes the EARLIEST so it is more likely to read as at
+        or below W. Both land on wrong-exclusion, which #235's sweep repairs."""
+        import mcp_server
+        ms = mcp_server._iso_to_epoch_ms("2026-04-26T00:00:00Z")
+        assert mcp_server._position_of_valid_time(
+            ms, self.TS_POSITIONS, end="intro") == 5
+        assert mcp_server._position_of_valid_time(
+            ms, self.TS_POSITIONS, end="close") == 2
+
+    def test_unmappable_instant_returns_none_and_counts(self):
+        import mcp_server
+        stats = {}
+        ms = mcp_server._iso_to_epoch_ms("2026-06-15T00:00:00Z")
+        assert mcp_server._position_of_valid_time(
+            ms, self.TS_POSITIONS, end="intro", stats=stats) is None
+        assert stats["unmappable_intro"] == 1
+
+    def test_collision_is_counted(self):
+        import mcp_server
+        stats = {}
+        ms = mcp_server._iso_to_epoch_ms("2026-04-26T00:00:00Z")
+        mcp_server._position_of_valid_time(
+            ms, self.TS_POSITIONS, end="close", stats=stats)
+        assert stats["collisions"] == 1
+
+    def test_unknown_end_raises(self):
+        """A typo must not silently pick the intro policy for a close."""
+        import mcp_server
+        import pytest
+        ms = mcp_server._iso_to_epoch_ms("2026-05-02T00:00:00Z")
+        with pytest.raises(ValueError):
+            mcp_server._position_of_valid_time(ms, self.TS_POSITIONS, end="closed")
+
+
+class TestFactIsLiveAtPosition:
+    """The membership rule, shared by all three position-filtered sites:
+    intro_pos <= W AND (open OR close_pos > W)."""
+
+    TS_POSITIONS = {
+        "2026-04-01T00:00:00Z": [0],
+        "2026-05-02T00:00:00Z": [1],
+        "2026-04-26T00:00:00Z": [2],
+    }
+    WATERMARK_POS = 1
+
+    def _ms(self, iso):
+        import mcp_server
+        return mcp_server._iso_to_epoch_ms(iso)
+
+    def test_open_fact_introduced_below_w_is_live(self):
+        import mcp_server
+        assert mcp_server._fact_is_live_at_position(
+            self._ms("2026-04-01T00:00:00Z"), mcp_server._VALID_TIME_FOREVER_MS,
+            self.WATERMARK_POS, self.TS_POSITIONS)
+
+    def test_open_fact_introduced_above_w_is_not_live(self):
+        """#238's DATA-LOSS direction: dated 2026-04-26, EARLIER than the
+        watermark's own 2026-05-02, but topologically above it."""
+        import mcp_server
+        assert not mcp_server._fact_is_live_at_position(
+            self._ms("2026-04-26T00:00:00Z"), mcp_server._VALID_TIME_FOREVER_MS,
+            self.WATERMARK_POS, self.TS_POSITIONS)
+
+    def test_fact_closed_above_w_is_still_live(self):
+        """The close-side residual: close DATE 2026-04-26 is below the
+        envelope, so a date bound drops it, but close POSITION 2 is above W."""
+        import mcp_server
+        assert mcp_server._fact_is_live_at_position(
+            self._ms("2026-04-01T00:00:00Z"), self._ms("2026-04-26T00:00:00Z"),
+            self.WATERMARK_POS, self.TS_POSITIONS)
+
+    def test_fact_closed_at_w_is_not_live(self):
+        import mcp_server
+        assert not mcp_server._fact_is_live_at_position(
+            self._ms("2026-04-01T00:00:00Z"), self._ms("2026-05-02T00:00:00Z"),
+            self.WATERMARK_POS, self.TS_POSITIONS)
+
+    def test_unmappable_close_excludes(self):
+        """Cannot place the close, so cannot prove the fact is still live.
+        Exclusion is the recoverable direction."""
+        import mcp_server
+        stats = {}
+        assert not mcp_server._fact_is_live_at_position(
+            self._ms("2026-04-01T00:00:00Z"), self._ms("2026-06-15T00:00:00Z"),
+            self.WATERMARK_POS, self.TS_POSITIONS, stats)
+        assert stats["unmappable_close"] == 1
+
+
+class TestPreloadKnownDepsPositionBound:
+    """#245: :depends-on membership must be decided by position, not by the
+    watermark commit's own author date.
+
+    Measured on this repository at an affected position: the ts(W) bound
+    wrongly excludes 32 of 68 genuinely live edges (47%), all in the
+    wrong-exclusion direction, once #238's close-side residual is removed.
+    Wrong inclusion is 0 in both framings.
+
+    Linearization: 0 = c0 @ 2026-04-01, 1 = c1 (WATERMARK) @ 2026-05-02,
+    2 = c2 @ 2026-04-26 -- above the watermark but dated EARLIER, the
+    side-branch inversion.
+    """
+
+    TS_POSITIONS = {
+        "2026-04-01T00:00:00Z": [0],
+        "2026-05-02T00:00:00Z": [1],
+        "2026-04-26T00:00:00Z": [2],
+    }
+    WATERMARK_POS = 1
+
+    def _t_hi_ms(self):
+        import mcp_server
+        return mcp_server._iso_to_epoch_ms("2026-05-02T00:00:00Z")
+
+    def _seed(self, real_db):
+        """Four edges out of one module, one per quadrant of the rule."""
+        import mcp_server
+        src = mcp_server._code_ident("module", "mod_a.py")
+        real_db.execute(
+            f'(transact [[{src} :entity-type :type/module] '
+            f'[{src} :ident "{src}"]])'
+        )
+        # open, introduced at c0 (pos 0 <= W): live.
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            f'[[{src} :depends-on :module/open-below-w]])'
+        )
+        # open, introduced at c2 (pos 2 > W): NOT live. Today's ts(W) bound
+        # admits it, because c2's date is earlier than the watermark's.
+        real_db.execute(
+            '(transact {:valid-from "2026-04-26T00:00:00Z"} '
+            f'[[{src} :depends-on :module/open-above-w]])'
+        )
+        # closed at c2 (pos 2 > W): still live at W. Today's bound drops it,
+        # because the close DATE is below the envelope. This is the 47%.
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-26T00:00:00Z"} '
+            f'[[{src} :depends-on :module/closed-above-w]])'
+        )
+        # closed at c1 (pos 1 <= W): genuinely dead at W.
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-05-02T00:00:00Z"} '
+            f'[[{src} :depends-on :module/closed-below-w]])'
+        )
+        return src
+
+    def _run(self, real_db):
+        import mcp_server
+        file_deps, dep_valid_from = mcp_server._preload_known_deps(
+            real_db, {"mod_a.py": []},
+            ts_positions=self.TS_POSITIONS,
+            watermark_pos=self.WATERMARK_POS,
+            t_hi_ms=self._t_hi_ms(),
+        )
+        return file_deps.get("mod_a.py", set()), dep_valid_from
+
+    def test_edge_closed_above_the_watermark_is_reloaded(self, real_db):
+        """#245's measured direction. Excluded, the forward walk treats an
+        already-standing dependency as newly introduced and overwrites its
+        true :valid-from."""
+        self._seed(real_db)
+        deps, _ = self._run(real_db)
+        assert ":module/closed-above-w" in deps
+
+    def test_edge_introduced_above_the_watermark_is_excluded(self, real_db):
+        """The data-loss direction: present in the preload but absent from the
+        earlier commit's resolved imports on replay, so it is closed at that
+        earlier commit -- an inverted valid interval on the edge."""
+        self._seed(real_db)
+        deps, _ = self._run(real_db)
+        assert ":module/open-above-w" not in deps
+
+    def test_edge_closed_at_or_below_the_watermark_is_excluded(self, real_db):
+        self._seed(real_db)
+        deps, _ = self._run(real_db)
+        assert ":module/closed-below-w" not in deps
+
+    def test_open_edge_below_the_watermark_is_reloaded(self, real_db):
+        self._seed(real_db)
+        deps, _ = self._run(real_db)
+        assert ":module/open-below-w" in deps
+
+    def test_valid_from_is_the_edge_s_own_introduction(self, real_db):
+        """dep_valid_from must still carry the edge's true :valid-from, which
+        is what removed-dependency detection compares against."""
+        src = self._seed(real_db)
+        _, dep_valid_from = self._run(real_db)
+        assert dep_valid_from[(src, ":module/closed-above-w")].startswith(
+            "2026-04-01T00:00:00"
+        )
+
+    def test_the_prefilter_alone_does_not_close_the_hole(self, real_db):
+        """Misnamed: watermark_pos=None makes position_mode False, so this
+        does NOT exercise the widened prefilter `[(<= ?vf T_hi)]` -- it
+        exercises _valid_time_window_clauses(None), the off-mode fallback
+        `[(= ?vt FOREVER)]` (open-facts-only). It passes only because
+        open-above-w happens to be an open fact, so it survives that
+        fallback regardless of any position logic.
+
+        This test has NO power over the position filter or the prefilter it
+        was meant to isolate. test_edge_introduced_above_the_watermark_is_
+        excluded is the one that genuinely distinguishes fixed from broken
+        behaviour here -- confirmed to fail when the position filter is
+        deleted while the prefilter is kept. Kept anyway, undeleted, per the
+        precedent TestResumeWithInvertedAuthorDates sets for documenting a
+        powerless test rather than removing it."""
+        import mcp_server
+        self._seed(real_db)
+        file_deps, _ = mcp_server._preload_known_deps(
+            real_db, {"mod_a.py": []},
+            ts_positions=self.TS_POSITIONS,
+            watermark_pos=None,
+            t_hi_ms=self._t_hi_ms(),
+        )
+        assert ":module/open-above-w" in file_deps.get("mod_a.py", set())
+
+    def test_position_args_omitted_restores_today_s_behaviour(self, real_db):
+        """The degraded path: a watermark absent from this linearization keeps
+        the ts(W) date window rather than dropping to open-facts-only."""
+        import mcp_server
+        self._seed(real_db)
+        file_deps, _ = mcp_server._preload_known_deps(
+            real_db, {"mod_a.py": []},
+            valid_at_ms=mcp_server._iso_to_epoch_ms("2026-05-02T00:00:00Z"),
+        )
+        deps = file_deps.get("mod_a.py", set())
+        assert ":module/open-above-w" in deps       # the residual, unchanged
+        assert ":module/closed-above-w" not in deps  # the residual, unchanged
+
+
+class TestPreloadPinnedCommitsPositionBound:
+    """#245: :pinned-commit gets the same position rule as :depends-on.
+
+    Exposure is UNMEASURABLE on this repository -- 0 gitlink events in 610
+    commits, so real history produces no :pinned-commit facts and the probe
+    reports nothing for them. This fixture is synthetic, and the change ships
+    on the argument that the mechanism is identical, not on field evidence.
+
+    _preload_pinned_commits also has NO ident_to_file narrowing, so it lacks
+    even the partial mitigation that makes :depends-on's narrow figure small.
+
+    Same linearization as TestPreloadKnownDepsPositionBound.
+    """
+
+    TS_POSITIONS = {
+        "2026-04-01T00:00:00Z": [0],
+        "2026-05-02T00:00:00Z": [1],
+        "2026-04-26T00:00:00Z": [2],
+    }
+    WATERMARK_POS = 1
+
+    def _seed(self, real_db):
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            '[[:external-dependency/sub-open-below :ident '
+            '":external-dependency/sub-open-below"] '
+            '[:external-dependency/sub-open-below :pinned-commit "aaa111"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-26T00:00:00Z"} '
+            '[[:external-dependency/sub-open-above :ident '
+            '":external-dependency/sub-open-above"] '
+            '[:external-dependency/sub-open-above :pinned-commit "bbb222"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-26T00:00:00Z"} '
+            '[[:external-dependency/sub-closed-above :ident '
+            '":external-dependency/sub-closed-above"] '
+            '[:external-dependency/sub-closed-above :pinned-commit "ccc333"]])'
+        )
+
+    def _run(self, real_db):
+        import mcp_server
+        return mcp_server._preload_pinned_commits(
+            real_db,
+            ts_positions=self.TS_POSITIONS,
+            watermark_pos=self.WATERMARK_POS,
+            t_hi_ms=mcp_server._iso_to_epoch_ms("2026-05-02T00:00:00Z"),
+        )
+
+    def test_pin_closed_above_the_watermark_is_reloaded(self, real_db):
+        """Without it the server loses the prior SHA and closes the next bump
+        against the wrong one, exactly as the docstring describes."""
+        self._seed(real_db)
+        pinned = self._run(real_db)
+        assert pinned[":external-dependency/sub-closed-above"][0] == "ccc333"
+
+    def test_pin_set_above_the_watermark_is_excluded(self, real_db):
+        self._seed(real_db)
+        pinned = self._run(real_db)
+        assert ":external-dependency/sub-open-above" not in pinned
+
+    def test_open_pin_below_the_watermark_is_reloaded(self, real_db):
+        self._seed(real_db)
+        pinned = self._run(real_db)
+        assert pinned[":external-dependency/sub-open-below"][0] == "aaa111"
+
+    def test_position_args_omitted_restores_today_s_behaviour(self, real_db):
+        import mcp_server
+        self._seed(real_db)
+        pinned = mcp_server._preload_pinned_commits(real_db)
+        assert ":external-dependency/sub-open-above" in pinned
+
+
+class TestPreloadKnownEntitiesCloseSide:
+    """#238's close-side residual, and the reason #245's observable loss was
+    2 edges rather than 32.
+
+    PR #246 made _preload_known_entities position-correct on its INTRODUCTION
+    side only; its close side stayed a T_hi(W) date bound with the identical
+    author-date inversion. On this repository the four modules deleted by
+    df6b8be at position 124 (vulcan.py plus three test modules) have a close
+    DATE below the envelope but a close POSITION above W, so they vanish from
+    file_entities at positions 118-123 and take 30 misclassified :depends-on
+    edges out of both sides of the diff before it is computed.
+
+    Same linearization as TestPreloadKnownEntitiesPositionBound:
+    0 = c0 @ 2026-04-01, 1 = c1 (WATERMARK) @ 2026-05-02, 2 = c2 @ 2026-04-26.
+    """
+
+    LINEARIZATION = ["c0" * 20, "c1" * 20, "c2" * 20]
+    HASH_TO_POS = {h: i for i, h in enumerate(LINEARIZATION)}
+    WATERMARK_POS = 1
+    T_HI = "2026-05-02T00:00:00Z"
+    TS_POSITIONS = {
+        "2026-04-01T00:00:00Z": [0],
+        "2026-05-02T00:00:00Z": [1],
+        "2026-04-26T00:00:00Z": [2],
+        "2026-04-27T00:00:00Z": [3],
+    }
+
+    def _seed(self, real_db):
+        """c0's commit facts stay open so the :introduced-by -> :date -> :hash
+        join still resolves at the re-admission instant.
+
+        closed_above_w: introduced at c0, CLOSED at c2's date. Close date
+            2026-04-26 < T_hi 2026-05-02, so a :valid-at T_hi query misses it,
+            but its close POSITION 2 is above W: still live at W. The
+            vulcan.py shape.
+        closed_below_w: introduced at c0, closed at c1's date, i.e. exactly at
+            the envelope. Close position 1 <= W: genuinely dead at W.
+        """
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            f'[[:commit/c0 :hash "{self.LINEARIZATION[0]}"] '
+            '[:commit/c0 :date "2026-04-01T00:00:00Z"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-26T00:00:00Z"} '
+            '[[:module/closed-above-w :entity-type :type/module] '
+            '[:module/closed-above-w :ident ":module/closed-above-w"] '
+            '[:module/closed-above-w :path "vulcan.py"] '
+            '[:module/closed-above-w :description "vulcan.py"] '
+            '[:module/closed-above-w :introduced-by :commit/c0]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-05-02T00:00:00Z"} '
+            '[[:module/closed-below-w :entity-type :type/module] '
+            '[:module/closed-below-w :ident ":module/closed-below-w"] '
+            '[:module/closed-below-w :path "gone.py"] '
+            '[:module/closed-below-w :description "gone.py"] '
+            '[:module/closed-below-w :introduced-by :commit/c0]])'
+        )
+
+    def _run(self, real_db, tmp_path):
+        import mcp_server
+        return mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+            hash_to_pos=self.HASH_TO_POS, watermark_pos=self.WATERMARK_POS,
+            ts_positions=self.TS_POSITIONS,
+            t_hi_ms=mcp_server._iso_to_epoch_ms(self.T_HI),
+        )
+
+    def test_entity_closed_above_the_watermark_is_readmitted(self, real_db, tmp_path):
+        """Fails on master: the T_hi(W) date bound drops it."""
+        self._seed(real_db)
+        entity_valid_from, *_ = self._run(real_db, tmp_path)
+        assert ":module/closed-above-w" in entity_valid_from
+
+    def test_readmitted_entity_carries_its_path_and_description(self, real_db, tmp_path):
+        """The re-admission pass must produce full rows, not bare idents --
+        file_entities is what _preload_known_deps' ident_to_file narrows
+        against, and it is where the 30 edges were lost."""
+        self._seed(real_db)
+        _vf, descriptions, _ib, file_entities, _sp = self._run(real_db, tmp_path)
+        assert descriptions[":module/closed-above-w"] == "vulcan.py"
+        assert ":module/closed-above-w" in file_entities["vulcan.py"]
+
+    def test_readmitted_entity_carries_its_introducing_commit(self, real_db, tmp_path):
+        """#231's retract value must survive re-admission."""
+        self._seed(real_db)
+        _vf, _d, entity_introduced_by, _fe, _sp = self._run(real_db, tmp_path)
+        assert entity_introduced_by[":module/closed-above-w"] == (
+            f":commit/{self.LINEARIZATION[0][:12]}"
+        )
+
+    def test_entity_closed_at_or_below_the_watermark_stays_excluded(
+        self, real_db, tmp_path
+    ):
+        """Re-admission must not become an unconditional add-back."""
+        self._seed(real_db)
+        entity_valid_from, *_ = self._run(real_db, tmp_path)
+        assert ":module/closed-below-w" not in entity_valid_from
+
+    def test_readmission_is_position_gated_not_date_gated(self, real_db, tmp_path):
+        """The close-side twin of test_the_envelope_alone_does_not_close_the
+        _hole. Without ts_positions/t_hi_ms there is no phase 2 at all, so the
+        entity stays lost -- proving re-admission comes from the position
+        rule and not from a widened date bound."""
+        import mcp_server
+        self._seed(real_db)
+        entity_valid_from, *_ = mcp_server._preload_known_entities(
+            real_db, str(tmp_path), valid_at=self.T_HI,
+            hash_to_pos=self.HASH_TO_POS, watermark_pos=self.WATERMARK_POS,
+        )
+        assert ":module/closed-above-w" not in entity_valid_from
+
+    def test_reintroduced_entity_keeps_its_current_values(self, real_db, tmp_path):
+        """An ident closed above W and re-introduced below W is live via phase
+        1. Phase 2 must not overwrite it with the historical interval.
+
+        The OLD interval closes at 2026-04-26T00:00:00Z -- position 2 in
+        TS_POSITIONS, ABOVE W (position 1) -- deliberately, not at some date
+        absent from TS_POSITIONS. An earlier version of this test closed the
+        OLD interval at 2026-04-20T00:00:00Z, which isn't in TS_POSITIONS at
+        all: _position_of_valid_time returned None for it, so
+        _fact_is_live_at_position excluded the OLD interval before either
+        dedup guard ran, and the test passed even with both guards deleted
+        (both the `if ident in entity_valid_from: continue` in the readmit-
+        collection loop, and the `and ident not in entity_valid_from` in the
+        re-admission accept lambda) -- a vacuous regression test, caught by
+        ablation."""
+        import mcp_server
+        self._seed(real_db)
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-26T00:00:00Z"} '
+            '[[:module/recycled :entity-type :type/module] '
+            '[:module/recycled :ident ":module/recycled"] '
+            '[:module/recycled :path "recycled.py"] '
+            '[:module/recycled :description "OLD"] '
+            '[:module/recycled :introduced-by :commit/c0]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-26T00:00:00Z"} '
+            '[[:module/recycled :entity-type :type/module] '
+            '[:module/recycled :ident ":module/recycled"] '
+            '[:module/recycled :path "recycled.py"] '
+            '[:module/recycled :description "NEW"] '
+            '[:module/recycled :introduced-by :commit/c0]])'
+        )
+        _vf, descriptions, _ib, _fe, _sp = self._run(real_db, tmp_path)
+        assert descriptions[":module/recycled"] == "NEW"
+
+    def test_two_distinct_closing_instants_readmit_independently(self, real_db, tmp_path):
+        """Pins that the re-admission loop's one-_collect-pass-per-distinct-
+        closing-instant design keeps two overlapping re-admission groups
+        separate, with no cross-group leakage -- genuine coverage this class
+        previously lacked.
+
+        A single closing instant can't distinguish the two: with only one
+        re-admission pass there is nothing for a wrong group to leak from.
+        This seeds a SECOND entity, closed-above-w-2, closing at a distinct
+        instant (2026-04-27, position 3) above W, alongside closed-above-w's
+        existing close at 2026-04-26 (position 2) -- two re-admission passes.
+        Both entities must come back with their OWN description/path, not
+        just be present: closed-above-w-2's :ident window (04-01 to 04-27)
+        is also live at 2026-04-26's re-admission instant (2026-04-25
+        23:59:59.999), so a wrong-group leak would surface as one entity's
+        row overwriting the other's, not as an absence.
+
+        This test has NO power over whether the accept lambda binds close_ms
+        per-iteration via a default argument (`lambda ident, _c=close_ms:
+        ...`) versus a bare free variable -- confirmed by replacing the
+        default-argument bind with a bare closure and re-running: all 8
+        tests in this class still passed. That is expected: `_collect` is
+        invoked synchronously inside each loop iteration, so no lambda
+        outlives its iteration and late binding cannot bite. The `_c=
+        close_ms` default-argument bind is kept anyway as defensive style --
+        the bug it guards against becomes live if `_collect` is ever made
+        deferred or async, at which point the lambdas could outlive the loop
+        that created them."""
+        self._seed(real_db)
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-27T00:00:00Z"} '
+            '[[:module/closed-above-w-2 :entity-type :type/module] '
+            '[:module/closed-above-w-2 :ident ":module/closed-above-w-2"] '
+            '[:module/closed-above-w-2 :path "phobos.py"] '
+            '[:module/closed-above-w-2 :description "phobos.py"] '
+            '[:module/closed-above-w-2 :introduced-by :commit/c0]])'
+        )
+        _vf, descriptions, _ib, file_entities, _sp = self._run(real_db, tmp_path)
+        assert descriptions[":module/closed-above-w"] == "vulcan.py"
+        assert ":module/closed-above-w" in file_entities["vulcan.py"]
+        assert descriptions[":module/closed-above-w-2"] == "phobos.py"
+        assert ":module/closed-above-w-2" in file_entities["phobos.py"]
+
+    def test_introduction_above_watermark_excludes_even_when_ident_window_is_live(
+        self, real_db, tmp_path
+    ):
+        """Both gates apply, independently, to every re-admitted row.
+
+        The readmit-collection loop's _fact_is_live_at_position check only
+        inspects the :ident fact's OWN :db/valid-from/:db/valid-to -- it has
+        no way to see :introduced-by at all. _collect's own :introduced-by
+        position clause is what actually gates introduction, on phase 1 AND
+        every re-admission pass alike.
+
+        This entity's :ident window opens at c0's date (position 0, <= W) and
+        closes at c2's date (position 2, > W) -- exactly the shape that
+        clears the readmit-collection gate and gets a re-admission pass
+        scheduled. But its :introduced-by points at c2 itself (position 2,
+        > W): a case _fact_is_live_at_position cannot see, since it never
+        looks at :introduced-by. Only _collect's own watermark clause catches
+        it. It must stay excluded."""
+        self._seed(real_db)
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z"} '
+            f'[[:commit/c2 :hash "{self.LINEARIZATION[2]}"] '
+            '[:commit/c2 :date "2026-04-26T00:00:00Z"]])'
+        )
+        real_db.execute(
+            '(transact {:valid-from "2026-04-01T00:00:00Z" '
+            ':valid-to "2026-04-26T00:00:00Z"} '
+            '[[:module/intro-above-w :entity-type :type/module] '
+            '[:module/intro-above-w :ident ":module/intro-above-w"] '
+            '[:module/intro-above-w :path "ghost.py"] '
+            '[:module/intro-above-w :description "ghost.py"] '
+            '[:module/intro-above-w :introduced-by :commit/c2]])'
+        )
+        entity_valid_from, *_ = self._run(real_db, tmp_path)
+        assert ":module/intro-above-w" not in entity_valid_from
+
+
+class TestPreloadStateUnmappableAnnounce:
+    """An unplaceable :db/valid-from or :db/valid-to means the position
+    inversion's assumption is broken for that fact. Excluding is the
+    recoverable direction, but it must not be silent -- the same reasoning
+    _commit_date_query applies when a non-empty watermark has no :date."""
+
+    def test_unmappable_close_is_announced_on_stderr(self, real_db, capsys):
+        import mcp_server
+        ts_positions = {"2026-04-01T00:00:00Z": [0], "2026-05-02T00:00:00Z": [1]}
+        stats = {}
+        mcp_server._fact_is_live_at_position(
+            mcp_server._iso_to_epoch_ms("2026-04-01T00:00:00Z"),
+            mcp_server._iso_to_epoch_ms("2026-06-15T00:00:00Z"),
+            1, ts_positions, stats,
+        )
+        mcp_server._announce_unplaceable_facts(stats)
+        assert "unplaceable" in capsys.readouterr().err
+
+    def test_clean_stats_announce_nothing(self, real_db, capsys):
+        import mcp_server
+        mcp_server._announce_unplaceable_facts({"collisions": 3})
+        assert capsys.readouterr().err == ""
+
+
+class TestEpochMsToIso:
+    def test_round_trips_a_commit_instant(self):
+        import mcp_server
+        ms = mcp_server._iso_to_epoch_ms("2026-04-26T00:00:00Z")
+        assert mcp_server._epoch_ms_to_iso(ms) == "2026-04-26T00:00:00.000Z"
+
+    def test_one_millisecond_before_an_instant(self):
+        """The re-admission pass's 'last instant this entity was live'."""
+        import mcp_server
+        ms = mcp_server._iso_to_epoch_ms("2026-04-26T00:00:00Z")
+        assert mcp_server._epoch_ms_to_iso(ms - 1) == "2026-04-25T23:59:59.999Z"
+
+
+class TestBuildTsPositions:
+    def test_groups_colliding_instants(self):
+        import mcp_server
+        metadata = [
+            ("a" * 40, "2026-04-01T00:00:00Z", "x@y", "s0"),
+            ("b" * 40, "2026-04-26T00:00:00Z", "x@y", "s1"),
+            ("c" * 40, "2026-04-26T00:00:00Z", "x@y", "s2"),
+        ]
+        assert mcp_server._build_ts_positions(metadata) == {
+            "2026-04-01T00:00:00Z": [0],
+            "2026-04-26T00:00:00Z": [1, 2],
+        }
+
+
 class TestPreloadProvisionalIdents:
     def test_empty_when_no_markers(self, real_db):
         import mcp_server
@@ -10209,7 +10891,9 @@ class TestRunIngestion:
         leaving the server permanently unable to connect."""
         import mcp_server
 
-        def slow_preload(db, repo_path, valid_at=None, hash_to_pos=None, watermark_pos=None):
+        def slow_preload(db, repo_path, valid_at=None, hash_to_pos=None,
+                         watermark_pos=None, ts_positions=None, t_hi_ms=None,
+                         stats=None):
             time.sleep(0.3)
             return {}, {}, {}, {}, {}
 
@@ -12553,6 +13237,104 @@ def _inverted_author_date_repo(path):
     commit(
         {"late.py": "def helper_fn():\n    return 99\n\ndef late_fn():\n    return 3\n"},
         "2026-04-26T00:00:00Z", "2026-05-05T00:00:00Z", "c3 late-add-late_fn",
+    )
+    commit(
+        {"base.py": "def base_fn():\n    return 1\n\ndef base_fn2():\n    return 4\n"},
+        "2026-04-27T00:00:00Z", "2026-05-06T00:00:00Z", "c4 base-add-base_fn2",
+    )
+    return path
+
+
+def _inverted_author_date_repo_with_deps(path):
+    """_inverted_author_date_repo plus the two shapes #245 and #238's close
+    side need, added to the EXISTING five commits rather than as new ones --
+    TestResumeWithInvertedAuthorDates._run_resume asserts processed == 4 and
+    depends on which commits each stream claims, so the commit count must not
+    move.
+
+        pos 0  c0  + doomed.py (imports base) and dep_src.py
+                     (imports doomed)                            @ 2026-04-01
+        pos 1  c1  mid.py                                        @ 2026-05-02  <- W
+        pos 2  c2  late.py modified, dep_src.py touched          @ 2026-04-20
+        pos 3  c3  late.py + late_fn, and DELETES doomed.py      @ 2026-04-26  <- above W, dated earlier
+        pos 4  c4  base.py + base_fn2                            @ 2026-04-27
+
+    doomed.py's module entity CLOSES at c3: close position 3 is above W, while
+    the close DATE 2026-04-26 is below the envelope T_hi(W) = 2026-05-02. That
+    is exactly the four-modules-deleted-by-df6b8be shape #238's close-side
+    residual was measured on.
+
+    That close is NOT reachable in the two-run drive _run_resume performs --
+    Stage B is the only writer of a close above the watermark and is gated on
+    `completed_all`, so an interrupted run never reaches it. See
+    TestResumeWithInvertedAuthorDatesAndDeps' docstring for the three-run
+    drive that does reach it, and for what was and was not measurable there.
+
+    There are deliberately TWO :depends-on edges, one on each side of the
+    dropped module, because only one of them can show #245's harm:
+
+      doomed.py -> base.py    the dropped module is the edge's SOURCE. This is
+                              the edge that vanishes: _preload_known_deps
+                              resolves a row's file via
+                              ident_to_file[src_ident], built from
+                              file_entities, so an absent doomed.py takes every
+                              edge it owns with it -- #245's own "30
+                              misclassified edges ... before any diff was
+                              computed".
+      dep_src.py -> doomed.py the dropped module is the edge's TARGET. This one
+                              SURVIVES either way: dep_src.py is live at W, so
+                              ident_to_file resolves and the row is kept
+                              whatever happened to doomed.py. Kept as the
+                              negative control, and as the reason
+                              test_resumed_run_preserves_the_standing_dep_edge_valid_from
+                              has no ablation power.
+
+    dep_src.py is also re-touched at c2 (a comment-only body edit that leaves
+    `import doomed` in place). c2 is the GAP commit run 2's forward walk
+    replays, and dep-edge diffing (`current_deps - previous_deps`) only runs
+    for files that appear in a commit's own diff -- a dep edge whose source
+    file is never touched again after c0 is never re-diffed at all.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    _subprocess.run(["git", "init"], cwd=path, check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=path,
+                    check=True, capture_output=True)
+    _subprocess.run(["git", "config", "user.name", "T"], cwd=path,
+                    check=True, capture_output=True)
+
+    def commit(files, author_date, committer_date, msg):
+        for filename, body in files.items():
+            (path / filename).write_text(body)
+        _subprocess.run(["git", "add", "."], cwd=path, check=True, capture_output=True)
+        env = {**os.environ,
+               "GIT_AUTHOR_DATE": author_date, "GIT_COMMITTER_DATE": committer_date}
+        _subprocess.run(["git", "commit", "-m", msg], cwd=path,
+                        check=True, capture_output=True, env=env)
+
+    commit(
+        {"base.py": "def base_fn():\n    return 1\n",
+         "late.py": "def helper_fn():\n    return 0\n",
+         "doomed.py": "import base\n\ndef doomed_fn():\n    return base.base_fn() + 7\n",
+         "dep_src.py": "import doomed\n\ndef src_fn():\n    return doomed.doomed_fn()\n"},
+        "2026-04-01T00:00:00Z", "2026-04-01T00:00:00Z", "c0 base+late+doomed+dep_src",
+    )
+    commit(
+        {"mid.py": "def mid_fn():\n    return 2\n"},
+        "2026-05-02T00:00:00Z", "2026-05-03T00:00:00Z", "c1 mid",
+    )
+    commit(
+        {"late.py": "def helper_fn():\n    return 99\n",
+         "dep_src.py": "import doomed\n\ndef src_fn():\n    # touched at c2\n"
+                       "    return doomed.doomed_fn()\n"},
+        "2026-04-20T00:00:00Z", "2026-05-04T00:00:00Z", "c2 late-mod-helper",
+    )
+    # The commit() helper only writes files; the deletion has to be staged
+    # explicitly before c3's commit call runs `git add .`.
+    _subprocess.run(["git", "rm", "doomed.py"], cwd=path,
+                    check=True, capture_output=True)
+    commit(
+        {"late.py": "def helper_fn():\n    return 99\n\ndef late_fn():\n    return 3\n"},
+        "2026-04-26T00:00:00Z", "2026-05-05T00:00:00Z", "c3 late-add-late_fn+rm-doomed",
     )
     commit(
         {"base.py": "def base_fn():\n    return 1\n\ndef base_fn2():\n    return 4\n"},
@@ -19813,6 +20595,436 @@ class TestResumeWithInvertedAuthorDates:
         )
         inverted = [(i, vf, vt) for i, vf, vt in rows if vt is not None and vt < vf]
         assert inverted == [], f"inverted valid intervals on :ident facts: {inverted}"
+
+
+class TestResumeWithInvertedAuthorDatesAndDeps:
+    """#238's close side and #245, end-to-end on a resumed run.
+
+    Sibling of TestResumeWithInvertedAuthorDates, which covers the
+    INTRODUCTION side. Read that class's docstring first -- the run-1 stream
+    ratio, the sleep-count stop point, and why a forward-only resume cannot
+    reach this class of bug at all are all explained there and all apply here.
+
+    Both defects here are wrong-EXCLUSION: doomed.py closes ABOVE the
+    watermark with a date BELOW the envelope, so a date-bounded preload cannot
+    see it at W and drops it -- and with it, out of file_entities, every
+    :depends-on edge that names it as source, "before any diff was computed"
+    (#245's own phrasing for the shape its probe measured).
+
+    WHY THIS NEEDS THREE RUNS, NOT TWO (the Step 2 investigation this test was
+    required to do before asserting anything). TestResumeWithInvertedAuthorDates'
+    two-run drive cannot produce this precondition. Run 1 is interrupted, and
+    Stage B -- the ONLY writer of a close above the forward watermark -- is
+    gated on `if completed_all:` in _run_ingestion, so an interrupted run never
+    reaches it. The reverse stream writes provisional INTRODUCTIONS only; it
+    applies no lifecycle. Measured directly: after run 1 of the two-run drive
+    against this fixture, :module/doomed-py's :ident is still open-ended
+    (valid-to = the FOREVER sentinel), so there is nothing above W for the
+    close side of the preload to be right or wrong about. The third run exists
+    solely to get a close durably above W:
+
+        run 1  interrupted after 4 commits  -> fwd {c0,c1} (W = c1), rev {c4,c3},
+                                               gap {c2}
+        run 2  interrupted after 2 yields   -> Stage A claims c2 (W = c2), then
+                                               Stage B sweeps c3, which applies
+                                               c3's deletion of doomed.py and
+                                               closes it at 2026-04-26 -- above
+                                               W (position 3 > 2) and below the
+                                               envelope T_hi(W) = 2026-05-02
+        run 3  the resume under test        -> its preload is the first one that
+                                               sees the close
+
+    _run_resume_three asserts that shape between runs rather than trusting it,
+    so a drift in the sleep accounting fails loudly instead of silently
+    degrading these tests into a fresh-ingestion check.
+
+    WHAT THIS CLASS ASSERTS ON, AND WHY IT IS NOT THE GRAPH. The graph that
+    comes out of run 3 is byte-for-byte identical with and without the
+    production change -- verified over every :ident interval, every
+    :depends-on interval and every multi-valued :introduced-by, on this
+    fixture and on a variant where c4 re-adds doomed.py. That is structural,
+    not a weakness of the fixture: a close above W can only be written by
+    Stage B, Stage B requires the gap to be closed, and it sweeps the
+    frontier-high region ASCENDING. So by the time a close above W exists the
+    forward walk has nothing left to replay, and every commit any later run
+    still has to process sits ABOVE the close -- where a module deleted at
+    that close appears in no diff. The consumer that would misuse the dropped
+    state has, by construction, nothing left to consume. #245's projected harm
+    needs one more thing this pipeline cannot currently produce: a gap commit
+    BELOW a durable close.
+
+    What does diverge, sharply, is the state run 3 resumes FROM, so that is
+    what the two load-bearing tests assert on -- captured by wrapping
+    _load_ingestion_preload_state during the real run, never by calling the
+    preload directly with hand-built arguments (which is what
+    TestPreloadKnownEntitiesCloseSide already does, and which cannot show that
+    _run_ingestion reaches the preload with the arguments that make the
+    position rule fire at all).
+
+    ABLATION, per test, stated rather than claimed in aggregate:
+
+        readmits_the_module_closed_above_the_watermark   FAILS without the fix
+        keeps_the_dropped_modules_own_dep_edge           FAILS without the fix
+        preserves_the_standing_dep_edge_valid_from       cannot fail
+        writes_no_inverted_valid_interval                cannot fail
+        mints_no_duplicate_introduced_by                 cannot fail
+
+    The three powerless ones are KEPT, on the precedent
+    TestResumeWithInvertedAuthorDates set for its own third test: state the
+    absence of power, do not claim it, do not quietly delete the test. They
+    pin the SHAPE -- that the resume, the close above W and the envelope
+    inversion are all real and reachable -- and the standing bi-temporal
+    invariants across it. Each one's own docstring says why it cannot fail.
+    """
+
+    _progress = TestResumeWithInvertedAuthorDates._progress
+    _results = staticmethod(TestResumeWithInvertedAuthorDates._results)
+
+    async def _run_resume_three(self, repo, graph, monkeypatch):
+        """Drives the three-run sequence this class's docstring describes.
+
+        Returns (db, preload): the reopened post-resume db, and the preload
+        state RUN 3 ACTUALLY RESUMED FROM, captured by wrapping
+        _load_ingestion_preload_state for the duration of that run only.
+
+        The capture is a wrapper, not a re-derivation: calling the preload
+        directly with hand-built arguments is what
+        TestPreloadKnownEntitiesCloseSide already does, and it cannot show that
+        _run_ingestion reaches the preload with the arguments that make the
+        position rule fire. Everything here -- the watermark, the
+        linearization, hash_to_pos, ts_positions, the envelope -- is whatever
+        the real resumed run computed.
+
+        Runs 1 and 2 are interrupted by the same sleep-count trick
+        TestResumeWithInvertedAuthorDates._run_resume uses, including its
+        `if t: await original_sleep(t); return` guard -- without it
+        _ensure_db_async's lock-contention backoff consumes a count and the
+        run stops one step early, which was a real CI-only failure on this
+        fixture.
+
+        Run 2's two counted yields are NOT two pipeline commits: the first is
+        Stage A's single gap commit (c2) and the second is Stage B's first
+        swept commit (c3). Both stages yield through the same
+        `await asyncio.sleep(0)`.
+        """
+        import mcp_server
+        from minigraf import MiniGrafDb
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._graph_path = graph
+        original_sleep = asyncio.sleep
+        captured = {}
+        original_load = mcp_server._load_ingestion_preload_state
+
+        def capturing_load(*args, **kwargs):
+            state = original_load(*args, **kwargs)
+            # Positional unpack of _load_ingestion_preload_state's documented
+            # return tuple; named here so a change to its shape fails loudly
+            # in one place instead of silently shifting an index.
+            (
+                _watermark, _prior_ingested, entity_valid_from,
+                _entity_descriptions, _entity_introduced_by, file_entities,
+                file_deps, dep_valid_from, *_rest,
+            ) = state
+            captured["entity_valid_from"] = dict(entity_valid_from)
+            captured["file_entities"] = {
+                path: list(idents) for path, idents in file_entities.items()
+            }
+            captured["file_deps"] = {
+                path: set(deps) for path, deps in file_deps.items()
+            }
+            captured["dep_valid_from"] = dict(dep_valid_from)
+            return state
+
+        async def drive(ratio, stop_after, capture=False):
+            monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", ratio)
+            mcp_server._db = None
+            mcp_server._ingest_progress = self._progress()
+            if stop_after is None:
+                with patch.object(
+                    mcp_server, "_load_ingestion_preload_state",
+                    capturing_load if capture else original_load,
+                ):
+                    await mcp_server._run_ingestion(str(repo), "HEAD")
+                mcp_server._db = None
+                return
+            calls = {"n": 0}
+
+            async def stop_after_nth(t):
+                # See _run_resume's stop_after_fourth for why non-zero sleeps
+                # must not be counted.
+                if t:
+                    await original_sleep(t)
+                    return
+                calls["n"] += 1
+                if calls["n"] == stop_after:
+                    mcp_server._shutdown_requested.set()
+                await original_sleep(t)
+
+            with patch("mcp_server.asyncio.sleep", stop_after_nth):
+                await mcp_server._run_ingestion(str(repo), "HEAD")
+            mcp_server._db = None
+
+        await drive("2:1000000", 4)
+        assert mcp_server._ingest_progress["status"] == "stopped"
+        assert mcp_server._ingest_progress["processed"] == 4
+
+        await drive(f"{10**6}:1", 2)
+        assert mcp_server._ingest_progress["status"] == "stopped"
+
+        # The precondition, asserted rather than assumed -- this is the state
+        # the two-run drive provably cannot reach, and every claim these tests
+        # make about the close side rests on it.
+        doomed = mcp_server._code_ident("module", "doomed.py")
+        db = MiniGrafDb.open(graph)
+        try:
+            rows = self._results(
+                db,
+                '(query [:find ?vf ?vt :any-valid-time '
+                f':where [?e :ident "{doomed}"] '
+                '[?e :db/valid-from ?vf] [?e :db/valid-to ?vt]])',
+            )
+            closed = [
+                (vf, vt) for vf, vt in rows
+                if int(vt) < mcp_server._VALID_TIME_FOREVER_MS
+            ]
+            assert closed == [(
+                mcp_server._iso_to_epoch_ms("2026-04-01T00:00:00Z"),
+                mcp_server._iso_to_epoch_ms("2026-04-26T00:00:00Z"),
+            )], (
+                f"run 2 did not leave {doomed} closed at c3's instant, so run "
+                f"3's preload has no close above the watermark to get wrong: "
+                f"{rows}"
+            )
+            watermark = self._results(
+                db, '(query [:find ?h :where [:ingestion/watermark :hash ?h]])'
+            )
+            assert watermark, "no watermark after run 2"
+        finally:
+            # Single-handle invariant: this handle must be gone before run 3
+            # opens its own.
+            del db
+
+        await drive(f"{10**6}:1", None, capture=True)
+        assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
+        assert captured, (
+            "run 3 never called _load_ingestion_preload_state -- it did not "
+            "take the resume path at all"
+        )
+
+        mcp_server._db = None
+        return MiniGrafDb.open(graph), captured
+
+    @pytest.mark.asyncio
+    async def test_resumed_run_preserves_the_standing_dep_edge_valid_from(
+        self, tmp_path, monkeypatch
+    ):
+        """#245's projected harm, asserted on :valid-from rather than on edge
+        existence -- the edge exists in both the broken and the fixed graph.
+        What the defect would destroy is WHEN it was introduced:
+        `current_deps - previous_deps` treating a standing edge as new at the
+        replayed gap commit and re-dating it.
+
+        NO ABLATION POWER -- verified, not assumed: it passes with
+        mcp_server.py reverted to master. Two independent reasons, both worth
+        recording.
+
+        The first is specific to this edge. _preload_known_deps drops a row
+        only when its SOURCE module is missing from file_entities. The module
+        dropped by the defect is doomed.py, which is this edge's TARGET;
+        dep_src.py, its source, is live at W either way, so the row survives
+        the preload with or without the fix. The edge that DOES vanish is
+        doomed.py -> base.py, and that one is asserted on directly by
+        test_resumed_preload_keeps_the_dropped_modules_own_dep_edge.
+
+        The second reason would defeat this test even with the source-side
+        edge, and is why the powerful assertions in this class are on preload
+        state rather than on the graph: no gap commit ever sits below a
+        durable close. A close above W can only be written by Stage B, Stage B
+        requires the gap to be closed, and it sweeps ASCENDING -- so by the
+        time the close exists, the forward walk has nothing left to replay and
+        every remaining commit sits above the close, where a deleted module
+        appears in no diff. See the class docstring."""
+        import mcp_server
+        repo = _inverted_author_date_repo_with_deps(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        db, _preload = await self._run_resume_three(repo, graph, monkeypatch)
+
+        src = mcp_server._code_ident("module", "dep_src.py")
+        rows = self._results(
+            db,
+            '(query [:find ?vf :any-valid-time '
+            f':where [?e :ident "{src}"] '
+            '[?e :depends-on ?dep] '
+            '[?e :db/valid-from ?vf] [?e :db/valid-to ?vt]])',
+        )
+        assert rows, "the dep_src -> doomed edge vanished entirely"
+        earliest = min(int(r[0]) for r in rows)
+        assert earliest == mcp_server._iso_to_epoch_ms("2026-04-01T00:00:00Z"), (
+            "the standing :depends-on edge was re-introduced at the replayed "
+            f"gap commit instead of keeping c0's :valid-from (#245): {rows}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resumed_run_writes_no_inverted_valid_interval(
+        self, tmp_path, monkeypatch
+    ):
+        """The general corruption signature both issues produce. A fact whose
+        window closes BEFORE it opens is unrecoverable, and it is what a
+        wrongly-preloaded entity produces when it is closed at a commit
+        earlier than its own introduction.
+
+        NO ABLATION POWER on the close side -- verified, not assumed: it
+        passes with mcp_server.py reverted to master. Its sibling of the same
+        name in TestResumeWithInvertedAuthorDates does have power, but against
+        the INTRODUCTION clause (over-inclusion), which is already on master
+        and is not what this branch changes. The close-side clause is a
+        re-ADMISSION: it can only make the preload larger, and a larger
+        preload cannot produce an inverted interval by the route this checks.
+        The general reason no graph-level assertion in this class can have
+        power -- Stage B's ascending sweep leaves no gap commit below a
+        durable close -- is in the class docstring. Kept because the invariant
+        is worth holding on a three-run resume as well as a two-run one."""
+        import mcp_server
+        repo = _inverted_author_date_repo_with_deps(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        db, _preload = await self._run_resume_three(repo, graph, monkeypatch)
+
+        rows = self._results(
+            db,
+            '(query [:find ?i ?vf ?vt :any-valid-time '
+            ':where [?e :ident ?i] '
+            '[?e :db/valid-from ?vf] [?e :db/valid-to ?vt]])',
+        )
+        inverted = [
+            r for r in rows
+            if int(r[2]) < mcp_server._VALID_TIME_FOREVER_MS
+            and int(r[2]) < int(r[1])
+        ]
+        assert inverted == [], f"inverted valid intervals written: {inverted}"
+
+    @pytest.mark.asyncio
+    async def test_resumed_run_mints_no_duplicate_introduced_by(
+        self, tmp_path, monkeypatch
+    ):
+        """The wrong-EXCLUSION consequence: a module missing from the preload
+        takes _build_code_triples' introduction branch on replay and gains a
+        second live :introduced-by.
+
+        NO ABLATION POWER -- verified, not assumed: it passes with
+        mcp_server.py reverted to master. Two reasons, the first being the one
+        that also defeats it in TestResumeWithInvertedAuthorDates.
+
+        The branch it needs is _build_code_triples' introduction branch, and
+        the only work run 3 has left is Stage B, whose
+        _forward_apply(lifecycle_only=True) DISCARDS that output for "A"/"M"
+        files (it is called for its dict side effects only) and keeps it
+        solely for "R". So the excluded module cannot mint a second
+        :introduced-by here even when it is excluded.
+
+        And Stage B is all that is left because its ascending sweep means no
+        gap commit ever sits below a durable close -- the class docstring's
+        structural argument, which is why the powerful assertions here are on
+        preload state instead. Kept because "no entity holds two live
+        :introduced-by values" is a standing #235 invariant and this is a
+        resume path it has not otherwise been checked on."""
+        repo = _inverted_author_date_repo_with_deps(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        db, _preload = await self._run_resume_three(repo, graph, monkeypatch)
+
+        rows = self._results(
+            db, '(query [:find ?e (count ?c) :where [?e :introduced-by ?c]])'
+        )
+        assert [r for r in rows if int(r[1]) > 1] == []
+
+    @pytest.mark.asyncio
+    async def test_resumed_preload_readmits_the_module_closed_above_the_watermark(
+        self, tmp_path, monkeypatch
+    ):
+        """#238's close side, on the state a REAL resumed run resumed from.
+
+        doomed.py is introduced at c0 (position 0, at or below W = c2) and
+        closed at c3 (position 3, above W) with valid_to = 2026-04-26, which
+        is at or below the envelope T_hi(W) = 2026-05-02. Phase 1's
+        :valid-at T_hi(W) query therefore cannot see it, and the resumed walk
+        must still start from a state in which it is live -- it WAS live at W.
+
+        HAS ABLATION POWER: with mcp_server.py reverted to master, both the
+        file_entities key and the entity_valid_from entry are absent. That is
+        #245's "dropped out of file_entities" shape, measured on the real
+        three-run drive rather than on a direct call to the preload."""
+        import mcp_server
+        repo = _inverted_author_date_repo_with_deps(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        _db, preload = await self._run_resume_three(repo, graph, monkeypatch)
+
+        module = mcp_server._code_ident("module", "doomed.py")
+        assert "doomed.py" in preload["file_entities"], (
+            "doomed.py, live at the watermark and closed only ABOVE it, was "
+            "dropped from the resumed walk's file_entities because its close "
+            "DATE fell inside the envelope (#238 close side): "
+            f"{sorted(preload['file_entities'])}"
+        )
+        assert module in preload["file_entities"]["doomed.py"], (
+            f"{module} missing from its own file's entity list: "
+            f"{preload['file_entities']['doomed.py']}"
+        )
+        assert preload["entity_valid_from"].get(module) == "2026-04-01T00:00:00Z", (
+            f"{module} is absent from, or misdated in, entity_valid_from -- "
+            "the resumed walk would treat it as never introduced: "
+            f"{preload['entity_valid_from'].get(module)!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_resumed_preload_keeps_the_dropped_modules_own_dep_edge(
+        self, tmp_path, monkeypatch
+    ):
+        """#245, on the state a REAL resumed run resumed from.
+
+        The edge doomed.py -> base.py is introduced at c0 and closed at c3
+        along with its source module, so it is live at W by position and dead
+        at W by date -- the same inversion, one level down. It is the edge
+        that #245's phrase "taking 30 misclassified :depends-on edges with
+        them before any diff was computed" refers to: _preload_known_deps
+        resolves each row through ident_to_file, which is built from
+        file_entities, so an absent doomed.py silently discards every edge it
+        owns regardless of what the :depends-on rows themselves say.
+
+        HAS ABLATION POWER: with mcp_server.py reverted to master, file_deps
+        has no 'doomed.py' key at all.
+
+        The sibling edge dep_src.py -> doomed.py is asserted here too, as a
+        NEGATIVE control: its source is live at W, so it survives in both
+        versions. It is the reason
+        test_resumed_run_preserves_the_standing_dep_edge_valid_from has no
+        power, and pinning it here keeps the fixture honest about which of the
+        two edges is load-bearing."""
+        import mcp_server
+        repo = _inverted_author_date_repo_with_deps(tmp_path / "repo")
+        graph = str(repo / "memory.graph")
+        _db, preload = await self._run_resume_three(repo, graph, monkeypatch)
+
+        doomed = mcp_server._code_ident("module", "doomed.py")
+        base = mcp_server._code_ident("module", "base.py")
+
+        assert preload["file_deps"].get("doomed.py") == {base}, (
+            "the doomed.py -> base.py edge was dropped from the resumed "
+            "walk's file_deps: doomed.py is missing from file_entities, so "
+            "_preload_known_deps could not resolve the row's source file "
+            f"(#245). file_deps = {preload['file_deps']}"
+        )
+        assert preload["dep_valid_from"].get((doomed, base), "").startswith(
+            "2026-04-01"
+        ), (
+            "the dropped module's edge lost c0's :valid-from: "
+            f"{preload['dep_valid_from'].get((doomed, base))!r}"
+        )
+        # Negative control -- survives with and without the fix.
+        assert base != doomed
+        assert doomed in preload["file_deps"].get("dep_src.py", set()), (
+            "the target-side edge vanished, which no version of this code "
+            f"should do: {preload['file_deps']}"
+        )
 
 
 class _FakeClock:
