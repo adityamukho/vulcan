@@ -29,9 +29,23 @@ TWO STAGES, and the first one may make the second moot:
     returns against a position-correct oracle. This answers #257 on its own
     terms rather than resting on Stage 1's structural argument.
 
-Stage 2 is not redundant with Stage 1. Stage 1's zero implies Stage 2's zero
-only through an argument about how :description is written; Stage 2 checks the
-shipped query's actual output and needs no such argument.
+Stage 2 is not redundant with Stage 1, but it is NOT independent of it either.
+What Stage 2 adds is coverage: it drives the shipped query over the WHOLE
+preloaded population at every affected watermark and checks its actual output,
+rather than reasoning from how :description is written.
+
+What Stage 2 cannot do is find a mismatch outside Stage 1's census.
+diff_descriptions can only record a mismatch for an ident whose preloaded value
+is absent from the values live at that position, which requires the ident to
+carry at least two DISTINCT values across time -- i.e. to be a census offender.
+So value_mismatches is ALWAYS a subset of the census offenders. Worse, the
+ambiguity rule removes exactly that subset in the case where the mechanism is
+most likely to fire: when the two competing versions are contemporaneous at a
+position, the oracle's live set has two members, the ident is classified
+ambiguous, and no comparison happens at all. A zero from Stage 2 must therefore
+be read against per_position's compared_idents and offenders_present, which say
+whether any offender was ever actually compared. Zero mismatches out of zero
+informative comparisons is not a null result.
 
 ONE MODE, unlike the #245 probe's date-only/--verify-fix pair. #257 is the
 residual in the SHIPPED code, so _preload_known_entities is always driven with
@@ -176,10 +190,19 @@ def diff_descriptions(
     Ordering matters: ambiguity is tested BEFORE the value comparison, so an
     ambiguous ident contributes to neither the mismatch count nor the
     membership counters.
+
+    compared_idents counts the fourth quantity, and it is what makes a zero in
+    value_mismatches interpretable: how many idents actually REACHED the value
+    comparison -- neither ambiguous nor excluded by membership. Without it,
+    "zero mismatches" cannot be distinguished from "zero comparisons", and the
+    two mean opposite things. Only an ident that carries more than one distinct
+    value across time can ever be a mismatch, and that is exactly the ident the
+    ambiguity rule removes when its versions overlap at a position.
     """
     value_mismatches: Dict[str, Dict] = {}
     ambiguous: List[str] = []
     preloaded_not_live: List[str] = []
+    compared = 0
 
     for ident, preloaded_value in actual.items():
         live_values = oracle.get(ident)
@@ -189,6 +212,7 @@ def diff_descriptions(
         if len(live_values) > 1:
             ambiguous.append(ident)
             continue
+        compared += 1
         if preloaded_value not in live_values:
             value_mismatches[ident] = {
                 "preloaded": preloaded_value,
@@ -199,6 +223,7 @@ def diff_descriptions(
 
     return {
         "value_mismatches": value_mismatches,
+        "compared_idents": compared,
         "ambiguous_idents": sorted(ambiguous),
         "preloaded_not_live": sorted(preloaded_not_live),
         "live_not_preloaded": sorted(live_not_preloaded),
@@ -326,17 +351,25 @@ def sweep(
 
     STAGE 1 MAY MAKE STAGE 2 MOOT, but Stage 2 runs regardless. A zero census
     implies zero mismatches only through an argument about how :description is
-    written; Stage 2 checks the shipped query's actual output and rests on no
-    such argument. Two independent lines of evidence for the price of one
-    ingest.
+    written; Stage 2 verifies the shipped query's actual output over the whole
+    preloaded population at every affected watermark and rests on no such
+    argument.
+
+    The two stages are NOT independent, though, and this sweep's output must
+    not be read as if they were. A mismatch is only recordable for an ident
+    carrying more than one distinct value, so Stage 2's finding is a strict
+    SUBSET of Stage 1's offenders -- and diff_descriptions skips exactly that
+    subset as ambiguous whenever the competing versions are contemporaneous at
+    a position. per_position therefore records compared_idents (how many idents
+    reached the value comparison) and offenders_present (which census offenders
+    were in the preload at all), so a reader can tell a genuine zero from zero
+    informative comparisons without re-deriving it from the raw lists.
 
     provenance: repo_path alone was not enough to reproduce the first #245
     artifact -- it named a scratch directory that no longer existed, with no
     branch and no head SHA. branch and head_commit are recorded here so a
     future run carries its own.
     """
-    import subprocess
-
     import mcp_server
 
     if len(commit_metadata) != len(linearization):
@@ -364,11 +397,23 @@ def sweep(
     unmappable_vf, unmappable_vt = count_unmappable_description_facts(
         facts, ts_positions
     )
+    # The ONLY idents that can ever produce a value mismatch: a mismatch needs
+    # the preloaded value to be absent from the live set, which needs at least
+    # two distinct values on the ident. Tracked per position (offenders_present)
+    # so the artifact says whether the mechanism even had a candidate there,
+    # instead of leaving that to be re-derived from the census by hand.
+    census_offenders = {
+        ident
+        for entity_type in ENTITY_TYPES
+        for ident in census[entity_type]["offending_idents"]
+    }
 
     positions = affected_positions(commit_metadata)
     per_position = []
     mismatch_distinct: set = set()
     mismatch_weighted = 0
+    compared_total = 0
+    offender_comparisons = 0
     ambiguous_total = 0
     preloaded_not_live_total = 0
     live_not_preloaded_total = 0
@@ -389,7 +434,20 @@ def sweep(
         oracle = position_correct_descriptions(facts, ts_positions, w)
         result = diff_descriptions(entity_descriptions, oracle)
 
+        offenders_present = census_offenders & set(entity_descriptions)
+        # An offender that was preloaded still may not have been COMPARED: it
+        # is dropped if the oracle called it ambiguous, or if it was preloaded
+        # while nothing was live for it. Subtracting both is what turns
+        # "0 mismatches" into a claim with a denominator.
+        offenders_compared = (
+            offenders_present
+            - set(result["ambiguous_idents"])
+            - set(result["preloaded_not_live"])
+        )
+
         preload_sizes.append(len(entity_descriptions))
+        compared_total += result["compared_idents"]
+        offender_comparisons += len(offenders_compared)
         mismatch_weighted += len(result["value_mismatches"])
         mismatch_distinct.update(result["value_mismatches"])
         ambiguous_total += len(result["ambiguous_idents"])
@@ -402,20 +460,24 @@ def sweep(
             "preloaded_idents": len(entity_descriptions),
             "oracle_idents": len(oracle),
             "value_mismatches": result["value_mismatches"],
+            "compared_idents": result["compared_idents"],
+            "offenders_present": sorted(offenders_present),
+            "offenders_compared": sorted(offenders_compared),
             "ambiguous_idents": result["ambiguous_idents"],
             "preloaded_not_live": len(result["preloaded_not_live"]),
             "live_not_preloaded": len(result["live_not_preloaded"]),
         })
 
-    head_commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repo_path, capture_output=True, text=True, check=True,
-    ).stdout.strip()
-
     return {
         "repo_path": repo_path,
         "branch": branch,
-        "head_commit": head_commit,
+        # The ingested head, taken from the linearization rather than from a
+        # fresh `git rev-parse HEAD`: it is the commit this sweep's graph
+        # actually ends at. A rev-parse would name whatever the working tree
+        # is checked out to -- on a probe branch, a commit that is not on the
+        # swept branch at all -- and the artifact would claim provenance it
+        # does not have. probe_dep_preload_exposure.py:829-832 does the same.
+        "head_commit": linearization[-1] if linearization else None,
         "commits": len(commit_metadata),
         "affected_positions": positions,
         "misclassifying_positions": [
@@ -428,6 +490,14 @@ def sweep(
         ),
         "value_mismatch_total_position_weighted": mismatch_weighted,
         "value_mismatch_distinct_idents": len(mismatch_distinct),
+        # The denominators for the two numbers above. compared_idents_total is
+        # how many (position, ident) pairs reached the value comparison at all;
+        # offender_value_comparisons is how many of those were on a census
+        # offender -- the only idents a mismatch is possible for. A zero
+        # mismatch count with offender_value_comparisons == 0 means the
+        # mechanism was never given a chance to show, not that it did not fire.
+        "compared_idents_total": compared_total,
+        "offender_value_comparisons": offender_comparisons,
         "ambiguous_idents_total": ambiguous_total,
         "preloaded_not_live_total": preloaded_not_live_total,
         "live_not_preloaded_total": live_not_preloaded_total,
@@ -564,6 +634,11 @@ def main() -> int:
     print(f"  mismatches, position-weighted:   {report['value_mismatch_total_position_weighted']}")
     print(f"  mismatches, distinct idents:     {report['value_mismatch_distinct_idents']}")
     print()
+    print("  (the denominators -- a zero above is only a null result if these")
+    print("   are nonzero; only a census offender can ever mismatch:)")
+    print(f"  value comparisons made:          {report['compared_idents_total']}")
+    print(f"  of those, on a census offender:  {report['offender_value_comparisons']}")
+    print()
     print("  (counted separately, NOT the finding:)")
     print(f"  ambiguous idents:                {report['ambiguous_idents_total']}")
     print(f"  preloaded but not live:          {report['preloaded_not_live_total']}")
@@ -604,6 +679,21 @@ def main() -> int:
             "two are indistinguishable from the mismatch count alone. Check\n"
             ":description facts above: nonzero there with zero here is the\n"
             "signature of the latter."
+        )
+
+    if (
+        report["census_idents_with_multiple_values"] > 0
+        and report["offender_value_comparisons"] == 0
+    ):
+        print()
+        print(
+            "NOTE: the census found offenders but NOT ONE of them ever reached\n"
+            "the value comparison -- at every affected position each was either\n"
+            "ambiguous (both values live at once) or not preloaded. Since only a\n"
+            "census offender can produce a mismatch, Stage 2's mismatch count is\n"
+            "zero out of zero informative comparisons here. It neither confirms\n"
+            "nor refutes #257's mechanism on this history; do not write it up as\n"
+            "agreement. See per_position's offenders_present/offenders_compared."
         )
 
     if report["gitlink_events"] == 0:
