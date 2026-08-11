@@ -336,3 +336,57 @@ def experiment_2(tmpdir, populations=IDENT_POPULATIONS, filler=1_000_000, reps=3
         del db
 
     return results
+
+
+def experiment_3(tmpdir, e1, sizes=SIZES, reps=20):
+    """E3: whole-relation batch cost, and the crossover against N point
+    queries at CANDIDATES_PER_COMMIT.
+
+    The batch form is whole-relation-plus-Python-narrowing, because minigraf
+    has no set-membership predicate (`contains?` is a STRING predicate,
+    query/datalog/parser.rs:1175) and so a query cannot be scoped to N specific
+    idents server-side. _preload_known_deps already uses exactly this shape.
+
+    reps=20 because the batch call is milliseconds, not microseconds, and is
+    stable well before 20 -- the same figure bench_lineage_query_cost.py uses
+    for its preload.
+
+    crossover_n is the number of point queries whose combined cost equals ONE
+    batch call. Below it, point queries win; above it, the batch does. Compare
+    against CANDIDATES_PER_COMMIT to decide whether a per-commit batch is
+    worth building.
+    """
+    results = {}
+    hit_idents = [f":e/hit{i}" for i in range(CANDIDATES_PER_COMMIT)]
+
+    print("\n=== E3: whole-relation batch vs N point queries ===")
+    print(f"({reps} reps/cell, 1 asserted warmup before each timed loop; "
+          f"N = {CANDIDATES_PER_COMMIT} candidates/commit)")
+    print(f"{'filler':>10} {'batch ms':>10} {'rows':>8} "
+          f"{'N x point':>11} {'crossover N':>12} {'winner':>10}")
+
+    for n in sizes:
+        db, _ = fresh_db(tmpdir, f"e3_{n}")
+        populate_filler(db, n)
+        populate_lineage_entities(db, hit_idents)
+
+        batch_ms, batch_len = timed_whole_relation(
+            db, reps, expected_len=CANDIDATES_PER_COMMIT
+        )
+        point_ms = e1[n]["intro_by_hit"]
+        n_point_ms = point_ms * CANDIDATES_PER_COMMIT
+        crossover_n = batch_ms / point_ms if point_ms else float("inf")
+        winner = "batch" if n_point_ms > batch_ms else "point"
+
+        results[n] = {
+            "batch_ms": batch_ms,
+            "batch_len": batch_len,
+            "point_ms": point_ms,
+            "n_point_ms": n_point_ms,
+            "crossover_n": crossover_n,
+        }
+        print(f"{n:>10} {batch_ms:>10.3f} {batch_len:>8} {n_point_ms:>11.1f} "
+              f"{crossover_n:>12.0f} {winner:>10}")
+        del db
+
+    return results
