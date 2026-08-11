@@ -7355,11 +7355,26 @@ def _preload_known_entities(
 
     What survives is VALUES. entity_descriptions still carries whichever
     :description version was live at DATE T_hi(W), which can be a version
-    written above W with an inverted author date. The forward walk uses this
-    dict for body-change detection, so a from-the-future description makes a
-    real change compare equal and go unrecorded. Membership is position-exact;
-    values are not. UNMEASURED -- the #245 exposure probe measured membership
-    only -- and tracked as #257.
+    written above W with an inverted author date. Membership is position-exact;
+    values are not. That is #257.
+
+    What the consequence is NOT: body-change detection. An earlier version of
+    this paragraph claimed the forward walk diffs descriptions to decide
+    whether a body changed, so a from-the-future value would make a real change
+    compare equal and go unrecorded. That is false. Body-change detection is
+    unchanged_idents, computed in _precompute_file_triples from the parsed node
+    text (#221) and consumed by _build_code_triples; entity_descriptions is
+    only ever WRITTEN there. Every READ of it in _forward_apply feeds
+    _build_close_triples' `desc` argument.
+
+    What the consequence IS: `desc` is the value _build_close_triples retracts
+    when an entity closes. A wrong value there retracts a :description fact
+    that was never asserted, so the one that IS live never gets closed and
+    stays live past its window -- a stale-fact bug, not a lost body edit.
+    MEASURED on this repository's history and recorded in
+    evals/at_scale/results/257-description-preload-exposure.json (the #245
+    probe measured membership only); read that artifact's limitations before
+    treating its mismatch count as a bound.
 
     _preload_known_deps and _preload_pinned_commits are position-filtered the
     same way (#245). This function's close side is what made their exposure

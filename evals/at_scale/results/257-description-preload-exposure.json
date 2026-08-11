@@ -1,0 +1,335 @@
+{
+  "repo_path": ".",
+  "branch": "master",
+  "head_commit": "1dceec17f7fb41b3d5d2b3f35edb54048d2f3ebf",
+  "commits": 656,
+  "affected_positions": [
+    118,
+    119,
+    120,
+    121,
+    122,
+    123,
+    124,
+    125,
+    126,
+    127,
+    128,
+    645,
+    646,
+    647,
+    648,
+    649
+  ],
+  "misclassifying_positions": [],
+  "description_facts_total": 2737,
+  "census": {
+    "module": {
+      "idents_total": 55,
+      "idents_with_multiple_values": 0,
+      "offending_idents": {}
+    },
+    "function": {
+      "idents_total": 2030,
+      "idents_with_multiple_values": 3,
+      "offending_idents": {
+        ":function/tests-test-mcp-server-py-commit": [
+          "_commit",
+          "commit"
+        ],
+        ":function/tests-test-mcp-server-py-snapshot": [
+          "_snapshot",
+          "snapshot"
+        ],
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main": [
+          "_main",
+          "main"
+        ]
+      }
+    },
+    "class": {
+      "idents_total": 284,
+      "idents_with_multiple_values": 0,
+      "offending_idents": {}
+    },
+    "variable": {
+      "idents_total": 227,
+      "idents_with_multiple_values": 0,
+      "offending_idents": {}
+    },
+    "field": {
+      "idents_total": 62,
+      "idents_with_multiple_values": 0,
+      "offending_idents": {}
+    },
+    "external-dependency": {
+      "idents_total": 76,
+      "idents_with_multiple_values": 0,
+      "offending_idents": {}
+    }
+  },
+  "census_idents_with_multiple_values": 3,
+  "value_mismatch_total_position_weighted": 0,
+  "value_mismatch_distinct_idents": 0,
+  "compared_idents_total": 12685,
+  "offender_value_comparisons": 0,
+  "ambiguous_idents_total": 15,
+  "preloaded_not_live_total": 0,
+  "live_not_preloaded_total": 677,
+  "unmappable_description_valid_from": 0,
+  "unmappable_description_valid_to": 0,
+  "timestamp_collisions": 0,
+  "preload_descriptions_empty_everywhere": false,
+  "gitlink_events": 0,
+  "per_position": [
+    {
+      "position": 118,
+      "envelope": "2026-04-26T12:57:34Z",
+      "preloaded_idents": 147,
+      "oracle_idents": 174,
+      "value_mismatches": {},
+      "compared_idents": 147,
+      "offenders_present": [],
+      "offenders_compared": [],
+      "ambiguous_idents": [],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 27
+    },
+    {
+      "position": 119,
+      "envelope": "2026-04-26T12:58:03Z",
+      "preloaded_idents": 147,
+      "oracle_idents": 174,
+      "value_mismatches": {},
+      "compared_idents": 147,
+      "offenders_present": [],
+      "offenders_compared": [],
+      "ambiguous_idents": [],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 27
+    },
+    {
+      "position": 120,
+      "envelope": "2026-04-26T13:00:10Z",
+      "preloaded_idents": 147,
+      "oracle_idents": 174,
+      "value_mismatches": {},
+      "compared_idents": 147,
+      "offenders_present": [],
+      "offenders_compared": [],
+      "ambiguous_idents": [],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 27
+    },
+    {
+      "position": 121,
+      "envelope": "2026-05-02T13:12:41Z",
+      "preloaded_idents": 147,
+      "oracle_idents": 174,
+      "value_mismatches": {},
+      "compared_idents": 147,
+      "offenders_present": [],
+      "offenders_compared": [],
+      "ambiguous_idents": [],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 27
+    },
+    {
+      "position": 122,
+      "envelope": "2026-05-02T13:13:10Z",
+      "preloaded_idents": 147,
+      "oracle_idents": 174,
+      "value_mismatches": {},
+      "compared_idents": 147,
+      "offenders_present": [],
+      "offenders_compared": [],
+      "ambiguous_idents": [],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 27
+    },
+    {
+      "position": 123,
+      "envelope": "2026-05-02T13:13:20Z",
+      "preloaded_idents": 147,
+      "oracle_idents": 174,
+      "value_mismatches": {},
+      "compared_idents": 147,
+      "offenders_present": [],
+      "offenders_compared": [],
+      "ambiguous_idents": [],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 27
+    },
+    {
+      "position": 124,
+      "envelope": "2026-05-02T13:13:20Z",
+      "preloaded_idents": 72,
+      "oracle_idents": 99,
+      "value_mismatches": {},
+      "compared_idents": 72,
+      "offenders_present": [],
+      "offenders_compared": [],
+      "ambiguous_idents": [],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 27
+    },
+    {
+      "position": 125,
+      "envelope": "2026-05-02T13:13:20Z",
+      "preloaded_idents": 72,
+      "oracle_idents": 99,
+      "value_mismatches": {},
+      "compared_idents": 72,
+      "offenders_present": [],
+      "offenders_compared": [],
+      "ambiguous_idents": [],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 27
+    },
+    {
+      "position": 126,
+      "envelope": "2026-05-02T13:13:20Z",
+      "preloaded_idents": 72,
+      "oracle_idents": 99,
+      "value_mismatches": {},
+      "compared_idents": 72,
+      "offenders_present": [],
+      "offenders_compared": [],
+      "ambiguous_idents": [],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 27
+    },
+    {
+      "position": 127,
+      "envelope": "2026-05-02T13:13:20Z",
+      "preloaded_idents": 72,
+      "oracle_idents": 99,
+      "value_mismatches": {},
+      "compared_idents": 72,
+      "offenders_present": [],
+      "offenders_compared": [],
+      "ambiguous_idents": [],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 27
+    },
+    {
+      "position": 128,
+      "envelope": "2026-05-02T13:13:20Z",
+      "preloaded_idents": 72,
+      "oracle_idents": 99,
+      "value_mismatches": {},
+      "compared_idents": 72,
+      "offenders_present": [],
+      "offenders_compared": [],
+      "ambiguous_idents": [],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 27
+    },
+    {
+      "position": 645,
+      "envelope": "2026-08-11T04:04:35Z",
+      "preloaded_idents": 2285,
+      "oracle_idents": 2361,
+      "value_mismatches": {},
+      "compared_idents": 2282,
+      "offenders_present": [
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
+        ":function/tests-test-mcp-server-py-commit",
+        ":function/tests-test-mcp-server-py-snapshot"
+      ],
+      "offenders_compared": [],
+      "ambiguous_idents": [
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
+        ":function/tests-test-mcp-server-py-commit",
+        ":function/tests-test-mcp-server-py-snapshot"
+      ],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 76
+    },
+    {
+      "position": 646,
+      "envelope": "2026-08-11T04:04:35Z",
+      "preloaded_idents": 2285,
+      "oracle_idents": 2361,
+      "value_mismatches": {},
+      "compared_idents": 2282,
+      "offenders_present": [
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
+        ":function/tests-test-mcp-server-py-commit",
+        ":function/tests-test-mcp-server-py-snapshot"
+      ],
+      "offenders_compared": [],
+      "ambiguous_idents": [
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
+        ":function/tests-test-mcp-server-py-commit",
+        ":function/tests-test-mcp-server-py-snapshot"
+      ],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 76
+    },
+    {
+      "position": 647,
+      "envelope": "2026-08-11T04:04:35Z",
+      "preloaded_idents": 2285,
+      "oracle_idents": 2361,
+      "value_mismatches": {},
+      "compared_idents": 2282,
+      "offenders_present": [
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
+        ":function/tests-test-mcp-server-py-commit",
+        ":function/tests-test-mcp-server-py-snapshot"
+      ],
+      "offenders_compared": [],
+      "ambiguous_idents": [
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
+        ":function/tests-test-mcp-server-py-commit",
+        ":function/tests-test-mcp-server-py-snapshot"
+      ],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 76
+    },
+    {
+      "position": 648,
+      "envelope": "2026-08-11T04:04:35Z",
+      "preloaded_idents": 2300,
+      "oracle_idents": 2376,
+      "value_mismatches": {},
+      "compared_idents": 2297,
+      "offenders_present": [
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
+        ":function/tests-test-mcp-server-py-commit",
+        ":function/tests-test-mcp-server-py-snapshot"
+      ],
+      "offenders_compared": [],
+      "ambiguous_idents": [
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
+        ":function/tests-test-mcp-server-py-commit",
+        ":function/tests-test-mcp-server-py-snapshot"
+      ],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 76
+    },
+    {
+      "position": 649,
+      "envelope": "2026-08-11T04:04:35Z",
+      "preloaded_idents": 2303,
+      "oracle_idents": 2379,
+      "value_mismatches": {},
+      "compared_idents": 2300,
+      "offenders_present": [
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
+        ":function/tests-test-mcp-server-py-commit",
+        ":function/tests-test-mcp-server-py-snapshot"
+      ],
+      "offenders_compared": [],
+      "ambiguous_idents": [
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
+        ":function/tests-test-mcp-server-py-commit",
+        ":function/tests-test-mcp-server-py-snapshot"
+      ],
+      "preloaded_not_live": 0,
+      "live_not_preloaded": 76
+    }
+  ],
+  "ingest_status": "complete"
+}
