@@ -8,8 +8,45 @@ _preload_known_deps and _preload_pinned_commits stayed at ts(W) -- the
 watermark commit's own author date -- because those facts carry no commit
 reference to join a :hash to, and so admit no position clause.
 
-This probe MEASURES that residual. It fixes nothing, and the oracle below is
-NOT a candidate fix -- see position_exact_live_edges' docstring.
+This probe MEASURES that residual against real history, and -- as of #245 --
+also VERIFIES the fix: the fixed preloads accept position arguments
+(ts_positions, watermark_pos, t_hi_ms), and --verify-fix (sweep's verify_fix
+parameter) drives them instead of the date-only call. An earlier version of
+this docstring said the oracle's inversion (invert_ms_to_positions,
+edge_live_at -> position_exact_live_edges) was NOT a candidate fix; that was
+true against the pre-#246 shape this probe was conceived against, where
+build_linearization and _git_commits ran BELOW the preload block. It is false
+against current master: PR #246 moved both above the preload block, which is
+what makes full-history commit_metadata available at preload time and is
+exactly what lets a resuming forward walk perform the identical
+timestamp-to-position inversion with only the watermark in hand
+(mcp_server._position_of_valid_time, _fact_is_live_at_position). That
+inversion IS the basis of the shipped fix.
+
+What still separates the oracle from the fix, and must stay separated, is the
+ambiguity policy: edge_live_at resolves a collision toward NOT understating
+exposure (earliest position for an ambiguous introduction, latest for an
+ambiguous close), while mcp_server._position_of_valid_time resolves the same
+collision the OPPOSITE way, toward the recoverable direction (latest for an
+introduction, earliest for a close) -- see position_exact_live_edges'
+docstring for why the two must never be unified into one helper.
+
+--verify-fix HAS NOT BEEN RUN TO COMPLETION AGAINST FULL HISTORY (as of this
+commit). An attempt against this repository's ~657-commit history reached
+only 247 commits in 9.8 hours (~25 commits/hour) before being killed. A
+py-spy dump of the stalled attempt showed it stuck in
+mcp_server._reverse_apply -> _entity_introduced_by_query ->
+_entity_introduced_by_values_query -> _db_execute -> minigraf_ffi.execute --
+issue #239's pre-existing per-ident :introduced-by point-query cost, NOT the
+close-side preload path this mode exists to verify (confirmed by `git diff
+master..HEAD -- mcp_server.py`, which touches only _preload_known_entities,
+_preload_known_deps, _preload_pinned_commits, _load_ingestion_preload_state
+and its own helpers -- _reverse_apply and the :introduced-by queries are
+untouched by this branch). #239 needs to be fixed before this mode's
+acceptance run is practical to complete. Do not read the mode's mere
+existence, its unit-test coverage, or the small-repo smoke test in this
+module's own review history as evidence it has been validated at ingestion
+scale -- it has not.
 
 TWO figures, not one (final whole-branch review, CRITICAL finding). The first
 version of this probe held file_entities -- the output of
@@ -234,11 +271,33 @@ def position_exact_live_edges(
 ) -> set:
     """The (src_ident, dep_ident) edges genuinely live at position w.
 
-    NOT A CANDIDATE FIX, and must never be read as one. This works only
-    because the entire history is in hand at analysis time: it inverts each
-    fact's stored timestamps back to positions. A resuming forward walk has no
-    such thing -- that is the whole reason #245 exists. It is a measurement
-    device and nothing else. None of #245's three options resemble it.
+    NOT ITSELF A FIX -- this function runs offline with the entire history in
+    hand and no watermark-only constraint, so it is a measurement device, not
+    a preload. But the INVERSION it performs (invert_ms_to_positions ->
+    edge_live_at, both timestamp-to-position lookups against full-history
+    commit_metadata) is, as of #245, the same technique the shipped fix uses:
+    mcp_server._position_of_valid_time / _fact_is_live_at_position perform the
+    identical inversion inside _load_ingestion_preload_state, with only the
+    watermark position in hand. An earlier version of this docstring said "a
+    resuming forward walk has no such thing -- that is the whole reason #245
+    exists"; that was true against the pre-#246 shape this probe was conceived
+    against, where build_linearization ran below the preload block, and it is
+    false against current master, where PR #246 moved it above and made
+    full-history commit_metadata available at preload time.
+
+    What keeps this function itself out of the fix path is edge_live_at's
+    ambiguity policy, not the inversion: edge_live_at resolves a collision
+    toward NOT understating exposure (min position for an ambiguous
+    introduction, max for an ambiguous close), the deliberate OPPOSITE of
+    mcp_server._position_of_valid_time's policy, which resolves toward the
+    recoverable direction (max for an introduction, min for a close) because a
+    fix must not risk the unrecoverable inverted-interval direction (see
+    _preload_known_entities' docstring). A measurement must not understate; a
+    fix must not invert. The two policies must never be unified into one
+    helper -- pinned on the fix side by
+    test_collision_resolves_toward_exclusion_at_both_ends. sweep's verify_fix
+    parameter (--verify-fix) is the actual fix-verification path; this
+    function remains the oracle it drives against.
 
     Restricted to edges whose source module appears in file_entities, mirroring
     _preload_known_deps' own ident_to_file filter. WHICH file_entities the
@@ -460,9 +519,53 @@ def sweep(
     linearization: List[str],
     commit_metadata: Sequence[CommitMeta],
     branch: Optional[str] = None,
+    verify_fix: bool = False,
 ) -> Dict:
     """Drive the REAL preload functions at each affected position and diff
     against the oracle, in BOTH the narrow and the wide entity framing.
+
+    verify_fix (--verify-fix) selects which arguments the two real preloads
+    are driven with:
+
+      False (default) -- the date-only call: _preload_known_entities gets
+        valid_at/hash_to_pos/watermark_pos, _preload_known_deps gets only
+        valid_at_ms. This is #245's pre-fix measurement path.
+
+      True -- ALSO passes ts_positions=ts_positions, watermark_pos=w,
+        t_hi_ms=mcp_server._iso_to_epoch_ms(envelopes[w]) to both preloads,
+        which is what turns position_mode on inside them
+        (mcp_server._fact_is_live_at_position). This is the fixed preload
+        path, exercised exactly as _load_ingestion_preload_state exercises it
+        -- same functions, same kwargs, only the watermark in hand. The
+        oracle side (position_exact_live_edges) is unchanged either way; it
+        always has the whole history.
+
+    Once verify_fix is True, NARROW and WIDE are expected to CONVERGE: narrow
+    is _preload_known_entities' own output, wide rebuilds that same set
+    position-correctly from :path facts, and after the close side became
+    position-exact (#238's close-side residual, closed by this branch) the two
+    computations select the identical entity set. Convergence is therefore the
+    EXPECTED result under verify_fix, not independent corroboration of
+    anything -- it is reported explicitly as framings_converged below so a
+    reader does not mistake "both report zero" for two separate confirmations.
+    Before the close-side fix, the two framings differed by ~16x on this
+    repository; that gap is precisely what closing #238's close-side residual
+    was supposed to erase.
+
+    AGREEMENT UNDER verify_fix CHECKS PLUMBING, NOT ALGORITHM. The oracle
+    (position_exact_live_edges) and the fix (mcp_server._fact_is_live_at_position
+    via _preload_known_entities/_preload_known_deps) now perform the same
+    timestamp-to-position inversion -- but the oracle runs offline with the
+    entire history already in hand, while the fix runs inside
+    _load_ingestion_preload_state with only the watermark position W, through
+    the real minigraf queries, the real entity_type loop, and the real
+    ident_to_file narrowing. A zero-diff run here confirms that plumbing
+    reproduces the algorithm correctly; it is NOT independent evidence the
+    algorithm itself is correct, because both sides share it. The unit tests
+    (test_at_scale_dep_preload_probe.py, and #238/#245's own
+    TestPreloadKnownEntitiesCloseSide / TestPreloadKnownDepsPositionBound /
+    TestResumeWithInvertedAuthorDates suites in tests/test_mcp_server.py) are
+    the non-circular evidence for the algorithm; this sweep is not.
 
     Calls the functions under test rather than a restatement of what we
     believe they do. On the #238 branch a reviewer and an implementer both
@@ -567,6 +670,24 @@ def sweep(
     measured_src_idents: set = set()
     for w in affected_positions(commit_metadata):
         valid_at_ms = mcp_server._iso_to_epoch_ms(timestamps[w])
+        # Position args are threaded to _preload_known_deps ONLY under
+        # verify_fix, and only as a matched trio -- mirroring
+        # _load_ingestion_preload_state's own all-three-or-none position_mode
+        # gate (watermark_pos AND ts_positions AND t_hi_ms, mcp_server.py:
+        # _preload_known_deps' position_mode). Passing a subset would silently
+        # fall back to the date-only path inside the preload, and this sweep
+        # would think it was verifying the fix when it was not.
+        #
+        # _preload_known_entities is different: it already receives
+        # hash_to_pos/watermark_pos unconditionally (that pair alone
+        # position-filters the INTRODUCTION side, #238) and only gains
+        # ts_positions/t_hi_ms -- which additionally position-filter the CLOSE
+        # side, #245's residual -- under verify_fix.
+        position_kwargs = (
+            {"ts_positions": ts_positions, "watermark_pos": w,
+             "t_hi_ms": mcp_server._iso_to_epoch_ms(envelopes[w])}
+            if verify_fix else {}
+        )
 
         (
             _entity_valid_from, _entity_descriptions, _entity_introduced_by,
@@ -574,6 +695,7 @@ def sweep(
         ) = mcp_server._preload_known_entities(
             db, repo_path, valid_at=envelopes[w],
             hash_to_pos=hash_to_pos, watermark_pos=w,
+            **{k: v for k, v in position_kwargs.items() if k != "watermark_pos"},
         )
         wide_file_entities = position_correct_file_entities(path_facts, ts_positions, w)
 
@@ -590,9 +712,11 @@ def sweep(
         # isolates.
         _narrow_file_deps, narrow_dep_valid_from = mcp_server._preload_known_deps(
             db, narrow_file_entities, valid_at_ms=valid_at_ms,
+            **position_kwargs,
         )
         _wide_file_deps, wide_dep_valid_from = mcp_server._preload_known_deps(
             db, wide_file_entities, valid_at_ms=valid_at_ms,
+            **position_kwargs,
         )
         narrow_actual = set(narrow_dep_valid_from.keys())
         wide_actual = set(wide_dep_valid_from.keys())
@@ -666,9 +790,42 @@ def sweep(
     def _distinct(key: str) -> int:
         return len({tuple(e) for p in per_position for e in p[key]})
 
+    narrow_wrongly_included_total = sum(len(p["narrow_wrongly_included"]) for p in per_position)
+    narrow_wrongly_excluded_total = sum(len(p["narrow_wrongly_excluded"]) for p in per_position)
+    wide_wrongly_included_total = sum(len(p["wide_wrongly_included"]) for p in per_position)
+    wide_wrongly_excluded_total = sum(len(p["wide_wrongly_excluded"]) for p in per_position)
+    narrow_wrongly_included_distinct = _distinct("narrow_wrongly_included")
+    narrow_wrongly_excluded_distinct = _distinct("narrow_wrongly_excluded")
+    wide_wrongly_included_distinct = _distinct("wide_wrongly_included")
+    wide_wrongly_excluded_distinct = _distinct("wide_wrongly_excluded")
+
+    # Named explicitly rather than left for a reader to infer from two equal
+    # numbers (task-7 brief). Once the entity preload's close side is
+    # position-correct, narrow (_preload_known_entities' own output) and wide
+    # (position_correct_file_entities, rebuilt position-correctly at both
+    # ends) select the SAME entity set by construction -- so under verify_fix
+    # this is the EXPECTED result, not independent corroboration. It is only
+    # a meaningful non-trivial signal when verify_fix is True; under the
+    # date-only default path the two are expected to keep differing (that gap
+    # is the original #245 finding), so a False here in default mode is not
+    # itself informative.
+    framings_converged = (
+        narrow_wrongly_included_total == wide_wrongly_included_total
+        and narrow_wrongly_excluded_total == wide_wrongly_excluded_total
+        and narrow_wrongly_included_distinct == wide_wrongly_included_distinct
+        and narrow_wrongly_excluded_distinct == wide_wrongly_excluded_distinct
+    )
+
     return {
         "repo_path": repo_path,
         "branch": branch,
+        "verify_fix": verify_fix,
+        # See framings_converged's own note: meaningful as "the fix's close
+        # side collapses the narrow/wide gap to zero" only when verify_fix is
+        # True. Always computed and always reported, so a reader comparing
+        # this artifact against the pre-fix baseline can see the collapse
+        # directly rather than diffing eight numbers by hand.
+        "framings_converged": framings_converged,
         # The ingested head, taken from the linearization rather than from a
         # fresh `git rev-parse`: it is the commit this sweep's graph actually
         # ends at, which a later rev-parse of the same branch need not be.
@@ -685,25 +842,17 @@ def sweep(
         # NARROW -- file_entities as _preload_known_entities returns it. The
         # shipped behaviour, and the ts(W) :depends-on bound measured
         # CONDITIONAL ON #238's still-open close-side residual.
-        "narrow_wrongly_included_total_position_weighted": sum(
-            len(p["narrow_wrongly_included"]) for p in per_position
-        ),
-        "narrow_wrongly_excluded_total_position_weighted": sum(
-            len(p["narrow_wrongly_excluded"]) for p in per_position
-        ),
-        "narrow_wrongly_included_distinct_edges": _distinct("narrow_wrongly_included"),
-        "narrow_wrongly_excluded_distinct_edges": _distinct("narrow_wrongly_excluded"),
+        "narrow_wrongly_included_total_position_weighted": narrow_wrongly_included_total,
+        "narrow_wrongly_excluded_total_position_weighted": narrow_wrongly_excluded_total,
+        "narrow_wrongly_included_distinct_edges": narrow_wrongly_included_distinct,
+        "narrow_wrongly_excluded_distinct_edges": narrow_wrongly_excluded_distinct,
 
         # WIDE -- file_entities rebuilt position-correctly at BOTH ends. The
         # ts(W) :depends-on bound measured in ISOLATION.
-        "wide_wrongly_included_total_position_weighted": sum(
-            len(p["wide_wrongly_included"]) for p in per_position
-        ),
-        "wide_wrongly_excluded_total_position_weighted": sum(
-            len(p["wide_wrongly_excluded"]) for p in per_position
-        ),
-        "wide_wrongly_included_distinct_edges": _distinct("wide_wrongly_included"),
-        "wide_wrongly_excluded_distinct_edges": _distinct("wide_wrongly_excluded"),
+        "wide_wrongly_included_total_position_weighted": wide_wrongly_included_total,
+        "wide_wrongly_excluded_total_position_weighted": wide_wrongly_excluded_total,
+        "wide_wrongly_included_distinct_edges": wide_wrongly_included_distinct,
+        "wide_wrongly_excluded_distinct_edges": wide_wrongly_excluded_distinct,
 
         "timestamp_collisions": len(collisions),
         "unmappable_valid_from_facts": unmappable_vf,
@@ -766,7 +915,26 @@ def main() -> int:
     )
     parser.add_argument("--repo-path", default=".")
     parser.add_argument("--branch", default=None)
-    parser.add_argument("--json-out", default=None)
+    # --output is accepted as an alias of --json-out (same dest) so either
+    # spelling works from the command line.
+    parser.add_argument("--json-out", "--output", dest="json_out", default=None)
+    parser.add_argument(
+        "--verify-fix", action="store_true",
+        help=(
+            "Drive the two real preloads with position arguments "
+            "(ts_positions, watermark_pos, t_hi_ms) instead of the date-only "
+            "call, i.e. exercise the FIXED preload path (#238/#245) rather "
+            "than measure the pre-fix residual. Also tightens the exit gate: "
+            "any nonzero wrongly_included/wrongly_excluded in either framing, "
+            "or any timestamp collision, fails the run in addition to the "
+            "unmappable-fact checks that always apply. "
+            "NOT YET RUN TO COMPLETION at full-history scale: an attempt on "
+            "this repo's ~657 commits reached 247 in 9.8 hours before being "
+            "killed, stuck in _reverse_apply's per-ident :introduced-by "
+            "query (#239, pre-existing, unrelated to the preload path this "
+            "flag verifies). See the module docstring."
+        ),
+    )
     args = parser.parse_args()
 
     import frontier_registry
@@ -796,12 +964,17 @@ def main() -> int:
         commit_metadata = mcp_server._git_commits(args.repo_path, None, branch)
         db = mcp_server._db if mcp_server._db is not None else mcp_server.open_db(str(graph_path))
         report = sweep(
-            db, args.repo_path, linearization, commit_metadata, branch=branch
+            db, args.repo_path, linearization, commit_metadata, branch=branch,
+            verify_fix=args.verify_fix,
         )
         report["ingest_status"] = ingest_status
 
     print(json.dumps(report, indent=2))
     print()
+    print(
+        f"mode:                                     "
+        f"{'--verify-fix (fixed, position-filtered preloads)' if report['verify_fix'] else 'date-only (pre-fix / #245 residual measurement)'}"
+    )
     print(f"repo:                                     {report['repo_path']} @ {report['branch']}")
     print(f"ingested head:                            {report['head_commit']}")
     print(f"commits:                                  {report['commits']}")
@@ -846,6 +1019,28 @@ def main() -> int:
         f"{report['wide_wrongly_excluded_distinct_edges']}"
     )
     print()
+    print(f"framings_converged:                       {report['framings_converged']}")
+    if report["verify_fix"]:
+        print(
+            "  (--verify-fix mode: narrow and wide are EXPECTED to converge --\n"
+            "   narrow is _preload_known_entities' own output, wide rebuilds that\n"
+            "   same set position-correctly, and once the close side is\n"
+            "   position-exact the two select the identical entity set. This is\n"
+            "   the expected result, not independent corroboration -- see sweep's\n"
+            "   docstring. Agreement here checks PLUMBING, not algorithm: the\n"
+            "   oracle (position_exact_live_edges) runs offline with the whole\n"
+            "   history; the fix runs inside _load_ingestion_preload_state with\n"
+            "   only the watermark, through the real queries, the real\n"
+            "   entity_type loop, and the real ident_to_file narrowing. The unit\n"
+            "   tests are the non-circular evidence for the algorithm itself.)"
+        )
+    else:
+        print(
+            "  (date-only mode: narrow and wide are NOT expected to converge --\n"
+            "   this is the pre-fix #245 residual measurement. Pass --verify-fix\n"
+            "   to drive the fixed, position-filtered preloads instead.)"
+        )
+    print()
     print(f"preload returned zero deps at every W:    {report['preload_deps_empty_everywhere']}")
     print(f"timestamp collisions:                     {report['timestamp_collisions']}")
     print(f"unmappable :valid-from facts (measured):  {report['unmappable_valid_from_facts']}")
@@ -861,13 +1056,30 @@ def main() -> int:
     # WIDE's own raw material -- which invalidates the wrongly_included/
     # wrongly_excluded numbers above. Zero gitlink events only NARROWS what
     # was measured; it does not call the rest of the report into question.
-    measurement_invalid = (
+    unmappable_facts_present = (
         report["unmappable_valid_from_facts"] > 0
         or report["unmappable_valid_to_facts"] > 0
         or report["unmappable_module_path_valid_from"] > 0
         or report["unmappable_module_path_valid_to"] > 0
     )
-    if measurement_invalid:
+    # --verify-fix's acceptance criteria fold into this SAME gate rather than
+    # adding a second one (task-7 brief): a run either produces a trustworthy,
+    # passing measurement, or it doesn't, and there is one exit code. Nonzero
+    # timestamp_collisions belongs here and not only in the unmappable check
+    # above because the fix and the oracle resolve a collision in OPPOSITE
+    # directions (mcp_server._position_of_valid_time vs this module's
+    # edge_live_at) -- a nonzero count makes the fix/oracle comparison
+    # invalid, exactly like an unmappable fact does, even though neither side
+    # left a fact literally unplaceable.
+    fix_acceptance_failed = report["verify_fix"] and (
+        report["narrow_wrongly_included_total_position_weighted"] > 0
+        or report["narrow_wrongly_excluded_total_position_weighted"] > 0
+        or report["wide_wrongly_included_total_position_weighted"] > 0
+        or report["wide_wrongly_excluded_total_position_weighted"] > 0
+        or report["timestamp_collisions"] > 0
+    )
+    measurement_invalid = unmappable_facts_present or fix_acceptance_failed
+    if unmappable_facts_present:
         print()
         print(
             "INVALID MEASUREMENT: nonzero unmappable :valid-from/:valid-to facts,\n"
@@ -875,6 +1087,17 @@ def main() -> int:
             "built from, mean the timestamp-to-position inversion this sweep\n"
             "depends on is broken for at least one fact. The wrongly_included/\n"
             "wrongly_excluded numbers above are not trustworthy until this is zero."
+        )
+    if fix_acceptance_failed:
+        print()
+        print(
+            "VERIFY-FIX ACCEPTANCE FAILED: --verify-fix requires zero wrongly_\n"
+            "included and zero wrongly_excluded in BOTH framings, and zero\n"
+            "timestamp_collisions (the fix and the oracle resolve a collision in\n"
+            "OPPOSITE directions, so a nonzero count invalidates the comparison\n"
+            "rather than merely widening it). At least one of those is nonzero\n"
+            "above -- this is a real finding about the fix, not noise; do not\n"
+            "adjust this gate to make a failing run pass."
         )
     if report["preload_deps_empty_everywhere"]:
         print()
