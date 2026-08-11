@@ -1,7 +1,7 @@
 {
   "repo_path": ".",
   "branch": "master",
-  "head_commit": "8310f7d01a5736c3170653117b6bc0f38439f877",
+  "head_commit": "1dceec17f7fb41b3d5d2b3f35edb54048d2f3ebf",
   "commits": 656,
   "affected_positions": [
     118,
@@ -71,6 +71,8 @@
   "census_idents_with_multiple_values": 3,
   "value_mismatch_total_position_weighted": 0,
   "value_mismatch_distinct_idents": 0,
+  "compared_idents_total": 12685,
+  "offender_value_comparisons": 0,
   "ambiguous_idents_total": 15,
   "preloaded_not_live_total": 0,
   "live_not_preloaded_total": 677,
@@ -86,6 +88,9 @@
       "preloaded_idents": 147,
       "oracle_idents": 174,
       "value_mismatches": {},
+      "compared_idents": 147,
+      "offenders_present": [],
+      "offenders_compared": [],
       "ambiguous_idents": [],
       "preloaded_not_live": 0,
       "live_not_preloaded": 27
@@ -96,6 +101,9 @@
       "preloaded_idents": 147,
       "oracle_idents": 174,
       "value_mismatches": {},
+      "compared_idents": 147,
+      "offenders_present": [],
+      "offenders_compared": [],
       "ambiguous_idents": [],
       "preloaded_not_live": 0,
       "live_not_preloaded": 27
@@ -106,6 +114,9 @@
       "preloaded_idents": 147,
       "oracle_idents": 174,
       "value_mismatches": {},
+      "compared_idents": 147,
+      "offenders_present": [],
+      "offenders_compared": [],
       "ambiguous_idents": [],
       "preloaded_not_live": 0,
       "live_not_preloaded": 27
@@ -116,6 +127,9 @@
       "preloaded_idents": 147,
       "oracle_idents": 174,
       "value_mismatches": {},
+      "compared_idents": 147,
+      "offenders_present": [],
+      "offenders_compared": [],
       "ambiguous_idents": [],
       "preloaded_not_live": 0,
       "live_not_preloaded": 27
@@ -126,6 +140,9 @@
       "preloaded_idents": 147,
       "oracle_idents": 174,
       "value_mismatches": {},
+      "compared_idents": 147,
+      "offenders_present": [],
+      "offenders_compared": [],
       "ambiguous_idents": [],
       "preloaded_not_live": 0,
       "live_not_preloaded": 27
@@ -136,6 +153,9 @@
       "preloaded_idents": 147,
       "oracle_idents": 174,
       "value_mismatches": {},
+      "compared_idents": 147,
+      "offenders_present": [],
+      "offenders_compared": [],
       "ambiguous_idents": [],
       "preloaded_not_live": 0,
       "live_not_preloaded": 27
@@ -146,6 +166,9 @@
       "preloaded_idents": 72,
       "oracle_idents": 99,
       "value_mismatches": {},
+      "compared_idents": 72,
+      "offenders_present": [],
+      "offenders_compared": [],
       "ambiguous_idents": [],
       "preloaded_not_live": 0,
       "live_not_preloaded": 27
@@ -156,6 +179,9 @@
       "preloaded_idents": 72,
       "oracle_idents": 99,
       "value_mismatches": {},
+      "compared_idents": 72,
+      "offenders_present": [],
+      "offenders_compared": [],
       "ambiguous_idents": [],
       "preloaded_not_live": 0,
       "live_not_preloaded": 27
@@ -166,6 +192,9 @@
       "preloaded_idents": 72,
       "oracle_idents": 99,
       "value_mismatches": {},
+      "compared_idents": 72,
+      "offenders_present": [],
+      "offenders_compared": [],
       "ambiguous_idents": [],
       "preloaded_not_live": 0,
       "live_not_preloaded": 27
@@ -176,6 +205,9 @@
       "preloaded_idents": 72,
       "oracle_idents": 99,
       "value_mismatches": {},
+      "compared_idents": 72,
+      "offenders_present": [],
+      "offenders_compared": [],
       "ambiguous_idents": [],
       "preloaded_not_live": 0,
       "live_not_preloaded": 27
@@ -186,6 +218,9 @@
       "preloaded_idents": 72,
       "oracle_idents": 99,
       "value_mismatches": {},
+      "compared_idents": 72,
+      "offenders_present": [],
+      "offenders_compared": [],
       "ambiguous_idents": [],
       "preloaded_not_live": 0,
       "live_not_preloaded": 27
@@ -196,6 +231,13 @@
       "preloaded_idents": 2285,
       "oracle_idents": 2361,
       "value_mismatches": {},
+      "compared_idents": 2282,
+      "offenders_present": [
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
+        ":function/tests-test-mcp-server-py-commit",
+        ":function/tests-test-mcp-server-py-snapshot"
+      ],
+      "offenders_compared": [],
       "ambiguous_idents": [
         ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
         ":function/tests-test-mcp-server-py-commit",
@@ -210,6 +252,13 @@
       "preloaded_idents": 2285,
       "oracle_idents": 2361,
       "value_mismatches": {},
+      "compared_idents": 2282,
+      "offenders_present": [
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
+        ":function/tests-test-mcp-server-py-commit",
+        ":function/tests-test-mcp-server-py-snapshot"
+      ],
+      "offenders_compared": [],
       "ambiguous_idents": [
         ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
         ":function/tests-test-mcp-server-py-commit",
@@ -224,6 +273,13 @@
       "preloaded_idents": 2285,
       "oracle_idents": 2361,
       "value_mismatches": {},
+      "compared_idents": 2282,
+      "offenders_present": [
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
+        ":function/tests-test-mcp-server-py-commit",
+        ":function/tests-test-mcp-server-py-snapshot"
+      ],
+      "offenders_compared": [],
       "ambiguous_idents": [
         ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
         ":function/tests-test-mcp-server-py-commit",
@@ -238,6 +294,13 @@
       "preloaded_idents": 2300,
       "oracle_idents": 2376,
       "value_mismatches": {},
+      "compared_idents": 2297,
+      "offenders_present": [
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
+        ":function/tests-test-mcp-server-py-commit",
+        ":function/tests-test-mcp-server-py-snapshot"
+      ],
+      "offenders_compared": [],
       "ambiguous_idents": [
         ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
         ":function/tests-test-mcp-server-py-commit",
@@ -252,6 +315,13 @@
       "preloaded_idents": 2303,
       "oracle_idents": 2379,
       "value_mismatches": {},
+      "compared_idents": 2300,
+      "offenders_present": [
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
+        ":function/tests-test-mcp-server-py-commit",
+        ":function/tests-test-mcp-server-py-snapshot"
+      ],
+      "offenders_compared": [],
       "ambiguous_idents": [
         ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main",
         ":function/tests-test-mcp-server-py-commit",

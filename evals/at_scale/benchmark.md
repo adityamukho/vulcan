@@ -706,7 +706,11 @@ standard for measurement corrections.
 
 ## Description Preload Exposure Probe — 257-description-preload-exposure
 
-- Repo: `.` @ `master` (`8310f7d`, full history, 656 commits)
+- Repo: `.` @ `master` (`1dceec1`, full history, 656 commits) — the head is
+  taken from the linearization, i.e. the commit the swept graph actually ends
+  at. An earlier version of this entry named `8310f7d`, a commit on the probe
+  branch that is not on `master` at all: `sweep()` was recording `git rev-parse
+  HEAD` instead. Fixed in the probe; the artifact was regenerated.
 - Script: `evals/at_scale/probe_description_preload_exposure.py`
 - Raw: `evals/at_scale/results/257-description-preload-exposure.json`
 - Question: does `_preload_known_entities`' date-bounded `:description`
@@ -731,6 +735,8 @@ standard for measurement corrections.
 | &nbsp;&nbsp;external-dependency | 0 of 76 |
 | Stage 2 — value mismatches, position-weighted | 0 |
 | Stage 2 — value mismatches, distinct idents | 0 |
+| Stage 2 — value comparisons actually made | 12685 |
+| **Stage 2 — of those, on a census offender** | **0** |
 | Ambiguous idents (not the finding) | 15 |
 | Preloaded but not live (not the finding) | 0 |
 | Live but not preloaded (not the finding) | 677 |
@@ -740,9 +746,11 @@ standard for measurement corrections.
 | Gitlink events | 0 |
 
 **Verdict: the census half of the prediction is FALSIFIED; the mismatch half
-holds on this history.** This is Outcome 2 of the design spec's three-way
-read, not Outcome 1 — reported as a real finding, not folded into a
-close-oriented "prediction holds" framing.
+is UNTESTED where it mattered — not confirmed.** The mismatch count is 0, but
+zero of those comparisons were on an ident that could have produced a mismatch
+(see item 2), so the 0 is not a null result. This is Outcome 2 of the design
+spec's three-way read, not Outcome 1 — reported as a real finding, not folded
+into a close-oriented "prediction holds" framing.
 
 1. **Three `function` idents carry two distinct `:description` values each,
    contradicting the spec's premise that description is a deterministic
@@ -769,18 +777,38 @@ close-oriented "prediction holds" framing.
    alone would be enough to break the "description is a deterministic
    function of ident" premise for `function`; here both are present.
 
-2. **Stage 2 (the shipped `_preload_known_entities` driven against a
-   position-correct oracle at all 16 structurally affected watermarks) found
-   zero value mismatches** — `W actually mismatching: 0`, both
-   position-weighted and distinct-ident mismatch counts are 0. The census
-   firing did not translate into an observed wrong value anywhere in this
-   repository's history: none of the 16 structurally affected watermarks
-   happened to straddle a window where the date-envelope-selected version of
-   `_commit`/`commit`, `_snapshot`/`snapshot`, or `_main`/`main` diverged from
-   the position-correct one. A census-nonzero, mismatch-zero result is
-   internally consistent (the census is necessary but not sufficient for a
-   mismatch — it also requires an affected watermark to land inside the
-   window the two competing versions bracket), not a contradiction.
+2. **Stage 2's zero is zero out of ZERO informative comparisons, and settles
+   nothing about the mechanism.** The shipped `_preload_known_entities` was
+   driven against the position-correct oracle at all 16 affected watermarks and
+   12685 value comparisons were made, but **not one of them was on a census
+   offender** (`offender_value_comparisons: 0`). A mismatch is only recordable
+   for an ident carrying at least two distinct values across time — i.e. a
+   census offender — so `value_mismatches` is always a strict subset of item
+   1's three idents. Those three were excluded at every position where the
+   question could have been put:
+
+   | Positions | Offenders in the preload | Disposition |
+   |---|---|---|
+   | 118–128 (11 W) | 0 of 3 | not preloaded at all — none of the three functions existed yet |
+   | 645–649 (5 W) | 3 of 3 | **both values simultaneously live → classified `ambiguous`, comparison skipped** |
+
+   So the probe *declined to compare* at 645–649; it did not find agreement
+   there. Stage 2 therefore **neither confirms nor refutes** #257's mechanism
+   at those positions. What Stage 2 does establish is narrower and still worth
+   having: across the 12685 comparisons it did make — the whole preloaded
+   population at every affected watermark — the shipped query's output never
+   diverged from the position-correct oracle for any ident where a single
+   correct value existed. That is a real check on the query, not evidence about
+   the three idents that could actually exhibit the defect.
+
+   The exclusion is not incidental, either. The ambiguity rule removes exactly
+   the case where the mechanism is most likely to fire: two competing versions
+   contemporaneous at a position is both what makes the oracle unable to name a
+   single right answer and what gives a date bound a wrong version to pick. The
+   probe now prints this as a NOTE and records `compared_idents`,
+   `offenders_present` and `offenders_compared` per position, so the limitation
+   is checkable from the artifact rather than by re-derivation.
+
 3. **The submodule `external-dependency` arm is UNMEASURABLE on this
    history, not zero.** `gitlink events: 0` — this repository has no
    `.gitmodules` changes, so the one entity type whose `:description` is
@@ -794,7 +822,10 @@ close-oriented "prediction holds" framing.
    repository (for reasons unrelated to #257's stated `entity_descriptions`
    mechanism — a slug-collision bug in `_code_ident`/`_canonical_ident`, not
    a `:valid-at` date-vs-position bug), while the mechanism #257 actually
-   describes produced zero observed mismatches here. A single repository's
-   656 commits finding 0 of 16 affected watermarks landing on a divergent
-   window does not bound the risk on a larger or differently-shaped history;
-   it is one data point, not a proof of absence.
+   describes was never put to the test on those three idents at all (item 2).
+   This run neither bounds the risk nor demonstrates it. It is one repository,
+   and on that repository the only candidates were unmeasurable — which is
+   weaker than "one data point against"; it is not a data point about the
+   mechanism at all. The two arms it does close off are narrower: the shipped
+   query agreed with the oracle on 12685 unambiguous comparisons, and no
+   entity type other than `function` has an ident carrying two values.
