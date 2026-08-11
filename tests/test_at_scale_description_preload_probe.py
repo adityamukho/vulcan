@@ -308,9 +308,25 @@ class TestLoadDescriptionFacts:
         )
 
     def test_rows_are_deduplicated(self, real_db):
-        """An entity carrying several :entity-type or :ident versions across
-        time multiplies each :description row under :any-valid-time without
-        changing any answer. load_dep_edges dedupes for the same reason.
+        """An entity carrying several :ident versions across time multiplies
+        each :description row under :any-valid-time without changing any
+        answer. load_dep_edges dedupes for the same reason.
+
+        Constructed to actually produce the duplication, not just assert its
+        absence: :module/a's :ident fact is closed and re-opened with the SAME
+        value (":module/a" both times), giving it two distinct time-versions
+        while :entity-type and :description each keep exactly one. Because ?vf
+        and ?vt bind to :description's own window regardless of how many
+        :ident versions exist, both :ident versions join against the same
+        :description row and produce two IDENTICAL
+        (entity_type, ident, desc, vf, vt) tuples from the raw query -- this
+        was confirmed empirically against this real backend before writing
+        the assertion below, not assumed. A dedup-count assertion is used
+        instead of a pairwise-distinctness assertion (`len(keys) ==
+        len(facts)`) because pairwise distinctness holds trivially whenever
+        only one record is ever produced in the first place; asserting the
+        exact count of 1 is what actually fails if the `seen`/`continue` dedup
+        logic in load_description_facts is deleted.
         """
         import mcp_server
 
@@ -321,7 +337,23 @@ class TestLoadDescriptionFacts:
             '[:module/a :description "a.py"]]',
             "2026-01-01T00:00:00Z",
         )
+        mcp_server._ingest_close(
+            real_db,
+            ['[:module/a :ident ":module/a"]'],
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+            "test close ident v1",
+        )
+        mcp_server._transact(
+            real_db,
+            '[[:module/a :ident ":module/a"]]',
+            "2026-01-02T00:00:00Z",
+        )
         facts = load_description_facts(real_db)
+        assert len(facts) == 1, (
+            "expected the two :ident versions' duplicate rows to collapse to "
+            "one record; got %d -- dedup did not fire" % len(facts)
+        )
         keys = {(f["entity_type"], f["ident"], f["desc"], f["vf_ms"], f["vt_ms"])
                 for f in facts}
         assert len(keys) == len(facts)
