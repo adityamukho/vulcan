@@ -232,3 +232,67 @@ def count_unmappable_description_facts(
         and not invert_ms_to_positions(f["vt_ms"], ts_positions)
     )
     return unmappable_vf, unmappable_vt
+
+
+def load_description_facts(db) -> List[Dict]:
+    """Every :description fact on a preloaded entity type, current and
+    historical, with its validity window.
+
+    The raw material for BOTH stages. One query per entity type, matching
+    _preload_known_entities' own per-type loop, so the population measured is
+    the population that function actually loads.
+
+    CLAUSE ORDER IS LOAD-BEARING. [?e :description ?desc] must be the EAV
+    clause immediately preceding the :db/valid-from / :db/valid-to
+    pseudo-attributes, because those bind to whichever EAV clause on ?e most
+    recently precedes them. [?e :ident ?ident] therefore goes BEFORE
+    :description, never between: moving it would bind ?vf/?vt to the ident
+    fact's window instead -- and since :ident outlives every :description
+    version it supersedes, every closed description would read as still live
+    and the oracle would be wrong at every position. Silently. This is
+    load_module_path_facts' documented rule applied to :description, and
+    test_the_window_belongs_to_the_description_fact_not_the_ident_fact pins it
+    against a real backend.
+
+    Deduplicated on (entity_type, ident, desc, vf, vt). An entity carrying more
+    than one :entity-type or :ident version across time otherwise multiplies
+    each :description row under :any-valid-time without changing any answer --
+    the same reason load_dep_edges dedupes. Two DISTINCT windows on the same
+    (ident, desc) pair are legitimately kept: that is a delete-and-re-add, and
+    the census must see both intervals to report them as one value.
+
+    A per-type query failure raises rather than being swallowed. That is a
+    deliberate difference from _preload_known_entities' own `except Exception:
+    pass` (mcp_server.py:7491-7492): this function is a measurement device, and
+    a silently empty population here would read as a clean zero exposure.
+    """
+    import json
+
+    import mcp_server
+
+    seen = set()
+    facts: List[Dict] = []
+    for entity_type in ENTITY_TYPES:
+        raw = mcp_server._db_execute(
+            db,
+            "(query [:find ?ident ?desc ?vf ?vt "
+            ":any-valid-time "
+            f":where [?e :entity-type :type/{entity_type}] "
+            "[?e :ident ?ident] "
+            "[?e :description ?desc] "
+            "[?e :db/valid-from ?vf] "
+            "[?e :db/valid-to ?vt]])",
+        )
+        for ident, desc, vf, vt in json.loads(raw).get("results", []):
+            key = (entity_type, ident, desc, int(vf), int(vt))
+            if key in seen:
+                continue
+            seen.add(key)
+            facts.append({
+                "entity_type": entity_type,
+                "ident": ident,
+                "desc": desc,
+                "vf_ms": int(vf),
+                "vt_ms": int(vt),
+            })
+    return facts

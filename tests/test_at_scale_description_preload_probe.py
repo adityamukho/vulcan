@@ -19,6 +19,7 @@ from evals.at_scale.probe_description_preload_exposure import (
     census_distinct_values,
     count_unmappable_description_facts,
     diff_descriptions,
+    load_description_facts,
     position_correct_descriptions,
 )
 from evals.at_scale.probe_dep_preload_exposure import (
@@ -224,3 +225,103 @@ class TestCountUnmappableDescriptionFacts:
         assert count_unmappable_description_facts(
             facts, build_ts_positions(META)
         ) == (0, 0)
+
+
+import pytest
+
+
+@pytest.fixture
+def real_db(monkeypatch, tmp_path):
+    """A real in-memory MiniGrafDb, per docs/testing-conventions.md Pattern 1.
+
+    Not a MagicMock: a fake never parses the Datalog string, and the clause
+    ordering this task exists to pin is only observable when minigraf actually
+    parses and executes the query.
+    """
+    from minigraf import MiniGrafDb
+
+    real_open_in_memory = MiniGrafDb.open_in_memory
+    monkeypatch.setattr(
+        MiniGrafDb, "open", staticmethod(lambda path: real_open_in_memory())
+    )
+    import mcp_server
+
+    mcp_server.open_db(str(tmp_path / "t.graph"))
+    yield mcp_server.get_db()
+
+
+class TestLoadDescriptionFacts:
+    def test_an_open_description_carries_the_forever_sentinel(self, real_db):
+        import mcp_server
+
+        mcp_server._transact(
+            real_db,
+            '[[:module/a :entity-type :type/module] '
+            '[:module/a :ident ":module/a"] '
+            '[:module/a :description "a.py"]]',
+            "2026-01-01T00:00:00Z",
+        )
+        facts = load_description_facts(real_db)
+        assert len(facts) == 1
+        assert facts[0]["entity_type"] == "module"
+        assert facts[0]["ident"] == ":module/a"
+        assert facts[0]["desc"] == "a.py"
+        assert facts[0]["vt_ms"] >= VALID_TIME_FOREVER_MS
+
+    def test_the_window_belongs_to_the_description_fact_not_the_ident_fact(
+        self, real_db
+    ):
+        """THE CLAUSE-ORDER ABLATION.
+
+        :db/valid-from and :db/valid-to bind to whichever EAV clause on ?e most
+        recently precedes them. Here :description is closed while :ident stays
+        open. The correct query returns the CLOSED window; a query with
+        [?e :ident ?ident] moved between :description and the pseudo-attributes
+        returns the ident fact's OPEN window instead -- the forever sentinel --
+        and every superseded description would silently read as still live,
+        making the oracle's live set wrong at every position.
+        """
+        import mcp_server
+
+        mcp_server._transact(
+            real_db,
+            '[[:module/a :entity-type :type/module] '
+            '[:module/a :ident ":module/a"] '
+            '[:module/a :description "a.py"]]',
+            "2026-01-01T00:00:00Z",
+        )
+        mcp_server._ingest_close(
+            real_db,
+            ['[:module/a :description "a.py"]'],
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+            "test close",
+        )
+        facts = load_description_facts(real_db)
+        closed = [f for f in facts if f["vt_ms"] < VALID_TIME_FOREVER_MS]
+        assert closed, (
+            "no closed :description window found -- the query is binding "
+            "?vt to the still-open :ident fact, which is the clause-order bug"
+        )
+        assert closed[0]["vt_ms"] == mcp_server._iso_to_epoch_ms(
+            "2026-01-02T00:00:00Z"
+        )
+
+    def test_rows_are_deduplicated(self, real_db):
+        """An entity carrying several :entity-type or :ident versions across
+        time multiplies each :description row under :any-valid-time without
+        changing any answer. load_dep_edges dedupes for the same reason.
+        """
+        import mcp_server
+
+        mcp_server._transact(
+            real_db,
+            '[[:module/a :entity-type :type/module] '
+            '[:module/a :ident ":module/a"] '
+            '[:module/a :description "a.py"]]',
+            "2026-01-01T00:00:00Z",
+        )
+        facts = load_description_facts(real_db)
+        keys = {(f["entity_type"], f["ident"], f["desc"], f["vf_ms"], f["vt_ms"])
+                for f in facts}
+        assert len(keys) == len(facts)
