@@ -390,3 +390,143 @@ def experiment_3(tmpdir, e1, sizes=SIZES, reps=20):
         del db
 
     return results
+
+
+def experiment_4(tmpdir, reps=300):
+    """E4: one point at roughly the scale the killed #245 acceptance run
+    reached -- ~247 commits of this repo, a ~35 MB graph.
+
+    Exists to answer a specific question: is the 52x per-commit gap between
+    #239's measured 2.74 s/commit and the killed run's 142.5 s/commit explained
+    by graph size, or does it remain unaccounted for? A single data point, not
+    an ingestion.
+
+    250k facts approximates that graph's fact count. It is an estimate and is
+    reported as one.
+    """
+    n = 250_000
+    db, path = fresh_db(tmpdir, "e4")
+    populate_filler(db, n)
+    hit_idents = [f":e/hit{i}" for i in range(CANDIDATES_PER_COMMIT)]
+    populate_lineage_entities(db, hit_idents)
+    miss_idents = [f":e/n{i}" for i in range(0, n, max(1, n // reps))]
+
+    row = {
+        "filler": n,
+        "graph_bytes": os.path.getsize(path),
+        "is_live_hit": timed(mcp_server._entity_ident_is_live, db, hit_idents, reps, True),
+        "is_live_miss": timed(mcp_server._entity_ident_is_live, db, miss_idents, reps, False),
+        "intro_by_hit": timed(mcp_server._entity_introduced_by_query, db, hit_idents, reps, True),
+        "intro_by_miss": timed(mcp_server._entity_introduced_by_query, db, miss_idents, reps, False),
+    }
+    del db
+
+    print("\n=== E4: one point at the killed run's approximate scale ===")
+    print(f"filler={n:,}  graph={row['graph_bytes'] / 1e6:.1f} MB")
+    print(f"  _entity_ident_is_live       HIT {row['is_live_hit']:.4f}  "
+          f"MISS {row['is_live_miss']:.4f} ms/call")
+    print(f"  _entity_introduced_by_query HIT {row['intro_by_hit']:.4f}  "
+          f"MISS {row['intro_by_miss']:.4f} ms/call")
+    return row
+
+
+# Fixed by the spec BEFORE any data existed, so it cannot be chosen to fit the
+# result. The control's own spread across 50x is ~1.15x, so 2x sits far outside
+# measured noise while leaving no room to argue a genuine cliff into "flat".
+FLAT_THRESHOLD = 2.0
+
+MEASURED_KEYS = ("is_live_hit", "is_live_miss", "intro_by_hit", "intro_by_miss")
+
+
+def compute_verdict(e1, e2):
+    """FLAT iff every measured series grows by less than FLAT_THRESHOLD across
+    BOTH size axes. Returns a dict carrying the ratios that produced it."""
+    ratios = {}
+    for label, table in (("filler", e1), ("ident_population", e2)):
+        for key in MEASURED_KEYS:
+            series = [table[k][key] for k in sorted(table)]
+            lo, hi = min(series), max(series)
+            ratios[f"{label}:{key}"] = hi / lo if lo else float("inf")
+    worst_name = max(ratios, key=ratios.get)
+    worst = ratios[worst_name]
+    return {
+        "flat": worst < FLAT_THRESHOLD,
+        "threshold": FLAT_THRESHOLD,
+        "worst_ratio": worst,
+        "worst_series": worst_name,
+        "ratios": ratios,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--output", default=os.path.join(
+        REPO, "evals/at_scale/results/239-introduced-by-query-cost.json"))
+    ap.add_argument("--quick", action="store_true",
+                    help="tiny sizes for a smoke run; NOT a valid measurement")
+    args = ap.parse_args()
+
+    sizes = (5_000, 20_000, 50_000) if args.quick else SIZES
+    populations = (100, 500, 1_000) if args.quick else IDENT_POPULATIONS
+    filler = 20_000 if args.quick else 1_000_000
+    reps = 30 if args.quick else 300
+    batch_reps = 5 if args.quick else 20
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        pin_whole_relation_binds_idents(tmpdir)
+        e1 = experiment_1(tmpdir, sizes=sizes, reps=reps)
+        e2 = experiment_2(tmpdir, populations=populations, filler=filler, reps=reps)
+        e3 = experiment_3(tmpdir, e1, sizes=sizes, reps=batch_reps)
+        e4 = experiment_4(tmpdir, reps=reps) if not args.quick else None
+
+    control_ok, control_messages = validate_control(e1)
+    verdict = compute_verdict(e1, e2)
+
+    report = {
+        "quick": args.quick,
+        "control_ok": control_ok,
+        "control_messages": control_messages,
+        "e1_filler_axis": {str(k): v for k, v in e1.items()},
+        "e2_ident_population_axis": {str(k): v for k, v in e2.items()},
+        "e3_batch_crossover": {str(k): v for k, v in e3.items()},
+        "e4_real_scale_point": e4,
+        "verdict": verdict,
+        "candidates_per_commit": CANDIDATES_PER_COMMIT,
+    }
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    with open(args.output, "w") as fh:
+        json.dump(report, fh, indent=2, sort_keys=True)
+    print(f"\nwrote {args.output}")
+
+    print("\n=== VERDICT ===")
+    if args.quick:
+        print("QUICK RUN -- smoke only, NOT a valid measurement.")
+        return 0
+    if not control_ok:
+        print("INVALID MEASUREMENT: the control did not reproduce.")
+        for m in control_messages:
+            print(f"  - {m}")
+        print("The verdict is withheld. bench_lineage_query_cost.py measured")
+        print("_lineage_is_provisional FLAT at 0.046-0.053 ms/call; this bench")
+        print("disagrees, so its other numbers cannot be trusted either.")
+        return 2
+    control_hit_ratio = max(r["control_hit"] for r in e1.values()) / min(
+        r["control_hit"] for r in e1.values()
+    )
+    print(f"control reproduced (ceiling {CONTROL_CEILING_MS} ms/call misconfiguration "
+          f"tripwire: OK; growth {control_hit_ratio:.2f}x < 2.0x flatness check: OK)")
+    print(f"worst growth: {verdict['worst_ratio']:.2f}x on {verdict['worst_series']} "
+          f"(threshold {FLAT_THRESHOLD}x)")
+    if verdict["flat"]:
+        print("FLAT -- per-call cost is constant in graph size.")
+        print("#239's premise holds: the cost is CALL COUNT. Fix is a per-commit")
+        print("batch or a write-through cache; E3's crossover picks between them.")
+    else:
+        print("NOT FLAT -- per-call cost grows.")
+        print("Batching only reduces how often we pay a growing cost. The fix is")
+        print("a companion index -- the #152/#236 pattern a third time.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
