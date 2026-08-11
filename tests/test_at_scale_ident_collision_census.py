@@ -337,6 +337,27 @@ class TestInputsFromCommitExtraction:
         assert paths == {"vendor/x", "vendor/y", "vendor/z"}
 
 
+def _make_repo(tmp_path, commits):
+    """Build a single-branch git repo, applying each {path: text} dict as one
+    commit. Shared by the collect_inputs tests, which need a REAL repo because
+    they drive the real _extract_commit rather than a stub.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for cmd in (
+        ["git", "init", "-q", "-b", "main"],
+        ["git", "config", "user.email", "t@example.com"],
+        ["git", "config", "user.name", "t"],
+    ):
+        subprocess.run(cmd, cwd=repo, check=True)
+    for i, files in enumerate(commits):
+        for name, text in files.items():
+            (repo / name).write_text(text)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", f"c{i}"], cwd=repo, check=True)
+    return repo
+
+
 class TestCollectInputsEndToEnd:
     def test_a_private_public_pair_collides_through_real_extraction(self, tmp_path):
         """Drives the REAL _extract_commit over a purpose-built repo. Every
@@ -346,17 +367,10 @@ class TestCollectInputsEndToEnd:
 
         Counterfactual: with only `def helper` in the file, offenders is empty.
         """
-        repo = tmp_path / "repo"
-        repo.mkdir()
-        (repo / "mod.py").write_text("def _helper():\n    pass\n\ndef helper():\n    pass\n")
-        for cmd in (
-            ["git", "init", "-q", "-b", "main"],
-            ["git", "config", "user.email", "t@example.com"],
-            ["git", "config", "user.name", "t"],
-            ["git", "add", "-A"],
-            ["git", "commit", "-q", "-m", "init"],
-        ):
-            subprocess.run(cmd, cwd=repo, check=True)
+        repo = _make_repo(
+            tmp_path,
+            [{"mod.py": "def _helper():\n    pass\n\ndef helper():\n    pass\n"}],
+        )
 
         inputs, diagnostics = collect_inputs(str(repo), "main", jobs=1)
 
@@ -366,3 +380,33 @@ class TestCollectInputsEndToEnd:
         assert len(found) == 1
         names = {inp.name for inp in next(iter(found.values()))}
         assert names == {"_helper", "helper"}
+
+    def test_the_returned_inputs_do_not_depend_on_pool_scheduling(self, tmp_path):
+        """The audit's output is a COMMITTED artifact, so which worker finished
+        first must not reach it.
+
+        Counterfactual: returning `list(seen)` -- consumption order -- fails the
+        sorted-form assert even at jobs=1, because each file's module input is
+        collected before the functions parsed out of it while "function" sorts
+        before "module". With jobs > 1 it additionally varies between two
+        otherwise identical runs, which is what the equality assert pins.
+        """
+        repo = _make_repo(
+            tmp_path,
+            [
+                {"alpha.py": "import os\n\n\ndef a():\n    pass\n"},
+                {"beta.py": "class B:\n    def m(self):\n        pass\n"},
+            ],
+        )
+
+        first, _ = collect_inputs(str(repo), "main", jobs=2)
+        second, _ = collect_inputs(str(repo), "main", jobs=2)
+
+        # Guards the two asserts below against passing vacuously on an empty
+        # or single-element list.
+        assert len(first) > 4
+        assert first == second
+        assert first == sorted(
+            first,
+            key=lambda inp: (inp.entity_type, inp.producer, inp.file_path, inp.name or ""),
+        )

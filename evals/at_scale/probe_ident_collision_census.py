@@ -431,13 +431,16 @@ def collect_inputs(
             ): commit_hash
             for commit_hash in hashes
         }
-        # as_completed, not futures.items(): both consume every submitted
-        # future, but submission order blocks on commit N while every result
-        # after it piles up unconsumed in memory. Harvesting is far cheaper
-        # than extraction, so draining in completion order keeps the backlog
-        # to what the pool has genuinely finished.
+        # as_completed drains in completion order, so a straggler at position 0
+        # does not hold the loop. That alone bounds NOTHING, though: a Future
+        # keeps its _result after result() returns, and this dict keeps a
+        # strong reference to every future for the whole `with` block, so peak
+        # memory would be identical to iterating futures.items(). The pop is
+        # what actually drops the reference and lets a consumed result be
+        # collected. Safe because as_completed snapshots its argument before
+        # the first loop body runs.
         for future in as_completed(futures):
-            commit_hash = futures[future]
+            commit_hash = futures.pop(future)
             try:
                 file_results, gitlink_changes, _gitmodules, _renamed = future.result()
             except Exception:
@@ -454,7 +457,17 @@ def collect_inputs(
     walk_order = {commit_hash: i for i, commit_hash in enumerate(hashes)}
     failed.sort(key=walk_order.__getitem__)
 
-    return list(seen), {
+    # `seen` was filled in result-consumption order, i.e. pool completion order,
+    # which varies run to run once jobs > 1. This audit's output is a COMMITTED
+    # artifact, so scheduling must not reach it: impose a total ordering on the
+    # inputs themselves. name is Optional, and sorting None against str raises,
+    # hence `or ""`.
+    ordered = sorted(
+        seen,
+        key=lambda inp: (inp.entity_type, inp.producer, inp.file_path, inp.name or ""),
+    )
+
+    return ordered, {
         "head_commit": hashes[-1] if hashes else None,
         "branch": resolved_branch,
         "commits": len(hashes),
