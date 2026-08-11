@@ -31,11 +31,14 @@ See docs/superpowers/specs/2026-08-11-ident-collision-audit-design.md.
 from __future__ import annotations
 
 import hashlib
+import multiprocessing
 import re
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import combinations
 from pathlib import Path
 from typing import (
+    Any,
     Callable,
     Dict,
     Iterable,
@@ -323,3 +326,138 @@ def score_all_rules(
         row["description"] = description
         scored[rule_id] = row
     return scored
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: collect the inputs, through the real extractor
+# ---------------------------------------------------------------------------
+
+
+def inputs_from_commit_extraction(
+    file_results: Sequence[tuple],
+    gitlink_changes: Sequence[tuple],
+) -> List[EntityInput]:
+    """Harvest every _code_ident input one commit's extraction implies.
+
+    file_results entries are (status, file_path, extracted, precomputed,
+    old_path) per _extract_commit's contract (mcp_server.py:8475-8484). A "D"
+    entry carries extracted=None and precomputed=None and is skipped: the path
+    names an entity being CLOSED, not one being introduced, and its inputs were
+    already collected when it was introduced.
+
+    The category-to-entity_type mapping and the field qualification mirror
+    _precompute_file_triples (mcp_server.py:7044-7122). If that function and
+    this one ever disagree, that one is right.
+    """
+    collected: List[EntityInput] = []
+
+    for _status, file_path, extracted, precomputed, _old_path in file_results:
+        if extracted is None:
+            continue
+        collected.append(EntityInput("module", "code", file_path, None))
+        for fn_name in extracted.get("functions", []):
+            collected.append(EntityInput("function", "code", file_path, fn_name))
+        for cls_name in extracted.get("classes", []):
+            collected.append(EntityInput("class", "code", file_path, cls_name))
+        for gvar_name in extracted.get("globals", []):
+            collected.append(EntityInput("variable", "code", file_path, gvar_name))
+        for field_name, owning_class, _is_static in extracted.get("fields", []):
+            collected.append(
+                EntityInput("field", "code", file_path, f"{owning_class}.{field_name}")
+            )
+        # Only UNRESOLVED imports. A resolved one already points at the in-tree
+        # module ident the module producer above contributes, so counting it
+        # again would manufacture a cross-producer collision on every internal
+        # import in the repository.
+        for import_name, _dep_ident, is_resolved in (
+            (precomputed or {}).get("resolved_imports", [])
+        ):
+            if not is_resolved:
+                collected.append(EntityInput("module", "import", import_name, None))
+
+    # add/bump/remove all reach one `for kind, sha, path` loop that takes
+    # _code_ident("module", path) unconditionally (mcp_server.py:9555-9556),
+    # so every kind contributes.
+    for _kind, _sha, path in gitlink_changes:
+        collected.append(EntityInput("module", "gitlink", path, None))
+
+    return collected
+
+
+def collect_inputs(
+    repo_path: str,
+    branch: Optional[str] = None,
+    jobs: Optional[int] = None,
+) -> Tuple[List[EntityInput], Dict[str, Any]]:
+    """Walk the branch and collect every input that ever reached _code_ident.
+
+    Drives mcp_server._extract_commit rather than re-implementing parsing.
+    That function is documented read-only, stateless and DB-free
+    (mcp_server.py:8455) and is exactly what _run_ingestion's worker pool
+    runs, so this audit measures the code that actually produces idents in
+    production rather than a reimplementation that could drift from it.
+
+    Walking A/M/R across every commit reaches every version of every file that
+    ever existed on the branch: each distinct blob at each path is introduced
+    by exactly one such entry, so no separate initial-tree pass is needed.
+
+    Inputs are deduplicated here. A name unchanged across 400 commits costs one
+    entry, not 400.
+
+    The pool uses an explicit "spawn" context for the same reason
+    _run_ingestion does (mcp_server.py:10536-10546): workers are created lazily
+    while other threads may already be alive in this process (this runs under
+    pytest, and Task 5 puts a CLI on top of it), and forking with a thread
+    holding a lock deadlocks the child forever. It also makes the start method
+    independent of the platform default, which changed in 3.14.
+    """
+    resolved_branch = branch or mcp_server._default_git_branch(repo_path)
+    ignore_patterns = mcp_server._load_ignore_patterns(repo_path)
+    commits = mcp_server._git_commits(repo_path, None, resolved_branch)
+    # _git_commits walks --topo-order --reverse, so hashes[-1] is the branch
+    # tip. Taken from the walked list, not a separate rev-parse, so the
+    # reported head cannot disagree with what was actually measured.
+    hashes = [row[0] for row in commits]
+
+    seen: Dict[EntityInput, None] = {}
+    failed: List[str] = []
+
+    with ProcessPoolExecutor(
+        max_workers=jobs, mp_context=multiprocessing.get_context("spawn")
+    ) as executor:
+        futures = {
+            executor.submit(
+                mcp_server._extract_commit, repo_path, commit_hash, ignore_patterns
+            ): commit_hash
+            for commit_hash in hashes
+        }
+        # as_completed, not futures.items(): both consume every submitted
+        # future, but submission order blocks on commit N while every result
+        # after it piles up unconsumed in memory. Harvesting is far cheaper
+        # than extraction, so draining in completion order keeps the backlog
+        # to what the pool has genuinely finished.
+        for future in as_completed(futures):
+            commit_hash = futures[future]
+            try:
+                file_results, gitlink_changes, _gitmodules, _renamed = future.result()
+            except Exception:
+                # Per-commit failure must not abort the audit -- it is a
+                # measurement diagnostic, and the report's exit gate decides
+                # whether there were too many for the run to mean anything.
+                failed.append(commit_hash)
+                continue
+            for inp in inputs_from_commit_extraction(file_results, gitlink_changes):
+                seen[inp] = None
+
+    # Completion order is whatever the pool happened to finish first; sort back
+    # into walk order so a re-run's recorded diagnostic is byte-comparable.
+    walk_order = {commit_hash: i for i, commit_hash in enumerate(hashes)}
+    failed.sort(key=walk_order.__getitem__)
+
+    return list(seen), {
+        "head_commit": hashes[-1] if hashes else None,
+        "branch": resolved_branch,
+        "commits": len(hashes),
+        "extraction_failures": len(failed),
+        "failed_commits": failed,
+    }

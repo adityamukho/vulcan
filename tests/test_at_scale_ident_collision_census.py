@@ -11,6 +11,8 @@ against a degenerate stub as well as against the real implementation proves
 nothing and does not belong here.
 """
 
+import subprocess
+
 import pytest
 
 from evals.at_scale.probe_ident_collision_census import (
@@ -18,8 +20,10 @@ from evals.at_scale.probe_ident_collision_census import (
     SHAPES,
     EntityInput,
     classify_shapes,
+    collect_inputs,
     current_ident,
     group_by_ident,
+    inputs_from_commit_extraction,
     offenders,
     raw_value,
     score_all_rules,
@@ -252,3 +256,113 @@ class TestCandidateRules:
         assert set(scored) == set(RULES)
         for row in scored.values():
             assert set(row) == {"description", "residual", "renames"}
+
+
+class TestInputsFromCommitExtraction:
+    def test_deleted_files_carry_no_extraction_and_are_skipped(self):
+        """_extract_commit returns extracted=None and precomputed=None for a
+        "D" entry (contract at mcp_server.py:8477-8480, built at 8639).
+        Dereferencing either would raise; treating the path as a live module
+        input would invent an entity.
+        """
+        file_results = [("D", "a/gone.py", None, None, "")]
+        assert inputs_from_commit_extraction(file_results, []) == []
+
+    def test_a_parsed_file_yields_module_and_every_named_entity(self):
+        extracted = {
+            "functions": ["foo", "_foo"],
+            "classes": ["Cls"],
+            "globals": ["CONST"],
+            "fields": [("x", "Cls", False)],
+            "imports": [],
+            "calls": [],
+        }
+        precomputed = {"resolved_imports": []}
+        got = inputs_from_commit_extraction(
+            [("A", "a/b.py", extracted, precomputed, "")], []
+        )
+        assert EntityInput("module", "code", "a/b.py", None) in got
+        assert EntityInput("function", "code", "a/b.py", "_foo") in got
+        assert EntityInput("class", "code", "a/b.py", "Cls") in got
+        assert EntityInput("variable", "code", "a/b.py", "CONST") in got
+
+    def test_fields_are_qualified_with_their_owning_class(self):
+        """_precompute_file_triples builds the field name as
+        f"{owning_class}.{field_name}" (mcp_server.py:7098). An audit keying on
+        the bare field name would merge Cls.x and Other.x and overstate the
+        collision count.
+        """
+        extracted = {
+            "functions": [], "classes": ["Cls"], "globals": [],
+            "fields": [("x", "Cls", False)], "imports": [], "calls": [],
+        }
+        got = inputs_from_commit_extraction(
+            [("M", "a/b.py", extracted, {"resolved_imports": []}, "")], []
+        )
+        assert EntityInput("field", "code", "a/b.py", "Cls.x") in got
+        assert EntityInput("field", "code", "a/b.py", "x") not in got
+
+    def test_only_unresolved_imports_become_import_inputs(self):
+        """A resolved import already points at an in-tree module ident that the
+        module producer contributes. Counting it again would manufacture a
+        cross-producer collision on every internal import in the repository.
+        """
+        extracted = {
+            "functions": [], "classes": [], "globals": [],
+            "fields": [], "imports": [], "calls": [],
+        }
+        precomputed = {
+            "resolved_imports": [
+                ("a.b", ":module/a-b-py", True),
+                ("requests", ":module/requests", False),
+            ]
+        }
+        got = inputs_from_commit_extraction(
+            [("A", "z.py", extracted, precomputed, "")], []
+        )
+        assert EntityInput("module", "import", "requests", None) in got
+        assert EntityInput("module", "import", "a.b", None) not in got
+
+    def test_gitlink_paths_of_every_kind_become_module_inputs(self):
+        """_gitlink_changes emits add/bump/remove (mcp_server.py:4597); all
+        three fall into one `for kind, sha, path` loop that takes
+        _code_ident("module", path) unconditionally (mcp_server.py:9555-9556),
+        so all three name a submodule entity at that path.
+        """
+        got = inputs_from_commit_extraction(
+            [], [("add", "sha1", "vendor/x"), ("bump", "sha2", "vendor/y"),
+                 ("remove", "sha3", "vendor/z")]
+        )
+        paths = {inp.file_path for inp in got if inp.producer == "gitlink"}
+        assert paths == {"vendor/x", "vendor/y", "vendor/z"}
+
+
+class TestCollectInputsEndToEnd:
+    def test_a_private_public_pair_collides_through_real_extraction(self, tmp_path):
+        """Drives the REAL _extract_commit over a purpose-built repo. Every
+        other test in this file would still pass if Stage 1 collected the wrong
+        triples -- this is the one that catches the audit mis-driving the
+        extractor.
+
+        Counterfactual: with only `def helper` in the file, offenders is empty.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "mod.py").write_text("def _helper():\n    pass\n\ndef helper():\n    pass\n")
+        for cmd in (
+            ["git", "init", "-q", "-b", "main"],
+            ["git", "config", "user.email", "t@example.com"],
+            ["git", "config", "user.name", "t"],
+            ["git", "add", "-A"],
+            ["git", "commit", "-q", "-m", "init"],
+        ):
+            subprocess.run(cmd, cwd=repo, check=True)
+
+        inputs, diagnostics = collect_inputs(str(repo), "main", jobs=1)
+
+        assert diagnostics["commits"] == 1
+        assert diagnostics["extraction_failures"] == 0
+        found = offenders(group_by_ident(inputs, current_ident))
+        assert len(found) == 1
+        names = {inp.name for inp in next(iter(found.values()))}
+        assert names == {"_helper", "helper"}
