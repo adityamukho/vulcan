@@ -12,18 +12,26 @@ nothing and does not belong here.
 """
 
 import subprocess
+import sys
 
 import pytest
 
+from evals.at_scale import probe_ident_collision_census
 from evals.at_scale.probe_ident_collision_census import (
+    ENTITY_TYPES,
+    PREDICTIONS,
     RULES,
     SHAPES,
     EntityInput,
+    build_report,
     classify_shapes,
     collect_inputs,
     current_ident,
+    evaluate_predictions,
     group_by_ident,
     inputs_from_commit_extraction,
+    main,
+    measurement_invalid,
     offenders,
     raw_value,
     score_all_rules,
@@ -376,6 +384,12 @@ class TestCollectInputsEndToEnd:
 
         assert diagnostics["commits"] == 1
         assert diagnostics["extraction_failures"] == 0
+        # The resolved ignore patterns decide which files were counted at all,
+        # so a recorded run that omits them cannot explain why a re-run on the
+        # same head_commit disagreed. Presence (not contents) is what is
+        # pinned: the list depends on the environment's MINIGRAF_INGEST_IGNORE
+        # and on any .temporalignore, which is exactly why it is recorded.
+        assert isinstance(diagnostics["ignore_patterns"], list)
         found = offenders(group_by_ident(inputs, current_ident))
         assert len(found) == 1
         names = {inp.name for inp in next(iter(found.values()))}
@@ -410,3 +424,178 @@ class TestCollectInputsEndToEnd:
             first,
             key=lambda inp: (inp.entity_type, inp.producer, inp.file_path, inp.name or ""),
         )
+
+
+def _report_over(inputs, **diag):
+    diagnostics = {
+        "head_commit": "abc123", "branch": "main", "commits": 10,
+        "extraction_failures": 0, "failed_commits": [],
+        "ignore_patterns": [],
+    }
+    diagnostics.update(diag)
+    return build_report(inputs, diagnostics, "/repo")
+
+
+class TestBuildReport:
+    def test_offenders_are_reported_verbatim_not_only_counted(self):
+        """A nonzero count escalates this to fix design, and that work should
+        start from the data rather than re-deriving it by hand. Counterfactual:
+        a report carrying only counts passes every other test in this class.
+        """
+        report = _report_over(_known_collision_inputs())
+        rows = report["offenders"]["function"]["idents"]
+        assert len(rows) == 3
+        members = rows[":function/tests-test-mcp-server-py-commit"]
+        assert sorted(m["name"] for m in members) == ["_commit", "commit"]
+        assert all(m["file_path"] == "tests/test_mcp_server.py" for m in members)
+        assert all(m["producer"] == "code" for m in members)
+
+    def test_every_entity_type_appears_even_at_zero(self):
+        """A missing key and a zero are different claims. Only the second one
+        says "measured, found none".
+        """
+        report = _report_over([_fn("a/b.py", "solo")])
+        assert set(report["offenders"]) == set(ENTITY_TYPES)
+        assert report["offenders"]["class"]["count"] == 0
+
+    def test_candidate_table_carries_every_rule(self):
+        report = _report_over(_known_collision_inputs())
+        assert set(report["candidates"]) == set(RULES)
+
+    def test_what_shaped_the_file_set_is_recorded(self):
+        """collect_inputs resolves the ignore patterns from
+        MINIGRAF_INGEST_IGNORE plus any .temporalignore, so they decide which
+        files were counted. Two runs on one head_commit can legitimately
+        disagree, and only this field explains why.
+
+        Counterfactual: a build_report that dropped the key still passes every
+        other test in this class, and its artifact silently loses the reason.
+        """
+        report = _report_over([_fn("a/b.py", "solo")], ignore_patterns=["vendor/*"])
+        assert report["ignore_patterns"] == ["vendor/*"]
+
+    def test_branch_and_head_commit_are_both_recorded(self):
+        """The audit resolves an unspecified branch through
+        _default_git_branch, so head_commit is mainline's tip and NOT the
+        working branch's. Recorded together, that reads as deliberate; with
+        either missing it reads as a stale run.
+        """
+        report = _report_over([_fn("a/b.py", "solo")])
+        assert report["branch"] == "main"
+        assert report["head_commit"] == "abc123"
+
+
+class TestExitGate:
+    def test_finding_collisions_is_not_an_invalid_measurement(self):
+        """The exit code reflects measurement VALIDITY, never the finding.
+        Collisions are the number #263 asks for and must never fail the run.
+        Do not adjust this gate to make a run pass.
+        """
+        report = _report_over(_known_collision_inputs())
+        assert report["offenders"]["function"]["count"] == 3
+        assert measurement_invalid(report) is None
+
+    def test_zero_commits_is_invalid(self):
+        assert measurement_invalid(_report_over([], commits=0)) is not None
+
+    def test_zero_triples_is_invalid(self):
+        """Distinguishes "measured, found none" from "measured nothing". A run
+        that collected no inputs cannot report zero collisions as a finding.
+        """
+        assert measurement_invalid(_report_over([])) is not None
+
+    def test_extraction_failures_above_one_percent_are_invalid(self):
+        inputs = _known_collision_inputs()
+        assert measurement_invalid(
+            _report_over(inputs, commits=100, extraction_failures=2)
+        ) is not None
+        assert measurement_invalid(
+            _report_over(inputs, commits=100, extraction_failures=1)
+        ) is None
+
+
+class TestPredictions:
+    def test_every_declared_prediction_is_evaluated(self):
+        report = _report_over(_known_collision_inputs())
+        evaluated = evaluate_predictions(report)
+        assert set(evaluated) == {pid for pid, _ in PREDICTIONS}
+        for row in evaluated.values():
+            assert row["outcome"] in ("held", "failed")
+
+    def test_a_prediction_can_actually_fail(self):
+        """Predictions exist to be falsifiable. An evaluator that returns
+        "held" unconditionally is worse than none, because it launders a
+        failed prediction as confirmation. Three offenders is exactly the
+        count P1 says the audit must EXCEED.
+        """
+        evaluated = evaluate_predictions(_report_over(_known_collision_inputs()))
+        assert evaluated["P1"]["outcome"] == "failed"
+
+    def test_a_prediction_can_actually_hold(self):
+        """The counterfactual for the test above: an evaluator hard-wired to
+        "failed" also makes a failed prediction meaningless, and would pass it.
+        The fixture is three same-file private/public pairs, so
+        leading-underscore is the only named shape present.
+        """
+        evaluated = evaluate_predictions(_report_over(_known_collision_inputs()))
+        assert evaluated["P2"]["outcome"] == "held"
+
+
+class TestCli:
+    def test_the_cli_prints_branch_head_and_exits_zero_on_a_valid_run(
+        self, monkeypatch, capsys
+    ):
+        """main's stdout is what a reader of the recorded run sees first. The
+        branch/head pair must be in it, because with no --branch the head is
+        mainline's tip rather than the checked-out branch's.
+
+        collect_inputs is stubbed rather than run: driving real history here
+        would take minutes and is Task 6's job. Everything downstream of it --
+        build_report, the gate, the exit code -- is the real code.
+        """
+        monkeypatch.setattr(
+            probe_ident_collision_census,
+            "collect_inputs",
+            lambda repo_path, branch=None, jobs=None: (
+                _known_collision_inputs(),
+                {
+                    "head_commit": "deadbee", "branch": "master", "commits": 7,
+                    "extraction_failures": 0, "failed_commits": [],
+                    "ignore_patterns": ["vendor/*"],
+                },
+            ),
+        )
+        monkeypatch.setattr(sys, "argv", ["probe", "--repo-path", "/repo"])
+
+        assert main() == 0
+
+        out = capsys.readouterr().out
+        assert "master" in out
+        assert "deadbee" in out
+        assert "vendor/*" in out
+        # The finding itself must not be reported as an error.
+        assert "INVALID MEASUREMENT" not in out
+
+    def test_the_cli_exits_nonzero_only_on_an_invalid_measurement(
+        self, monkeypatch, capsys
+    ):
+        """The counterfactual for the test above, and the pair that pins the
+        exit code to VALIDITY rather than to the finding: same offenders, but
+        nothing was walked.
+        """
+        monkeypatch.setattr(
+            probe_ident_collision_census,
+            "collect_inputs",
+            lambda repo_path, branch=None, jobs=None: (
+                [],
+                {
+                    "head_commit": None, "branch": "master", "commits": 0,
+                    "extraction_failures": 0, "failed_commits": [],
+                    "ignore_patterns": [],
+                },
+            ),
+        )
+        monkeypatch.setattr(sys, "argv", ["probe"])
+
+        assert main() == 1
+        assert "INVALID MEASUREMENT" in capsys.readouterr().out

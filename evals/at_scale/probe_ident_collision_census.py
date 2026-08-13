@@ -25,12 +25,34 @@ facts, and never mutates mcp_server. The candidate rules below are standalone
 pure functions, deliberately NOT monkeypatches of _canonical_ident -- an audit
 must not mutate the module it measures.
 
+WHAT THE CONTENT-FETCH `continue` DOES AND DOES NOT COST. _extract_commit
+silently drops an A/M file whose blob fetch raises (mcp_server.py:8641-8644).
+This is NOT an undercount of production's idents: production ingestion runs
+that same function and takes that same `continue`, so a file skipped there
+never produces an ident in production either. The census stays exact with
+respect to the idents production actually generates. The residual risk is
+narrower -- if a fetch fails TRANSIENTLY, two runs over the same head_commit
+can collect different input sets, so a recorded number is reproducible only to
+the extent that git object reads are. `extraction_failures` does not cover
+this: that counter only sees _extract_commit raising outright, and this branch
+swallows the error inside it.
+
+WHICH BRANCH GETS MEASURED. collect_inputs resolves an unspecified branch
+through mcp_server._default_git_branch, i.e. the repository's mainline, not
+whatever branch happens to be checked out. That is deliberate: the audit must
+count the idents mainline history produces, not ones introduced by the
+in-progress work that is adding this probe. `branch` and `head_commit` are
+both recorded and both printed, so a run is never ambiguous about what it read.
+
 See docs/superpowers/specs/2026-08-11-ident-collision-audit-design.md.
 """
 
 from __future__ import annotations
 
+import argparse
+import datetime
 import hashlib
+import json
 import multiprocessing
 import re
 import sys
@@ -404,6 +426,14 @@ def collect_inputs(
     Inputs are deduplicated here. A name unchanged across 400 commits costs one
     entry, not 400.
 
+    The resolved branch and the resolved ignore-pattern list are BOTH returned
+    as diagnostics because both are environment-dependent and both change which
+    idents get counted: _default_git_branch honours MINIGRAF_GIT_BRANCH, and
+    _load_ignore_patterns merges MINIGRAF_INGEST_IGNORE with any .temporalignore
+    in the working tree. Without them recorded, two runs on the same
+    head_commit can legitimately disagree with nothing in the artifact
+    explaining why.
+
     The pool uses an explicit "spawn" context for the same reason
     _run_ingestion does (mcp_server.py:10536-10546): workers are created lazily
     while other threads may already be alive in this process (this runs under
@@ -470,7 +500,261 @@ def collect_inputs(
     return ordered, {
         "head_commit": hashes[-1] if hashes else None,
         "branch": resolved_branch,
+        "ignore_patterns": list(ignore_patterns),
         "commits": len(hashes),
         "extraction_failures": len(failed),
         "failed_commits": failed,
     }
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: report, predictions, exit gate, CLI
+# ---------------------------------------------------------------------------
+
+
+# Fixed BEFORE any data exists, so the run cannot be rationalized afterwards.
+# A prediction that fails is a finding about the design, not noise to be
+# smoothed over: it is recorded in the result either way.
+#
+# Every statement below is worded to say exactly what evaluate_predictions
+# mechanically checks. A statement broader than its check would let a "held"
+# be read as evidence for something the audit never measured.
+PREDICTIONS: Tuple[Tuple[str, str], ...] = (
+    ("P1", "The true collision count exceeds the 3 #257's census found, "
+           "because that census can only see collisions whose loser was "
+           "closed and reopened."),
+    ("P2", "leading-underscore is the dominant named shape among all "
+           "offenders."),
+    ("P3", "R5, the control, reports a nonzero residual at least as large as "
+           "the leading-underscore offender count."),
+    ("P4", "R2 renames strictly fewer than all idents: it leaves plain module "
+           "idents untouched, because a module input has no '::' separator to "
+           "produce an adjacent hyphen run."),
+    ("P5", "R4's rename count equals the total ident count."),
+)
+
+
+def build_report(
+    inputs: Sequence[EntityInput],
+    diagnostics: Dict[str, Any],
+    repo_path: str,
+) -> Dict[str, Any]:
+    """Assemble the committed artifact from Stage 1's inputs.
+
+    Carries branch, head_commit AND ignore_patterns, because all three decide
+    which idents were counted and none of them is recoverable from the numbers
+    afterwards. head_commit is mainline's tip, not the working branch's, unless
+    a branch was passed explicitly -- see the module docstring.
+
+    The content-fetch caveat in the module docstring applies to every count
+    here: they are exact with respect to the idents production generates, and
+    reproducible only to the extent that git object reads are.
+    """
+    baseline = group_by_ident(inputs, current_ident)
+    all_offenders = offenders(baseline)
+
+    per_type: Dict[str, Dict[str, Any]] = {}
+    for entity_type in ENTITY_TYPES:
+        rows = {
+            ident: members
+            for ident, members in all_offenders.items()
+            if members[0].entity_type == entity_type
+        }
+        per_type[entity_type] = {
+            # A missing key and a zero are different claims; only the second
+            # says "measured, found none". Every type appears unconditionally.
+            "idents_total": sum(
+                1 for _ident, members in baseline.items()
+                if members[0].entity_type == entity_type
+            ),
+            "count": len(rows),
+            # Verbatim members, not just a count: a nonzero count escalates
+            # this to fix design, and that work starts from the data rather
+            # than re-deriving it by hand.
+            "idents": {
+                ident: [
+                    {"producer": m.producer, "file_path": m.file_path, "name": m.name}
+                    for m in members
+                ]
+                for ident, members in rows.items()
+            },
+        }
+
+    shape_counts: Dict[str, int] = {shape: 0 for shape in SHAPES}
+    for members in all_offenders.values():
+        for shape in classify_shapes(members):
+            shape_counts[shape] += 1
+
+    report: Dict[str, Any] = {
+        "repo_path": repo_path,
+        "branch": diagnostics["branch"],
+        "head_commit": diagnostics["head_commit"],
+        # Indexed, not .get()-with-default: a silent [] here would record "no
+        # patterns were applied" for a run whose patterns simply were not
+        # threaded, which is precisely the ambiguity this field exists to end.
+        "ignore_patterns": diagnostics["ignore_patterns"],
+        "commits": diagnostics["commits"],
+        "extraction_failures": diagnostics["extraction_failures"],
+        "failed_commits": diagnostics["failed_commits"],
+        "triples_total": len(inputs),
+        "idents_total": len(baseline),
+        "offenders": per_type,
+        "offenders_total": len(all_offenders),
+        "offenders_by_shape": shape_counts,
+        "candidates": score_all_rules(inputs, baseline),
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+    }
+    report["predictions"] = evaluate_predictions(report)
+    return report
+
+
+def evaluate_predictions(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Score every declared prediction against the measured report.
+
+    Each outcome is derived from a number in the report. An evaluator that
+    returned "held" unconditionally would be worse than no predictions at all,
+    because it would launder a failed prediction as confirmation.
+    """
+    statements = dict(PREDICTIONS)
+    shape_counts = report["offenders_by_shape"]
+    leading = shape_counts.get("leading-underscore", 0)
+
+    def _row(pid: str, held: bool, evidence: str) -> Dict[str, Any]:
+        return {
+            "statement": statements[pid],
+            "outcome": "held" if held else "failed",
+            "evidence": evidence,
+        }
+
+    total = report["offenders_total"]
+    dominant = max(
+        (s for s in SHAPES if s != "other"),
+        key=lambda s: shape_counts.get(s, 0),
+        default="other",
+    )
+    r5 = report["candidates"]["R5"]["residual"]
+    r4 = report["candidates"]["R4"]["renames"]
+    r2 = report["candidates"]["R2"]["renames"]
+
+    return {
+        "P1": _row("P1", total > 3, f"offenders_total={total}"),
+        "P2": _row(
+            "P2",
+            dominant == "leading-underscore",
+            f"dominant shape={dominant} at {shape_counts.get(dominant, 0)}",
+        ),
+        "P3": _row("P3", r5 >= leading and r5 > 0,
+                   f"R5 residual={r5}, leading-underscore offenders={leading}"),
+        "P4": _row("P4", r2 < report["idents_total"],
+                   f"R2 renames={r2} of {report['idents_total']} idents"),
+        "P5": _row("P5", r4 == report["idents_total"],
+                   f"R4 renames={r4} of {report['idents_total']} idents"),
+    }
+
+
+def measurement_invalid(report: Dict[str, Any]) -> Optional[str]:
+    """Why this run cannot be believed, or None.
+
+    VALIDITY ONLY. A nonzero collision count is the number #263 asks for and
+    must NEVER fail the run -- finding collisions is this audit's entire
+    purpose. Do not widen this gate to make a run "pass".
+    """
+    if report["commits"] == 0:
+        return "Zero commits walked. Nothing was measured."
+    if report["triples_total"] == 0:
+        return (
+            "Zero inputs collected across "
+            f"{report['commits']} commits. A run that collected nothing "
+            "cannot report zero collisions as a finding."
+        )
+    failures = report["extraction_failures"]
+    if failures > report["commits"] * 0.01:
+        return (
+            f"_extract_commit raised on {failures} of {report['commits']} "
+            "commits (>1%). The input set is incomplete, so the count is a "
+            "bound rather than the exact number this audit exists to produce."
+        )
+    return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Count, exactly, how many _code_ident values on real history are "
+            "reachable from more than one (entity_type, file_path, name) input."
+        )
+    )
+    parser.add_argument("--repo-path", default=".")
+    parser.add_argument("--branch", default=None)
+    parser.add_argument("--jobs", type=int, default=None)
+    parser.add_argument("--json-out", "--output", dest="json_out", default=None)
+    args = parser.parse_args()
+
+    inputs, diagnostics = collect_inputs(args.repo_path, args.branch, jobs=args.jobs)
+    report = build_report(inputs, diagnostics, args.repo_path)
+
+    print(json.dumps(report, indent=2))
+    print()
+    print(f"repo:                   {report['repo_path']} @ {report['branch']}")
+    # Printed next to the branch on purpose. With no --branch, this is
+    # mainline's tip rather than the checked-out branch's, which reads as a
+    # stale run unless both are visible together.
+    print(f"head:                   {report['head_commit']}")
+    print(f"ignore patterns:        {report['ignore_patterns'] or '(none)'}")
+    print(f"commits:                {report['commits']}")
+    print(f"extraction failures:    {report['extraction_failures']}")
+    print(f"distinct inputs:        {report['triples_total']}")
+    print(f"distinct idents:        {report['idents_total']}")
+    print()
+    print("OFFENDERS (idents reachable from >1 distinct input)")
+    for entity_type in ENTITY_TYPES:
+        row = report["offenders"][entity_type]
+        print(f"  {entity_type:<12} {row['count']:>6} of {row['idents_total']}")
+    print(f"  {'TOTAL':<12} {report['offenders_total']:>6}")
+    print()
+    print("BY SHAPE (an offender may carry more than one label)")
+    for shape in SHAPES:
+        print(f"  {shape:<20} {report['offenders_by_shape'][shape]:>6}")
+    print()
+    print("CANDIDATE RULES")
+    print(f"  {'rule':<6} {'residual':>9} {'renames':>9}   description")
+    for rule_id in sorted(RULES):
+        row = report["candidates"][rule_id]
+        print(
+            f"  {rule_id:<6} {row['residual']:>9} {row['renames']:>9}   "
+            f"{row['description']}"
+        )
+    print()
+    print("PREDICTIONS (fixed before the run; a failure is a finding)")
+    for pid, _ in PREDICTIONS:
+        row = report["predictions"][pid]
+        print(f"  {pid}  {row['outcome']:<7} {row['evidence']}")
+
+    if report["candidates"]["R5"]["residual"] == 0 and (
+        report["offenders_by_shape"]["leading-underscore"] > 0
+    ):
+        print()
+        print(
+            "NOTE: R5 is the CONTROL and reported zero residual on a history\n"
+            "that HAS leading-underscore offenders. R5 slugs the name\n"
+            "independently, and strip('-') still eats the leading underscore,\n"
+            "so it cannot separate them. The scorer is wrong and every other\n"
+            "row in the candidate table is suspect. Do not act on this run."
+        )
+
+    reason = measurement_invalid(report)
+    if reason:
+        print()
+        print(f"INVALID MEASUREMENT. {reason}")
+        print("Do not adjust this gate to make a run pass.")
+
+    if args.json_out:
+        Path(args.json_out).write_text(json.dumps(report, indent=2))
+        print(f"\nWrote {args.json_out}")
+    return 1 if reason else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
