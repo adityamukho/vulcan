@@ -34,6 +34,7 @@ from evals.at_scale.probe_ident_collision_census import (
     measurement_invalid,
     offenders,
     raw_value,
+    renames_by_entity_type,
     score_all_rules,
     score_rule,
 )
@@ -257,6 +258,62 @@ class TestCandidateRules:
         _, ident_fn = RULES["R1"]
         assert ident_fn(module) != current_ident(module)
 
+    @pytest.mark.parametrize("rule_id", ["R1", "R2", "R3", "R4", "R5"])
+    def test_the_per_type_breakdown_sums_to_the_whole_corpus_total(self, rule_id):
+        """The breakdown sits beside score_rule's `renames` in the report, so
+        it must describe that same number. Two independent walks of the
+        baseline groups is exactly how a breakdown drifts from the total it
+        annotates -- silently, since neither is obviously wrong on its own.
+
+        Counterfactual: a renames_by_entity_type that counted INPUTS rather
+        than baseline idents reports 4 module + 6 function here against a
+        total of 8, and this fails for every rule.
+        """
+        inputs = _known_collision_inputs() + [
+            EntityInput("module", "code", "a/b_c.py", None),
+            EntityInput("module", "code", "d/e.py", None),
+            EntityInput("class", "code", "a/b_c.py", "Cls"),
+        ]
+        baseline = group_by_ident(inputs, current_ident)
+        _, ident_fn = RULES[rule_id]
+        breakdown = renames_by_entity_type(ident_fn, baseline)
+        assert sum(row["renamed"] for row in breakdown.values()) == score_rule(
+            inputs, ident_fn, baseline
+        )["renames"]
+        assert sum(row["total"] for row in breakdown.values()) == len(baseline)
+
+    def test_R2_spares_module_idents_while_renaming_function_idents(self):
+        """P4's mechanism, at the level the report measures it. A module input
+        has no '::' separator, so a path with no adjacent non-alphanumerics
+        produces no hyphen run for R2's dropped collapse to preserve.
+
+        Counterfactual: R1 changes the charset instead, so it renames the
+        underscore-bearing module ident too -- asserted below so this test
+        cannot pass against a breakdown that reports zero module renames for
+        every rule.
+        """
+        inputs = _known_collision_inputs() + [
+            EntityInput("module", "code", "a/b.py", None),
+            EntityInput("module", "code", "d/e.py", None),
+        ]
+        baseline = group_by_ident(inputs, current_ident)
+        r2 = renames_by_entity_type(RULES["R2"][1], baseline)
+        assert r2["module"] == {"renamed": 0, "total": 2}
+        assert r2["function"]["renamed"] == r2["function"]["total"] == 3
+
+        r4 = renames_by_entity_type(RULES["R4"][1], baseline)
+        assert r4["module"]["renamed"] == 2
+
+    def test_every_declared_entity_type_appears_even_at_zero(self):
+        """Same claim as the report's per-type offender table: a missing key
+        and a zero are different statements. P4's evaluator indexes "module"
+        directly and must not KeyError on a function-only corpus.
+        """
+        baseline = group_by_ident(_known_collision_inputs(), current_ident)
+        breakdown = renames_by_entity_type(RULES["R2"][1], baseline)
+        assert set(breakdown) == set(ENTITY_TYPES)
+        assert breakdown["module"] == {"renamed": 0, "total": 0}
+
     def test_score_all_rules_covers_every_declared_rule(self):
         inputs = _known_collision_inputs()
         baseline = group_by_ident(inputs, current_ident)
@@ -462,6 +519,20 @@ class TestBuildReport:
         report = _report_over(_known_collision_inputs())
         assert set(report["candidates"]) == set(RULES)
 
+    def test_each_candidate_row_carries_its_per_type_rename_breakdown(self):
+        """WHERE a rule's rename cost lands is what separates two rules that
+        both reach zero residual, and it is the data P4 is ruled on. Composed
+        in build_report, not in score_all_rules, whose
+        {description, residual, renames} shape is pinned elsewhere.
+        """
+        report = _report_over(_known_collision_inputs())
+        for rule_id in RULES:
+            breakdown = report["candidates"][rule_id]["renames_by_entity_type"]
+            assert set(breakdown) == set(ENTITY_TYPES)
+            assert sum(row["renamed"] for row in breakdown.values()) == (
+                report["candidates"][rule_id]["renames"]
+            )
+
     def test_what_shaped_the_file_set_is_recorded(self):
         """collect_inputs resolves the ignore patterns from
         MINIGRAF_INGEST_IGNORE plus any .temporalignore, so they decide which
@@ -539,6 +610,45 @@ class TestPredictions:
         """
         evaluated = evaluate_predictions(_report_over(_known_collision_inputs()))
         assert evaluated["P2"]["outcome"] == "held"
+
+    def test_P4_holds_when_R2_spares_module_idents(self):
+        """P4's claim is about the FRACTION renamed per type, not the corpus
+        total. A plain module path has no adjacent non-alphanumerics, so R2's
+        dropped collapse leaves it alone while every function ident -- whose
+        raw value always carries '::' -- moves.
+        """
+        report = _report_over(
+            _known_collision_inputs() + [EntityInput("module", "code", "a/b.py", None)]
+        )
+        row = evaluate_predictions(report)["P4"]
+        assert row["outcome"] == "held"
+        assert "module 0/1 = 0.000" in row["evidence"]
+        assert "function 3/3 = 1.000" in row["evidence"]
+
+    def test_P4_fails_when_module_idents_are_renamed_just_as_often(self):
+        """The counterfactual, and the proof P4 is falsifiable on a corpus
+        that CAN evaluate it: 'a//b.py' carries an adjacent separator run, so
+        R2 preserves it and the module fraction reaches function's 1.000.
+        A >= comparison, or one on totals rather than fractions, passes here.
+        """
+        report = _report_over(
+            _known_collision_inputs()
+            + [EntityInput("module", "code", "a//b.py", None)]
+        )
+        row = evaluate_predictions(report)["P4"]
+        assert row["outcome"] == "failed"
+        assert "module 1/1 = 1.000" in row["evidence"]
+
+    def test_P4_names_the_empty_denominator_rather_than_dividing_by_zero(self):
+        """A function-only corpus cannot rule on P4 at all. Recorded as
+        "failed" -- held/failed is pinned by test_every_declared_prediction_is
+        _evaluated -- but the evidence must say WHY, or a reader sees a bare
+        0/0 and reads a real ruling into a corpus that could not produce one.
+        """
+        row = evaluate_predictions(_report_over(_known_collision_inputs()))["P4"]
+        assert row["outcome"] == "failed"
+        assert "not evaluable: no module idents in this corpus" in row["evidence"]
+        assert "0/0" not in row["evidence"].split("(")[0]
 
 
 class TestCli:

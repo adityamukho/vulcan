@@ -338,6 +338,46 @@ def score_rule(
     return {"residual": residual, "renames": renames}
 
 
+def renames_by_entity_type(
+    ident_fn: Callable[[EntityInput], str],
+    baseline_groups: Dict[str, List[EntityInput]],
+) -> Dict[str, Dict[str, int]]:
+    """Rename cost split by entity type, as {entity_type: {"renamed", "total"}}.
+
+    score_rule's single `renames` integer cannot answer the question that
+    decides between candidate rules: WHERE the rename cost lands. R2 drops
+    only the hyphen collapse, and a module input has no '::' separator to
+    produce an adjacent hyphen run, so it should spare module idents while
+    renaming nearly every named one. A whole-corpus total hides that shape
+    completely.
+
+    Keyed on the entity_type of a group's first member, matching how
+    build_report already partitions baseline groups per type.
+
+    The rename criterion is score_rule's, verbatim -- a baseline ident counts
+    as renamed when any input in its group maps somewhere other than that same
+    ident -- so these per-type counts SUM to score_rule's total. A test pins
+    that equality for every rule, because the two paths silently drifting is
+    how a per-type breakdown stops describing the total it sits beside.
+
+    Every declared entity type appears even at zero, for the same reason
+    build_report emits them all: a missing key and a zero are different claims.
+    An entity_type outside ENTITY_TYPES is still counted rather than dropped,
+    so the sum invariant holds unconditionally.
+    """
+    per_type: Dict[str, Dict[str, int]] = {
+        entity_type: {"renamed": 0, "total": 0} for entity_type in ENTITY_TYPES
+    }
+    for ident, members in baseline_groups.items():
+        row = per_type.setdefault(
+            members[0].entity_type, {"renamed": 0, "total": 0}
+        )
+        row["total"] += 1
+        if any(ident_fn(member) != ident for member in members):
+            row["renamed"] += 1
+    return per_type
+
+
 def score_all_rules(
     inputs: Sequence[EntityInput],
     baseline_groups: Dict[str, List[EntityInput]],
@@ -527,9 +567,10 @@ PREDICTIONS: Tuple[Tuple[str, str], ...] = (
            "offenders."),
     ("P3", "R5, the control, reports a nonzero residual at least as large as "
            "the leading-underscore offender count."),
-    ("P4", "R2 renames strictly fewer than all idents: it leaves plain module "
-           "idents untouched, because a module input has no '::' separator to "
-           "produce an adjacent hyphen run."),
+    ("P4", "R2's rename cost falls on named entities, not on module idents: "
+           "a module input has no '::' separator to produce an adjacent "
+           "hyphen run, so R2 renames a strictly smaller FRACTION of module "
+           "idents than of function idents."),
     ("P5", "R4's rename count equals the total ident count."),
 )
 
@@ -585,6 +626,12 @@ def build_report(
         for shape in classify_shapes(members):
             shape_counts[shape] += 1
 
+    candidates = score_all_rules(inputs, baseline)
+    for rule_id, (_description, ident_fn) in RULES.items():
+        candidates[rule_id]["renames_by_entity_type"] = renames_by_entity_type(
+            ident_fn, baseline
+        )
+
     report: Dict[str, Any] = {
         "repo_path": repo_path,
         "branch": diagnostics["branch"],
@@ -601,7 +648,11 @@ def build_report(
         "offenders": per_type,
         "offenders_total": len(all_offenders),
         "offenders_by_shape": shape_counts,
-        "candidates": score_all_rules(inputs, baseline),
+        # Composed here rather than inside score_all_rules: that function's
+        # {description, residual, renames} shape is Task 3's contract and a
+        # test pins it. The breakdown answers WHERE a rule's rename cost lands,
+        # which is what separates two rules that both reach zero residual.
+        "candidates": candidates,
         "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         ),
@@ -636,7 +687,41 @@ def evaluate_predictions(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     )
     r5 = report["candidates"]["R5"]["residual"]
     r4 = report["candidates"]["R4"]["renames"]
-    r2 = report["candidates"]["R2"]["renames"]
+
+    # P4 is a claim about the SHAPE of R2's rename cost, so it is ruled on
+    # fractions rather than on the whole-corpus total, which cannot distinguish
+    # "spares module idents" from "renames slightly fewer than everything".
+    r2_by_type = report["candidates"]["R2"]["renames_by_entity_type"]
+    module_row = r2_by_type["module"]
+    function_row = r2_by_type["function"]
+    empty_denominators = [
+        entity_type
+        for entity_type, row in (("module", module_row), ("function", function_row))
+        if row["total"] == 0
+    ]
+    if empty_denominators:
+        # Not evaluable on this corpus. Recorded as "failed" rather than as a
+        # third outcome value -- held/failed is pinned by a test -- but the
+        # evidence must say WHY, or a reader sees a bare 0/0 and reads a real
+        # ruling into a corpus that could not produce one.
+        p4_held = False
+        p4_evidence = (
+            "not evaluable: no "
+            + " or ".join(empty_denominators)
+            + " idents in this corpus (module "
+            f"{module_row['renamed']}/{module_row['total']}, function "
+            f"{function_row['renamed']}/{function_row['total']})"
+        )
+    else:
+        module_fraction = module_row["renamed"] / module_row["total"]
+        function_fraction = function_row["renamed"] / function_row["total"]
+        p4_held = module_fraction < function_fraction
+        p4_evidence = (
+            f"R2 renames module {module_row['renamed']}/{module_row['total']} "
+            f"= {module_fraction:.3f}, function "
+            f"{function_row['renamed']}/{function_row['total']} "
+            f"= {function_fraction:.3f}"
+        )
 
     return {
         "P1": _row("P1", total > 3, f"offenders_total={total}"),
@@ -647,8 +732,7 @@ def evaluate_predictions(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         ),
         "P3": _row("P3", r5 >= leading and r5 > 0,
                    f"R5 residual={r5}, leading-underscore offenders={leading}"),
-        "P4": _row("P4", r2 < report["idents_total"],
-                   f"R2 renames={r2} of {report['idents_total']} idents"),
+        "P4": _row("P4", p4_held, p4_evidence),
         "P5": _row("P5", r4 == report["idents_total"],
                    f"R4 renames={r4} of {report['idents_total']} idents"),
     }
@@ -726,6 +810,23 @@ def main() -> int:
             f"  {rule_id:<6} {row['residual']:>9} {row['renames']:>9}   "
             f"{row['description']}"
         )
+    print()
+    # Only the zero-residual rules: they are the live contenders, and WHERE
+    # their rename cost lands is what separates them. One line per rule per
+    # type across all five rules would bury that under rows for rules already
+    # ruled out.
+    print("RENAME COST BY ENTITY TYPE (zero-residual rules only)")
+    contenders = [r for r in sorted(RULES) if report["candidates"][r]["residual"] == 0]
+    if not contenders:
+        print("  (none: no candidate rule reached zero residual)")
+    for rule_id in contenders:
+        breakdown = report["candidates"][rule_id]["renames_by_entity_type"]
+        cells = " ".join(
+            f"{entity_type}={breakdown[entity_type]['renamed']}"
+            f"/{breakdown[entity_type]['total']}"
+            for entity_type in ENTITY_TYPES
+        )
+        print(f"  {rule_id:<6} {cells}")
     print()
     print("PREDICTIONS (fixed before the run; a failure is a finding)")
     for pid, _ in PREDICTIONS:
