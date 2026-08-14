@@ -59,20 +59,28 @@ Add to `tests/test_mcp_server.py`, at the end of the file:
 ```python
 class TestWriteExecutorIsShutDownOnEarlyFailure:
     """#250: write_executor is created above the try whose finally shuts it
-    down, with two awaited calls in the gap. If _open_index_writer_safe or
-    _frontier_load raises, a live ThreadPoolExecutor thread leaks for the
-    lifetime of the process.
+    down, with two awaited calls in the gap.
 
-    Counts live threads rather than wall clock, per docs/testing-conventions.md.
-    ThreadPoolExecutor names its workers "ThreadPoolExecutor-N_M", so a leaked
-    worker is directly observable by name.
+    THE GUARD ASSERTS SHUTDOWN STATE, NOT THREAD LIVENESS, and the distinction
+    is the finding that produced it. #250's body says a live thread "leaks for
+    the lifetime of the process"; measured on this interpreter, it does not.
+    CPython's ThreadPoolExecutor registers a weakref callback that wakes its
+    worker once the executor becomes unreachable, so when _run_ingestion's
+    frame dies the thread exits on its own.
+
+    That cleanup is emergent, not designed. It disappears the moment anything
+    retains the traceback -- which pins the frame holding the executor -- and
+    that is the exact fifth shape PR #254 found here and had to fix with
+    `e.__traceback__ = None`. It also never JOINS the worker, which
+    shutdown(wait=True) does.
+
+    So the defect axis is "was the executor shut down on this path", and that
+    is what this asserts, per docs/testing-conventions.md: pin the defect axis,
+    never a downstream symptom that something else happens to clean up.
     """
 
-    def _worker_threads(self):
-        return {t for t in threading.enumerate() if t.name.startswith("ThreadPoolExecutor")}
-
     @pytest.mark.parametrize("failing", ["_open_index_writer_safe", "_frontier_load"])
-    def test_no_executor_thread_survives_a_pre_try_failure(
+    def test_the_executor_is_shut_down_when_a_pre_try_call_raises(
         self, tmp_path, git_repo, monkeypatch, failing
     ):
         import mcp_server
@@ -81,26 +89,39 @@ class TestWriteExecutorIsShutDownOnEarlyFailure:
         mcp_server._db = None
         mcp_server._graph_path = ""
 
+        created = []
+
+        class _Recording(concurrent.futures.ThreadPoolExecutor):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                created.append(self)
+
+        # mcp_server resolves concurrent.futures.ThreadPoolExecutor at call
+        # time, so patching the attribute catches every executor the run
+        # builds -- including the preload one, which uses `with` and must
+        # therefore also come back shut down.
+        monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", _Recording)
+
         def boom(*a, **kw):
             raise RuntimeError(f"induced failure in {failing}")
 
         monkeypatch.setattr(mcp_server, failing, boom)
 
-        before = self._worker_threads()
         asyncio.run(mcp_server._run_ingestion(str(git_repo), "master"))
 
         # _run_ingestion swallows the failure into _ingest_progress rather than
         # raising, so assert we actually exercised the intended path.
         assert mcp_server._ingest_progress["status"] == "error"
         assert "induced failure" in (mcp_server._ingest_progress["error"] or "")
+        assert created, (
+            "no ThreadPoolExecutor was constructed -- the run aborted before "
+            "reaching write_executor, so this test proves nothing"
+        )
 
-        deadline = time.time() + 5.0
-        while time.time() < deadline and (self._worker_threads() - before):
-            time.sleep(0.05)
-        leaked = self._worker_threads() - before
-        assert not leaked, (
-            f"write_executor leaked {len(leaked)} thread(s) after {failing} raised: "
-            f"{[t.name for t in leaked]}"
+        unclosed = [ex for ex in created if not ex._shutdown]
+        assert not unclosed, (
+            f"{len(unclosed)} of {len(created)} executor(s) were never shut "
+            f"down after {failing} raised"
         )
         mcp_server._db = None
 ```
@@ -109,7 +130,11 @@ class TestWriteExecutorIsShutDownOnEarlyFailure:
 
 Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestWriteExecutorIsShutDownOnEarlyFailure -v`
 
-Expected: **both parametrisations FAIL** with `write_executor leaked 1 thread(s)`. This is the ablation — it is proof against the unmodified code, so record the exact output in the commit message. If either passes here, stop: the test is not exercising the gap, and the likely cause is that `git_repo` produced a repo whose ingestion aborts before reaching line 10681 at all.
+Expected: **both parametrisations FAIL** with `1 of N executor(s) were never shut down`. Record the exact output in the commit message.
+
+If either PASSES here, stop and report — the test is not exercising the gap. The likely cause is that `git_repo` produced a repo whose ingestion aborts before line 10681, which the `assert created` line is there to distinguish from a genuine pass.
+
+Do **not** substitute a thread-liveness assertion. `ThreadPoolExecutor._shutdown` is `False` while live and `True` after `shutdown()`, verified on this interpreter; a thread-liveness check passes before the fix and proves nothing.
 
 - [ ] **Step 3: Hoist the name**
 
@@ -168,9 +193,17 @@ git commit -m "Shut down write_executor on the two pre-try failure paths
 
 _run_ingestion created write_executor above the try whose finally shut it
 down, with two awaited calls in the gap (_open_index_writer_safe and
-_frontier_load). Either raising leaked a live ThreadPoolExecutor thread for
-the process lifetime, and the comment beside the outer handler asserted the
-opposite.
+_frontier_load). Either raising left it never shut down, and the comment
+beside the outer handler asserted the opposite.
+
+#250's body overstates the symptom, and the guard is aimed accordingly.
+Measured on CPython 3.14.6: the worker thread does NOT leak for the process
+lifetime -- ThreadPoolExecutor's weakref callback wakes it once the frame
+holding the executor dies. That cleanup is emergent, not designed: it vanishes
+the moment anything retains the traceback, which is the fifth shape PR #254
+already had to fix here with e.__traceback__ = None, and it never joins the
+worker the way shutdown(wait=True) does. So the test asserts shutdown STATE,
+which fails before this change, rather than thread liveness, which does not.
 
 The name is now bound above the outer try and a single guarded shutdown lives
 in the outermost finally; the inner one is deleted, leaving one cleanup writer
