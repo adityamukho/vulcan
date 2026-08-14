@@ -1383,27 +1383,44 @@ def evaluate_predictions(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     total = report["offenders_total"]
     r5 = report["candidates"]["R5"]["residual"]
 
-    # P2. `max` returns the FIRST maximal element, and SHAPES[0] is
-    # "leading-underscore" -- so an all-zero corpus, or an exact tie, would
-    # hand P2 a "held" it did not earn. Both are ruled out explicitly:
-    # unevaluable when there are no offenders at all, and STRICT dominance
-    # otherwise, with the runner-up named in the evidence so a near-tie is
-    # visible without re-running anything.
+    # P2 is ruled by STRICT comparison against the runner-up, not by max().
+    # max() returns the first maximal element and SHAPES[0] is
+    # "leading-underscore", so it named leading-underscore the winner on a
+    # corpus where every count was 0 -- and a zero-offender run clears the
+    # validity gate, so that laundered "held" reached the committed artifact.
+    # The same first-wins bias read an exact tie as a win.
     rivals = sorted(
-        ((shape_counts.get(s, 0), s) for s in SHAPES if s != "other"),
+        (
+            (shape_counts.get(shape, 0), shape)
+            for shape in SHAPES
+            if shape not in ("other", "leading-underscore")
+        ),
         reverse=True,
     )
-    if not rivals or rivals[0][0] == 0:
-        p2 = _row("P2", False, "not evaluable: no offenders in this corpus")
-    else:
-        runner_up_count, runner_up = next(
-            ((c, s) for c, s in rivals if s != "leading-underscore"), (0, "none")
+    runner_up_count, runner_up = rivals[0]
+    if total == 0:
+        p2_held = False
+        p2_evidence = (
+            "not evaluable: no offenders in this corpus "
+            "(offenders_total=0, leading-underscore=0)"
         )
-        p2 = _row(
-            "P2",
-            leading > runner_up_count,
-            f"leading-underscore={leading}, runner-up {runner_up}="
-            f"{runner_up_count}",
+    elif leading == 0 and runner_up_count == 0:
+        # Offenders exist but every named shape is empty, i.e. they all landed
+        # in "other". Distinct from the case above and worth saying so:
+        # "other" is where an UNPREDICTED collision family surfaces, so this is
+        # a finding, not an empty run.
+        p2_held = False
+        p2_evidence = (
+            "not evaluable: no offender carries a named shape "
+            f"(offenders_total={total}, all in 'other')"
+        )
+    else:
+        # Strict: a tie is not a win. The runner-up is named and counted so a
+        # near-tie is visible without re-running anything.
+        p2_held = leading > runner_up_count
+        p2_evidence = (
+            f"leading-underscore={leading}, "
+            f"runner-up {runner_up}={runner_up_count}"
         )
 
     # P4 compares FRACTIONS, per entity type -- an ident-count total says
@@ -1529,15 +1546,20 @@ def main() -> int:
             f"{row['description']}"
         )
     print()
-    print("SELF-CHECKS (wiring assertions, NOT predictions)")
-    for sid, _ in SELF_CHECKS:
-        row = report["self_checks"][sid]
-        print(f"  {sid}  {row['outcome']:<7} {row['evidence']}")
-    print()
     print("PREDICTIONS (fixed before the run; a failure is a finding)")
     for pid, _ in PREDICTIONS:
         row = report["predictions"][pid]
         print(f"  {pid}  {row['outcome']:<7} {row['evidence']}")
+    print()
+    # Under its own heading, never inside the predictions block: these hold by
+    # construction, so counting them among the predictions would inflate the
+    # held tally with something that was never at risk.
+    print("SELF-CHECKS (hold by construction; a failure indicts the SCORER)")
+    for sid, _ in SELF_CHECKS:
+        row = report["self_checks"][sid]
+        print(f"  {sid}  {row['outcome']:<7} {row['evidence']}")
+        if row["outcome"] == "failed":
+            print(f"      {row['statement']}")
 
     if report["candidates"]["R5"]["residual"] == 0 and (
         report["offenders_by_shape"]["leading-underscore"] > 0
