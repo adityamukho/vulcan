@@ -227,7 +227,8 @@ Pure addition. Nothing is wired to it yet, so the suite stays green throughout.
 - Test: `tests/test_mcp_server.py`
 
 **Interfaces:**
-- Consumes: existing `_try_open_with_self_heal(path)`, `_is_lock_error(exc)`, `SESSION_RULES`, `_user_rules`, `_db_execute(db, datalog)`, `_get_graph_path()`, `_LOCK_RETRY_MAX`, `_LOCK_RETRY_BASE`, `_INGEST_LOCK_RETRY_BASE`, `_INGEST_LOCK_RETRY_CAP`, `_INGEST_LOCK_RETRY_BUDGET`.
+- Consumes: existing `_is_lock_error(exc)`, `_stale_lock_holder_pid(exc)`, `_clear_stale_lock(path, pid)`, `SESSION_RULES`, `_user_rules`, `_db_execute(db, datalog)`, `_get_graph_path()`, `_LOCK_RETRY_MAX`, `_LOCK_RETRY_BASE`, `_INGEST_LOCK_RETRY_BASE`, `_INGEST_LOCK_RETRY_CAP`, `_INGEST_LOCK_RETRY_BUDGET`.
+- **Does NOT consume `_try_open_with_self_heal` or `_open_db_at`.** See `_open_for_lease` below — this was a defect in an earlier draft of this plan and it is the one thing most likely to be "helpfully" reverted.
 - Produces, relied on by Tasks 3-9:
   - `_lease_manager: _DbLeaseManager` — module-level singleton
   - `_DbLeaseManager.lease_count -> int` (property)
@@ -355,6 +356,33 @@ import weakref
 Insert into `mcp_server.py` immediately after `_open_db_at_with_extended_retry` ends (after line 3300, before `async def _ensure_db_async`):
 
 ```python
+def _open_for_lease(path: str) -> MiniGrafDb:
+    """Open a handle FOR THE LEASE MANAGER, self-healing a stale lock.
+
+    Deliberately does not go through _open_db_at / _try_open_with_self_heal,
+    and the difference is the entire point. _open_db_at's contract is to
+    PUBLISH the handle into the module global `_db` -- which is precisely the
+    stray reference the lease protocol exists to remove. Routed through it,
+    release() could never drop the last reference: the lease count would reach
+    zero while `_db` still held the handle, so the lock file would survive
+    every lease and the next open would be a second handle.
+
+    The self-heal logic below mirrors _try_open_with_self_heal minus that
+    publication. The duplication is deliberate and TEMPORARY: the task that
+    deletes `_db` also deletes _open_db_at, _try_open_with_self_heal and the
+    two retry wrappers, leaving this as the only opener.
+    """
+    try:
+        return MiniGrafDb.open(path)
+    except Exception as e:
+        if not _is_lock_error(e):
+            raise
+        holder_pid = _stale_lock_holder_pid(e)
+        if holder_pid is not None and _clear_stale_lock(path, holder_pid):
+            return MiniGrafDb.open(path)
+        raise
+
+
 class _DbLeaseManager:
     """Owns this process's single MiniGrafDb handle and its lifetime (#255).
 
@@ -434,7 +462,7 @@ class _DbLeaseManager:
 
             self._detect_leaked_handle(path)
             try:
-                handle = _try_open_with_self_heal(path)
+                handle = _open_for_lease(path)
             except Exception as e:
                 if _is_lock_error(e):
                     return None
@@ -481,6 +509,10 @@ class _DbLeaseManager:
             self._handle = None
             self._count = 0
             self._prev_ref = None
+            # The path must clear too, or a graph path set by one test leaks
+            # into the next one that never binds its own -- nothing else
+            # resets this manager between tests.
+            self._path = ""
 
 
 _lease_manager = _DbLeaseManager()
