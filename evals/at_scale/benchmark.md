@@ -829,3 +829,172 @@ into a close-oriented "prediction holds" framing.
    mechanism at all. The two arms it does close off are narrower: the shipped
    query agreed with the oracle on 12685 unambiguous comparisons, and no
    entity type other than `function` has an ident carrying two values.
+
+## Ident Collision Census — 263-ident-collision-census
+
+- Repo: `.` @ `master` (`14166d1`, full history, 674 commits)
+- Script: `evals/at_scale/probe_ident_collision_census.py`
+- Raw: `evals/at_scale/results/263-ident-collision-census.json`
+- Run: `.venv/bin/python evals/at_scale/probe_ident_collision_census.py
+  --repo-path . --json-out evals/at_scale/results/263-ident-collision-census.json`
+- Question: how many `_code_ident` values on real history are reachable from
+  more than one distinct `(entity_type, file_path, name)` input? #257's census
+  observed three such collisions from the graph side; #263 asks for the true
+  count and for what a fix would cost.
+
+**On the head commit.** `head_commit` is `14166d1`, mainline's tip — *not* the
+tip of the `audit-263-ident-collision-census` branch this probe was written on.
+That is deliberate, not a stale run: `collect_inputs` resolves an unspecified
+branch through `mcp_server._default_git_branch`, which returns `master` here, so
+the measurement counts the idents mainline history produces and excludes the
+probe being added. `branch` and `head_commit` are both recorded in the artifact
+and both printed by the CLI so a run is never ambiguous about what it read.
+
+**Why source-derived and not graph-derived.** A graph-side census structurally
+cannot answer this. When two entities collide, the loser takes
+`_build_code_triples`' already-known branch, which appends `:modified-in` and
+nothing else — no `:entity-type`, no `:ident`, no `:description`, no `:file`.
+The graph holds no record of the losing input's `(file_path, name)` pair at all.
+The three collisions #257 saw were visible only because those entities were
+closed and reopened, which re-runs the introduction branch. Any graph-side count
+is a bound; only the inputs give an exact one.
+
+| Metric | Value |
+|---|---|
+| Exit code | 0 (valid measurement) |
+| Commits walked | 674 |
+| Extraction failures | 0 |
+| Distinct inputs collected | 2789 |
+| Distinct idents | 2780 |
+| Ignore patterns applied | `3rdParty/`, `third_party/`, `vendor/`, `node_modules/`, `dist/`, `build/`, `*.min.js`, `*.map` |
+| **Offenders (idents reachable from >1 distinct input)** | **9 of 2780 (0.32%)** |
+| &nbsp;&nbsp;module | **1** of 133 |
+| &nbsp;&nbsp;function | **7** of 2058 |
+| &nbsp;&nbsp;class | **1** of 290 |
+| &nbsp;&nbsp;variable | 0 of 232 |
+| &nbsp;&nbsp;field | 0 of 67 |
+
+**By shape** (an offender may carry more than one label; `other` is emitted only
+when no named shape applied, so it is where an unpredicted family surfaces):
+
+| Shape | Count |
+|---|---|
+| leading-underscore | 7 |
+| case-only | 0 |
+| separator-vs-path | 1 |
+| cross-producer | 0 |
+| other | 1 |
+
+**The nine offenders in full:**
+
+| Ident | Colliding inputs | Shape |
+|---|---|---|
+| `:module/mcp-server` | import `mcp.server`, import `mcp_server` | separator-vs-path |
+| `:function/tests-test-mcp-server-py-commit` | `tests/test_mcp_server.py` `_commit` / `commit` | leading-underscore |
+| `:function/tests-test-mcp-server-py-snapshot` | `tests/test_mcp_server.py` `_snapshot` / `snapshot` | leading-underscore |
+| `:function/tests-test-mcp-server-py-boom` | `tests/test_mcp_server.py` `_boom` / `boom` | leading-underscore |
+| `:function/tests-test-mcp-server-py-parse` | `tests/test_mcp_server.py` `_parse` / `parse` | leading-underscore |
+| `:function/tests-test-mcp-server-py-results` | `tests/test_mcp_server.py` `_results` / `results` | leading-underscore |
+| `:function/evals-at-scale-profile-forward-reconcile-attribution-py-main` | `evals/at_scale/profile_forward_reconcile_attribution.py` `_main` / `main` | leading-underscore |
+| `:class/tests-test-mcp-server-py-fakedb` | `tests/test_mcp_server.py` `FakeDb` / `_FakeDb` | leading-underscore |
+| `:function/tests-test-mcp-server-py-init` | `tests/test_mcp_server.py` `__init__` / `_init` | **other** |
+
+**Candidate rules** — residual is offenders remaining under the rule; renames is
+baseline idents that move, i.e. the cost the change imposes on every existing
+graph:
+
+| Rule | Residual | Renames | % of 2780 | Description |
+|---|---|---|---|---|
+| R1 | **0** | 2710 | 97.5% | keep underscores: charset becomes `[^a-z0-9_-]` |
+| R2 | 1 | 2649 | 95.3% | no hyphen collapse: drop `re.sub(r'-+', '-', slug)` |
+| R3 | **0** | 2721 | 97.9% | R1 + R2 |
+| R4 | **0** | 2780 | 100.0% | hash suffix: current slug + `-` + `sha256(raw)[:8]` |
+| R5 | 9 | 2647 | 95.2% | CONTROL, expected to still collide |
+
+Rename cost by entity type, for the rules that reach zero residual:
+
+| Rule | module | function | class | variable | field |
+|---|---|---|---|---|---|
+| R1 | 74/133 | 2049/2058 | 289/290 | 231/232 | 67/67 |
+| R3 | 74/133 | 2058/2058 | 290/290 | 232/232 | 67/67 |
+| R4 | 133/133 | 2058/2058 | 290/290 | 232/232 | 67/67 |
+
+R2's split is recorded too, because P4 is ruled on it: module 2/133, function
+2058/2058, class 290/290, variable 232/232, field 67/67. R5's: module 0/133,
+function 2058/2058, class 290/290, variable 232/232, field 67/67.
+
+**Predictions** (fixed before any data existed; a failure is a finding about the
+design, not noise). All four held:
+
+| ID | Outcome | Evidence, verbatim |
+|---|---|---|
+| P1 — the true count exceeds the 3 #257's census found | **held** | `offenders_total=9` |
+| P2 — leading-underscore strictly outnumbers every other named shape | **held** | `leading-underscore=7, runner-up separator-vs-path=1` |
+| P3 — R5, the control, reports nonzero residual at least as large as the leading-underscore count | **held** | `R5 residual=9, leading-underscore offenders=7` |
+| P4 — R2's rename cost falls on named entities, not module idents | **held** | `R2 renames module 2/133 = 0.015, function 2058/2058 = 1.000` |
+
+Self-check (holds by construction; a failure would indict the scorer, not the
+design, which is why it is reported apart from the predictions):
+
+| ID | Outcome | Evidence, verbatim |
+|---|---|---|
+| S1 — R4 renames every ident, so its rename count must equal the ident total | **held** | `R4 renames=2780, idents_total=2780` |
+
+**The control behaved.** R5 came back with residual 9 — every offender survives
+it, because `_slug_current` strips leading hyphens, so `_commit` and `commit`
+both reduce to `commit` under independent slugging. The CLI's `NOTE: R5` warning
+did not fire. Had R5 reported clean while `leading-underscore` was nonzero, every
+other row in the candidate table would have been suspect.
+
+**Findings:**
+
+1. **The count is 9, three times what the graph could see.** #257's graph-side
+   census found 3; the input-side count is 9. All three of #257's are present
+   (`:function/tests-test-mcp-server-py-commit`,
+   `:function/tests-test-mcp-server-py-snapshot`,
+   `:function/evals-at-scale-profile-forward-reconcile-attribution-py-main`),
+   confirming the two measurements are of the same phenomenon and that the
+   graph-side number is the bound the design spec said it was. The six the graph
+   could not see are exactly the ones whose loser was never closed and reopened.
+
+2. **`other` was not empty, and what landed there is a real finding.**
+   `:function/tests-test-mcp-server-py-init` collides `__init__` with `_init`.
+   The shape classifier's `leading-underscore` test compares names after
+   `lstrip("_")` on the last dot-segment, so `__init__` → `init__` and `_init` →
+   `init` are unequal and the pair falls through to `other`. It is still an
+   underscore collision in substance — the trailing dunder underscores also slug
+   to hyphens and get stripped — but it is a *dunder-versus-private* variant the
+   predictions did not name. The classifier is not wrong; its
+   `leading-underscore` label is narrower than the underscore family actually
+   present on this history.
+
+3. **One collision is not an underscore problem at all, and it crosses the
+   internal/external boundary.** `:module/mcp-server` is reached from two
+   unresolved import specifiers: `mcp.server` (the external `mcp` package's
+   submodule) and `mcp_server` (this repository's own top-level module). `.` and
+   `_` both slug to `-`, so an external dependency and an in-tree module land on
+   one ident. This is the single offender R2 does not fix — dropping the hyphen
+   collapse changes nothing when there is no hyphen run to preserve — and it is
+   why R2's residual is 1 rather than 0. R1 fixes it (`mcp_server` keeps its
+   underscore); so do R3 and R4.
+
+4. **No cross-producer and no case-only collisions on this history.** Both
+   counts are 0. `cross-producer` being 0 does not mean the three producers
+   sharing the `:module/` namespace is safe — it means this repository has no
+   gitlinks at all (consistent with #257's `gitlink events: 0`), so the
+   code/gitlink arm of that risk was never exercised. Absence of opportunity,
+   not absence of risk.
+
+5. **Every zero-residual rule is a near-total rename.** The cheapest one, R1,
+   still moves 2710 of 2780 idents (97.5%); R3 moves 2721 (97.9%) and R4 moves
+   all 2780. There is no candidate here that fixes the 9 while leaving the other
+   2771 idents where they are. The per-type split shows why: R1 and R3 spare
+   only module idents (74/133 renamed) because a module's raw value is a bare
+   path with no `::` separator and often no underscore; every function, class,
+   variable and field ident carries a `::` that changes under any charset or
+   collapse change.
+
+**Conclusion: a fix needs a migration for existing graphs, not only a forward
+change** — the cheapest rule that eliminates all 9 collisions (R1) still renames
+97.5% of existing idents, so a forward-only change would orphan the history of
+nearly every code entity in every graph already written.
