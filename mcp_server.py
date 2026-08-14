@@ -3373,6 +3373,66 @@ def _open_for_lease(path: str) -> MiniGrafDb:
         raise
 
 
+def _describe_referrers(obj: Any, limit: int = 6) -> str:
+    """Name the places still referencing obj, for the lease-leak diagnostic.
+
+    Reports the BINDING NAME where it can, because "still held by: escaped"
+    is actionable and "still held by: dict" is not. Two mechanisms, because
+    neither alone covers the common case on this interpreter (Python 3.13+,
+    PEP 667):
+
+    * A call-stack walk checks every live frame's f_locals for a name bound
+      to obj. This is the primary path -- a leaked lease handle is almost
+      always sitting in a caller's local variable. But PEP 667 turned
+      f_locals into a write-through proxy (not a plain dict), and an
+      ordinary function frame is frequently not gc-tracked at all, so
+      gc.get_referrers(obj) returns nothing for it -- verified empirically:
+      it silently produced "<no named holder found>" for exactly this case
+      before the stack walk was added, which is the "verification fails
+      open" failure mode this project has been bitten by before.
+    * gc.get_referrers still covers what the stack walk cannot: a module's
+      globals (a real dict, found this way) or another object's __dict__
+      holding the reference from outside the current call stack.
+
+    Two innermost frames are skipped when walking the stack: this function's
+    own (holds `obj` itself as a parameter) always, and its direct caller's
+    only when that caller is `_detect_leaked_handle` (holds the weakref
+    target in a local for the duration of this call) -- both are artifacts of
+    running the diagnostic, not a real holder. The second skip is matched by
+    code identity rather than a fixed stack depth, so a second, unanticipated
+    caller only loses that one (harmless) skip rather than silently
+    mis-skipping a real frame.
+
+    Best-effort by nature -- a reference held only from a C-level structure
+    has no name to report.
+    """
+    found: List[str] = []
+
+    frame = sys._getframe(1)  # skip this function's own frame
+    if frame is not None and frame.f_code is _DbLeaseManager._detect_leaked_handle.__code__:
+        frame = frame.f_back  # also skip _detect_leaked_handle's bookkeeping local
+    while frame is not None and len(found) < limit:
+        for name, value in frame.f_locals.items():
+            if value is obj and name not in found:
+                found.append(name)
+        frame = frame.f_back
+
+    for referrer in gc.get_referrers(obj):
+        if len(found) >= limit:
+            break
+        if isinstance(referrer, dict):
+            names = [k for k, v in referrer.items() if v is obj]
+            if names:
+                found.append(", ".join(sorted(names)))
+        elif hasattr(referrer, "f_code"):
+            code = referrer.f_code
+            found.append(f"{os.path.basename(code.co_filename)}:{code.co_name}")
+        else:
+            found.append(type(referrer).__name__)
+
+    return "; ".join(found) if found else "<no named holder found>"
+
+
 class _DbLeaseManager:
     """Owns this process's single MiniGrafDb handle and its lifetime (#255).
 
@@ -3505,7 +3565,36 @@ class _DbLeaseManager:
             self._path = ""
 
     def _detect_leaked_handle(self, path: str) -> None:
-        return  # implemented in Task 3
+        """Fire if the previously released handle is still alive.
+
+        Called at 0 -> 1 and from reset(). A live weakref here means a caller
+        kept its `db` past the end of its `with` block: the manager dropped its
+        reference, the count says "released", and the file lock is still held.
+        Left alone, that surfaces later and elsewhere as minigraf's "Database
+        is already open in this process". Naming the holder is the whole point
+        -- gc.get_referrers is what found the four holder sites in PR #254,
+        after two attempts to reason it out from the source were both wrong.
+
+        Must be called with self._lock held.
+        """
+        ref = self._prev_ref
+        if ref is None:
+            return
+        stale = ref()
+        self._prev_ref = None
+        if stale is None:
+            return  # released cleanly, which is the normal path
+        holders = _describe_referrers(stale)
+        del stale  # do not let this frame be one of the holders we report
+        msg = (
+            f"DB lease leak: the handle from the previous lease on {path!r} was "
+            f"still alive at the next acquire. A caller kept a reference past "
+            f"the end of its `with db_lease()` block, so the graph file lock "
+            f"was never released. Still held by: {holders}"
+        )
+        if self.strict_leak_detection and os.environ.get("PYTEST_CURRENT_TEST"):
+            raise RuntimeError(msg)
+        print(f"[db_lease] {msg}", file=sys.stderr)
 
 
 _lease_manager = _DbLeaseManager()
@@ -3534,8 +3623,9 @@ def db_lease(extended: bool = False):
             if remaining <= 0:
                 raise RuntimeError(
                     f"could not acquire a lease on {path!r} within "
-                    f"{_INGEST_LOCK_RETRY_BUDGET}s: the file lock is held by "
-                    f"another process"
+                    f"{_INGEST_LOCK_RETRY_BUDGET}s: the graph file lock did not "
+                    f"clear -- see the preceding [db_lease] diagnostic for who is "
+                    f"still holding it"
                 )
             time.sleep(min(delay, remaining))
             delay = min(delay * 2, _INGEST_LOCK_RETRY_CAP)
@@ -3551,8 +3641,9 @@ def db_lease(extended: bool = False):
         if handle is None:
             raise RuntimeError(
                 f"could not acquire a lease on {path!r} after "
-                f"{_LOCK_RETRY_MAX} attempts: the file lock is held by another "
-                f"process"
+                f"{_LOCK_RETRY_MAX} attempts: the graph file lock did not clear "
+                f"-- see the preceding [db_lease] diagnostic for who is still "
+                f"holding it"
             )
     leased = _LeasedDb(handle)
     handle = None  # this frame must not outlive the lease either
@@ -3589,7 +3680,8 @@ async def db_lease_async():
     if handle is None:
         raise RuntimeError(
             f"could not acquire a lease on {path!r} after {_LOCK_RETRY_MAX} "
-            f"attempts: the file lock is held by another process"
+            f"attempts: the graph file lock did not clear -- see the preceding "
+            f"[db_lease] diagnostic for who is still holding it"
         )
     leased = _LeasedDb(handle)
     handle = None

@@ -813,6 +813,164 @@ class TestDbLeaseManager:
         assert mcp_server._lease_manager.lease_count == 0
 
 
+class TestDbLeaseLeakDetector:
+    """#255: the count reaching zero means the manager dropped ITS reference.
+    The handle only actually dies if nobody kept a stray one -- and a stray
+    reference is the entire bug. The detector turns a later, confusing
+    "Database is already open in this process" into a diagnostic that names the
+    variable still holding it.
+
+    It cannot run at __exit__: the caller's `as db` name is still bound at that
+    moment, so every release would look like a leak. It runs at the next
+    0 -> 1 acquire and from _reset_db_state().
+    """
+
+    def test_a_handle_that_escaped_its_lease_is_reported(self, tmp_path, monkeypatch):
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        mcp_server._reset_db_state()
+
+        with mcp_server.db_lease() as db:
+            # Reach THROUGH the proxy: holding `db` itself is not a leak,
+            # because _LeasedDb severs its own reference at block exit. Only a
+            # reference to the real handle survives, which is what the
+            # detector exists to catch.
+            escaped = db._handle
+        assert mcp_server._lease_manager.lease_count == 0
+
+        with pytest.raises(RuntimeError, match="DB lease leak") as exc_info:
+            with mcp_server.db_lease():
+                pass
+        # Scoped to the "Still held by:" segment, not the whole message: the
+        # rest of the message embeds `path`, and pytest's tmp_path bakes this
+        # very test's own name into that path -- "test_a_handle_that_escaped_
+        # its..." -- so a bare `"escaped" in str(exc_info.value)` passes even
+        # when _describe_referrers finds nothing and falls back to
+        # "<no named holder found>". Caught by ablating _describe_referrers
+        # to always return that fallback string and confirming THIS scoped
+        # assertion (unlike the unscoped one) fails.
+        holders = str(exc_info.value).split("Still held by:", 1)[1]
+        assert "escaped" in holders, (
+            "the diagnostic must name the variable still holding the handle -- "
+            "that naming is the whole value over minigraf's own lock error; "
+            f"got holders={holders!r}"
+        )
+        del escaped
+        mcp_server._reset_db_state()
+
+    def test_a_clean_release_is_not_reported(self, tmp_path, monkeypatch):
+        """Positive control's counterpart: the detector must not fire on the
+        normal path, or it would be noise and get switched off."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        mcp_server._reset_db_state()
+
+        for _ in range(3):
+            with mcp_server.db_lease() as db:
+                mcp_server._db_execute(db, "(query [:find ?e :where [?e :ident ?v]])")
+        assert mcp_server._lease_manager.lease_count == 0
+
+    def test_reset_blames_the_leaking_test_not_its_successor(self, tmp_path, monkeypatch):
+        """The detector fires one step late at acquire time. Running it from
+        _reset_db_state() is what puts the blame on the test that leaked."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        mcp_server._reset_db_state()
+
+        with mcp_server.db_lease() as db:
+            escaped = db._handle
+        with pytest.raises(RuntimeError, match="DB lease leak"):
+            mcp_server._reset_db_state()
+        del escaped
+        mcp_server._reset_db_state()
+
+    def test_holding_the_proxy_past_its_block_is_not_a_leak(self, tmp_path, monkeypatch):
+        """The interaction between _LeasedDb and the detector, pinned.
+
+        Keeping `db` itself past the block -- the mistake a caller is most
+        likely to make -- is NOT a leak: the proxy severed its reference at
+        __exit__, so the real handle already died. This is why the detector's
+        reach narrowed once leases stopped yielding the raw handle, and it is
+        worth pinning: if _LeasedDb ever stopped severing, this test keeps
+        passing but test_a_lease_in_a_loop_does_not_double_open fails, which
+        is the pair that localises the fault.
+        """
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+
+        with mcp_server.db_lease() as db:
+            pass
+        still_bound = db                      # the proxy, already severed
+
+        with mcp_server.db_lease():           # must NOT raise
+            pass
+        assert not os.path.exists(graph + ".lock")
+        del still_bound
+
+    def test_strict_can_be_switched_off_for_a_deliberate_ablation(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Task 9's ablation reconstructs a leak on purpose, so it needs an
+        opt-out -- an attribute, not an env var, so it cannot leak into an
+        unrelated process -- and the opt-out must still print.
+
+        Exercised through _reset_db_state() rather than through a second
+        acquire, and the reason is the point of the next test: with a real
+        handle still held, no acquire can succeed whatever the detector does.
+        reset() runs the same detector and opens nothing, so it is the one
+        path where the opt-out is observable by itself.
+        """
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        mcp_server._reset_db_state()
+        monkeypatch.setattr(mcp_server._lease_manager, "strict_leak_detection", False)
+
+        with mcp_server.db_lease() as db:
+            escaped = db._handle
+
+        mcp_server._reset_db_state()               # must NOT raise
+        assert "DB lease leak" in capsys.readouterr().err
+        del escaped
+        monkeypatch.setattr(mcp_server._lease_manager, "strict_leak_detection", True)
+        mcp_server._reset_db_state()
+
+    def test_the_detector_diagnoses_but_cannot_rescue(self, tmp_path, monkeypatch):
+        """The honest bound on what this detector is worth, pinned.
+
+        A stray reference means the graph file lock is STILL HELD, so the next
+        acquire fails no matter what: minigraf refuses a second same-process
+        open, and _clear_stale_lock correctly declines to steal a lock whose
+        holder PID is our own live process. The detector buys a named holder
+        in the log before that failure -- never a recovery from it.
+
+        Worth a test because the opposite is the natural assumption, and
+        acting on it would mean building retry or force-clear logic that can
+        only ever corrupt.
+        """
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+        monkeypatch.setattr(mcp_server._lease_manager, "strict_leak_detection", False)
+
+        with mcp_server.db_lease() as db:
+            escaped = db._handle
+
+        with pytest.raises(RuntimeError, match="could not acquire a lease"):
+            with mcp_server.db_lease():
+                pass
+        del escaped
+        mcp_server._reset_db_state()
+
+
 class TestLiveLockHolderPid:
     """Unit tests for _live_lock_holder_pid — the proactive pre-check used
     to avoid racing another live process for the ingestion lock (#108)."""
