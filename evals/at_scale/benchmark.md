@@ -830,6 +830,30 @@ into a close-oriented "prediction holds" framing.
    query agreed with the oracle on 12685 unambiguous comparisons, and no
    entity type other than `function` has an ident carrying two values.
 
+**Resolution (2026-08-14): #257 CLOSED as an accepted residual, not fixed, and
+item 4 above is what closed it — it was never answered.** The interval-inversion
+fix is not built. Two corrections to how the arms were described, both verified
+against the shipped code:
+
+- **The submodule arm is remove → re-add at the same path, not a rename.**
+  `_gitlink_changes` classifies from the gitlink tree entry's modes and never
+  reads `.gitmodules`; `"bump"` writes `:pinned-commit` + `:modified-in` only.
+  A name-only `.gitmodules` edit produces no event and rewrites no
+  `:description`. Item 3's "independently variable from the ident-bearing path"
+  is right about the value and wrong about what triggers a second write.
+- **The three `function` collisions in item 4 were fixed by #263 (rule R3), but
+  the ARM is not closed.** These descriptions are pre-slug raw values, so
+  ident → description is injective only if the slug is, and R3's zero is
+  measured over 674 commits rather than proven: `a/b.py` and `a-b.py` both reach
+  `:module/a-b-py`. #267 is the missing census over history written under R3.
+
+Both arms additionally need a **close-then-reintroduce**, since every
+`entity_descriptions` write site is guarded by "ident not currently live". The
+standing record is `_preload_known_entities`' docstring and the strict xfail in
+`TestPreloadKnownEntitiesDescriptionValueIsDateBounded`, which fails the suite if
+anyone fixes the preload — so this measurement is not the only thing keeping the
+mechanism visible.
+
 ## Ident Collision Census — 263-ident-collision-census
 
 - Repo: `.` @ `master` (`14166d1`, full history, 674 commits)
