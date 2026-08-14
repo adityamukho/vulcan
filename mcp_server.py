@@ -4090,12 +4090,37 @@ _MIN_ENTITY_LEN = 4
 def _canonical_ident(entity_type: str, value: str) -> str:
     """Slug-canonicalize a value into a Minigraf keyword ident.
 
-    Lowercases, replaces any character outside [a-z0-9-] with a hyphen,
-    collapses consecutive hyphens, strips leading/trailing hyphens.
-    Ported from _to_kw() in minigraf-examples LlamaIndex integration.
+    Lowercases, replaces any character outside [a-z0-9_-] with a hyphen,
+    strips leading/trailing hyphens. Originally ported from _to_kw() in
+    minigraf-examples' LlamaIndex integration.
+
+    #263 — TWO deliberate departures from that original rule, both load-bearing
+    for identity and neither safe to "simplify" away:
+
+    1. '_' is INSIDE the allowed charset, so a private marker survives. Mapping
+       it to '-' made `foo` and `_foo` (and `__init__` and `_init`) the same
+       entity.
+    2. Consecutive hyphens are NOT collapsed, so separator arity carries
+       information: `_code_ident`'s '::' join survives as '--' and stays
+       distinct from a single '-' that came from one character in the path.
+
+    Together these are rule R3 of the #263 audit, measured at ZERO residual
+    collisions over 674 commits of this repo (9 of 2780 idents collided under
+    the old rule). That zero is MEASURED, NOT PROVEN BY CONSTRUCTION — a
+    contrived path/name combination can still collide. R4 (a hash suffix) would
+    have been collision-free by construction and was rejected because idents are
+    the human- and agent-legible handle in query results. The guards are
+    TestIdentCollisionRegression263 (the 9 measured pairs, in the suite) and
+    evals/at_scale/probe_ident_collision_census.py (full-history re-measurement,
+    deliberately not in CI).
+
+    Changing this rule changes every ident the graph will ever mint, and
+    ingestion recomputes idents from scratch on every run rather than reading
+    them back — so an old-rule graph read by new-rule code forks every entity
+    silently. That is what :ingestion/format-version and its refusal exist to
+    catch; bump GRAPH_FORMAT_VERSION with any change here.
     """
-    slug = re.sub(r"[^a-z0-9-]", "-", value.lower())
-    slug = re.sub(r"-+", "-", slug).strip("-")
+    slug = re.sub(r"[^a-z0-9_-]", "-", value.lower()).strip("-")
     return f":{entity_type}/{slug}"
 
 
@@ -5257,6 +5282,124 @@ def _frontier_read_bounds(db: Any, ident: str) -> Optional[Tuple[str, str]]:
     return (results[0][0], results[0][1]) if results else None
 
 
+# Bumped whenever a change makes facts already in a graph unreadable by the
+# current code -- today that means the ident rule in _canonical_ident (#263),
+# since ingestion recomputes every ident from scratch rather than reading it
+# back, so an old-rule graph read by new-rule code silently FORKS every entity
+# instead of erroring. Version 1 is the R3 rule; a graph with no stamp at all
+# predates it. There is deliberately NO migration -- see
+# docs/superpowers/specs/2026-08-14-ident-rule-r3-and-format-version-design.md:
+# the supported recovery is a rebuild into a fresh graph path.
+GRAPH_FORMAT_VERSION = 1
+_FORMAT_VERSION_IDENT = ":ingestion/format-version"
+
+
+class GraphFormatVersionError(RuntimeError):
+    """Raised when a graph's format version does not match GRAPH_FORMAT_VERSION.
+
+    Deliberately a hard failure rather than a warning: continuing would write
+    new-rule idents alongside old-rule ones for the same entities, which
+    produces no error anywhere downstream and corrupts the graph silently.
+    """
+
+
+def _graph_format_version_read(db: Any) -> Optional[int]:
+    """Return the graph's stamped format version, or None if it has no stamp."""
+    raw = _db_execute(
+        db, f"(query [:find ?v :where [{_FORMAT_VERSION_IDENT} :version ?v]])"
+    )
+    results = json.loads(raw).get("results", [])
+    if not results:
+        return None
+    try:
+        return int(results[0][0])
+    except (TypeError, ValueError):
+        # A non-integer stamp is a corrupt stamp, and treating it as "absent"
+        # would let the graph be adopted at the current version. Report it as a
+        # version that can never match instead.
+        return -1
+
+
+def _graph_has_ingestion_state(db: Any) -> bool:
+    """True if this graph has been ingested into before.
+
+    This is what makes an ABSENT stamp mean "version 0", not "fresh" -- the
+    distinction the whole guard turns on. Every graph that exists today
+    predates the stamp, so treating absence as "new, adopt the current version"
+    would stamp a pre-#263 graph as good and produce exactly the silent fork
+    the stamp exists to prevent. Only a graph with no ingestion state at all
+    may be adopted.
+    """
+    return (
+        _watermark_query(db) is not None
+        or _frontier_read_bounds(db, _FRONTIER_LOW_IDENT) is not None
+        or _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT) is not None
+    )
+
+
+def _graph_format_version_verify(db: Any) -> None:
+    """Refuse to ingest a graph written under a different ident rule.
+
+    READ-ONLY, and deliberately so: this runs at the very top of a run, before
+    anything has written, because a refusal partway through would leave a graph
+    half-written under two ident rules -- worse than either rule applied
+    consistently. The matching write lives in _graph_format_version_stamp_if_new.
+
+    Passes silently for a graph that is stamped at the current version, and for
+    a genuinely new graph (which the stamping half then adopts).
+    """
+    stamped = _graph_format_version_read(db)
+    if stamped == GRAPH_FORMAT_VERSION:
+        return
+    if stamped is None and not _graph_has_ingestion_state(db):
+        return  # genuinely new -- _graph_format_version_stamp_if_new adopts it
+    found = "no version stamp (pre-#263)" if stamped is None else f"version {stamped}"
+    raise GraphFormatVersionError(
+        f"This graph has {found}, but this build ingests at graph format "
+        f"version {GRAPH_FORMAT_VERSION}. The entity ident rule changed "
+        "(#263), and ingesting would silently create a second, forked "
+        "entity for everything already in the graph. There is no "
+        "migration: re-ingest into a FRESH graph path (set "
+        "MINIGRAF_GRAPH_PATH to a new file, or delete the existing graph "
+        "and its .fts.sqlite3 index first)."
+    )
+
+
+def _graph_format_version_stamp_if_new(
+    db: Any, run_ts_iso: str, index_con: Optional[Any] = None
+) -> None:
+    """Stamp a genuinely new graph at the current format version. No-op
+    otherwise.
+
+    Must be the FIRST write of a run. A fresh graph that got its ingestion state
+    written but not its stamp would, on the next run, look exactly like a
+    pre-#263 graph (state present, stamp absent) and be refused -- so this
+    cannot be deferred until after the walk.
+
+    Takes index_con so it joins the run's single fact-index session rather than
+    falling through _index_write's index_con=None path, which opens and commits
+    a connection of its own (pinned by
+    TestRunIngestionBatchedIndexWrites.test_ingestion_commits_index_once_per_commit_not_per_triple).
+
+    Writes via the internal _transact helper, never the public
+    handle_minigraf_transact handler, matching _watermark_update and
+    _frontier_persist_claim. Guarded read-first (#156: a deterministic ident
+    does NOT make a re-transact idempotent at the graph level), so calling this
+    on an already-stamped graph adds no facts.
+    """
+    if _graph_format_version_read(db) is not None or _graph_has_ingestion_state(db):
+        return
+    _transact(
+        db,
+        f"[[{_FORMAT_VERSION_IDENT} :entity-type :type/ingestion]"
+        f" [{_FORMAT_VERSION_IDENT} :ident \"{_FORMAT_VERSION_IDENT}\"]"
+        f' [{_FORMAT_VERSION_IDENT} :description "graph format version"]'
+        f" [{_FORMAT_VERSION_IDENT} :version {GRAPH_FORMAT_VERSION}]]",
+        run_ts_iso,
+        index_con=index_con,
+    )
+
+
 def _frontier_seed_from_watermark(
     db: Any, linearization: List[str], run_ts_iso: str, index_con: Optional[Any] = None
 ) -> None:
@@ -6119,7 +6262,14 @@ MINIGRAF_SCHEMA: Dict[str, Dict[str, Dict[str, type]]] = {
     },
     "ingestion": {
         "required": {":description": str},
-        "optional": {":hash": str, ":alias": str, ":last-run-at": str, ":last-commit": str, ":total-ingested": int},
+        # :version carries the graph format version (#263). It MUST stay listed
+        # here: minigraf_audit iterates every registered type and retracts any
+        # attribute outside its allowed set, querying the live graph directly,
+        # so dropping this line makes an audit run silently delete the very
+        # stamp that protects the graph from being read under the wrong ident
+        # rule.
+        "optional": {":hash": str, ":alias": str, ":last-run-at": str, ":last-commit": str,
+                     ":total-ingested": int, ":version": int},
     },
     "commit": {
         "required": {":description": str},
@@ -8260,6 +8410,14 @@ def _load_ingestion_preload_state(
     permuting hashes across positions.
     """
     db = _db if _db is not None else _open_db_at_with_extended_retry(_graph_path or _get_graph_path())
+    # FIRST thing after the handle exists, and deliberately here rather than
+    # anywhere later: this is the earliest point in a run that has a db, and
+    # everything below it (and every write in _frontier_load and the walks
+    # after it) would be written under the current ident rule. A refusal that
+    # fired later would leave a graph half-written under two rules. Read-only;
+    # the matching stamp write is _run_ingestion's first write. Raises
+    # GraphFormatVersionError, which _run_ingestion surfaces as a failed run.
+    _graph_format_version_verify(db)
     watermark = _watermark_query(db)
     if len(commit_metadata) != len(linearization):
         raise ValueError(
@@ -10517,6 +10675,12 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             "%Y-%m-%dT%H:%M:%S.%f"
         )[:-3] + "Z"
         db = await _ensure_db_async()
+        # The run's FIRST write, ahead of _frontier_load's own migrations: a
+        # fresh graph that got ingestion state without its stamp would look
+        # exactly like a pre-#263 graph on the next run and be refused (#263).
+        await loop.run_in_executor(
+            write_executor, _graph_format_version_stamp_if_new, db, run_ts_iso, index_con,
+        )
         allocator = await loop.run_in_executor(
             write_executor, _frontier_load, db, linearization, run_ts_iso, index_con,
         )

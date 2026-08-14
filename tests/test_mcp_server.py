@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import datetime
 import json
+import re
 import sqlite3
 import sys
 import os
@@ -1531,6 +1532,135 @@ class TestIngestTagsGraphLevelIdempotency:
         assert json.loads(raw)["results"] == [["v1.1.0"]]
 
 
+TS = "2026-01-01T00:00:00.000Z"
+
+
+class TestGraphFormatVersion:
+    """#263: the ident rule changed, and ingestion recomputes every ident from
+    scratch rather than reading it back, so an old-rule graph ingested by
+    new-rule code forks every entity with no error anywhere. There is no
+    migration; the stamp exists to turn that silent fork into a refusal."""
+
+    def _stamp_count(self, db):
+        import mcp_server
+        raw = mcp_server._db_execute(
+            db, "(query [:find ?a ?v :where [:ingestion/format-version ?a ?v]])"
+        )
+        return json.loads(raw)["results"]
+
+    def test_fresh_graph_is_stamped_at_the_current_version(self, real_db):
+        import mcp_server
+        mcp_server._graph_format_version_verify(real_db)
+        mcp_server._graph_format_version_stamp_if_new(real_db, TS)
+        assert mcp_server._graph_format_version_read(real_db) == mcp_server.GRAPH_FORMAT_VERSION
+
+    def test_stamped_graph_at_current_version_proceeds(self, real_db):
+        import mcp_server
+        mcp_server._graph_format_version_verify(real_db)
+        mcp_server._graph_format_version_stamp_if_new(real_db, TS)
+        mcp_server._graph_format_version_verify(real_db)
+        mcp_server._graph_format_version_stamp_if_new(real_db, TS)  # must not raise
+
+    def test_absent_stamp_on_an_ingested_graph_refuses(self, real_db):
+        """THE trap this guard turns on: every graph that exists today predates
+        the stamp, so an absent stamp must read as version 0 (old), never as
+        "fresh, adopt the current version". A guard that adopts here stamps a
+        pre-#263 graph as good and produces the exact fork it exists to stop."""
+        import mcp_server
+        mcp_server._watermark_update(real_db, "hash1", TS, "prior run")
+        with pytest.raises(mcp_server.GraphFormatVersionError) as exc:
+            mcp_server._graph_format_version_verify(real_db)
+        mcp_server._graph_format_version_stamp_if_new(real_db, TS)
+        assert "no version stamp" in str(exc.value)
+        # And it must NOT have stamped the graph on its way out.
+        assert mcp_server._graph_format_version_read(real_db) is None
+
+    def test_mismatched_version_refuses(self, real_db, monkeypatch):
+        import mcp_server
+        mcp_server._graph_format_version_verify(real_db)
+        mcp_server._graph_format_version_stamp_if_new(real_db, TS)
+        monkeypatch.setattr(mcp_server, "GRAPH_FORMAT_VERSION", mcp_server.GRAPH_FORMAT_VERSION + 1)
+        with pytest.raises(mcp_server.GraphFormatVersionError):
+            mcp_server._graph_format_version_verify(real_db)
+        mcp_server._graph_format_version_stamp_if_new(real_db, TS)
+
+    def test_refuses_before_writing_anything(self, real_db):
+        """A refusal partway through a run leaves a graph half-written under two
+        ident rules, which is worse than either rule applied consistently."""
+        import mcp_server
+        mcp_server._watermark_update(real_db, "hash1", TS, "prior run")
+        with execute_spy() as calls:
+            with pytest.raises(mcp_server.GraphFormatVersionError):
+                mcp_server._graph_format_version_verify(real_db)
+        mcp_server._graph_format_version_stamp_if_new(real_db, TS)
+        assert not [c for c in calls if c.startswith("(transact") or c.startswith("(retract")]
+
+    def test_repeated_calls_do_not_duplicate_facts(self, real_db):
+        """#156: a deterministic ident does NOT make a re-transact idempotent at
+        the graph level -- re-asserting the same (entity, attribute, value)
+        under a new valid-from creates a second genuinely live fact."""
+        import mcp_server
+        for _ in range(3):
+            mcp_server._graph_format_version_verify(real_db)
+        mcp_server._graph_format_version_stamp_if_new(real_db, TS)
+        rows = self._stamp_count(real_db)
+        assert len(rows) == 4, rows  # :entity-type, :ident, :description, :version -- one each
+
+    def test_does_not_clobber_an_advanced_version(self, real_db, monkeypatch):
+        """Proving non-duplication of an UNCHANGED value cannot distinguish a
+        correct guard from one that ignores its own check. A graph stamped
+        AHEAD of this build must be refused, never quietly rewritten backwards."""
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "GRAPH_FORMAT_VERSION", mcp_server.GRAPH_FORMAT_VERSION + 5)
+        mcp_server._graph_format_version_verify(real_db)
+        mcp_server._graph_format_version_stamp_if_new(real_db, TS)
+        future = mcp_server._graph_format_version_read(real_db)
+        monkeypatch.undo()
+        with pytest.raises(mcp_server.GraphFormatVersionError):
+            mcp_server._graph_format_version_verify(real_db)
+        mcp_server._graph_format_version_stamp_if_new(real_db, TS)
+        assert mcp_server._graph_format_version_read(real_db) == future
+
+    def test_corrupt_non_integer_stamp_refuses_rather_than_reading_as_absent(self, real_db):
+        """A stamp that cannot be parsed must not fall through to the
+        absent-stamp branch, which on an empty graph would adopt it."""
+        import mcp_server
+        mcp_server._transact(
+            real_db,
+            '[[:ingestion/format-version :entity-type :type/ingestion]'
+            ' [:ingestion/format-version :ident ":ingestion/format-version"]'
+            ' [:ingestion/format-version :description "graph format version"]'
+            ' [:ingestion/format-version :version "not-a-number"]]',
+            TS,
+        )
+        assert mcp_server._graph_format_version_read(real_db) == -1
+        with pytest.raises(mcp_server.GraphFormatVersionError):
+            mcp_server._graph_format_version_verify(real_db)
+        mcp_server._graph_format_version_stamp_if_new(real_db, TS)
+
+    def test_stamping_refuses_a_graph_that_already_has_ingestion_state(self, real_db):
+        """What forces the stamp to be a run's FIRST write. If it could stamp a
+        graph that already carries ingestion state, then a pre-#263 graph would
+        be adopted as current on its next run — the exact silent fork the guard
+        exists to prevent. The ordering in _run_ingestion is what makes this
+        safe for a genuinely fresh graph; this is the backstop."""
+        import mcp_server
+        mcp_server._watermark_update(real_db, "hash1", TS, "prior run")
+        mcp_server._graph_format_version_stamp_if_new(real_db, TS)
+        assert mcp_server._graph_format_version_read(real_db) is None
+
+    def test_audit_does_not_retract_the_version_stamp(self, real_db):
+        """minigraf_audit iterates every MINIGRAF_SCHEMA-registered type and
+        retracts attributes outside its allowed set. `ingestion` IS registered,
+        so :version must be in its optional set or an audit run silently
+        deletes the stamp that protects the graph."""
+        import mcp_server
+        mcp_server._graph_format_version_verify(real_db)
+        mcp_server._graph_format_version_stamp_if_new(real_db, TS)
+        mcp_server.handle_minigraf_audit()
+        assert mcp_server._graph_format_version_read(real_db) == mcp_server.GRAPH_FORMAT_VERSION
+
+
 class TestWatermarkUpdateGraphLevelIdempotency:
     """#187: same failure shape as #156 (TestIngestTagsGraphLevelIdempotency), but in
     _watermark_update -- called once per COMMIT rather than once per run. Only :hash
@@ -2416,21 +2546,39 @@ class TestCanonicalIdent:
         import mcp_server
         assert mcp_server._canonical_ident("preference", "use postgres") == ":preference/use-postgres"
 
-    def test_replaces_underscores(self):
+    def test_preserves_underscores(self):
+        """#263 (R3): '_' is inside the allowed charset. Mapping it to '-' is
+        what made `foo` and `_foo` one entity."""
         import mcp_server
-        assert mcp_server._canonical_ident("constraint", "must_be_stateless") == ":constraint/must-be-stateless"
+        assert mcp_server._canonical_ident("constraint", "must_be_stateless") == ":constraint/must_be_stateless"
 
     def test_replaces_dots(self):
         import mcp_server
         assert mcp_server._canonical_ident("dependency", "pydantic.v2") == ":dependency/pydantic-v2"
 
-    def test_collapses_consecutive_hyphens(self):
+    def test_preserves_hyphen_runs(self):
+        """#263 (R3): the collapse is gone, so separator arity is meaningful —
+        this is what keeps _code_ident's '::' join ('--') distinct from a single
+        path character that slugged to '-'."""
         import mcp_server
-        assert mcp_server._canonical_ident("decision", "use  Redis") == ":decision/use-redis"
+        assert mcp_server._canonical_ident("decision", "use  Redis") == ":decision/use--redis"
+
+    def test_underscore_and_dot_no_longer_share_a_slug(self):
+        """The #263 module-namespace offender in miniature: '.' still maps to
+        '-' but '_' does not, so `mcp.server` and `mcp_server` part ways."""
+        import mcp_server
+        assert mcp_server._canonical_ident("module", "mcp.server") == ":module/mcp-server"
+        assert mcp_server._canonical_ident("module", "mcp_server") == ":module/mcp_server"
 
     def test_strips_leading_trailing_hyphens(self):
         import mcp_server
         assert mcp_server._canonical_ident("decision", " redis ") == ":decision/redis"
+
+    def test_does_not_strip_leading_trailing_underscores(self):
+        """strip("-") must NOT become strip("-_"): a leading underscore is the
+        private marker #263 exists to preserve."""
+        import mcp_server
+        assert mcp_server._canonical_ident("function", "_private_") == ":function/_private_"
 
 
 class TestValidateFacts:
@@ -5903,22 +6051,112 @@ class TestCodeIdent:
 
     def test_function_ident_distinct_from_module(self):
         import mcp_server
-        # Same entity_type — separator must place tokens in a different order
+        # Same entity_type — separator must place tokens in a different order.
+        # Under #263's R3 the '::' join survives as '--' and the path's own '_'
+        # survives as '_', so these two are separated twice over rather than
+        # only by token order.
         fn_ident = mcp_server._code_ident("function", "src/auth.py", "login")
-        # "src/auth.py::login" → src-auth-py-login
-        # "src/auth_login.py"  → src-auth-login-py  (py comes last, not before login)
         file_ident = mcp_server._code_ident("function", "src/auth_login.py")
-        assert fn_ident == ":function/src-auth-py-login"
-        assert file_ident == ":function/src-auth-login-py"
+        assert fn_ident == ":function/src-auth-py--login"
+        assert file_ident == ":function/src-auth_login-py"
         assert fn_ident != file_ident
 
     def test_class_ident(self):
         import mcp_server
-        assert mcp_server._code_ident("class", "src/auth.py", "User") == ":class/src-auth-py-user"
+        assert mcp_server._code_ident("class", "src/auth.py", "User") == ":class/src-auth-py--user"
+
+    def test_private_and_public_names_are_distinct(self):
+        """#263's dominant shape (7 of 9 offenders): a leading underscore must
+        survive into the ident."""
+        import mcp_server
+        assert (mcp_server._code_ident("function", "a.py", "_commit")
+                != mcp_server._code_ident("function", "a.py", "commit"))
 
     def test_name_is_lowercased(self):
         import mcp_server
-        assert mcp_server._code_ident("function", "Foo.py", "MyFunc") == ":function/foo-py-myfunc"
+        assert mcp_server._code_ident("function", "Foo.py", "MyFunc") == ":function/foo-py--myfunc"
+
+
+# Every (entity_type, file_path, name) input pair that the #263 census found
+# reachable to ONE ident over 674 commits of this repo — 9 of 2780 idents
+# (0.32%), lifted verbatim from
+# evals/at_scale/results/263-ident-collision-census.json. Kept as DATA, not as
+# generated cases, so the corpus stays traceable to the measurement that
+# produced it.
+_263_COLLIDING_INPUTS = [
+    # (entity_type, [(file_path, name), (file_path, name)])
+    ("module", [("mcp.server", None), ("mcp_server", None)]),
+    ("function", [("evals/at_scale/profile_forward_reconcile_attribution.py", "_main"),
+                  ("evals/at_scale/profile_forward_reconcile_attribution.py", "main")]),
+    ("function", [("tests/test_mcp_server.py", "__init__"),
+                  ("tests/test_mcp_server.py", "_init")]),
+    ("function", [("tests/test_mcp_server.py", "_boom"), ("tests/test_mcp_server.py", "boom")]),
+    ("function", [("tests/test_mcp_server.py", "_commit"), ("tests/test_mcp_server.py", "commit")]),
+    ("function", [("tests/test_mcp_server.py", "_parse"), ("tests/test_mcp_server.py", "parse")]),
+    ("function", [("tests/test_mcp_server.py", "_results"), ("tests/test_mcp_server.py", "results")]),
+    ("function", [("tests/test_mcp_server.py", "_snapshot"), ("tests/test_mcp_server.py", "snapshot")]),
+    ("class", [("tests/test_mcp_server.py", "FakeDb"), ("tests/test_mcp_server.py", "_FakeDb")]),
+]
+
+
+def _pre_r3_slug(value):
+    """The slug rule as it stood before #263 — `_` outside the allowed charset
+    and consecutive hyphens collapsed. Inlined here as the POSITIVE CONTROL for
+    the corpus below, not imported, so it stays pinned even as the production
+    rule moves on."""
+    slug = re.sub(r"[^a-z0-9-]", "-", value.lower())
+    return re.sub(r"-+", "-", slug).strip("-")
+
+
+class TestIdentCollisionRegression263:
+    """#263: the R3 slug (`_` kept, hyphen-run collapse dropped) must keep every
+    input pair the census found colliding on a distinct ident.
+
+    Asserts a COUNT of distinct idents rather than any timing, per #261. The
+    corpus is a fixed 9 pairs, so it catches a regression in the rule but cannot
+    discover NEW collisions in new history — that stays the job of
+    evals/at_scale/probe_ident_collision_census.py, which is deliberately not
+    wired into CI (a 674-commit run is far too expensive for the suite)."""
+
+    def test_all_census_offenders_now_get_distinct_idents(self):
+        import mcp_server
+        still_colliding = []
+        for entity_type, inputs in _263_COLLIDING_INPUTS:
+            idents = {mcp_server._code_ident(entity_type, fp, name) for fp, name in inputs}
+            if len(idents) != len(inputs):
+                still_colliding.append((entity_type, inputs, sorted(idents)))
+        assert not still_colliding, (
+            f"{len(still_colliding)} of {len(_263_COLLIDING_INPUTS)} census "
+            f"offender pairs still collide: {still_colliding}"
+        )
+
+    def test_positive_control_corpus_collided_under_the_old_rule(self):
+        """Without this the test above cannot tell "R3 separates these" from
+        "the corpus was wrong and these never collided". Every pair must be
+        shown to collide under the pre-#263 slug."""
+        separated_anyway = []
+        for entity_type, inputs in _263_COLLIDING_INPUTS:
+            idents = set()
+            for fp, name in inputs:
+                value = f"{fp}::{name}" if name else fp
+                idents.add(f":{entity_type}/{_pre_r3_slug(value)}")
+            if len(idents) != 1:
+                separated_anyway.append((entity_type, inputs, sorted(idents)))
+        assert not separated_anyway, (
+            "these corpus pairs did NOT collide under the old rule, so they are "
+            f"not evidence of anything: {separated_anyway}"
+        )
+
+    def test_module_namespace_offender_crosses_the_bare_canonical_ident_path(self):
+        """The one non-underscore collision. Both `mcp.server` and `mcp_server`
+        reach `:module/` through _resolve_module_ident's bare _canonical_ident
+        call (mcp_server.py:4250/4285), not through _code_ident — which is why
+        the rule had to change in _canonical_ident itself. Fixing only
+        _code_ident would have left this pair colliding."""
+        import mcp_server
+        external = mcp_server._canonical_ident("module", "mcp.server")
+        in_tree = mcp_server._canonical_ident("module", "mcp_server")
+        assert external != in_tree, f"both still slug to {external}"
 
 
 @pytest.fixture
@@ -8710,6 +8948,12 @@ class TestIngestionWrites:
     def test_run_ingestion_writes_last_run_when_no_commits(self, real_db, tmp_path, monkeypatch):
         import mcp_server
 
+        # Stamp BEFORE the _watermark_query stub below: this test simulates a
+        # RESUMED run (watermark present, no commits left), and a graph with
+        # ingestion state but no format stamp is exactly what #263's guard
+        # refuses as pre-#263. Stamping first makes it a current-format graph;
+        # stamping after the stub would be refused by stamp_if_new itself.
+        mcp_server._graph_format_version_stamp_if_new(real_db, "2026-01-01T00:00:00.000Z")
         monkeypatch.setattr(mcp_server, "_watermark_query", lambda db: "abc123")
         monkeypatch.setattr(mcp_server, "_git_commits", lambda repo, watermark, branch: [])
         # #222 phase 2d: which commits get walked is now driven by
@@ -9429,21 +9673,28 @@ class TestPreloadKnownDeps:
         """
         import mcp_server
 
+        # The ident must be the one _code_ident builds for "mod_a.py" TODAY:
+        # _preload_known_deps keys ident_to_file by _code_ident("module", path)
+        # (mcp_server.py:8032), so a hand-written ident that no longer matches
+        # the rule silently drops every row and reads as the #133 bug returning.
+        # Under #263's R3 the path's '_' survives: ":module/mod_a-py".
+        src = mcp_server._code_ident("module", "mod_a.py")
+        assert src == ":module/mod_a-py"
         real_db.execute(
             '(transact {:valid-from "2020-01-01T00:00:00Z"} '
-            '[[:module/mod-a-py :entity-type :type/module] '
-            '[:module/mod-a-py :ident ":module/mod-a-py"]])'
+            f'[[{src} :entity-type :type/module] '
+            f'[{src} :ident "{src}"]])'
         )
         real_db.execute(
             '(transact {:valid-from "2024-01-01T00:00:00Z"} '
-            '[[:module/mod-a-py :depends-on :module/mod-b]])'
+            f'[[{src} :depends-on :module/mod-b]])'
         )
 
-        file_entities = {"mod_a.py": [":module/mod-a-py"]}
+        file_entities = {"mod_a.py": [src]}
         file_deps, dep_valid_from = mcp_server._preload_known_deps(real_db, file_entities)
 
         assert file_deps["mod_a.py"] == {":module/mod-b"}
-        assert dep_valid_from[(":module/mod-a-py", ":module/mod-b")] == "2024-01-01T00:00:00.000Z"
+        assert dep_valid_from[(src, ":module/mod-b")] == "2024-01-01T00:00:00.000Z"
 
     def test_query_includes_any_valid_time_and_forever_filter(self, real_db):
         """The query must ask for :any-valid-time (required for any per-fact
