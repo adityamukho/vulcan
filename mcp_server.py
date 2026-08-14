@@ -10586,6 +10586,11 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     # Reset HERE, not at module import, because this server is long-lived:
     # see _reset_introduced_by_ambiguity_log_budget.
     _reset_introduced_by_ambiguity_log_budget()
+    # Bound BEFORE the try so the outermost finally can shut it down no matter
+    # where a failure lands, including the two awaited calls
+    # (_open_index_writer_safe, _frontier_load) that sit above the inner try
+    # (#250). Without this the finally would need an unbound-name guard.
+    write_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
     try:
         # Enumerated BEFORE the preload (#238), which needs the positions to
         # bound its queries. Above the DB open too, not merely above the
@@ -11090,16 +11095,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             # Never let a finished run's budget gate a later interactive
             # transact (#241).
             _ingest_checkpoint_policy = None
-            write_executor.shutdown(wait=True)
 
     except Exception as e:
-        # write_executor is shut down by the inner finally above on the
-        # normal exit paths from that try. That is NOT guaranteed if
-        # _open_index_writer_safe or _frontier_load (both called before the
-        # inner try even starts) raises: this except is reachable with
-        # write_executor never shut down, leaking it. Not fixed here --
-        # out of scope for #241, and doing so needs an unbound-name guard
-        # since write_executor may not exist yet at that point either.
+        # write_executor is shut down by the outermost finally below, which
+        # covers every path into this handler -- including the two awaited
+        # calls above the inner try (_open_index_writer_safe, _frontier_load).
+        # The comment that used to sit here asserted the inner finally already
+        # covered them; it did not, and that is #250.
         _ingest_progress["phase"] = None
         _ingest_progress["status"] = "error"
         _ingest_progress["error"] = str(e)
@@ -11126,6 +11128,12 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         if _ingest_checkpoint_policy is not None:
             _ingest_progress["checkpoint_summary"] = _ingest_checkpoint_policy.summary()
         _ingest_checkpoint_policy = None
+        # The single shutdown for this executor. It lives here, not in the
+        # inner finally, because two awaited calls (_open_index_writer_safe,
+        # _frontier_load) sit above the inner try and can raise in the gap --
+        # #250. One cleanup writer for one resource.
+        if write_executor is not None:
+            write_executor.shutdown(wait=True)
 
 
 async def handle_minigraf_ingest_git(

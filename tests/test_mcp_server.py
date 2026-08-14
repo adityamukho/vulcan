@@ -15,6 +15,7 @@ cost/network/non-determinism in CI — see docs/testing-conventions.md for the
 full rationale and pattern reference.
 """
 import asyncio
+import concurrent.futures
 import contextlib
 import datetime
 import json
@@ -22254,3 +22255,72 @@ class TestLockErrorRecognisesSameProcessOpen:
             )
         finally:
             del first
+
+
+class TestWriteExecutorIsShutDownOnEarlyFailure:
+    """#250: write_executor is created above the try whose finally shuts it
+    down, with two awaited calls in the gap.
+
+    THE GUARD ASSERTS SHUTDOWN STATE, NOT THREAD LIVENESS, and the distinction
+    is the finding that produced it. #250's body says a live thread "leaks for
+    the lifetime of the process"; measured on this interpreter, it does not.
+    CPython's ThreadPoolExecutor registers a weakref callback that wakes its
+    worker once the executor becomes unreachable, so when _run_ingestion's
+    frame dies the thread exits on its own.
+
+    That cleanup is emergent, not designed. It disappears the moment anything
+    retains the traceback -- which pins the frame holding the executor -- and
+    that is the exact fifth shape PR #254 found here and had to fix with
+    `e.__traceback__ = None`. It also never JOINS the worker, which
+    shutdown(wait=True) does.
+
+    So the defect axis is "was the executor shut down on this path", and that
+    is what this asserts, per docs/testing-conventions.md: pin the defect axis,
+    never a downstream symptom that something else happens to clean up.
+    """
+
+    @pytest.mark.parametrize("failing", ["_open_index_writer_safe", "_frontier_load"])
+    def test_the_executor_is_shut_down_when_a_pre_try_call_raises(
+        self, tmp_path, git_repo, monkeypatch, failing
+    ):
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        mcp_server._db = None
+        mcp_server._graph_path = ""
+
+        created = []
+
+        class _Recording(concurrent.futures.ThreadPoolExecutor):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                created.append(self)
+
+        # mcp_server resolves concurrent.futures.ThreadPoolExecutor at call
+        # time, so patching the attribute catches every executor the run
+        # builds -- including the preload one, which uses `with` and must
+        # therefore also come back shut down.
+        monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", _Recording)
+
+        def boom(*a, **kw):
+            raise RuntimeError(f"induced failure in {failing}")
+
+        monkeypatch.setattr(mcp_server, failing, boom)
+
+        asyncio.run(mcp_server._run_ingestion(str(git_repo), "master"))
+
+        # _run_ingestion swallows the failure into _ingest_progress rather than
+        # raising, so assert we actually exercised the intended path.
+        assert mcp_server._ingest_progress["status"] == "error"
+        assert "induced failure" in (mcp_server._ingest_progress["error"] or "")
+        assert created, (
+            "no ThreadPoolExecutor was constructed -- the run aborted before "
+            "reaching write_executor, so this test proves nothing"
+        )
+
+        unclosed = [ex for ex in created if not ex._shutdown]
+        assert not unclosed, (
+            f"{len(unclosed)} of {len(created)} executor(s) were never shut "
+            f"down after {failing} raised"
+        )
+        mcp_server._db = None
