@@ -13,6 +13,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      # One interpreter failing says nothing about the other two, and cancelling
+      # them presents a single failure as three broken jobs — which cost real
+      # diagnosis time on PR #262. Let every interpreter report its own verdict.
+      fail-fast: false
       matrix:
         python-version:
           - "3.10"
