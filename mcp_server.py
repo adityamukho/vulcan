@@ -12,6 +12,7 @@ import configparser
 import contextlib
 import datetime
 import fnmatch
+import gc
 import hashlib
 import json
 import multiprocessing
@@ -22,6 +23,7 @@ import subprocess as _subprocess
 import sys
 import threading
 import time
+import weakref
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -3298,6 +3300,321 @@ def _open_db_at_with_extended_retry(path: str) -> MiniGrafDb:
             delay = min(delay * 2, _INGEST_LOCK_RETRY_CAP)
     assert last_exc is not None
     raise last_exc
+
+
+class _LeasedDb:
+    """What a lease hands out. Forwards to the real MiniGrafDb, and severs
+    that link the moment the lease ends.
+
+    `with db_lease() as db:` does NOT unbind `db` at block exit -- that is
+    plain Python. Without this wrapper the caller's surviving binding keeps the
+    real handle alive past its own lease: the count reaches zero with the
+    handle still referenced, and the next acquire opens a SECOND handle on the
+    same file. Measured, that raises "Database is already open in this process"
+    on the second iteration of any loop -- precisely the shape of
+    _run_ingestion's per-commit loop.
+
+    Severing here is what makes "a release genuinely releases" a property of
+    the protocol rather than of caller discipline. Without it every lease block
+    would have to end by dropping its own binding, which is the same invisible
+    ordering rule that produced #251/#253, merely relocated.
+
+    __getattr__ fires only for attributes not found normally, so `_handle`
+    (a slot) and `_sever` resolve directly and never recurse.
+    """
+
+    __slots__ = ("_handle",)
+
+    def __init__(self, handle: MiniGrafDb) -> None:
+        object.__setattr__(self, "_handle", handle)
+
+    def _sever(self) -> None:
+        object.__setattr__(self, "_handle", None)
+
+    def __getattr__(self, name: str) -> Any:
+        handle = object.__getattribute__(self, "_handle")
+        if handle is None:
+            raise RuntimeError(
+                f"graph handle used after its lease ended (attribute {name!r}) "
+                f"-- take a new lease with db_lease() rather than holding one "
+                f"past its block"
+            )
+        return getattr(handle, name)
+
+    def __repr__(self) -> str:
+        live = object.__getattribute__(self, "_handle") is not None
+        return f"<_LeasedDb {'live' if live else 'released'}>"
+
+
+def _open_for_lease(path: str) -> MiniGrafDb:
+    """Open a handle FOR THE LEASE MANAGER, self-healing a stale lock.
+
+    Deliberately does not go through _open_db_at / _try_open_with_self_heal,
+    and the difference is the entire point. _open_db_at's contract is to
+    PUBLISH the handle into the module global `_db` -- which is precisely the
+    stray reference the lease protocol exists to remove. Routed through it,
+    release() could never drop the last reference: the lease count would reach
+    zero while `_db` still held the handle, so the lock file would survive
+    every lease and the next open would be a second handle.
+
+    The self-heal logic below mirrors _try_open_with_self_heal minus that
+    publication. The duplication is deliberate and TEMPORARY: the task that
+    deletes `_db` also deletes _open_db_at, _try_open_with_self_heal and the
+    two retry wrappers, leaving this as the only opener.
+    """
+    try:
+        return MiniGrafDb.open(path)
+    except Exception as e:
+        if not _is_lock_error(e):
+            raise
+        holder_pid = _stale_lock_holder_pid(e)
+        if holder_pid is not None and _clear_stale_lock(path, holder_pid):
+            return MiniGrafDb.open(path)
+        raise
+
+
+class _DbLeaseManager:
+    """Owns this process's single MiniGrafDb handle and its lifetime (#255).
+
+    `_db = None` was this module's "release the graph file lock" idiom. It is
+    not one: it releases only when it drops the LAST reference, so any local
+    `db` still on a stack keeps the handle -- and its lock -- alive while the
+    global says otherwise. That is the #251/#253 mechanism, and since minigraf
+    1.2.2 it surfaces as "Database is already open in this process" rather than
+    as silent page-table corruption.
+
+    Here the count is authoritative. The handle is opened at 0 -> 1 and dropped
+    at 1 -> 0; every acquisition in between reuses it. `_db_native_lock` is a
+    separate concern and is NOT folded in: it serializes CALLS INTO a handle,
+    while this class governs the handle's LIFETIME.
+
+    THIS IS NOT THE WEAKREF GUARD REJECTED IN #253. That one reused a handle
+    whenever a weakref to it was still live, including handles whose backing
+    file had been deleted -- it resurrected dead graphs and segfaulted the
+    suite 3/3 runs. Reuse here requires count > 0: a caller is inside a `with`
+    block right now, so the file cannot have been torn down under them. A live
+    weakref at count == 0 is the opposite of a reuse candidate -- it is the
+    leak signal (see _detect_leaked_handle).
+
+    One open attempt runs under self._lock, and the caller backs off OUTSIDE
+    it. Holding the lock across the attempt is what makes a same-process double
+    open impossible: a second thread blocks, then finds count > 0 and joins.
+    Sleeping under it would serialize every waiter behind one backoff budget.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._handle: Optional[MiniGrafDb] = None
+        self._path: str = ""
+        self._count: int = 0
+        self._prev_ref: Optional["weakref.ref"] = None
+        # Set False only by a test that deliberately reconstructs a leak (see
+        # the #255 interleaving ablation). Defaults to strict; flipping the
+        # default would quietly turn the always-on detector into a test-only one.
+        self.strict_leak_detection: bool = True
+
+    @property
+    def lease_count(self) -> int:
+        with self._lock:
+            return self._count
+
+    @property
+    def path(self) -> str:
+        with self._lock:
+            return self._path
+
+    def bind_path(self, path: str) -> None:
+        """Point the manager at a graph without opening it (open_db's job)."""
+        with self._lock:
+            if self._count > 0 and self._path and path != self._path:
+                raise RuntimeError(
+                    f"cannot bind {path!r}: {self._count} lease(s) outstanding "
+                    f"on {self._path!r}"
+                )
+            self._path = path
+
+    def try_acquire(self, path: str) -> Optional[MiniGrafDb]:
+        """One acquisition attempt.
+
+        Returns the leased handle, or None if the graph file lock is currently
+        held by another PROCESS -- the caller backs off and retries. Raises for
+        any non-lock error and for a path conflict.
+        """
+        with self._lock:
+            if self._count > 0:
+                if path != self._path:
+                    raise RuntimeError(
+                        f"lease requested for {path!r} while {self._count} "
+                        f"lease(s) are outstanding on {self._path!r}"
+                    )
+                self._count += 1
+                return self._handle
+
+            self._detect_leaked_handle(path)
+            try:
+                handle = _open_for_lease(path)
+            except Exception as e:
+                if _is_lock_error(e):
+                    return None
+                raise
+
+            # Rules are registered under the lock, before the count goes
+            # positive: a thread joining at count > 0 must never observe a
+            # handle whose session rules are half-registered.
+            for rule in SESSION_RULES:
+                _db_execute(handle, rule)
+            for rule in _user_rules:
+                _db_execute(handle, rule)
+
+            self._handle = handle
+            self._path = path
+            self._count = 1
+            self._prev_ref = None
+            return handle
+
+    def release(self) -> None:
+        with self._lock:
+            if self._count <= 0:
+                raise RuntimeError(
+                    "release() called with no outstanding lease -- an unbalanced "
+                    "release would drop a handle another caller is still using"
+                )
+            self._count -= 1
+            if self._count == 0:
+                handle, self._handle = self._handle, None
+                if handle is not None:
+                    # The detector's input. If this weakref is still live at the
+                    # next 0 -> 1 acquire, someone escaped their lease.
+                    self._prev_ref = weakref.ref(handle)
+
+    def reset(self) -> None:
+        """Force the manager back to its initial state.
+
+        For tests and for _run_ingestion's error path. Runs the leak detector
+        first, so a test that leaks a handle and then resets is blamed at its
+        own teardown rather than at its successor's first acquire.
+        """
+        with self._lock:
+            self._detect_leaked_handle(self._path or "<reset>")
+            self._handle = None
+            self._count = 0
+            self._prev_ref = None
+            # The path must clear too, or a graph path set by one test leaks
+            # into the next one that never binds its own -- nothing else
+            # resets this manager between tests.
+            self._path = ""
+
+    def _detect_leaked_handle(self, path: str) -> None:
+        return  # implemented in Task 3
+
+
+_lease_manager = _DbLeaseManager()
+
+
+@contextlib.contextmanager
+def db_lease(extended: bool = False):
+    """Hold a lease on the graph handle for the duration of the block.
+
+    Blocking backoff -- call this OFF the event loop, or from inside an
+    already-held async lease (where the count is already positive and no open
+    happens). extended=True selects the long time-budgeted backoff that
+    _load_ingestion_preload_state needs to survive an orphan-process cleanup
+    window (#106) instead of giving up in ~1.55s.
+    """
+    path = _lease_manager.path or _get_graph_path()
+    handle = None
+    if extended:
+        deadline = time.monotonic() + _INGEST_LOCK_RETRY_BUDGET
+        delay = _INGEST_LOCK_RETRY_BASE
+        while True:
+            handle = _lease_manager.try_acquire(path)
+            if handle is not None:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    f"could not acquire a lease on {path!r} within "
+                    f"{_INGEST_LOCK_RETRY_BUDGET}s: the file lock is held by "
+                    f"another process"
+                )
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, _INGEST_LOCK_RETRY_CAP)
+    else:
+        delay = _LOCK_RETRY_BASE
+        for attempt in range(_LOCK_RETRY_MAX):
+            handle = _lease_manager.try_acquire(path)
+            if handle is not None:
+                break
+            if attempt < _LOCK_RETRY_MAX - 1:
+                time.sleep(delay)
+                delay *= 2
+        if handle is None:
+            raise RuntimeError(
+                f"could not acquire a lease on {path!r} after "
+                f"{_LOCK_RETRY_MAX} attempts: the file lock is held by another "
+                f"process"
+            )
+    leased = _LeasedDb(handle)
+    handle = None  # this frame must not outlive the lease either
+    try:
+        yield leased
+    finally:
+        # Sever BEFORE releasing: the caller's `as db` name is still bound at
+        # this point, and severing is what stops it keeping the real handle
+        # alive past the count reaching zero.
+        leased._sever()
+        leased = None
+        _lease_manager.release()
+
+
+@contextlib.asynccontextmanager
+async def db_lease_async():
+    """Hold a lease, backing off with asyncio.sleep instead of time.sleep.
+
+    Await this from any event-loop coroutine (call_tool, _run_ingestion). A
+    blocking sleep here would freeze the single-threaded loop for the whole
+    retry budget, and worse, would prevent the very coroutine holding the lock
+    from ever releasing it during the wait (#99).
+    """
+    path = _lease_manager.path or _get_graph_path()
+    handle = None
+    delay = _LOCK_RETRY_BASE
+    for attempt in range(_LOCK_RETRY_MAX):
+        handle = _lease_manager.try_acquire(path)
+        if handle is not None:
+            break
+        if attempt < _LOCK_RETRY_MAX - 1:
+            await asyncio.sleep(delay)
+            delay *= 2
+    if handle is None:
+        raise RuntimeError(
+            f"could not acquire a lease on {path!r} after {_LOCK_RETRY_MAX} "
+            f"attempts: the file lock is held by another process"
+        )
+    leased = _LeasedDb(handle)
+    handle = None
+    try:
+        yield leased
+    finally:
+        leased._sever()
+        leased = None
+        _lease_manager.release()
+
+
+def _graph_path_current() -> str:
+    """The bound graph path, falling back to the environment."""
+    return _lease_manager.path or _get_graph_path()
+
+
+def _reset_db_state() -> None:
+    """Force the module's DB state back to its initial condition.
+
+    Replaces the `mcp_server._db = None` idiom at every test and eval call
+    site. Strictly stronger: it clears the lease COUNT too, so a test that
+    leaks a lease cannot poison its successor -- with the bare global there was
+    no way to reset the count at all.
+    """
+    _lease_manager.reset()
 
 
 async def _ensure_db_async() -> MiniGrafDb:

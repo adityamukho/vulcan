@@ -683,6 +683,136 @@ class TestOpenDbAtWithExtendedRetry:
         assert result is not None
 
 
+class TestDbLeaseManager:
+    """#255: `_db = None` releases only when it drops the LAST reference, so
+    it is not a release at all. A lease refcounts, and the handle drops exactly
+    when the count reaches zero -- which the sidecar .lock file makes directly
+    observable (minigraf's FileLock::drop removes it).
+    """
+
+    def test_nested_leases_open_exactly_one_handle(self, tmp_path, monkeypatch):
+        """The reuse that makes nesting free: call_tool holds the outer lease,
+        handle_minigraf_query nests inside it and must not open a second time."""
+        import mcp_server
+        from minigraf import MiniGrafDb
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+
+        opens = []
+        real_open = MiniGrafDb.open
+        monkeypatch.setattr(
+            MiniGrafDb, "open",
+            staticmethod(lambda p: (opens.append(p), real_open(p))[1]),
+        )
+
+        with mcp_server.db_lease() as outer:
+            with mcp_server.db_lease() as inner:
+                # Each lease yields its own _LeasedDb, so compare what they
+                # wrap, not the wrappers.
+                assert inner._handle is outer._handle, (
+                    "the nested lease must reuse the live handle, not open a second"
+                )
+                assert mcp_server._lease_manager.lease_count == 2
+            assert mcp_server._lease_manager.lease_count == 1
+        assert mcp_server._lease_manager.lease_count == 0
+        assert len(opens) == 1, f"expected exactly one open, got {len(opens)}: {opens}"
+
+    def test_a_lease_in_a_loop_does_not_double_open(self, tmp_path, monkeypatch):
+        """The regression that produced _LeasedDb, and the shape
+        _run_ingestion's per-commit loop actually uses.
+
+        `with ... as db:` does not unbind `db`, so before the proxy the second
+        iteration found the previous handle still referenced and opened a
+        SECOND one -- raising "Database is already open in this process".
+        """
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+
+        for i in range(3):
+            with mcp_server.db_lease() as db:
+                mcp_server._db_execute(db, "(query [:find ?e :where [?e :ident ?v]])")
+            assert not os.path.exists(graph + ".lock"), (
+                f"iteration {i}: the caller's surviving `db` binding kept the "
+                f"handle alive past the end of its lease"
+            )
+
+    def test_using_a_handle_after_its_lease_raises(self, tmp_path, monkeypatch):
+        """Use-after-release is loud, not a silent success against a handle
+        nobody holds a lease on."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        mcp_server._reset_db_state()
+
+        with mcp_server.db_lease() as db:
+            pass
+        with pytest.raises(RuntimeError, match="after its lease ended"):
+            mcp_server._db_execute(db, "(query [:find ?e :where [?e :ident ?v]])")
+
+    def test_release_actually_releases_the_file_lock(self, tmp_path, monkeypatch):
+        """The inversion of the old
+        test_release_idiom_does_not_drop_a_handle_others_still_hold: under the
+        lease protocol the lock file MUST be gone once the last lease exits."""
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+
+        with mcp_server.db_lease() as db:
+            mcp_server._db_execute(db, "(query [:find ?e :where [?e :ident ?v]])")
+            assert os.path.exists(graph + ".lock"), "lock must be held while leased"
+
+        assert not os.path.exists(graph + ".lock"), (
+            "the lock file survived the last lease -- the handle was not dropped, "
+            "which is exactly the #255 failure the lease protocol exists to remove"
+        )
+
+    def test_a_second_path_while_leased_is_refused(self, tmp_path, monkeypatch):
+        """_open_db_at(path, force=False) returned _db without ever comparing
+        paths. Not reachable from today's callers; nothing stopped it becoming
+        reachable."""
+        import mcp_server
+
+        graph_a = str(tmp_path / "a.graph")
+        graph_b = str(tmp_path / "b.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph_a)
+        mcp_server._reset_db_state()
+
+        with mcp_server.db_lease():
+            with pytest.raises(RuntimeError, match="lease requested for"):
+                mcp_server._lease_manager.try_acquire(graph_b)
+
+    def test_release_without_a_lease_is_an_error(self, tmp_path, monkeypatch):
+        """An unbalanced release would silently drop a live handle."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        mcp_server._reset_db_state()
+        with pytest.raises(RuntimeError, match="no outstanding lease"):
+            mcp_server._lease_manager.release()
+
+    async def test_async_lease_nests_under_a_sync_lease(self, tmp_path, monkeypatch):
+        """call_tool acquires asynchronously and the sync handler nests inside
+        it -- that nesting is what keeps the blocking backoff off the event
+        loop (#99)."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        mcp_server._reset_db_state()
+
+        async with mcp_server.db_lease_async() as outer:
+            with mcp_server.db_lease() as inner:
+                assert inner._handle is outer._handle
+                assert mcp_server._lease_manager.lease_count == 2
+        assert mcp_server._lease_manager.lease_count == 0
+
+
 class TestLiveLockHolderPid:
     """Unit tests for _live_lock_holder_pid — the proactive pre-check used
     to avoid racing another live process for the ingestion lock (#108)."""
