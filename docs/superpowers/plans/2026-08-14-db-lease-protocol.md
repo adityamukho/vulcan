@@ -624,8 +624,10 @@ def db_lease(extended: bool = False):
             if remaining <= 0:
                 raise RuntimeError(
                     f"could not acquire a lease on {path!r} within "
-                    f"{_INGEST_LOCK_RETRY_BUDGET}s: the file lock is held by "
-                    f"another process"
+                    f"{_INGEST_LOCK_RETRY_BUDGET}s: the graph file lock is "
+                    f"held and did not clear. If the holder PID is our own, a "
+                    f"previous lease's handle was never released -- check "
+                    f"stderr for a [db_lease] leak diagnostic naming the holder."
                 )
             time.sleep(min(delay, remaining))
             delay = min(delay * 2, _INGEST_LOCK_RETRY_CAP)
@@ -641,8 +643,10 @@ def db_lease(extended: bool = False):
         if handle is None:
             raise RuntimeError(
                 f"could not acquire a lease on {path!r} after "
-                f"{_LOCK_RETRY_MAX} attempts: the file lock is held by another "
-                f"process"
+                f"{_LOCK_RETRY_MAX} attempts: the graph file lock is held and "
+                f"did not clear. If the holder PID is our own, a previous "
+                f"lease's handle was never released -- check stderr for a "
+                f"[db_lease] leak diagnostic naming the holder."
             )
     leased = _LeasedDb(handle)
     handle = None  # this frame must not outlive the lease either
@@ -679,7 +683,10 @@ async def db_lease_async():
     if handle is None:
         raise RuntimeError(
             f"could not acquire a lease on {path!r} after {_LOCK_RETRY_MAX} "
-            f"attempts: the file lock is held by another process"
+            f"attempts: the graph file lock is held and did not clear. If the "
+            f"holder PID is our own, a previous lease's handle was never "
+            f"released -- check stderr for a [db_lease] leak diagnostic "
+            f"naming the holder."
         )
     leased = _LeasedDb(handle)
     handle = None
@@ -857,9 +864,16 @@ class TestDbLeaseLeakDetector:
     def test_strict_can_be_switched_off_for_a_deliberate_ablation(
         self, tmp_path, monkeypatch, capsys
     ):
-        """Task 9's ablation reconstructs a leak on purpose. It needs an
+        """Task 9's ablation reconstructs a leak on purpose, so it needs an
         opt-out -- an attribute, not an env var, so it cannot leak into an
-        unrelated process -- and the opt-out must still print."""
+        unrelated process -- and the opt-out must still print.
+
+        Exercised through _reset_db_state() rather than through a second
+        acquire, and the reason is the point of the next test: with a real
+        handle still held, no acquire can succeed whatever the detector does.
+        reset() runs the same detector and opens nothing, so it is the one
+        path where the opt-out is observable by itself.
+        """
         import mcp_server
 
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
@@ -868,11 +882,39 @@ class TestDbLeaseLeakDetector:
 
         with mcp_server.db_lease() as db:
             escaped = db._handle
-        with mcp_server.db_lease():
-            pass                                   # must NOT raise
+
+        mcp_server._reset_db_state()               # must NOT raise
         assert "DB lease leak" in capsys.readouterr().err
         del escaped
-        monkeypatch.setattr(mcp_server._lease_manager, "strict_leak_detection", True)
+        mcp_server._reset_db_state()
+
+    def test_the_detector_diagnoses_but_cannot_rescue(self, tmp_path, monkeypatch):
+        """The honest bound on what this detector is worth, pinned.
+
+        A stray reference means the graph file lock is STILL HELD, so the next
+        acquire fails no matter what: minigraf refuses a second same-process
+        open, and _clear_stale_lock correctly declines to steal a lock whose
+        holder PID is our own live process. The detector buys a named holder
+        in the log before that failure -- never a recovery from it.
+
+        Worth a test because the opposite is the natural assumption, and
+        acting on it would mean building retry or force-clear logic that can
+        only ever corrupt.
+        """
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+        monkeypatch.setattr(mcp_server._lease_manager, "strict_leak_detection", False)
+
+        with mcp_server.db_lease() as db:
+            escaped = db._handle
+
+        with pytest.raises(RuntimeError, match="could not acquire a lease"):
+            with mcp_server.db_lease():
+                pass
+        del escaped
         mcp_server._reset_db_state()
 ```
 
@@ -950,14 +992,14 @@ def _describe_referrers(obj: Any, limit: int = 6) -> str:
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestDbLeaseLeakDetector -v`
-Expected: all 5 PASS.
+Expected: all 6 PASS.
 
 If `test_a_handle_that_escaped_its_lease_is_reported` fails on the `"escaped" in str(...)` assertion, the referrer is being reported as a bare frame rather than by name. Do not weaken the assertion — it is the positive control, and a detector that reports `<no named holder found>` for the commonest case is the "verification fails open" failure mode. Fix `_describe_referrers` instead.
 
 - [ ] **Step 5: Run the full suite**
 
 Run: `.venv/bin/python -m pytest tests/test_mcp_server.py -q`
-Expected: 1348 passed, 1 xfailed.
+Expected: 1349 passed, 1 xfailed.
 
 - [ ] **Step 6: Commit**
 
