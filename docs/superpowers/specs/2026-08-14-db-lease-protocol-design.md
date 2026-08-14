@@ -167,8 +167,17 @@ that await `_ensure_db_async()` today — `minigraf_query`, `minigraf_transact`,
 `minigraf_retract`, `minigraf_rule`, `memory_prepare_turn`, `minigraf_audit`,
 and `minigraf_ingest_status` **only when** `_ingest_progress["status"] !=
 "running"`. `minigraf_report_issue`, `memory_finalize_turn` and
-`minigraf_ingest_git` are excluded, and that conditional on
-`minigraf_ingest_status` must be carried across verbatim.
+`minigraf_ingest_git` are excluded from `call_tool`'s pre-acquire, and that
+conditional on `minigraf_ingest_status` must be carried across verbatim.
+
+**Corrected 2026-08-14, during planning:** "excluded" above means excluded from
+`call_tool`'s pre-acquire, **not** that the tool never opens the graph.
+`handle_memory_finalize_turn` awaits `_ensure_db_async()` itself
+(mcp_server.py:7111), conditional on `MINIGRAF_EXTRACTION_STRATEGY` being one
+of `heuristic`/`llm`/`agent`. It is async, so it takes its own
+`async with db_lease_async():` over that same condition. An earlier draft of
+this section read as though the tool touched no DB at all, which would have
+dropped a real acquire.
 
 Two properties this must preserve, both easy to lose:
 
