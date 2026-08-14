@@ -220,6 +220,34 @@ wrong". The old slug is inlined in the test as the control.
   (submodule `.gitmodules` renames become the sole remaining source of two
   distinct `:description` values), but that arm is unmeasurable on this repo —
   0 gitlink events — so this change makes #257 decidable, not decided.
+
+  **REVISION 2026-08-14 — this bullet is wrong twice over, and #257 is now
+  CLOSED as an accepted residual.** Corrected against the shipped code when the
+  decision was actually taken:
+
+  1. **A submodule rename is not an arm at all.** `_gitlink_changes`
+     (`mcp_server.py:4622`) classifies purely from the gitlink tree entry's
+     old/new modes and never reads `.gitmodules`; `gitmodules_map` is only
+     fetched when a commit carries an `"add"` (`mcp_server.py:8914`); and the
+     `"bump"` branch writes `:pinned-commit` + `:modified-in` only
+     (`mcp_server.py:9745-9753`). A name-only `.gitmodules` edit therefore
+     produces no event and cannot rewrite `:description`. The real submodule arm
+     is narrower: **remove → re-add at the same path** with the name changed in
+     between. Still unmeasurable here (0 gitlink events).
+  2. **It was never the SOLE source.** Residual R3 slug collisions are a second
+     live arm, because the `:description` at these sites is the **pre-slug raw
+     value** (module → `file_path`, unresolved import → the raw specifier,
+     function/class/variable/field → the raw name). Ident → description is
+     injective only if the slug is, and R3's zero is measured over 674 commits,
+     not proven: `a/b.py` and `a-b.py` both reach `:module/a-b-py`. The #257
+     probe spec (`2026-08-11-description-preload-exposure-probe-design.md:53-57`)
+     named this arm correctly; the bullet above dropped it.
+
+  Both arms additionally require a **close-then-reintroduce**, since every
+  `entity_descriptions` write site is guarded by "ident not currently live".
+  That is what made accepting the residual defensible. The standing record is
+  `_preload_known_entities`' docstring plus the strict xfail in
+  `TestPreloadKnownEntitiesDescriptionValueIsDateBounded`.
 - **Does not claim collision-freedom by construction.** R3's zero is measured.
   A contrived path/name combination could still collide; the gate and the probe
   are how that stays visible.

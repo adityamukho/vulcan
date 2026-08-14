@@ -10899,6 +10899,20 @@ class TestPreloadKnownEntitiesDescriptionValueIsDateBounded:
 
     It does. That is what the xfail below pins.
 
+    #257 WAS CLOSED 2026-08-14 as an ACCEPTED residual, and this class is the
+    reason closing it is safe: the mechanism stays pinned in the suite instead
+    of in an open issue. The strict marker is load-bearing in the CLOSED
+    direction too -- if someone fixes the preload, this test starts passing and
+    strict=True fails the suite, which is how a silent fix gets noticed. Do not
+    delete the marker to make a run green; delete it only together with the fix.
+    _preload_known_entities' docstring carries why acceptance is defensible: the
+    defect needs one ident with two distinct :description values in disjoint
+    windows, every write site is guarded by "ident not currently live", and the
+    two surviving arms (a submodule removed and re-added at the same path with a
+    changed .gitmodules name -- NOT a rename, which writes no :description at
+    all; and a residual R3 slug collision, since these descriptions are the
+    pre-slug raw values) are respectively unmeasurable here and measured zero.
+
     Same linearization as TestPreloadKnownEntitiesCloseSide, and the inversion
     is the same one: 0 = c0 @ 2026-04-01, 1 = c1 (WATERMARK) @ 2026-05-02,
     2 = c2 @ 2026-04-26. Position 2 sits above the watermark but carries the

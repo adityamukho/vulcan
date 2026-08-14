@@ -7506,7 +7506,42 @@ def _preload_known_entities(
     What survives is VALUES. entity_descriptions still carries whichever
     :description version was live at DATE T_hi(W), which can be a version
     written above W with an inverted author date. Membership is position-exact;
-    values are not. That is #257.
+    values are not. That is #257 -- CLOSED as an ACCEPTED residual, not fixed.
+    The xfail(strict=True) in tests/test_mcp_server.py's
+    TestPreloadKnownEntitiesDescriptionValueIsDateBounded pins that the shipped
+    query really does return the future value, so any fix trips the suite; do
+    not remove that marker to make it green.
+
+    Why accepting it is defensible, and what would make it fire. The defect
+    needs ONE ident carrying TWO distinct :description values in disjoint
+    windows. Every write site here is guarded by "ident not currently live"
+    (_build_code_triples' introduction branches; the unresolved-import stub at
+    the `dep_ident not in state.entity_valid_from` gate; the gitlink "add"
+    handler), so a second value requires a CLOSE-THEN-REINTRODUCE from a
+    different raw source value -- not merely a second writer. Two arms survive
+    #263:
+
+      1. A submodule REMOVED and re-ADDED at the same path with its .gitmodules
+         name changed in between. NOT a rename: _gitlink_changes classifies
+         purely from the gitlink tree entry's old/new modes and never reads
+         .gitmodules, gitmodules_map is only fetched when a commit carries an
+         "add", and the "bump" branch writes :pinned-commit and :modified-in
+         only. So a name-only .gitmodules edit produces no event at all and
+         cannot rewrite :description. Unmeasurable on this repository: every
+         full-history sweep so far (#245, #257, #263) found 0 gitlink events,
+         the same blind spot #245 recorded for :pinned-commit.
+      2. A residual _canonical_ident slug collision, because the :description
+         at these sites is the PRE-SLUG raw value -- module -> file_path,
+         unresolved import -> the raw specifier, function/class/variable/field
+         -> the raw name. So ident -> description is injective only if the slug
+         is, and R3's zero is MEASURED over 674 commits, not proven: `a/b.py`
+         and `a-b.py` both reach :module/a-b-py. This arm is why "the value is
+         a deterministic function of the ident" is true of the INPUTS and not
+         of the ident string.
+
+    Fixing it means position-filtering an INTERVAL per attribute, not
+    inverting one valid_to the way the close side does. Do not build that
+    without evidence the mechanism fires; there is none as of 2026-08-14.
 
     What the consequence is NOT: body-change detection. An earlier version of
     this paragraph claimed the forward walk diffs descriptions to decide
