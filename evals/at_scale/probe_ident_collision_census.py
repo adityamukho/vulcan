@@ -563,8 +563,8 @@ PREDICTIONS: Tuple[Tuple[str, str], ...] = (
     ("P1", "The true collision count exceeds the 3 #257's census found, "
            "because that census can only see collisions whose loser was "
            "closed and reopened."),
-    ("P2", "leading-underscore is the dominant named shape among all "
-           "offenders."),
+    ("P2", "leading-underscore STRICTLY outnumbers every other named shape "
+           "among all offenders."),
     ("P3", "R5, the control, reports a nonzero residual at least as large as "
            "the leading-underscore offender count."),
     ("P4", "R2's rename cost falls on named entities, not on module idents: "
