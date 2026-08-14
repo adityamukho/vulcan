@@ -5411,29 +5411,103 @@ class TestMatchRenamedEntities:
         assert removed["function"] == [("foo", old)]
         assert added["function"] == [("bar", new)]
 
-    def test_matcher_growth_is_bounded_not_cubic(self):
-        """P2 (second-pass) performance regression guard. The per-pair
-        O(all_names) dict rebuild (the cubic term) is gone; a 600x600 pool of
-        realistic small functions must complete well within a generous bound.
-        Pre-fix a 600x600 pool took ~32s (and grew ~cubically); post-fix it is
-        ~5s. The 12s bound is chosen to sit cleanly between the two — loose
-        enough to stay non-flaky on slower CI, tight enough that a regression
-        back to the cubic rebuild (which would blow past ~30s) fails here."""
+    def test_matcher_per_pair_setup_does_not_scale_with_pool_size(self, monkeypatch):
+        """P2 (second-pass) performance regression guard — the successor to the
+        wall-clock `test_matcher_growth_is_bounded_not_cubic` this replaces
+        (#261).
+
+        The defect was a per-candidate-pair O(all_names) rebuild:
+        `_match_renamed_entities` built a fresh `pair_tracked_names` dict for
+        every pair it evaluated, and `_match_candidate_pair` re-seeded an
+        O(all_names) reverse dict on every call. Layered on the inherent
+        O(removed x added) scan, that made total work cubic in pool size. The
+        fix builds both structures ONCE PER ROUND and passes them in read-only,
+        excluding the pair's own two names per-pair in O(1).
+
+        So the property is a COUNT, not a duration: over a whole matching run
+        the matcher builds at most one such structure PER ROUND, and that
+        number is FLAT in pool size no matter how many pairs get evaluated.
+        Both halves of the cubic term are pinned — the shared per-round
+        `tracked_names` (build count) and the precomputed `tracked_reserved`
+        (a None there means `_match_candidate_pair` rebuilds the multiset
+        internally, per call).
+
+        Counting rather than timing follows #233's precedent
+        (`test_per_commit_writes_do_not_scale_with_entity_count` pins the defect
+        axis — entity count at a fixed commit count — instead of a wall-clock
+        number). The old assertion here measured elapsed seconds and so failed
+        on an otherwise-green master purely under concurrent CPU load, twice
+        getting misread as a real defect; see #261.
+
+        The `calls` positive control is load-bearing: a flat build count is
+        evidence of anything only if the larger pool really did evaluate many
+        times more pairs. Without it, a matcher that silently stopped scanning
+        would sail through.
+        """
         import mcp_server
-        parser = mcp_server._get_parser("test.py")
-        n = 600
-        removed = {"function": [], "class": [], "variable": [], "field": []}
-        added = {"function": [], "class": [], "variable": [], "field": []}
-        for i in range(n):
-            src_o = f"def old_{i}(a, b):\n    total = a + b + {i}\n    return total * a\n"
-            src_n = f"def new_{i}(a, b):\n    total = a + b + {i}\n    return total * a\n"
-            removed["function"].append((f"old_{i}", parser.parse(src_o.encode()).root_node.children[0]))
-            added["function"].append((f"new_{i}", parser.parse(src_n.encode()).root_node.children[0]))
-        start = time.perf_counter()
-        matches = mcp_server._match_renamed_entities(removed, added)
-        elapsed = time.perf_counter() - start
-        assert len(matches) == n
-        assert elapsed < 12.0, f"600x600 matcher took {elapsed:.2f}s (expected ~5s; cubic regression?)"
+        real_pair = mcp_server._match_candidate_pair
+
+        def run(n):
+            """Match an n x n pool of realistic small functions. Returns
+            (distinct per-round structures the matcher built, candidate pairs
+            it evaluated)."""
+            parser = mcp_server._get_parser("test.py")
+            removed = {"function": [], "class": [], "variable": [], "field": []}
+            added = {"function": [], "class": [], "variable": [], "field": []}
+            for i in range(n):
+                src_o = f"def old_{i}(a, b):\n    total = a + b + {i}\n    return total * a\n"
+                src_n = f"def new_{i}(a, b):\n    total = a + b + {i}\n    return total * a\n"
+                removed["function"].append((f"old_{i}", parser.parse(src_o.encode()).root_node.children[0]))
+                added["function"].append((f"new_{i}", parser.parse(src_n.encode()).root_node.children[0]))
+            # Hold a reference to every structure seen: CPython recycles the
+            # id() of a freed temporary, so counting ids without pinning the
+            # objects would collapse a per-pair rebuild back to a handful of
+            # reused addresses and pass vacuously.
+            seen = []
+            calls = 0
+
+            def spy(old_node, new_node, tracked_names, tracked_reserved=None, **kwargs):
+                nonlocal calls
+                calls += 1
+                assert tracked_reserved is not None, (
+                    "_match_candidate_pair was called without a precomputed "
+                    "tracked_reserved, so it rebuilds the O(all_names) multiset "
+                    "on every call — half of the original cubic term is back"
+                )
+                seen.append((tracked_names, tracked_reserved))
+                return real_pair(
+                    old_node, new_node, tracked_names,
+                    tracked_reserved=tracked_reserved, **kwargs
+                )
+
+            with monkeypatch.context() as m:
+                m.setattr(mcp_server, "_match_candidate_pair", spy)
+                matches = mcp_server._match_renamed_entities(removed, added)
+            assert len(matches) == n, "every pair in the pool should still match"
+            return len({(id(t), id(r)) for t, r in seen}), calls
+
+        small_builds, small_calls = run(40)
+        large_builds, large_calls = run(120)
+
+        # Positive control: 3x the pool really did cost ~9x the pair
+        # evaluations (n(n+1)/2: 820 vs 7260), so the flat build count below is
+        # a fact about the matcher and not about a scan that never happened.
+        assert small_calls > 40, f"40x40 pool evaluated only {small_calls} pairs"
+        assert large_calls > 4 * small_calls, (
+            f"120x120 pool evaluated {large_calls} pairs vs {small_calls} for "
+            "40x40 — the two runs are not far enough apart to say anything"
+        )
+
+        assert small_builds <= mcp_server._MAX_MATCH_ROUNDS, (
+            f"40x40 pool built {small_builds} tracked-name structures for "
+            f"{small_calls} candidate pairs; the bound is one per round "
+            f"(<= {mcp_server._MAX_MATCH_ROUNDS}), not one per pair"
+        )
+        assert large_builds == small_builds, (
+            f"tracked-name structure builds grew {small_builds} -> "
+            f"{large_builds} when the pool tripled — per-pair setup is scaling "
+            "with pool size again (the cubic term)"
+        )
 
     def test_cross_file_short_body_not_matched_without_relationship(self):
         """#174: two unrelated entities (different file_groups keys) with a
