@@ -886,7 +886,7 @@ async def _ingest_into(repo_path: str, branch: Optional[str], graph_path) -> Tup
     """
     import mcp_server
 
-    mcp_server._db = None
+    mcp_server._reset_db_state()
     mcp_server._graph_path = None
     mcp_server.open_db(str(graph_path))
     mcp_server._ingest_progress = {
@@ -962,11 +962,15 @@ def main() -> int:
 
         linearization = frontier_registry.build_linearization(args.repo_path, branch)
         commit_metadata = mcp_server._git_commits(args.repo_path, None, branch)
-        db = mcp_server._db if mcp_server._db is not None else mcp_server.open_db(str(graph_path))
-        report = sweep(
-            db, args.repo_path, linearization, commit_metadata, branch=branch,
-            verify_fix=args.verify_fix,
-        )
+        # _ingest_into's open_db() doesn't touch the (not-yet-wired) lease
+        # manager, so db_lease() needs the path bound explicitly or it falls
+        # back to _get_graph_path()'s default and opens the wrong graph.
+        mcp_server._lease_manager.bind_path(str(graph_path))
+        with mcp_server.db_lease() as db:
+            report = sweep(
+                db, args.repo_path, linearization, commit_metadata, branch=branch,
+                verify_fix=args.verify_fix,
+            )
         report["ingest_status"] = ingest_status
 
     print(json.dumps(report, indent=2))

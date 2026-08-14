@@ -48,11 +48,11 @@ def reset_mcp_server_db():
     suppress the warnings a later test asserts on.
     """
     import mcp_server
-    mcp_server._db = None
+    mcp_server._reset_db_state()
     mcp_server._grammar_cache.clear()
     mcp_server._reset_introduced_by_ambiguity_log_budget()
     yield
-    mcp_server._db = None
+    mcp_server._reset_db_state()
     mcp_server._grammar_cache.clear()
     mcp_server._reset_introduced_by_ambiguity_log_budget()
 
@@ -122,7 +122,7 @@ class TestOpenDb:
         monkeypatch.setattr(MiniGrafDb, "open", staticmethod(lambda path: real_open_in_memory()))
         import mcp_server
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "auto.graph"))
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = ""
 
         result = mcp_server.get_db()
@@ -142,7 +142,7 @@ class TestOpenDb:
         import mcp_server
         custom_path = str(tmp_path / "custom.graph")
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", custom_path)
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = ""
 
         mcp_server.get_db()
@@ -234,7 +234,7 @@ class TestGetDbLockRetry:
     def test_retries_on_lock_error_then_succeeds(self, tmp_path, monkeypatch):
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = graph_path
 
         # Real backoff (not mocked) — the subprocess needs genuine wall-clock
@@ -249,7 +249,7 @@ class TestGetDbLockRetry:
         monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = graph_path
 
         with _hold_lock_subprocess(graph_path):
@@ -264,7 +264,7 @@ class TestGetDbLockRetry:
         # the very first open() attempt — no fabricated exception, no mock.
         graph_path = str(tmp_path / "adir")
         os.makedirs(graph_path)
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = graph_path
 
         with pytest.raises(MiniGrafError) as exc_info:
@@ -291,7 +291,7 @@ class TestGetDbLockRetry:
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
         lock_path = graph_path + ".lock"
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = graph_path
 
         with _hold_lock_subprocess(graph_path, exit_immediately=True) as dead_pid:
@@ -311,7 +311,7 @@ class TestGetDbLockRetry:
         monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = graph_path
         lock_path = graph_path + ".lock"
 
@@ -342,7 +342,7 @@ class TestGetDbLockRetry:
         """
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = graph_path
 
         open_calls = {"n": 0}
@@ -452,7 +452,7 @@ class TestTryOpenWithSelfHealReuse:
         from minigraf import MiniGrafDb
 
         path = str(tmp_path / "race.graph")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = ""
 
         real_open_in_memory = MiniGrafDb.open_in_memory
@@ -541,7 +541,7 @@ class TestGetDbConcurrentResetRace:
             assert paused.wait(timeout=2), "tracer never reached get_db's return line"
             # Simulate call_tool's finally block racing in between get_db()'s
             # None-check and its return.
-            mcp_server._db = None
+            mcp_server._reset_db_state()
             resume.set()
         finally:
             t.join(timeout=2)
@@ -1150,7 +1150,7 @@ class TestMinigrafTransact:
         during checkpoint fails for real) rather than faking the exception."""
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = graph_path
         mcp_server.open_db(graph_path)
 
@@ -1261,7 +1261,7 @@ class TestMinigrafRetract:
         be reported as ok:False."""
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = graph_path
         mcp_server.open_db(graph_path)
         mcp_server.handle_minigraf_transact(
@@ -2708,7 +2708,10 @@ class TestMcpToolWiring:
             "minigraf_query", {"datalog": "[:find ?x :where [?e :x ?x]]"}
         ))
 
-        assert mcp_server._db is None, "lock must be released after call_tool so prepare_hook can open the DB"
+        assert mcp_server._lease_manager.lease_count == 0, (
+            "every lease must be released after call_tool so prepare_hook can "
+            "open the DB between turns"
+        )
 
     def test_call_tool_unknown_raises(self, real_db):
         import asyncio
@@ -2731,7 +2734,7 @@ class TestMcpToolWiring:
         import asyncio
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = graph_path
 
         def fail_if_called(_delay):
@@ -3420,7 +3423,7 @@ class TestMinigrafAudit:
         `retracted`, since the retraction is already durably applied."""
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = graph_path
         mcp_server.open_db(graph_path)
         mcp_server.handle_minigraf_transact(
@@ -6731,7 +6734,7 @@ class TestFrontierPersistClaim:
         within the same open() call (docs/testing-conventions.md Pattern 2).
         """
         import mcp_server
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(tmp_path / "t.graph"))
         db = mcp_server.get_db()
@@ -6745,7 +6748,7 @@ class TestFrontierPersistClaim:
         # outright (project-minigraf/minigraf#304) and used to let through as
         # silent corruption. Dropping `db` first is what makes the reopen real.
         del db
-        mcp_server._db = None  # release lock, force a genuine reopen below
+        mcp_server._reset_db_state()  # release lock, force a genuine reopen below
 
         mcp_server.open_db(str(tmp_path / "t.graph"))
         reopened_db = mcp_server.get_db()
@@ -7246,7 +7249,7 @@ class TestEntityIntroducedByValuesQuery:
 
         mcp_server._introduced_by_ambiguity_logged = 10**6
         await mcp_server._run_ingestion(str(repo), "master")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
         assert mcp_server._introduced_by_ambiguity_logged < 10**6, (
             "_run_ingestion must reset the per-run stderr budget"
@@ -11450,7 +11453,7 @@ class TestPreloadStateLinearizationWiring:
         # frontier_registry is a top-level module in this repo (imported
         # module-wide above), not a submodule of the installed minigraf
         # package -- `from minigraf import frontier_registry` does not exist.
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
@@ -11460,7 +11463,7 @@ class TestPreloadStateLinearizationWiring:
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
         assert mcp_server._ingest_progress["status"] == "complete"
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         linearization = frontier_registry.build_linearization(str(git_repo), "HEAD")
         commit_metadata = mcp_server._git_commits(str(git_repo), None, "HEAD")
         result = mcp_server._load_ingestion_preload_state(
@@ -11478,10 +11481,10 @@ class TestPreloadStateLinearizationWiring:
         """A misaligned pair silently mis-filters the ENTIRE preload, which is
         worse than the misattribution _reverse_apply's own check prevents."""
         import mcp_server
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(git_repo / "memory.graph"))
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         with pytest.raises(ValueError, match="positionally aligned"):
             mcp_server._load_ingestion_preload_state(
                 str(git_repo), ["a" * 40, "b" * 40], [("a" * 40, "2026-01-01T00:00:00Z", "e", "s")],
@@ -11500,10 +11503,10 @@ class TestPreloadStateLinearizationWiring:
         positions, silently shifting T_hi(W) and mis-filtering the whole
         preload without ever raising."""
         import mcp_server
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(git_repo / "memory.graph"))
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         linearization = ["a" * 40, "b" * 40]
         # Same length as linearization, but positions 0 and 1 are swapped.
         commit_metadata = [
@@ -11701,7 +11704,7 @@ class TestRunIngestion:
 
         original_sleep = asyncio.sleep
         async def patched_sleep(t):
-            db_none_snapshots.append(mcp_server._db is None)
+            db_none_snapshots.append(mcp_server._lease_manager.lease_count == 0)
             await original_sleep(t)
 
         with patch("mcp_server.asyncio.sleep", patched_sleep):
@@ -11761,7 +11764,7 @@ class TestRunIngestion:
             return inst
 
         monkeypatch.setattr(MiniGrafDb, "open", staticmethod(_open))
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -11816,7 +11819,7 @@ class TestRunIngestion:
             return inst
 
         monkeypatch.setattr(MiniGrafDb, "open", staticmethod(_open))
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
@@ -12076,7 +12079,7 @@ class TestRunIngestion:
         _subprocess.run(["git", "commit", "-am", "reformat"], cwd=repo, check=True, capture_output=True)
 
         try:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
             mcp_server._graph_path = None
             mcp_server.open_db(str(tmp_path / "memory.graph"))
             mcp_server._ingest_progress = {
@@ -12094,7 +12097,7 @@ class TestRunIngestion:
                 "fact -- this is the core repro #221 exists to fix"
             )
         finally:
-            mcp_server._db = None  # release the real file lock for subsequent tests
+            mcp_server._reset_db_state()  # release the real file lock for subsequent tests
 
     @pytest.mark.asyncio
     async def test_genuine_change_commit_still_produces_modified_in_fact(self, tmp_path):
@@ -12114,7 +12117,7 @@ class TestRunIngestion:
         _subprocess.run(["git", "commit", "-am", "real change"], cwd=repo, check=True, capture_output=True)
 
         try:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
             mcp_server._graph_path = None
             mcp_server.open_db(str(tmp_path / "memory.graph"))
             mcp_server._ingest_progress = {
@@ -12129,7 +12132,7 @@ class TestRunIngestion:
             ))
             assert len(result["results"]) == 1
         finally:
-            mcp_server._db = None  # release the real file lock for subsequent tests
+            mcp_server._reset_db_state()  # release the real file lock for subsequent tests
 
     @pytest.mark.asyncio
     async def test_only_the_changed_function_gets_modified_in_others_do_not(self, tmp_path):
@@ -12157,7 +12160,7 @@ class TestRunIngestion:
         _subprocess.run(["git", "commit", "-am", "change login only"], cwd=repo, check=True, capture_output=True)
 
         try:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
             mcp_server._graph_path = None
             mcp_server.open_db(str(tmp_path / "memory.graph"))
             mcp_server._ingest_progress = {
@@ -12181,7 +12184,7 @@ class TestRunIngestion:
                 "pre-#221 file-broadcast bug would have wrongly flagged it too"
             )
         finally:
-            mcp_server._db = None  # release the real file lock for subsequent tests
+            mcp_server._reset_db_state()  # release the real file lock for subsequent tests
 
 
 class TestRunIngestionCommitFaultIsolation:
@@ -12605,7 +12608,7 @@ class TestRunIngestionConcurrency:
             # Fresh, dedicated on-disk graph per run so each run starts from
             # a genuinely empty store — no leftover watermark, progress, or
             # shutdown signal from the previous run.
-            mcp_server._db = None
+            mcp_server._reset_db_state()
             mcp_server._graph_path = None
             mcp_server.open_db(str(graph_path))
             mcp_server._ingest_progress = {
@@ -12639,7 +12642,7 @@ class TestRunIngestionConcurrency:
                 (e, a, v) for e, a, v in rows
                 if a != ":last-run-at"
             }
-            mcp_server._db = None  # release the file lock for the next run
+            mcp_server._reset_db_state()  # release the file lock for the next run
             return transacted, facts
 
         sequential_triples, sequential_facts = await run_and_capture(1, tmp_path / "sequential.graph")
@@ -12825,7 +12828,7 @@ class TestRunIngestionShutdown:
         actually persists the watermark for run 2 to read.
         """
         import mcp_server
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
@@ -12870,7 +12873,7 @@ class TestRunIngestionShutdown:
         # it used to be silent corruption. Production has no such frame; this
         # is the test putting the process into a state the server never is.
         del db
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -12888,7 +12891,7 @@ class TestRunIngestionShutdown:
         assert mcp_server._ingest_progress["processed"] == 2
         assert mcp_server._count_commit_entities(mcp_server.get_db()) == 2
 
-        mcp_server._db = None  # release the real file lock for subsequent tests
+        mcp_server._reset_db_state()  # release the real file lock for subsequent tests
 
 
 class TestMainShutdown:
@@ -13166,7 +13169,7 @@ class TestRunStartupBackfillDbLockRelease:
 
         await mcp_server._run_startup_backfill()
 
-        assert mcp_server._db is None
+        assert mcp_server._lease_manager.lease_count == 0
 
     @pytest.mark.asyncio
     async def test_releases_db_lock_even_when_no_rebuild_needed(self, real_db):
@@ -13187,7 +13190,7 @@ class TestRunStartupBackfillDbLockRelease:
 
         await mcp_server._run_startup_backfill()
 
-        assert mcp_server._db is None
+        assert mcp_server._lease_manager.lease_count == 0
 
 
 class TestMainStartupBackfill:
@@ -14136,12 +14139,12 @@ class TestClosedEntityLifecyclePurge:
         import mcp_server
         graph = str(repo / "memory.graph")
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = graph
         mcp_server._ingest_progress = self._make_progress()
         await mcp_server._run_ingestion(str(repo), "HEAD")
         assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
-        mcp_server._db = None  # release the lock so we can reopen for querying
+        mcp_server._reset_db_state()  # release the lock so we can reopen for querying
         from minigraf import MiniGrafDb
         return MiniGrafDb.open(graph)
 
@@ -14275,7 +14278,7 @@ class TestCloseDiscardsLineageMarker:
         repo = _reused_path_repo(tmp_path / "repo", variant)
         graph = str(repo / "memory.graph")
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = graph
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -14313,7 +14316,7 @@ class TestRunIngestionBitemporalClose:
         commits = mcp_server._git_commits(str(repo), None)
         add_ts = commits[0][1]
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -14342,7 +14345,7 @@ class TestRunIngestionBitemporalClose:
             assert current_desc == [], \
                 f"Deleted function's :description must be closed at current time, got {current_desc}"
         finally:
-            mcp_server._db = None  # release the real file lock for subsequent tests
+            mcp_server._reset_db_state()  # release the real file lock for subsequent tests
 
     @pytest.mark.asyncio
     async def test_file_deletion_close_includes_ident_and_contains_triples(
@@ -14356,7 +14359,7 @@ class TestRunIngestionBitemporalClose:
         commits = mcp_server._git_commits(str(repo), None)
         add_ts = commits[0][1]
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -14386,7 +14389,7 @@ class TestRunIngestionBitemporalClose:
             assert results(f"(query [:find ?x :where [{module_ident} :contains ?x]])") == [], \
                 "Deleted function's :contains edge from the module must be closed"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_intra_file_deletion_closes_removed_function(
@@ -14400,7 +14403,7 @@ class TestRunIngestionBitemporalClose:
         commits = mcp_server._git_commits(str(repo), None)
         add_ts = commits[0][1]
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -14431,7 +14434,7 @@ class TestRunIngestionBitemporalClose:
             assert results(f"(query [:find ?x :where [{login_ident} :ident ?x]])") == [[login_ident]], \
                 "login() still present in file must not be closed"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_renamed_file_links_old_and_new_via_rename_edges(
@@ -14446,7 +14449,7 @@ class TestRunIngestionBitemporalClose:
         commits = mcp_server._git_commits(str(repo), None)
         add_ts = commits[0][1]
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -14487,7 +14490,7 @@ class TestRunIngestionBitemporalClose:
             ) == [[old_module_ident]], \
                 "New module's open triples must include :renamed-from pointing at the old ident"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_in_file_function_rename_links_via_rename_edges(
@@ -14510,7 +14513,7 @@ class TestRunIngestionBitemporalClose:
         _subprocess.run(["git", "commit", "-m", "rename fn"], cwd=repo, check=True, capture_output=True)
 
         import mcp_server
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -14562,7 +14565,7 @@ class TestRunIngestionBitemporalClose:
             assert results(f"(query [:find ?x :where [{new_fn_ident} :renamed-from ?x]])") == [[old_fn_ident]]
             assert results(f"(query [:find ?x :where [{old_fn_ident} :renamed-to ?x]])") == [[new_fn_ident]]
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_global_rename_links_via_rename_edges_end_to_end(
@@ -14589,7 +14592,7 @@ class TestRunIngestionBitemporalClose:
         _subprocess.run(["git", "commit", "-m", "rename global"], cwd=repo, check=True, capture_output=True)
 
         import mcp_server
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -14638,7 +14641,7 @@ class TestRunIngestionBitemporalClose:
             assert results(f"(query [:find ?x :where [{new_ident} :renamed-from ?x]])") == [[old_ident]]
             assert results(f"(query [:find ?x :where [{old_ident} :renamed-to ?x]])") == [[new_ident]]
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_rename_to_unsupported_ext_closes_old_entities(
@@ -14669,7 +14672,7 @@ class TestRunIngestionBitemporalClose:
         commits = mcp_server._git_commits(str(repo), None)
         add_ts = commits[0][1]
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -14711,7 +14714,7 @@ class TestRunIngestionBitemporalClose:
             assert not any(txt_module_ident in c for c in executed_cmds if c.strip().startswith("(transact")), \
                 "No module entity should be created for the unsupported .txt path"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_rename_from_unsupported_ext_creates_no_phantom_module(
@@ -14741,7 +14744,7 @@ class TestRunIngestionBitemporalClose:
         commits = mcp_server._git_commits(str(repo), None)
         add_ts = commits[0][1]
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -14775,7 +14778,7 @@ class TestRunIngestionBitemporalClose:
             assert results(f"(query [:find ?x :where [{new_fn_ident} :ident ?x]])") == [[new_fn_ident]], \
                 "The new .py file's entities must still be created as a plain add"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_renamed_to_is_open_ended_against_real_graph(self, tmp_path):
@@ -14822,7 +14825,7 @@ class TestRunIngestionBitemporalClose:
         rename_commit_ts = mcp_server._git_commits(str(repo), None)[1][1]
 
         # Real backend: real MiniGrafDb, real execute, real persistence.
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -14896,7 +14899,7 @@ class TestRunIngestionBitemporalClose:
         assert rt_at == [[new_module]], f":renamed-to must be visible at the rename commit, got {rt_at}"
         assert rf_at == [[old_module]], f":renamed-from must be visible at the rename commit, got {rf_at}"
 
-        mcp_server._db = None  # release the real file lock for subsequent tests
+        mcp_server._reset_db_state()  # release the real file lock for subsequent tests
 
     @pytest.mark.asyncio
     async def test_removed_field_secondary_attrs_are_closed_against_real_graph(self, tmp_path):
@@ -14926,7 +14929,7 @@ class TestRunIngestionBitemporalClose:
         _subprocess.run(["git", "commit", "-m", "remove bar"], cwd=repo, check=True, capture_output=True)
 
         # Real backend: real MiniGrafDb, real execute, real persistence.
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -14951,7 +14954,7 @@ class TestRunIngestionBitemporalClose:
         assert count(":entity-type", ":type/field") == 1, \
             "removed field bar's :entity-type must be closed so type-only queries don't resurrect it"
 
-        mcp_server._db = None  # release the real file lock for subsequent tests
+        mcp_server._reset_db_state()  # release the real file lock for subsequent tests
 
     @pytest.mark.asyncio
     async def test_unchanged_global_and_field_survive_unrelated_edit(
@@ -14985,7 +14988,7 @@ class TestRunIngestionBitemporalClose:
         commits = mcp_server._git_commits(str(repo), None)
         add_ts = commits[0][1]
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -15011,7 +15014,7 @@ class TestRunIngestionBitemporalClose:
             assert results(f"(query [:find ?x :where [{field_ident} :ident ?x]])") == [[field_ident]], \
                 "Unchanged field must NOT be closed on an unrelated function edit"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_file_rename_closes_unmatched_child_and_dependency(
@@ -15043,7 +15046,7 @@ class TestRunIngestionBitemporalClose:
         commits = mcp_server._git_commits(str(repo), None)
         add_ts = commits[0][1]
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -15080,7 +15083,7 @@ class TestRunIngestionBitemporalClose:
             assert results(f"(query [:find ?x :where [{new_module} :ident ?x]])") == [[new_module]], \
                 "New renamed file's module must still be created"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_same_file_rename_closes_old_ident_exactly_once(
@@ -15106,7 +15109,7 @@ class TestRunIngestionBitemporalClose:
         _subprocess.run(["git", "commit", "-m", "rename fn"], cwd=repo, check=True, capture_output=True)
 
         import mcp_server
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -15149,7 +15152,7 @@ class TestRunIngestionBitemporalClose:
             assert results(f"(query [:find ?x :where [{new_fn} :ident ?x]])") == [[new_fn]], \
                 "New function must be open after same-file rename"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
 
 # ---------------------------------------------------------------------------
@@ -15219,7 +15222,7 @@ class TestTransactValidTimeArgumentOrder:
         (c) a :valid-at BEFORE the window does NOT see it.
         """
         import mcp_server
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(tmp_path / "vt.graph"))
         db = mcp_server.get_db()
@@ -15247,7 +15250,7 @@ class TestTransactValidTimeArgumentOrder:
             assert q(':valid-at "2019-06-01T00:00:00Z"') == [], \
                 "fact must NOT be visible at a :valid-at before its window"
         finally:
-            mcp_server._db = None  # release the real file lock for subsequent tests
+            mcp_server._reset_db_state()  # release the real file lock for subsequent tests
 
 
 class TestRunIngestionBitemporalDeps:
@@ -15270,7 +15273,7 @@ class TestRunIngestionBitemporalDeps:
         commits = mcp_server._git_commits(str(repo), None)
         add_ts = commits[0][1]
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -15301,7 +15304,7 @@ class TestRunIngestionBitemporalDeps:
                 f"Expected the :depends-on edge to still be open at current time, got: {current}"
             )
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_removed_import_closes_depends_on_edge(
@@ -15317,7 +15320,7 @@ class TestRunIngestionBitemporalDeps:
         commits = mcp_server._git_commits(str(repo), None)
         add_ts = commits[0][1]
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -15345,7 +15348,7 @@ class TestRunIngestionBitemporalDeps:
                 f"import was removed, got: {current}"
             )
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
 
 class TestUnresolvedImportTagging:
@@ -15372,7 +15375,7 @@ class TestUnresolvedImportTagging:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add main"], cwd=repo, check=True, capture_output=True)
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
@@ -15402,7 +15405,7 @@ class TestUnresolvedImportTagging:
             assert results == [[":type/external-dependency"]], \
                 "tokio's external-dependency tag must be queryable against the real graph"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_unresolved_relative_import_not_tagged_external_end_to_end(self, tmp_path, monkeypatch):
@@ -15416,7 +15419,7 @@ class TestUnresolvedImportTagging:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add main"], cwd=repo, check=True, capture_output=True)
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = {"status": "idle", "processed": 0, "total": 0, "current_commit": "", "error": None}
@@ -15447,7 +15450,7 @@ class TestUnresolvedImportTagging:
             assert results == [], \
                 "unresolved relative import must not be queryable as an entity at all"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
 
 class TestGitIngestionPathIgnore:
@@ -15471,7 +15474,7 @@ class TestGitIngestionPathIgnore:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add vendored lib"], cwd=repo, check=True, capture_output=True)
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
@@ -15505,7 +15508,7 @@ class TestGitIngestionPathIgnore:
             ).get("results", [])
             assert func_results == [], "no function entities should exist under the ignored vendor/ directory"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_gitlink_under_default_ignored_directory_is_not_ingested(
@@ -15543,7 +15546,7 @@ class TestGitIngestionPathIgnore:
         _subprocess.run(["git", "add", ".gitmodules"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add submodule"], cwd=repo, check=True, capture_output=True)
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
@@ -15571,7 +15574,7 @@ class TestGitIngestionPathIgnore:
             assert results == [], \
                 "no external-dependency entity should exist for a submodule under the ignored vendor/ directory"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_import_into_ignored_path_becomes_external_dependency(
@@ -15595,7 +15598,7 @@ class TestGitIngestionPathIgnore:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add vendor and main"], cwd=repo, check=True, capture_output=True)
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
@@ -15626,7 +15629,7 @@ class TestGitIngestionPathIgnore:
             assert results == [[":type/external-dependency"]], \
                 "vendor.foo's external-dependency tag must be queryable against the real graph"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_env_var_ignore_pattern_excludes_custom_directory(
@@ -15647,7 +15650,7 @@ class TestGitIngestionPathIgnore:
         _subprocess.run(["git", "commit", "-m", "add generated file"], cwd=repo, check=True, capture_output=True)
 
         monkeypatch.setenv("MINIGRAF_INGEST_IGNORE", "generated/")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
@@ -15675,7 +15678,7 @@ class TestGitIngestionPathIgnore:
             ).get("results", [])
             assert results == [], "generated/ module must not be queryable against the real graph"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
 
 class TestResolveModuleImportTieredMatcher:
@@ -15828,7 +15831,7 @@ class TestPerCommitAccurateImportResolution:
         commits = mcp_server._git_commits(str(git_repo_with_future_dep), None)
         commit1_ts = commits[0][1]
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(git_repo_with_future_dep / "memory.graph"))
         mcp_server._ingest_progress = {
@@ -15871,7 +15874,7 @@ class TestPerCommitAccurateImportResolution:
             assert results == [[":type/external-dependency"]], \
                 "mod_b must be queryable as external-dependency at commit 1's timestamp"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
 
 class TestResolveModuleImportRelative:
@@ -15969,7 +15972,7 @@ class TestRunIngestionGitlinks:
         _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
         sub_hash = self._add_submodule_commit(repo)
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
@@ -16005,7 +16008,7 @@ class TestRunIngestionGitlinks:
             assert count(":submodule-name", '"lib"') == 1, \
                 "submodule's name must be queryable against the real graph"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_submodule_bump_closes_old_pinned_commit(self, tmp_path, monkeypatch):
@@ -16032,7 +16035,7 @@ class TestRunIngestionGitlinks:
         commits = mcp_server._git_commits(str(repo), None)
         first_commit_ts = commits[0][1]
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
@@ -16073,7 +16076,7 @@ class TestRunIngestionGitlinks:
                 f"(query [:find ?x :where [{ident} :pinned-commit ?x]])"
             ) == [[second_sha]], "current pinned-commit must reflect the bumped submodule sha"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_submodule_removal_closes_entity(self, tmp_path, monkeypatch):
@@ -16088,7 +16091,7 @@ class TestRunIngestionGitlinks:
         _subprocess.run(["git", "rm", "-f", "modules/lib"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "remove submodule"], cwd=repo, check=True, capture_output=True)
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
@@ -16117,7 +16120,7 @@ class TestRunIngestionGitlinks:
             assert results == [], \
                 "removed submodule's :ident must be closed and no longer queryable against the real graph"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_submodule_removal_closes_entity_type_and_path_against_real_graph(self, tmp_path):
@@ -16146,7 +16149,7 @@ class TestRunIngestionGitlinks:
         _subprocess.run(["git", "commit", "-m", "remove submodule"], cwd=repo, check=True, capture_output=True)
 
         # Real backend: real MiniGrafDb, real execute, real persistence.
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -16165,7 +16168,7 @@ class TestRunIngestionGitlinks:
         assert count(":path", '"modules/lib"') == 0, \
             "removed submodule's :path must be closed (issue #137)"
 
-        mcp_server._db = None  # release the real file lock for subsequent tests
+        mcp_server._reset_db_state()  # release the real file lock for subsequent tests
 
     @pytest.mark.asyncio
     async def test_submodule_discarded_entirely_at_merge_closes_pinned_commit(self, tmp_path):
@@ -16200,7 +16203,7 @@ class TestRunIngestionGitlinks:
             cwd=repo, check=True, capture_output=True,
         )
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = self._make_progress()
@@ -16219,7 +16222,7 @@ class TestRunIngestionGitlinks:
             assert count(":entity-type", ":type/external-dependency") == 0, \
                 "the submodule's external-dependency entity must be closed too"
         finally:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
 
 class TestSubmoduleDependencyLinking:
@@ -16272,7 +16275,7 @@ class TestSubmoduleDependencyLinking:
         _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add consumer"], cwd=repo, check=True, capture_output=True)
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -16293,7 +16296,7 @@ class TestSubmoduleDependencyLinking:
         assert rows(f"(query [:find ?v :where [{stub_ident} :resolves-to ?v]])") == [[submodule_ident]], \
             "unresolved-include stub must gain a :resolves-to edge to the submodule entity (issue #112)"
 
-        mcp_server._db = None  # release the real file lock for subsequent tests
+        mcp_server._reset_db_state()  # release the real file lock for subsequent tests
 
     @pytest.mark.asyncio
     async def test_stub_created_after_submodule_links_immediately(self, tmp_path):
@@ -16314,7 +16317,7 @@ class TestSubmoduleDependencyLinking:
         _subprocess.run(["git", "add", "consumer.py"], cwd=repo, check=True, capture_output=True)
         _subprocess.run(["git", "commit", "-m", "add consumer"], cwd=repo, check=True, capture_output=True)
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = None
         mcp_server._ingest_progress = self._make_progress()
         mcp_server.open_db(str(repo / "memory.graph"))
@@ -16332,7 +16335,7 @@ class TestSubmoduleDependencyLinking:
         assert rows(f"(query [:find ?v :where [{stub_ident} :resolves-to ?v]])") == [[submodule_ident]], \
             "stub created after the submodule already exists must link immediately (issue #112)"
 
-        mcp_server._db = None  # release the real file lock for subsequent tests
+        mcp_server._reset_db_state()  # release the real file lock for subsequent tests
 
 
 # ---------------------------------------------------------------------------
@@ -16766,11 +16769,11 @@ class TestFieldClassContainmentE2E:
 
         graph_path = str(tmp_path / "e2e.graph")
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph_path)
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = ""
 
         asyncio.run(mcp_server._run_ingestion(str(repo), "HEAD"))
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
         class_ident = mcp_server._code_ident("class", "models.py", "Account")
         field_ident = mcp_server._code_ident("field", "models.py", "Account.balance")
@@ -16786,10 +16789,10 @@ class TestFieldClassContainmentE2E:
         (repo / "models.py").write_text("class Account:\n    def deposit(self):\n        pass\n")
         self._commit(repo, "drop balance field")
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = ""
         asyncio.run(mcp_server._run_ingestion(str(repo), "HEAD"))
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
         # The class-contains edge to the removed field is CLOSED at current time.
         contains_after = self._query(
@@ -19601,7 +19604,7 @@ class TestStageAInterleave:
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
 
         await mcp_server._run_ingestion(str(repo), "master")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
         db = MiniGrafDb.open(str(graph))
         linearization = frontier_registry.build_linearization(str(repo))
@@ -19623,7 +19626,7 @@ class TestStageAInterleave:
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "3:1")
 
         await mcp_server._run_ingestion(str(repo), "master")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
         db = MiniGrafDb.open(str(graph))
         linearization = frontier_registry.build_linearization(str(repo))
@@ -19642,7 +19645,7 @@ class TestStageAInterleave:
         graph = tmp_path / "g.graph"
         monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
         await mcp_server._run_ingestion(str(repo), "master")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
         db = MiniGrafDb.open(str(graph))
         low = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT)
@@ -19664,7 +19667,7 @@ class TestStageAInterleave:
         repo = self._repo(tmp_path)
         monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
         await mcp_server._run_ingestion(str(repo), "master")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete"
 
@@ -19705,7 +19708,7 @@ class TestStageBCorrectionSweep:
         graph = tmp_path / "g.graph"
         monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
         await mcp_server._run_ingestion(str(repo), "master")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
         db = MiniGrafDb.open(str(graph))
         assert mcp_server._preload_provisional_idents(db) == set()
@@ -19718,7 +19721,7 @@ class TestStageBCorrectionSweep:
         graph = tmp_path / "g.graph"
         monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
         await mcp_server._run_ingestion(str(repo), "master")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
         db = MiniGrafDb.open(str(graph))
         raw = mcp_server._db_execute(db, "(query [:find ?e ?c :where [?e :introduced-by ?c]])")
@@ -19734,7 +19737,7 @@ class TestStageBCorrectionSweep:
         graph = tmp_path / "g.graph"
         monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
         await mcp_server._run_ingestion(str(repo), "master")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
         db = MiniGrafDb.open(str(graph))
         linearization = frontier_registry.build_linearization(str(repo), "master")
@@ -19798,7 +19801,7 @@ class TestStageBCorrectionSweep:
 
         monkeypatch.setattr(mcp_server, "_forward_apply", failing_forward_apply)
         await mcp_server._run_ingestion(str(repo), "master")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
         # Guard against a vacuous pass: the sweep must genuinely have reached
         # a second commit and failed on it.
@@ -19969,14 +19972,14 @@ class TestStageBRepairsLifecycleFacts:
         import mcp_server
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", ratio)
         monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
         }
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
     def _results(self, graph_path, datalog):
         import mcp_server
@@ -20285,11 +20288,11 @@ class TestNoDuplicateIntroducedByAfterFullIngest:
 
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
         monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         self._reset_progress()
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
-        mcp_server._db = None  # release the file lock before reopening
+        mcp_server._reset_db_state()  # release the file lock before reopening
 
         db = MiniGrafDb.open(str(graph_path))
         try:
@@ -20326,7 +20329,7 @@ class TestNoDuplicateIntroducedByAfterFullIngest:
         import mcp_server
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
         monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         self._reset_progress()
 
         real_forward = mcp_server._forward_apply
@@ -20344,7 +20347,7 @@ class TestNoDuplicateIntroducedByAfterFullIngest:
         finally:
             monkeypatch.setattr(mcp_server, "_forward_apply", real_forward)
         assert mcp_server._ingest_progress["status"] == "stopped", mcp_server._ingest_progress
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_a_pre_corrupted_graph_is_repaired_by_the_next_ingest(
@@ -20392,7 +20395,7 @@ class TestNoDuplicateIntroducedByAfterFullIngest:
             assert len(mcp_server._entity_introduced_by_values_query(db, fn_ident)) == 2
         finally:
             db = None
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         capsys.readouterr()  # drop the interrupted run's output
 
         # Resume. Stage A completes, then Stage B sweeps and repairs.
@@ -20400,7 +20403,7 @@ class TestNoDuplicateIntroducedByAfterFullIngest:
         monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         err = capsys.readouterr().err
 
         db = MiniGrafDb.open(str(graph_path))
@@ -20569,11 +20572,11 @@ class TestMultiStreamParityWithForwardOnly:
         import mcp_server
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", ratio)
         monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         self._reset_progress()
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
-        mcp_server._db = None  # release the file lock before reopening to query
+        mcp_server._reset_db_state()  # release the file lock before reopening to query
 
     async def _ingest_interrupted(self, repo, graph_path, monkeypatch, stop_after):
         """Ingest at the 1:1 default but request shutdown from inside the
@@ -20582,7 +20585,7 @@ class TestMultiStreamParityWithForwardOnly:
         import mcp_server
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
         monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         self._reset_progress()
 
         real_forward = mcp_server._forward_apply
@@ -20600,7 +20603,7 @@ class TestMultiStreamParityWithForwardOnly:
         finally:
             monkeypatch.setattr(mcp_server, "_forward_apply", real_forward)
         assert mcp_server._ingest_progress["status"] == "stopped", mcp_server._ingest_progress
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
     def _raw_query(self, graph_path, datalog):
         import mcp_server
@@ -21046,19 +21049,19 @@ class TestStagingAndShutdown:
         monkeypatch.setattr(mcp_server, "_forward_apply", stopping_forward)
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "stopped"
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
         # A run stopped in Stage A must NOT claim confirmed lineage at HEAD.
         db = MiniGrafDb.open(str(graph))
         linearization = frontier_registry.build_linearization(str(repo))
         assert mcp_server._lineage_confirmed_through_query(db) != linearization[-1]
         db = None
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
         monkeypatch.setattr(mcp_server, "_forward_apply", real_forward)
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete"
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         db2 = MiniGrafDb.open(str(graph))
         assert mcp_server._preload_provisional_idents(db2) == set()
         assert mcp_server._lineage_confirmed_through_query(db2) == linearization[-1]
@@ -21080,7 +21083,7 @@ class TestStagingAndShutdown:
                 f"the resume: {live}"
             )
         db2 = None
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
     @pytest.mark.asyncio
     async def test_neither_sync_wrapper_is_called_from_run_ingestion(self, tmp_path, monkeypatch):
@@ -21248,7 +21251,7 @@ class TestResumeWithInvertedAuthorDates:
         import mcp_server
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "2:1000000")
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = graph
 
         mcp_server._ingest_progress = self._progress()
@@ -21283,7 +21286,7 @@ class TestResumeWithInvertedAuthorDates:
         await mcp_server._run_ingestion(str(repo), "HEAD")
         assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         from minigraf import MiniGrafDb
         return MiniGrafDb.open(graph)
 
@@ -21506,7 +21509,7 @@ class TestResumeWithInvertedAuthorDatesAndDeps:
 
         async def drive(ratio, stop_after, capture=False):
             monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", ratio)
-            mcp_server._db = None
+            mcp_server._reset_db_state()
             mcp_server._ingest_progress = self._progress()
             if stop_after is None:
                 with patch.object(
@@ -21514,7 +21517,7 @@ class TestResumeWithInvertedAuthorDatesAndDeps:
                     capturing_load if capture else original_load,
                 ):
                     await mcp_server._run_ingestion(str(repo), "HEAD")
-                mcp_server._db = None
+                mcp_server._reset_db_state()
                 return
             calls = {"n": 0}
 
@@ -21531,7 +21534,7 @@ class TestResumeWithInvertedAuthorDatesAndDeps:
 
             with patch("mcp_server.asyncio.sleep", stop_after_nth):
                 await mcp_server._run_ingestion(str(repo), "HEAD")
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
         await drive("2:1000000", 4)
         assert mcp_server._ingest_progress["status"] == "stopped"
@@ -21580,7 +21583,7 @@ class TestResumeWithInvertedAuthorDatesAndDeps:
             "take the resume path at all"
         )
 
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         return MiniGrafDb.open(graph), captured
 
     @pytest.mark.asyncio
@@ -22459,11 +22462,11 @@ class TestSingleHandlePerProcess:
 
         graph = str(tmp_path / "t.graph")
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = ""
 
         held = mcp_server._open_db_at(graph)          # _run_ingestion's local `db`
-        mcp_server._db = None                          # call_tool's finally
+        mcp_server._reset_db_state()                          # call_tool's finally
         assert mcp_server._db is None
 
         # The handle is still fully usable, which is exactly the problem: the
@@ -22476,7 +22479,7 @@ class TestSingleHandlePerProcess:
         )
 
         del held
-        mcp_server._db = None
+        mcp_server._reset_db_state()
 
 
 class TestLockErrorRecognisesSameProcessOpen:
@@ -22574,7 +22577,7 @@ class TestWriteExecutorIsShutDownOnEarlyFailure:
         import mcp_server
 
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
-        mcp_server._db = None
+        mcp_server._reset_db_state()
         mcp_server._graph_path = ""
 
         created = []
@@ -22611,4 +22614,74 @@ class TestWriteExecutorIsShutDownOnEarlyFailure:
             f"{len(unclosed)} of {len(created)} executor(s) were never shut "
             f"down after {failing} raised"
         )
-        mcp_server._db = None
+        mcp_server._reset_db_state()
+
+
+class TestNoDirectDbGlobalAssignment:
+    """#255: assigning to a module attribute that no longer exists is silently
+    accepted by Python. Without this grep, code that still assigns directly
+    to the legacy `_db` global would keep "working" -- doing nothing -- and
+    the lease count it was meant to clear would leak into the next test.
+
+    Note for anyone editing this class: writing the literal assignment this
+    guard hunts for (module-dot-underscore-db-space-equals) anywhere in this
+    docstring or in the positive control below makes the guard match itself,
+    since git grep scans this very file. Both are phrased/built to avoid that
+    -- see test_the_grep_itself_matches_something's string concatenation.
+
+    Scoped to tests/ and evals/ for now; mcp_server.py joins the scan in the
+    commit that deletes the global.
+    """
+
+    # TestGetDbConcurrentResetRace (#122) assigns a live handle directly to
+    # the raw `_db` global to manufacture a race inside get_db()'s own
+    # implementation, which still reads/writes `_db` directly at this point
+    # in #255 (production code is not converted by this task). It is not a
+    # reset -- _reset_db_state() only knows how to clear the slot, not set it
+    # to a caller-supplied handle -- so this one site is expected to remain
+    # until get_db() itself converts. Anchored to the exact statement (both
+    # ends: no trailing comment, no other right-hand side) so a future site
+    # whose right-hand-side variable merely starts with the same four
+    # letters as the fixture this exception names is NOT swallowed by
+    # accident. Task 5 deletes both this exception and the test it excuses.
+    #
+    # Built by concatenation, like the positive control's canary line, so
+    # the pattern text itself is not a second hit when this class's own
+    # guard scans this file (see the class docstring).
+    _KNOWN_EXCEPTION = re.compile(
+        r"^tests/test_mcp_server\.py:\d+:\s*mcp_server\." + r"_db = real_db\s*$"
+    )
+
+    def test_no_test_or_eval_assigns_the_db_global_directly(self):
+        import subprocess
+        from pathlib import Path
+        repo = Path(__file__).resolve().parent.parent
+        hits = subprocess.run(
+            ["git", "grep", "-n", r"\._db\s*=", "--",
+             "tests/", "evals/at_scale/"],
+            cwd=repo, capture_output=True, text=True,
+        ).stdout.strip()
+        hits = "\n".join(
+            line for line in hits.splitlines()
+            if not self._KNOWN_EXCEPTION.match(line)
+        )
+        assert not hits, (
+            "these sites still assign the DB global directly; they must call "
+            f"mcp_server._reset_db_state() instead:\n{hits}"
+        )
+
+    def test_the_grep_itself_matches_something(self, tmp_path):
+        """Positive control. A pattern that matches nothing reports 'all clear'
+        forever; validate it against a known-positive before trusting a clean
+        result."""
+        import subprocess
+        # Built by concatenation, not a literal, so this line itself is not a
+        # second hit when the guard above scans this file (see class docstring).
+        canary_line = "mcp_server." + "_db = None\n"
+        (tmp_path / "canary.py").write_text(canary_line)
+        hits = subprocess.run(
+            ["grep", "-n", "-H", r"\._db\s*=", str(tmp_path / "canary.py")],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        assert hits, "the guard's pattern matches nothing -- it would fail open"
+        assert "canary.py" in hits, hits

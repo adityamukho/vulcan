@@ -547,18 +547,11 @@ def main() -> int:
     import mcp_server
     from evals.at_scale.probe_dep_preload_exposure import _ingest_into
 
-    def _run_sweep(branch, ingest_status):
+    def _run_sweep(db, branch, ingest_status):
         linearization = frontier_registry.build_linearization(
             args.repo_path, branch
         )
         commit_metadata = mcp_server._git_commits(args.repo_path, None, branch)
-        # Single-handle invariant (CLAUDE.md): reuse the live handle when one
-        # exists. Opening a second on the same file raises as of minigraf
-        # 1.2.3, and used to corrupt the page table silently (#251/#253).
-        db = (
-            mcp_server._db if mcp_server._db is not None
-            else mcp_server.open_db(str(graph_path))
-        )
         report = sweep(
             db, args.repo_path, linearization, commit_metadata, branch=branch,
         )
@@ -570,27 +563,29 @@ def main() -> int:
         if not graph_path.exists():
             print(f"No graph at {graph_path}. Refusing to sweep nothing.")
             return 1
-        mcp_server._db = None
-        mcp_server._graph_path = None
-        mcp_server.open_db(str(graph_path))
         branch = args.branch or mcp_server._default_git_branch(args.repo_path)
         linearization = frontier_registry.build_linearization(
             args.repo_path, branch
         )
-        raw = mcp_server._db_execute(
-            mcp_server._db,
-            "(query [:find (count ?c) :where [?c :entity-type :type/commit]])",
-        )
-        rows = json.loads(raw).get("results", [])
-        ingested = int(rows[0][0]) if rows else 0
-        if ingested != len(linearization):
-            print(
-                f"Graph holds {ingested} commits but the linearization has "
-                f"{len(linearization)}. Refusing to sweep a partial graph -- "
-                "an incomplete ingestion understates exposure everywhere."
+        # db_lease() opens on demand -- no separate open_db() needed, and
+        # doing one here would race the lease's own open against the
+        # single-handle invariant (CLAUDE.md).
+        mcp_server._lease_manager.bind_path(str(graph_path))
+        with mcp_server.db_lease() as db:
+            raw = mcp_server._db_execute(
+                db,
+                "(query [:find (count ?c) :where [?c :entity-type :type/commit]])",
             )
-            return 1
-        report = _run_sweep(branch, "pre-existing")
+            rows = json.loads(raw).get("results", [])
+            ingested = int(rows[0][0]) if rows else 0
+            if ingested != len(linearization):
+                print(
+                    f"Graph holds {ingested} commits but the linearization has "
+                    f"{len(linearization)}. Refusing to sweep a partial graph -- "
+                    "an incomplete ingestion understates exposure everywhere."
+                )
+                return 1
+            report = _run_sweep(db, branch, "pre-existing")
     else:
         import tempfile
 
@@ -610,7 +605,13 @@ def main() -> int:
                     + "). Refusing to sweep a partial or failed graph."
                 )
                 return 1
-            report = _run_sweep(branch, ingest_status)
+            # _ingest_into's open_db() doesn't touch the (not-yet-wired)
+            # lease manager, so db_lease() needs the path bound explicitly
+            # or it falls back to _get_graph_path()'s default and opens the
+            # wrong graph.
+            mcp_server._lease_manager.bind_path(str(graph_path))
+            with mcp_server.db_lease() as db:
+                report = _run_sweep(db, branch, ingest_status)
 
     print(json.dumps(report, indent=2))
     print()

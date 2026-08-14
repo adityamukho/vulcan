@@ -3706,6 +3706,12 @@ def _reset_db_state() -> None:
     leaks a lease cannot poison its successor -- with the bare global there was
     no way to reset the count at all.
     """
+    global _db
+    # TRANSITIONAL (removed in the commit that deletes `_db`): the legacy
+    # global and the manager coexist while call sites are converted, so a
+    # reset must clear both or a stale global would outlive the lease it
+    # shadowed.
+    _db = None
     _lease_manager.reset()
 
 

@@ -127,7 +127,7 @@ async def run_ingestion_benchmark(
     import fact_index
     import mcp_server
 
-    mcp_server._db = None
+    mcp_server._reset_db_state()
     mcp_server._graph_path = None
     mcp_server.open_db(str(graph_path))
     mcp_server._ingest_progress = {
@@ -193,7 +193,7 @@ async def run_ingestion_benchmark(
         original_patterns = mcp_server._DEFAULT_IGNORE_PATTERNS
         mcp_server._DEFAULT_IGNORE_PATTERNS = ()
         try:
-            mcp_server._db = None
+            mcp_server._reset_db_state()
             mcp_server._graph_path = None
             mcp_server.open_db(str(no_ignore_graph_path))
             mcp_server._ingest_progress = {
