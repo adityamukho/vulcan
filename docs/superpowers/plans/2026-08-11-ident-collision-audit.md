@@ -1282,13 +1282,30 @@ PREDICTIONS: Tuple[Tuple[str, str], ...] = (
     ("P1", "The true collision count exceeds the 3 #257's census found, "
            "because that census can only see collisions whose loser was "
            "closed and reopened."),
-    ("P2", "leading-underscore is the dominant named shape among all "
-           "offenders."),
+    ("P2", "leading-underscore STRICTLY outnumbers every other named shape "
+           "among all offenders."),
     ("P3", "R5, the control, reports a nonzero residual at least as large as "
            "the leading-underscore offender count."),
-    ("P4", "R2's rename count is proportionally lower on module idents than "
-           "on function idents, because a module input has no '::' separator."),
-    ("P5", "R4's rename count equals the total ident count."),
+    ("P4", "R2's rename cost falls on named entities, not on module idents: "
+           "a module input has no '::' separator to produce an adjacent "
+           "hyphen run, so R2 renames a strictly smaller FRACTION of module "
+           "idents than of function idents."),
+)
+
+# NOT a prediction -- a wiring assertion, kept out of PREDICTIONS so a reader
+# counting held/failed is not counting a tautology among them.
+#
+# R4 appends a hash suffix to EVERY ident by construction, so its rename count
+# must equal the total ident count; no run that clears the validity gate can
+# falsify that. Its value is diagnostic rather than predictive: if it ever
+# reports otherwise, score_rule's rename accounting is broken and every other
+# rule's rename number in the candidate table is suspect. This is the
+# rename-accounting analogue of R5's known-negative control, and it declares
+# itself as such for the same reason R5's description does.
+SELF_CHECKS: Tuple[Tuple[str, str], ...] = (
+    ("S1", "R4's rename count equals the total ident count. R4 appends a hash "
+           "suffix to every ident, so anything else means score_rule's rename "
+           "accounting is broken."),
 )
 
 
@@ -1347,6 +1364,7 @@ def build_report(
         ),
     }
     report["predictions"] = evaluate_predictions(report)
+    report["self_checks"] = evaluate_self_checks(report)
     return report
 
 
@@ -1363,28 +1381,80 @@ def evaluate_predictions(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         }
 
     total = report["offenders_total"]
-    dominant = max(
-        (s for s in SHAPES if s != "other"),
-        key=lambda s: shape_counts.get(s, 0),
-        default="other",
-    )
     r5 = report["candidates"]["R5"]["residual"]
-    r4 = report["candidates"]["R4"]["renames"]
-    r2 = report["candidates"]["R2"]["renames"]
+
+    # P2. `max` returns the FIRST maximal element, and SHAPES[0] is
+    # "leading-underscore" -- so an all-zero corpus, or an exact tie, would
+    # hand P2 a "held" it did not earn. Both are ruled out explicitly:
+    # unevaluable when there are no offenders at all, and STRICT dominance
+    # otherwise, with the runner-up named in the evidence so a near-tie is
+    # visible without re-running anything.
+    rivals = sorted(
+        ((shape_counts.get(s, 0), s) for s in SHAPES if s != "other"),
+        reverse=True,
+    )
+    if not rivals or rivals[0][0] == 0:
+        p2 = _row("P2", False, "not evaluable: no offenders in this corpus")
+    else:
+        runner_up_count, runner_up = next(
+            ((c, s) for c, s in rivals if s != "leading-underscore"), (0, "none")
+        )
+        p2 = _row(
+            "P2",
+            leading > runner_up_count,
+            f"leading-underscore={leading}, runner-up {runner_up}="
+            f"{runner_up_count}",
+        )
+
+    # P4 compares FRACTIONS, per entity type -- an ident-count total says
+    # nothing about where the rename cost lands, which is the whole claim.
+    # A missing denominator is reported as unevaluable in prose BEFORE any
+    # number, so a reader never meets a bare 0/0.
+    r2_by_type = report["candidates"]["R2"]["renames_by_entity_type"]
+    mod = r2_by_type.get("module", {"renamed": 0, "total": 0})
+    fn = r2_by_type.get("function", {"renamed": 0, "total": 0})
+    if mod["total"] == 0 or fn["total"] == 0:
+        empty = "module" if mod["total"] == 0 else "function"
+        p4 = _row(
+            "P4", False,
+            f"not evaluable: no {empty} idents in this corpus "
+            f"(module {mod['renamed']}/{mod['total']}, "
+            f"function {fn['renamed']}/{fn['total']})",
+        )
+    else:
+        mod_frac = mod["renamed"] / mod["total"]
+        fn_frac = fn["renamed"] / fn["total"]
+        p4 = _row(
+            "P4", mod_frac < fn_frac,
+            f"R2 renames module {mod['renamed']}/{mod['total']}={mod_frac:.3f}, "
+            f"function {fn['renamed']}/{fn['total']}={fn_frac:.3f}",
+        )
 
     return {
         "P1": _row("P1", total > 3, f"offenders_total={total}"),
-        "P2": _row(
-            "P2",
-            dominant == "leading-underscore",
-            f"dominant shape={dominant} at {shape_counts.get(dominant, 0)}",
-        ),
+        "P2": p2,
         "P3": _row("P3", r5 >= leading and r5 > 0,
                    f"R5 residual={r5}, leading-underscore offenders={leading}"),
-        "P4": _row("P4", r2 < report["idents_total"],
-                   f"R2 renames={r2} of {report['idents_total']} idents"),
-        "P5": _row("P5", r4 == report["idents_total"],
-                   f"R4 renames={r4} of {report['idents_total']} idents"),
+        "P4": p4,
+    }
+
+
+def evaluate_self_checks(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """The wiring assertions, reported separately from PREDICTIONS.
+
+    Kept apart so a reader counting held/failed predictions is not counting a
+    tautology among them, and so a failure here reads as what it is: not a
+    surprising fact about this history, but a broken scorer.
+    """
+    statements = dict(SELF_CHECKS)
+    r4 = report["candidates"]["R4"]["renames"]
+    total_idents = report["idents_total"]
+    return {
+        "S1": {
+            "statement": statements["S1"],
+            "outcome": "held" if r4 == total_idents else "failed",
+            "evidence": f"R4 renames={r4} of {total_idents} idents",
+        },
     }
 
 
@@ -1458,6 +1528,11 @@ def main() -> int:
             f"  {rule_id:<6} {row['residual']:>9} {row['renames']:>9}   "
             f"{row['description']}"
         )
+    print()
+    print("SELF-CHECKS (wiring assertions, NOT predictions)")
+    for sid, _ in SELF_CHECKS:
+        row = report["self_checks"][sid]
+        print(f"  {sid}  {row['outcome']:<7} {row['evidence']}")
     print()
     print("PREDICTIONS (fixed before the run; a failure is a finding)")
     for pid, _ in PREDICTIONS:
