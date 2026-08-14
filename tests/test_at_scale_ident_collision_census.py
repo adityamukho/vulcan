@@ -21,6 +21,7 @@ from evals.at_scale.probe_ident_collision_census import (
     ENTITY_TYPES,
     PREDICTIONS,
     RULES,
+    SELF_CHECKS,
     SHAPES,
     EntityInput,
     build_report,
@@ -28,6 +29,7 @@ from evals.at_scale.probe_ident_collision_census import (
     collect_inputs,
     current_ident,
     evaluate_predictions,
+    evaluate_self_checks,
     group_by_ident,
     inputs_from_commit_extraction,
     main,
@@ -639,6 +641,68 @@ class TestPredictions:
         assert row["outcome"] == "failed"
         assert "module 1/1 = 1.000" in row["evidence"]
 
+    def test_P2_is_not_evaluable_on_a_zero_offender_corpus(self):
+        """P2's old evaluator used max() over SHAPES, which returns the FIRST
+        maximal element -- and SHAPES[0] is "leading-underscore". With every
+        count at 0 it named leading-underscore the winner and recorded "held".
+        A zero-offender run clears the validity gate, so that laundered "held"
+        reached the committed artifact.
+
+        Counterfactual: the max()-based evaluator returns "held" here.
+        """
+        report = _report_over([_fn("a/b.py", "solo"), _fn("a/b.py", "other")])
+        # The corpus is valid -- this is not a run that measured nothing.
+        assert report["offenders_total"] == 0
+        assert measurement_invalid(report) is None
+
+        row = evaluate_predictions(report)["P2"]
+        assert row["outcome"] == "failed"
+        assert row["evidence"].startswith("not evaluable: no offenders in this corpus")
+
+    def test_P2_does_not_treat_an_exact_tie_as_dominance(self):
+        """"Dominant" means strictly more than the runner-up. max()'s
+        first-wins bias read a tie as a win, and the old evidence string showed
+        only the winner, so the tie was invisible to a reader.
+
+        Counterfactual: with a >= comparison this records "held"; with the
+        runner-up omitted from the evidence, a reader cannot tell it was 1-1.
+        """
+        # One leading-underscore pair and one case-only pair: 1 each.
+        inputs = [
+            _fn("a/b.py", "_foo"), _fn("a/b.py", "foo"),
+            _fn("c/d.py", "Bar"), _fn("c/d.py", "bar"),
+        ]
+        report = _report_over(inputs)
+        assert report["offenders_by_shape"]["leading-underscore"] == 1
+        assert report["offenders_by_shape"]["case-only"] == 1
+
+        row = evaluate_predictions(report)["P2"]
+        assert row["outcome"] == "failed"
+        assert "leading-underscore=1" in row["evidence"]
+        assert "runner-up case-only=1" in row["evidence"]
+
+    def test_P2_holds_on_a_genuine_win_and_names_the_runner_up(self):
+        """The counterfactual for both tests above: an evaluator hard-wired to
+        "failed" for P2 passes them and fails this one.
+        """
+        inputs = _known_collision_inputs() + [
+            _fn("c/d.py", "Bar"), _fn("c/d.py", "bar"),
+        ]
+        report = _report_over(inputs)
+        row = evaluate_predictions(report)["P2"]
+        assert row["outcome"] == "held"
+        assert "leading-underscore=3" in row["evidence"]
+        assert "runner-up case-only=1" in row["evidence"]
+
+    def test_the_retired_P5_label_is_not_reused(self):
+        """P5 was an identity -- R4 appends a hash suffix unconditionally, so
+        no run clearing the gate could falsify it. It moved to self_checks.
+        Reusing the label for a different claim would make this artifact and
+        the plan disagree about what P5 ever meant.
+        """
+        assert "P5" not in dict(PREDICTIONS)
+        assert [pid for pid, _ in PREDICTIONS] == ["P1", "P2", "P3", "P4"]
+
     def test_P4_names_the_empty_denominator_rather_than_dividing_by_zero(self):
         """A function-only corpus cannot rule on P4 at all. Recorded as
         "failed" -- held/failed is pinned by test_every_declared_prediction_is
@@ -649,6 +713,52 @@ class TestPredictions:
         assert row["outcome"] == "failed"
         assert "not evaluable: no module idents in this corpus" in row["evidence"]
         assert "0/0" not in row["evidence"].split("(")[0]
+
+
+class TestSelfChecks:
+    def test_the_self_check_holds_on_a_correctly_scored_report(self):
+        """The corpus carries a NON-colliding ident on purpose. Every ident in
+        _known_collision_inputs() is an offender, so a rename counter degraded
+        to count only colliding idents would still agree with the total there
+        and S1 would not fire. The solo ident is what makes that bug visible --
+        the same counterfactual Task 3's test_R4_renames_every_ident uses.
+        """
+        report = _report_over(_known_collision_inputs() + [_fn("z/z.py", "solo")])
+        assert set(report["self_checks"]) == {sid for sid, _ in SELF_CHECKS}
+        assert report["idents_total"] == 4
+        assert report["offenders_total"] == 3
+        assert report["self_checks"]["S1"]["outcome"] == "held"
+
+    def test_the_self_check_reports_a_failure_when_rename_accounting_breaks(self):
+        """The whole point of keeping S1. R4 appends a hash suffix to every
+        ident by construction, so a rename count below the ident total means
+        score_rule LOST idents -- and then every other rule's rename number in
+        the table is suspect too.
+
+        The report is degraded directly rather than by ablating score_rule,
+        because a self-check that only fires when its own source is edited is
+        untestable in the suite that has to prove it fires at all.
+
+        Counterfactual: a self-check hard-wired to "held" -- exactly the shape
+        S1 replaced -- passes the test above and fails this one.
+        """
+        report = _report_over(_known_collision_inputs())
+        assert report["candidates"]["R4"]["renames"] == report["idents_total"]
+
+        report["candidates"]["R4"]["renames"] -= 1
+        row = evaluate_self_checks(report)["S1"]
+        assert row["outcome"] == "failed"
+        assert "R4 renames=2" in row["evidence"]
+        assert "idents_total=3" in row["evidence"]
+
+    def test_self_checks_are_reported_apart_from_predictions(self):
+        """A reader tallying held/failed predictions must not be counting a
+        by-construction invariant among them. S1 was P5 until review found no
+        run clearing the gate could falsify it.
+        """
+        report = _report_over(_known_collision_inputs())
+        assert set(report["predictions"]).isdisjoint(report["self_checks"])
+        assert "S1" not in report["predictions"]
 
 
 class TestCli:
@@ -685,6 +795,14 @@ class TestCli:
         assert "vendor/*" in out
         # The finding itself must not be reported as an error.
         assert "INVALID MEASUREMENT" not in out
+        # Self-checks under their own heading, after the predictions block, so
+        # a reader tallying held/failed predictions is not counting a
+        # by-construction invariant among them.
+        assert "SELF-CHECKS" in out
+        assert out.index("PREDICTIONS") < out.index("SELF-CHECKS")
+        predictions_block = out[out.index("PREDICTIONS"):out.index("SELF-CHECKS")]
+        assert "S1" not in predictions_block
+        assert "P5" not in out
 
     def test_the_cli_exits_nonzero_only_on_an_invalid_measurement(
         self, monkeypatch, capsys

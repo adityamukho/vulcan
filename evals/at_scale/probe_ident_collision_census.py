@@ -571,8 +571,56 @@ PREDICTIONS: Tuple[Tuple[str, str], ...] = (
            "a module input has no '::' separator to produce an adjacent "
            "hyphen run, so R2 renames a strictly smaller FRACTION of module "
            "idents than of function idents."),
-    ("P5", "R4's rename count equals the total ident count."),
 )
+
+# NOT predictions. A prediction the data cannot contradict is a tautology, and
+# one sitting in the predictions block inflates the held count with something
+# that was never at risk. These are declared self-checks instead: statements
+# that MUST hold by construction, kept because a failure indicts the scorer
+# rather than the design. The model is RULES["R5"], whose description declares
+# it the known-negative control instead of pretending to be a candidate.
+#
+# P5 lived here as a prediction until review: R4 is _ident_hash_suffix, which
+# appends "-{digest}" to every ident unconditionally, so no run that clears the
+# validity gate can falsify it. The label P5 is retired and deliberately not
+# reused, so this artifact and the plan stay legible against each other.
+SELF_CHECKS: Tuple[Tuple[str, str], ...] = (
+    ("S1", "R4 appends a hash suffix to every ident by construction, so its "
+           "rename count must equal the total ident count. If it does not, "
+           "score_rule's rename accounting is broken and every other rule's "
+           "rename number in this table is suspect."),
+)
+
+
+def _outcome_row(statement: str, held: bool, evidence: str) -> Dict[str, Any]:
+    """One {statement, outcome, evidence} row, shared by predictions and
+    self-checks so nothing downstream needs a second shape."""
+    return {
+        "statement": statement,
+        "outcome": "held" if held else "failed",
+        "evidence": evidence,
+    }
+
+
+def evaluate_self_checks(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Score the by-construction invariants. A failure indicts the SCORER.
+
+    This is the rename-accounting analogue of the R5 control: R5 catches a
+    residual counter that reports a known-colliding rule as clean, and S1
+    catches a rename counter that has lost idents. Neither says anything about
+    the design under audit -- which is exactly why they are reported apart from
+    the predictions, where a held/failed tally is meant to be informative.
+    """
+    statements = dict(SELF_CHECKS)
+    r4_renames = report["candidates"]["R4"]["renames"]
+    idents_total = report["idents_total"]
+    return {
+        "S1": _outcome_row(
+            statements["S1"],
+            r4_renames == idents_total,
+            f"R4 renames={r4_renames}, idents_total={idents_total}",
+        ),
+    }
 
 
 def build_report(
@@ -658,6 +706,10 @@ def build_report(
         ),
     }
     report["predictions"] = evaluate_predictions(report)
+    # Reported apart from the predictions on purpose: a reader counting
+    # held/failed predictions must not be counting a by-construction invariant
+    # among them.
+    report["self_checks"] = evaluate_self_checks(report)
     return report
 
 
@@ -673,20 +725,52 @@ def evaluate_predictions(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     leading = shape_counts.get("leading-underscore", 0)
 
     def _row(pid: str, held: bool, evidence: str) -> Dict[str, Any]:
-        return {
-            "statement": statements[pid],
-            "outcome": "held" if held else "failed",
-            "evidence": evidence,
-        }
+        return _outcome_row(statements[pid], held, evidence)
 
     total = report["offenders_total"]
-    dominant = max(
-        (s for s in SHAPES if s != "other"),
-        key=lambda s: shape_counts.get(s, 0),
-        default="other",
-    )
     r5 = report["candidates"]["R5"]["residual"]
-    r4 = report["candidates"]["R4"]["renames"]
+
+    # P2 is ruled by STRICT comparison against the runner-up, not by max().
+    # max() returns the first maximal element and SHAPES[0] is
+    # "leading-underscore", so it named leading-underscore the winner on a
+    # corpus where every count was 0 -- and a zero-offender run clears the
+    # validity gate, so that laundered "held" reached the committed artifact.
+    # The same first-wins bias read an exact tie as a win. This is the defect
+    # P4 was corrected for, in a second place.
+    rivals = sorted(
+        (
+            (shape_counts.get(shape, 0), shape)
+            for shape in SHAPES
+            if shape not in ("other", "leading-underscore")
+        ),
+        reverse=True,
+    )
+    runner_up_count, runner_up = rivals[0]
+    if total == 0:
+        p2_held = False
+        p2_evidence = (
+            "not evaluable: no offenders in this corpus "
+            f"(offenders_total=0, leading-underscore=0)"
+        )
+    elif leading == 0 and runner_up_count == 0:
+        # Offenders exist but every named shape is empty, i.e. they all landed
+        # in "other". Distinct from the case above and worth saying so: "other"
+        # is where an UNPREDICTED collision family surfaces, so this is a
+        # finding, not an empty run.
+        p2_held = False
+        p2_evidence = (
+            "not evaluable: no offender carries a named shape "
+            f"(offenders_total={total}, all in 'other')"
+        )
+    else:
+        # Strict: a tie is not a win. The runner-up is named and counted so a
+        # near-tie is visible without re-running anything -- the old evidence
+        # string showed only the winner, which made a 3-vs-3 read as dominance.
+        p2_held = leading > runner_up_count
+        p2_evidence = (
+            f"leading-underscore={leading}, "
+            f"runner-up {runner_up}={runner_up_count}"
+        )
 
     # P4 is a claim about the SHAPE of R2's rename cost, so it is ruled on
     # fractions rather than on the whole-corpus total, which cannot distinguish
@@ -725,16 +809,10 @@ def evaluate_predictions(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 
     return {
         "P1": _row("P1", total > 3, f"offenders_total={total}"),
-        "P2": _row(
-            "P2",
-            dominant == "leading-underscore",
-            f"dominant shape={dominant} at {shape_counts.get(dominant, 0)}",
-        ),
+        "P2": _row("P2", p2_held, p2_evidence),
         "P3": _row("P3", r5 >= leading and r5 > 0,
                    f"R5 residual={r5}, leading-underscore offenders={leading}"),
         "P4": _row("P4", p4_held, p4_evidence),
-        "P5": _row("P5", r4 == report["idents_total"],
-                   f"R4 renames={r4} of {report['idents_total']} idents"),
     }
 
 
@@ -832,6 +910,16 @@ def main() -> int:
     for pid, _ in PREDICTIONS:
         row = report["predictions"][pid]
         print(f"  {pid}  {row['outcome']:<7} {row['evidence']}")
+    print()
+    # Under its own heading, never inside the predictions block: these hold by
+    # construction, so counting them among the predictions would inflate the
+    # held tally with something that was never at risk.
+    print("SELF-CHECKS (hold by construction; a failure indicts the SCORER)")
+    for sid, _ in SELF_CHECKS:
+        row = report["self_checks"][sid]
+        print(f"  {sid}  {row['outcome']:<7} {row['evidence']}")
+        if row["outcome"] == "failed":
+            print(f"      {row['statement']}")
 
     if report["candidates"]["R5"]["residual"] == 0 and (
         report["offenders_by_shape"]["leading-underscore"] > 0
