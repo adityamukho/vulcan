@@ -116,8 +116,23 @@ def raw_value(inp: EntityInput) -> str:
 
 
 def current_ident(inp: EntityInput) -> str:
-    """The ident production builds for this input, today."""
-    return mcp_server._code_ident(inp.entity_type, inp.file_path, inp.name)
+    """The ident the PRE-#263 rule built for this input.
+
+    FROZEN, and deliberately no longer `mcp_server._code_ident`. This whole
+    artifact is the audit that CHOSE the current rule: its PREDICTIONS block was
+    fixed before any data existed, and P3/P4 are statements about R5 and R2 as
+    measured against the old baseline. Re-baselining this onto whatever
+    production does today would silently re-evaluate those predictions against a
+    DIFFERENT experiment while still printing them as "held" -- destroying the
+    one property that makes a pre-registered prediction worth anything.
+
+    So this probe reproduces the historical measurement forever, and does NOT
+    track production. The forward guard against a regression in the shipped rule
+    is TestIdentCollisionRegression263 in tests/test_mcp_server.py; a census of
+    NEW history under the shipped rule needs its own probe (filed as a
+    follow-up), not a mutation of this one.
+    """
+    return f":{inp.entity_type}/{_slug_current(raw_value(inp))}"
 
 
 def group_by_ident(
@@ -277,7 +292,15 @@ def classify_shapes(members: Sequence[EntityInput]) -> Set[str]:
 
 
 def _slug_current(value: str) -> str:
-    """_canonical_ident's slug, verbatim (mcp_server.py:4097-4098)."""
+    """The PRE-#263 slug: '_' mapped to '-', then hyphen runs collapsed.
+
+    FROZEN. This was `_canonical_ident`'s slug verbatim when the audit ran;
+    production has since moved to R3 (#263). It is kept as a hand copy rather
+    than re-pointed at production for the reason in `current_ident`: this
+    artifact must keep reproducing the experiment its predictions were
+    registered against. The name is left as `_slug_current` so the recorded
+    report and this file stay legible against each other.
+    """
     slug = re.sub(r"[^a-z0-9-]", "-", value.lower())
     return re.sub(r"-+", "-", slug).strip("-")
 
