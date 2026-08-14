@@ -132,3 +132,35 @@ subprocess via `subprocess.run` to prove the index is actually shared via
 the filesystem/OS page cache, not via any in-process Python state — mirrors
 the existing DB lock-retry cluster's "spawn a real subprocess to
 manufacture a real condition" pattern.
+
+## Performance guards count operations, never wall clock
+
+A performance regression test asserts on a **count that expresses the defect
+axis** — write calls, structures built, pairs evaluated — not on elapsed
+seconds. Counts are deterministic; elapsed seconds are a property of the
+machine and whatever else is running on it, so a wall-clock assertion fails
+on a shared or contended CI runner and gets attributed to whatever change
+happens to be in flight (#261, where a load-sensitive failure was twice read
+as a real defect on a green `master`).
+
+Worked examples:
+
+- `test_per_commit_writes_do_not_scale_with_entity_count` and
+  `test_per_commit_writes_stay_in_the_forward_walk_s_range` (#233) pin
+  per-commit write calls at a fixed commit count, not run time.
+- `test_matcher_per_pair_setup_does_not_scale_with_pool_size` (#261, replacing
+  a 12-second bound) counts the O(pool)-sized structures the rename matcher
+  builds and asserts the number is flat as the pool triples.
+
+Two things such a test needs:
+
+- **A positive control.** A flat or small count proves nothing unless the
+  larger input really did more work, so assert that too (the matcher test
+  requires the 3x pool to evaluate >4x the candidate pairs). Otherwise code
+  that silently stopped working passes.
+- **An ablation.** Reintroduce the defect in the production code, confirm the
+  test fails, and confirm it fails on the *assertion that names the defect* —
+  then revert. A guard that has never been seen red guarantees nothing.
+
+If a timing assertion genuinely cannot be avoided, its margin must be
+justified in a comment against measured numbers, not tuned until it passes.
