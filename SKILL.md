@@ -106,7 +106,9 @@ Before storing a new entity, always check for existing canonical idents and alia
 If a reference matches an existing ident or alias, reuse that exact ident.
 Only mint a new ident if the entity is genuinely new.
 
-Canonical ident form: lowercase, hyphens only — `:decision/redis` not `:decision/Redis_cache`.
+Canonical ident form: lowercase; `_` and `-` are both preserved, every other character becomes `-`; leading/trailing hyphens are stripped (underscores are not). So `Redis_cache` → `:decision/redis_cache`, and `pydantic.v2` → `:dependency/pydantic-v2`.
+
+Underscores are preserved deliberately (#263): folding `_` into `-` made `foo` and `_foo` the same entity. For the same reason hyphen runs are **not** collapsed, so `a  b` → `a--b`, not `a-b`.
 
 Allowed entity types: `:decision/`, `:preference/`, `:constraint/`, `:dependency/`, `:module/`, `:function/`, `:class/`, `:variable/`, `:field/` (code structure — auto-ingested); `:commit/`, `:tag/`, `:ingestion/` are system-only (written by `minigraf_ingest_git`), do not write to them directly
 Required attribute on all types: `:description`
@@ -299,6 +301,10 @@ Vendored/third-party/generated paths are skipped for AST extraction by default (
 
 Do not write to `:ingestion/watermark` or any `:ingestion/` entity directly.
 
+**Graph format version.** Ingestion stamps `:ingestion/format-version` on a new graph and refuses to run against a graph stamped at a different version — including a graph with no stamp at all, which means it predates the stamp. The check runs before any write, so a refused run leaves the graph untouched.
+
+There is **no migration**. Entity idents are recomputed from `(entity type, file path, name)` on every run rather than read back, so ingesting an old-rule graph with new-rule code would create a second, forked entity for everything already stored, silently and with no error. The supported recovery is to re-ingest into a **fresh graph path**: point `MINIGRAF_GRAPH_PATH` at a new file, or delete the existing graph along with its `.fts.sqlite3` index. Re-running ingestion over the existing file does not repair it.
+
 ### minigraf_ingest_status
 
 Poll the current git ingestion progress.
@@ -337,7 +343,9 @@ potentially stale watermark.
 
 `minigraf_ingest_git` writes the following entity types. All relationship attributes (`:parent`, `:introduced-by`, `:modified-in`, `:contains`, `:depends-on`, `:tagged-commit`, `:resolves-to`) are stored as keyword entity references — they bypass string-value schema validation by design and are directly traversable in queries.
 
-**Ident slugging:** non-alphanumeric characters in paths and names are replaced with hyphens and consecutive hyphens collapsed. Examples: `src/auth.py` → `:module/src-auth-py`; function `login` in `src/auth.py` → `:function/src-auth-py-login`.
+**Ident slugging:** characters outside `[a-z0-9_-]` in paths and names are replaced with hyphens; underscores are kept and hyphen runs are **not** collapsed. Examples: `src/auth.py` → `:module/src-auth-py`; function `login` in `src/auth.py` → `:function/src-auth-py--login` (the `::` join survives as `--`); `mcp_server.py` → `:module/mcp_server-py`.
+
+Both rules exist to keep distinct entities apart (#263): folding `_` into `-` made `foo` and `_foo` one entity, and collapsing hyphen runs let a path character stand in for the `::` join. Note this means idents minted before this change do not match idents minted after it — see `:ingestion/format-version` below.
 
 #### `:type/commit` — one per git commit
 Ident: `:commit/<first-12-chars-of-hash>`

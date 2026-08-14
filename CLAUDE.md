@@ -46,6 +46,22 @@ process that opens the graph. See #241.
 The fact index is bi-temporal: it includes historical (retracted/superseded) facts
 alongside current ones, labeled with their validity window.
 
+**Graph format version — there is no migration, by design.** `GRAPH_FORMAT_VERSION`
+(mcp_server.py) is stamped as `:ingestion/format-version` and ingestion refuses to
+run against any other version, including an absent stamp (which means the graph
+predates it). Bump it whenever a change makes stored facts unreadable by current
+code — today that means the ident rule in `_canonical_ident` (#263), since
+ingestion recomputes idents from `(type, path, name)` on every run rather than
+reading them back, so an old-rule graph read by new-rule code silently FORKS every
+entity instead of erroring.
+
+Do not propose a migration for this. The standing decision is that any graph built
+before #222 closes gets **rebuilt into a fresh graph path**, never migrated or
+re-ingested in place: several #222-arc fixes (#235, #251/#253, #238/#245, phase 2d)
+write facts that do not self-heal on a later ingest, so those graphs are condemned
+independently of any one bug. Re-running ingestion over an existing file repairs
+nothing. See `docs/superpowers/specs/2026-08-14-ident-rule-r3-and-format-version-design.md`.
+
 **Single-handle invariant.** At most one live `MiniGrafDb` handle may exist per
 process. Two handles on one file each cache their own `page_count` and corrupt
 each other — the flaky `Page N out of bounds (total pages: M)` (#251, #253,
