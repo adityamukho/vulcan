@@ -1308,6 +1308,100 @@ The one non-uniform site is line 6668, where the handle is an argument rather th
 
 **Do not** widen any lease beyond the region that uses `db`. A lease held across code that does not need it re-creates the "hold the lock longer than necessary" problem that `_db = None` was introduced to solve.
 
+- [ ] **Step 4b: Replace the test that pins `get_db`'s internals**
+
+`TestGetDbConcurrentResetRace` (tests/test_mcp_server.py, locate by name) pins
+#122 against `get_db()`'s own body via `sys.settrace`, and it is the sole
+reason `TestNoDirectDbGlobalAssignment` carries a `_db = real_db` exclusion.
+Deleting `get_db` without handling it leaves a test tracing a function that no
+longer exists, and an exclusion protecting nothing.
+
+Delete that class and add this in its place:
+
+```python
+class TestLeaseAcquireCannotBeRacedByReset:
+    """Replaces TestGetDbConcurrentResetRace, which pinned #122 against
+    get_db()'s internals.
+
+    #122 was: get_db() read the `_db` global TWICE -- once in `if _db is None`,
+    once again in `return _db` -- so a reset landing between those two reads
+    returned None while a live handle existed. Reading the global exactly once
+    was the fix.
+
+    Under the lease manager that stops being a read-discipline and becomes
+    structural: try_acquire does its check, its open and its count increment
+    inside ONE `with self._lock:`, and reset() takes the same lock, so no reset
+    can land inside the window at all. This pins the SERIALIZATION rather than
+    the read count, because the read count is no longer what makes it safe.
+    """
+
+    def test_reset_cannot_interleave_inside_an_acquire(self, tmp_path, monkeypatch):
+        import threading
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+
+        inside = threading.Event()
+        release = threading.Event()
+        outcome = {}
+        real_open = mcp_server._open_for_lease
+
+        def slow_open(path):
+            # Runs inside try_acquire, with the manager lock held.
+            handle = real_open(path)
+            inside.set()
+            release.wait(timeout=5)
+            return handle
+
+        monkeypatch.setattr(mcp_server, "_open_for_lease", slow_open)
+
+        def acquirer():
+            with mcp_server.db_lease() as db:
+                outcome["handle"] = db._handle
+
+        t = threading.Thread(target=acquirer)
+        t.start()
+        try:
+            assert inside.wait(timeout=5), "never reached the open inside try_acquire"
+            reset_done = threading.Event()
+
+            def resetter():
+                mcp_server._reset_db_state()
+                reset_done.set()
+
+            r = threading.Thread(target=resetter)
+            r.start()
+            assert not reset_done.wait(timeout=0.5), (
+                "reset() completed while try_acquire held the manager lock -- "
+                "the window #122 was about is open again"
+            )
+            release.set()
+            r.join(timeout=5)
+            assert reset_done.is_set(), "reset never completed once the lock freed"
+        finally:
+            release.set()
+            t.join(timeout=5)
+
+        assert outcome.get("handle") is not None, (
+            "the acquiring thread got no handle despite holding a live lease"
+        )
+        mcp_server._reset_db_state()
+```
+
+Then remove the `_db = real_db` exclusion from
+`TestNoDirectDbGlobalAssignment.test_no_test_or_eval_assigns_the_db_global_directly`
+(the `hits = "\n".join(...)` filter and its comment). With
+`TestGetDbConcurrentResetRace` gone, the last direct assignment to the global
+is gone with it, and the guard must be unconditional again.
+
+**Ablation required:** the new test must fail if the serialization breaks.
+Demonstrate it by temporarily making `_DbLeaseManager.reset()` skip its
+`with self._lock:` (operate on the fields directly), confirming
+`test_reset_cannot_interleave_inside_an_acquire` FAILS with the "window ... is
+open again" message, then restoring it. Paste both outputs.
+
 - [ ] **Step 5: Delete `get_db`**
 
 Delete `mcp_server.py:3335-3357` entirely. Its "reads the global exactly once" guarantee (#122) is now structural: the manager returns the handle from under its own lock, so there is no global for a background thread to race.
@@ -1331,7 +1425,11 @@ Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestHandlersLeaseRath
 Expected: all 6 PASS.
 
 Run: `.venv/bin/python -m pytest tests/test_mcp_server.py -q`
-Expected: 1351 passed, 1 xfailed.
+Expected: **1357 passed, 1 xfailed** — 1351 entering, plus 4 parametrisations
+of the handler test, `test_open_db_leaves_no_handle_open`, `test_get_db_is_gone`
+and `test_reset_cannot_interleave_inside_an_acquire`, minus the deleted
+`TestGetDbConcurrentResetRace`. Investigate any other difference rather than
+adjusting this number.
 
 - [ ] **Step 8: Commit**
 
