@@ -159,9 +159,9 @@
   "offenders_by_shape": {
     "leading-underscore": 7,
     "case-only": 0,
-    "separator-vs-path": 1,
+    "separator-vs-path": 0,
     "cross-producer": 0,
-    "other": 1
+    "other": 2
   },
   "candidates": {
     "R1": {
@@ -300,7 +300,7 @@
       }
     }
   },
-  "timestamp": "2026-08-14T01:46:18Z",
+  "timestamp": "2026-08-14T02:21:03Z",
   "predictions": {
     "P1": {
       "statement": "The true collision count exceeds the 3 #257's census found, because that census can only see collisions whose loser was closed and reopened.",
@@ -310,7 +310,7 @@
     "P2": {
       "statement": "leading-underscore STRICTLY outnumbers every other named shape among all offenders.",
       "outcome": "held",
-      "evidence": "leading-underscore=7, runner-up separator-vs-path=1"
+      "evidence": "leading-underscore=7, runner-up separator-vs-path=0"
     },
     "P3": {
       "statement": "R5, the control, reports a nonzero residual at least as large as the leading-underscore offender count.",

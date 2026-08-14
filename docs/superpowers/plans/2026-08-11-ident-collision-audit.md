@@ -356,12 +356,19 @@ class TestClassifyShapes:
         assert "case-only" in shapes
         assert "leading-underscore" not in shapes
 
-    def test_inputs_from_different_files_are_separator_vs_path(self):
-        """The path/name boundary fell differently on the two inputs -- the
-        case _code_ident's own docstring anticipates.
+    def test_a_name_that_is_a_trailing_path_segment_is_separator_vs_path(self):
+        """One input's NAME is a trailing whole path segment of the other's
+        file_path -- the case _code_ident's own docstring anticipates. These
+        two really collide, and "the paths differ" is NOT the test: a plain
+        paths-differ pair and mcp_server.py against a name of "server" are
+        both pinned as negatives.
         """
-        members = [_fn("a/b.py", "c"), _fn("a/b_py", "c")]
-        assert "separator-vs-path" in classify_shapes(members)
+        members = [
+            _fn("src/utils_py/handlers", "utils"),
+            _fn("src/utils.py", "handlers.utils"),
+        ]
+        assert current_ident(members[0]) == current_ident(members[1])
+        assert classify_shapes(members) == {"separator-vs-path"}
 
     def test_import_and_in_tree_module_are_cross_producer(self):
         members = [
@@ -451,6 +458,31 @@ def _strip_private(name: Optional[str]) -> str:
     return f"{head}{dot}{stripped}" if dot else stripped
 
 
+def _name_is_trailing_path_segment(named: EntityInput, other: EntityInput) -> bool:
+    """True if `named`'s name is a trailing WHOLE path segment of `other`'s
+    file_path, extension stripped -- the design spec's definition of
+    separator-vs-path verbatim.
+
+    WHOLE-SEGMENT, not raw string suffix: "mcp_server.py" does NOT end with the
+    segment "server". mcp_server._path_segments and
+    mcp_server._segments_end_with (mcp_server.py:4102-4117) already do exactly
+    this, so they are reused rather than re-implemented -- READING the audited
+    module is fine, only mutating it is forbidden. Casefolded on both sides for
+    the same reason the leading-underscore check is: the ident lowercases, so an
+    exact-case comparison would drop a genuine instance into "other".
+    """
+    if not named.name:
+        return False
+    segments = mcp_server._path_segments(other.file_path)
+    if not segments:
+        return False
+    segments = segments[:-1] + [Path(segments[-1]).stem]
+    return mcp_server._segments_end_with(
+        [seg.casefold() for seg in segments],
+        [seg.casefold() for seg in mcp_server._path_segments(named.name)],
+    )
+
+
 def _pair_shapes(a: EntityInput, b: EntityInput) -> Set[str]:
     """Every collision family this pair belongs to.
 
@@ -492,10 +524,15 @@ def _pair_shapes(a: EntityInput, b: EntityInput) -> Set[str]:
         and _strip_private(a.name).casefold() == _strip_private(b.name).casefold()
     ):
         shapes.add("leading-underscore")
-    if a.file_path != b.file_path or (a.name is None) != (b.name is None):
-        # The two inputs put the path/name boundary in different places, so
-        # the ident cannot say where the path ended -- the collision family
-        # _code_ident's docstring already anticipates.
+    # The spec's definition, narrowly: one input's NAME is a trailing whole
+    # path segment of the other's file_path, so the ident cannot say where the
+    # path ended and the name began -- the family _code_ident's docstring
+    # anticipates. This deliberately does NOT fire merely because the two
+    # file_paths differ: "the paths differ" describes most collisions on any
+    # history and says nothing about a path/name boundary. See
+    # _name_is_trailing_path_segment, which reuses mcp_server._path_segments
+    # and mcp_server._segments_end_with for the whole-segment comparison.
+    if _name_is_trailing_path_segment(a, b) or _name_is_trailing_path_segment(b, a):
         shapes.add("separator-vs-path")
     return shapes
 
@@ -505,9 +542,12 @@ def classify_shapes(members: Sequence[EntityInput]) -> Set[str]:
 
     An offender may carry more than one label (a cross-producer collision is
     usually also something else), so this returns a set rather than picking a
-    single winner. "other" is emitted only when nothing else applied: it is
-    where an unpredicted collision family would surface, and collapsing it
-    into any named label would hide exactly the finding worth having.
+    single winner. "other" is emitted when nothing BUT "cross-producer"
+    applied -- not when no label at all applied. "cross-producer" says which
+    call sites the two inputs came from, never what made their values collide,
+    so an offender carrying only that label is still unexplained and belongs in
+    the bucket where an unpredicted collision family surfaces. Collapsing
+    "other" into any named label would hide exactly the finding worth having.
     """
     shapes: Set[str] = set()
     for a, b in combinations(members, 2):

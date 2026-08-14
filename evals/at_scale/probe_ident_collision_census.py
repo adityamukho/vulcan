@@ -130,7 +130,7 @@ def group_by_ident(
     touched its file, and counting occurrences would report every entity in
     the repository as colliding with itself.
     """
-    groups: Dict[str, Dict[EntityInput, None] ] = {}
+    groups: Dict[str, Dict[EntityInput, None]] = {}
     for inp in inputs:
         groups.setdefault(ident_fn(inp), {})[inp] = None
     return {ident: list(members) for ident, members in groups.items()}
@@ -166,6 +166,41 @@ def _strip_private(name: Optional[str]) -> str:
     head, dot, last = name.rpartition(".")
     stripped = last.lstrip("_")
     return f"{head}{dot}{stripped}" if dot else stripped
+
+
+def _name_is_trailing_path_segment(named: EntityInput, other: EntityInput) -> bool:
+    """True if `named`'s name is a trailing WHOLE path segment of `other`'s
+    file_path, extension stripped.
+
+    This is the design spec's definition of separator-vs-path verbatim (spec
+    line 189): "the `name` of one input appears as a trailing path segment of
+    another's `file_path`" -- the case _code_ident's own docstring anticipates,
+    where the ident cannot say whether the last component came from the path or
+    from the name.
+
+    WHOLE-SEGMENT, not raw string suffix. `mcp_server.py` does NOT end with the
+    segment `server`: the substring is there, but not as its own path
+    component, and calling that a path/name boundary would relabel ordinary
+    underscore collisions. The boundary logic is mcp_server._path_segments plus
+    mcp_server._segments_end_with (mcp_server.py:4102-4117), reused rather than
+    re-implemented for the third time -- reading the audited module is fine
+    here, only MUTATING it is forbidden.
+
+    Casefolded on both sides for the same reason the leading-underscore check
+    is: the ident lowercases, so `src/auth/Login.py` against a name of `login`
+    is a genuine instance of this family, and an exact-case comparison would
+    drop it into "other", which is reserved for UNPREDICTED families.
+    """
+    if not named.name:
+        return False
+    segments = mcp_server._path_segments(other.file_path)
+    if not segments:
+        return False
+    segments = segments[:-1] + [Path(segments[-1]).stem]
+    return mcp_server._segments_end_with(
+        [seg.casefold() for seg in segments],
+        [seg.casefold() for seg in mcp_server._path_segments(named.name)],
+    )
 
 
 def _pair_shapes(a: EntityInput, b: EntityInput) -> Set[str]:
@@ -209,10 +244,14 @@ def _pair_shapes(a: EntityInput, b: EntityInput) -> Set[str]:
         and _strip_private(a.name).casefold() == _strip_private(b.name).casefold()
     ):
         shapes.add("leading-underscore")
-    if a.file_path != b.file_path or (a.name is None) != (b.name is None):
-        # The two inputs put the path/name boundary in different places, so
-        # the ident cannot say where the path ended -- the collision family
-        # _code_ident's docstring already anticipates.
+    # The spec's definition, narrowly: one input's NAME is a trailing whole
+    # path segment of the other's file_path, so the ident cannot say where the
+    # path ended and the name began -- the family _code_ident's docstring
+    # anticipates. This deliberately does NOT fire merely because the two
+    # file_paths differ: "the paths differ" describes most collisions on any
+    # history and says nothing about a path/name boundary. See
+    # _name_is_trailing_path_segment.
+    if _name_is_trailing_path_segment(a, b) or _name_is_trailing_path_segment(b, a):
         shapes.add("separator-vs-path")
     return shapes
 
@@ -222,9 +261,12 @@ def classify_shapes(members: Sequence[EntityInput]) -> Set[str]:
 
     An offender may carry more than one label -- the per-pair checks are
     independent, not exclusive, so a cross-producer collision is usually also
-    something else. "other" is emitted only when nothing else applied: it is
-    where an unpredicted collision family would surface, and collapsing it
-    into any named label would hide exactly the finding worth having.
+    something else. "other" is emitted when nothing BUT "cross-producer"
+    applied -- not when no label at all applied. "cross-producer" says which
+    call sites the two inputs came from, never what made their values collide,
+    so an offender carrying only that label is still unexplained and belongs in
+    the bucket where an unpredicted collision family surfaces. Collapsing
+    "other" into any named label would hide exactly the finding worth having.
     """
     shapes: Set[str] = set()
     for a, b in combinations(members, 2):
@@ -459,9 +501,19 @@ def collect_inputs(
     runs, so this audit measures the code that actually produces idents in
     production rather than a reimplementation that could drift from it.
 
-    Walking A/M/R across every commit reaches every version of every file that
-    ever existed on the branch: each distinct blob at each path is introduced
-    by exactly one such entry, so no separate initial-tree pass is needed.
+    Every commit's file_results are consumed, filtered only on `extracted is
+    None` -- so A, M and R contribute, and so does any other status the raw
+    parse reports (T/typechange), which carries an extraction like any other
+    content change. That reaches every version of every file that ever existed
+    on the branch: each distinct blob at each path is introduced by exactly one
+    such entry, so no separate initial-tree pass is needed.
+
+    That coverage claim rests on mcp_server, not on this function.
+    _git_diff_tree_raw passes --root (mcp_server.py:4406), so the initial
+    commit reports its whole tree as adds instead of an empty diff, and merge
+    commits fall back to the --cc combined diff (_git_diff_tree_combined_raw,
+    mcp_server.py:4479) plus the one-parent-side supplement above it. A path a
+    merge resolved to a content no parent carried would otherwise be invisible.
 
     Inputs are deduplicated here. A name unchanged across 400 commits costs one
     entry, not 400.
@@ -691,6 +743,12 @@ def build_report(
         "commits": diagnostics["commits"],
         "extraction_failures": diagnostics["extraction_failures"],
         "failed_commits": diagnostics["failed_commits"],
+        # NAMED for the (entity_type, file_path, name) triple the question is
+        # framed on, but counted over DISTINCT EntityInputs, whose key is the
+        # 4-tuple including `producer`. The two coincide only while
+        # cross-producer is 0; on a history with gitlinks, one triple reached
+        # from two producers counts twice here, so read this as "distinct
+        # inputs", not "distinct triples".
         "triples_total": len(inputs),
         "idents_total": len(baseline),
         "offenders": per_type,

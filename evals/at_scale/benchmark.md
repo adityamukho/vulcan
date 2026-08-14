@@ -874,22 +874,35 @@ is a bound; only the inputs give an exact one.
 | &nbsp;&nbsp;variable | 0 of 232 |
 | &nbsp;&nbsp;field | 0 of 67 |
 
-**By shape** (an offender may carry more than one label; `other` is emitted only
-when no named shape applied, so it is where an unpredicted family surfaces):
+**The `module` row pools three producers.** `:module/` is one namespace shared by
+in-tree files (`_code_ident("module", path)`), gitlink/submodule paths, and the
+unresolved-import fallback `_canonical_ident("module", specifier)`, so the 133
+module idents are not 133 files. Split by producer over the same head: **57 from
+in-tree files, 76 from unresolved import specifiers, 0 from gitlinks** (this
+repository has no submodules — see finding 4). No module ident is reached from
+more than one producer, which is the same fact `cross-producer = 0` reports, so
+the two counts partition the 133 exactly. Sizing migration cost from `module 133`
+would over-count real file modules by more than 2×.
+
+**By shape** (an offender may carry more than one label; `other` is emitted when
+nothing *but* `cross-producer` applied — not when no label at all applied,
+because `cross-producer` names which call sites the inputs came from and never
+what made their values collide, so an offender carrying only that label is still
+unexplained and belongs where an unpredicted family surfaces):
 
 | Shape | Count |
 |---|---|
 | leading-underscore | 7 |
 | case-only | 0 |
-| separator-vs-path | 1 |
+| separator-vs-path | 0 |
 | cross-producer | 0 |
-| other | 1 |
+| other | 2 |
 
 **The nine offenders in full:**
 
 | Ident | Colliding inputs | Shape |
 |---|---|---|
-| `:module/mcp-server` | import `mcp.server`, import `mcp_server` | separator-vs-path |
+| `:module/mcp-server` | import `mcp.server`, import `mcp_server` | **other** |
 | `:function/tests-test-mcp-server-py-commit` | `tests/test_mcp_server.py` `_commit` / `commit` | leading-underscore |
 | `:function/tests-test-mcp-server-py-snapshot` | `tests/test_mcp_server.py` `_snapshot` / `snapshot` | leading-underscore |
 | `:function/tests-test-mcp-server-py-boom` | `tests/test_mcp_server.py` `_boom` / `boom` | leading-underscore |
@@ -928,10 +941,10 @@ design, not noise). All four held:
 
 | ID | Outcome | Evidence, verbatim |
 |---|---|---|
-| P1 — the true count exceeds the 3 #257's census found | **held** | `offenders_total=9` |
-| P2 — leading-underscore strictly outnumbers every other named shape | **held** | `leading-underscore=7, runner-up separator-vs-path=1` |
-| P3 — R5, the control, reports nonzero residual at least as large as the leading-underscore count | **held** | `R5 residual=9, leading-underscore offenders=7` |
-| P4 — R2's rename cost falls on named entities, not module idents | **held** | `R2 renames module 2/133 = 0.015, function 2058/2058 = 1.000` |
+| P1 — "The true collision count exceeds the 3 #257's census found, because that census can only see collisions whose loser was closed and reopened." | **held** | `offenders_total=9` |
+| P2 — "leading-underscore STRICTLY outnumbers every other named shape among all offenders." | **held** | `leading-underscore=7, runner-up separator-vs-path=0` |
+| P3 — "R5, the control, reports a nonzero residual at least as large as the leading-underscore offender count." | **held** | `R5 residual=9, leading-underscore offenders=7` |
+| P4 — "R2's rename cost falls on named entities, not on module idents: a module input has no `::` separator to produce an adjacent hyphen run, so R2 renames a strictly smaller FRACTION of module idents than of function idents." | **held** | `R2 renames module 2/133 = 0.015, function 2058/2058 = 1.000` |
 
 Self-check (holds by construction; a failure would indict the scorer, not the
 design, which is why it is reported apart from the predictions):
@@ -954,8 +967,13 @@ other row in the candidate table would have been suspect.
    `:function/tests-test-mcp-server-py-snapshot`,
    `:function/evals-at-scale-profile-forward-reconcile-attribution-py-main`),
    confirming the two measurements are of the same phenomenon and that the
-   graph-side number is the bound the design spec said it was. The six the graph
-   could not see are exactly the ones whose loser was never closed and reopened.
+   graph-side number is the bound the design spec said it was. The expected
+   reason the graph missed the other six is the mechanism above — their loser
+   was never closed and reopened, so the introduction branch never re-ran — but
+   this run did not measure that: it never opened a graph, so "six" is a
+   subtraction, not an observation. Nor is 9-vs-3 a controlled comparison: #257
+   measured at 656 commits and this run at 674, so the two counts are at
+   different heads and some of the gap could simply be history added since.
 
 2. **`other` was not empty, and what landed there is a real finding.**
    `:function/tests-test-mcp-server-py-init` collides `__init__` with `_init`.
@@ -976,23 +994,47 @@ other row in the candidate table would have been suspect.
    one ident. This is the single offender R2 does not fix — dropping the hyphen
    collapse changes nothing when there is no hyphen run to preserve — and it is
    why R2's residual is 1 rather than 0. R1 fixes it (`mcp_server` keeps its
-   underscore); so do R3 and R4.
+   underscore); so do R3 and R4. It is the **second** member of `other`, and the
+   shape table now says so: both of its inputs are unresolved import specifiers
+   with `name=None`, so there is no path/name boundary anywhere in the pair and
+   `separator-vs-path` — which asks whether one input's *name* is a trailing
+   whole path segment of the other's `file_path` — cannot apply to it.
 
-4. **No cross-producer and no case-only collisions on this history.** Both
-   counts are 0. `cross-producer` being 0 does not mean the three producers
-   sharing the `:module/` namespace is safe — it means this repository has no
-   gitlinks at all (consistent with #257's `gitlink events: 0`), so the
-   code/gitlink arm of that risk was never exercised. Absence of opportunity,
-   not absence of risk.
+4. **No cross-producer, no case-only and no separator-vs-path collisions on this
+   history.** All three counts are 0. `cross-producer` being 0 does not mean the
+   three producers sharing the `:module/` namespace is safe — it means this
+   repository has no gitlinks at all (consistent with #257's `gitlink events:
+   0`), so the code/gitlink arm of that risk was never exercised. Absence of
+   opportunity, not absence of risk. `separator-vs-path` at 0 is a *weaker*
+   result than it looks, for a structural reason: an ident carries its
+   entity_type, so every member of an offender group shares one, and the pairs
+   that most obviously satisfy the definition (a `module` at `src/auth/login.py`
+   against a `function` `login` in `src/auth.py`) span two types and therefore
+   can never be one group's members. The family is reachable within a single
+   type — `src/utils_py/handlers::utils` and `src/utils.py::handlers.utils` both
+   slug to `:function/src-utils-py-handlers-utils`, and the test suite pins that
+   pair — but it takes a path shape this repository does not contain. Read the 0
+   as "the `::` mitigation `_code_ident`'s docstring describes held on *this*
+   history", not as "the mitigation is airtight".
 
 5. **Every zero-residual rule is a near-total rename.** The cheapest one, R1,
    still moves 2710 of 2780 idents (97.5%); R3 moves 2721 (97.9%) and R4 moves
    all 2780. There is no candidate here that fixes the 9 while leaving the other
-   2771 idents where they are. The per-type split shows why: R1 and R3 spare
-   only module idents (74/133 renamed) because a module's raw value is a bare
-   path with no `::` separator and often no underscore; every function, class,
-   variable and field ident carries a `::` that changes under any charset or
-   collapse change.
+   2771 idents where they are. The per-type split shows why, and the two rules
+   spare different things:
+
+   - **R3** spares only module idents (74/133 renamed, 0 spared anywhere else).
+     It drops the collapse, and every named ident's raw value carries a `::`
+     whose adjacent hyphen run the collapse used to eat, so every function,
+     class, variable and field ident moves. A module's raw value is a bare path
+     with no `::`, so 59 of them are untouched.
+   - **R1** spares those same 59 module idents *and* 11 named ones (function
+     2049/2058, class 289/290, variable 231/232, field 67/67 → 9 + 1 + 1 + 0
+     spared). R1 changes only the charset, and `::` slugs to `-` under both the
+     current rule and R1, so a named ident whose path and name contain no
+     underscore at all is untouched — `install.py::main` is the shape.
+
+   The two together are 70 idents, exactly the 2780 − 2710 R1 does not rename.
 
 **Conclusion: a fix needs a migration for existing graphs, not only a forward
 change** — the cheapest rule that eliminates all 9 collisions (R1) still renames

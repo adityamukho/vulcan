@@ -16,6 +16,7 @@ import sys
 
 import pytest
 
+import mcp_server
 from evals.at_scale import probe_ident_collision_census
 from evals.at_scale.probe_ident_collision_census import (
     ENTITY_TYPES,
@@ -24,6 +25,7 @@ from evals.at_scale.probe_ident_collision_census import (
     SELF_CHECKS,
     SHAPES,
     EntityInput,
+    _slug_current,
     build_report,
     classify_shapes,
     collect_inputs,
@@ -140,12 +142,78 @@ class TestClassifyShapes:
         assert "case-only" in shapes
         assert "leading-underscore" not in shapes
 
-    def test_inputs_from_different_files_are_separator_vs_path(self):
-        """The path/name boundary fell differently on the two inputs -- the
-        case _code_ident's own docstring anticipates.
+    def test_a_name_that_is_a_trailing_path_segment_is_separator_vs_path(self):
+        """The spec's definition (design spec line 189): one input's NAME is a
+        trailing whole path segment of the other's file_path, so the ident
+        cannot say where the path ended and the name began -- the family
+        _code_ident's docstring anticipates.
+
+        These two REALLY collide, asserted below, and they are members one
+        offender group could actually hold: an ident carries its entity_type,
+        so every member of a group shares one, and a pair spanning two types
+        (the module src/auth/login.py against the function login in
+        src/auth.py) illustrates the family but can never be an offender.
+
+        Counterfactual: with the old `a.file_path != b.file_path` predicate the
+        label fired on any two inputs from different files, so it never
+        exercised this boundary at all; with a predicate that looks only at
+        file_path and never at `name`, this fails.
+        """
+        members = [
+            _fn("src/utils_py/handlers", "utils"),
+            _fn("src/utils.py", "handlers.utils"),
+        ]
+        assert current_ident(members[0]) == current_ident(members[1])
+        assert classify_shapes(members) == {"separator-vs-path"}
+
+    def test_a_plain_paths_differ_pair_is_not_separator_vs_path(self):
+        """The counterfactual for the test above, and the shape the old
+        predicate got wrong: a/b.py::c against a/b_py::c differ in file_path,
+        but 'c' is nowhere near either path's trailing segment, so nothing here
+        is about a path/name boundary.
+
+        Counterfactual: the old `a.file_path != b.file_path` predicate labels
+        this pair separator-vs-path and this assert fails.
         """
         members = [_fn("a/b.py", "c"), _fn("a/b_py", "c")]
-        assert "separator-vs-path" in classify_shapes(members)
+        assert "separator-vs-path" not in classify_shapes(members)
+
+    def test_an_underscore_inside_a_segment_is_not_a_trailing_segment(self):
+        """Whole-segment, not raw string suffix. 'mcp_server.py' contains
+        'server' but does not END WITH it as its own path component, so a
+        function named server elsewhere is not this family -- it is an
+        underscore/separator artifact, and calling it separator-vs-path would
+        relabel ordinary underscore collisions.
+
+        Counterfactual: a predicate using file_path.endswith(name) (or
+        endswith on the extension-stripped string) labels this pair
+        separator-vs-path.
+        """
+        members = [
+            EntityInput("module", "code", "mcp_server.py", None),
+            _fn("a/b.py", "server"),
+        ]
+        assert "separator-vs-path" not in classify_shapes(members)
+
+    def test_two_unresolved_import_specifiers_are_other_not_separator_vs_path(self):
+        """:module/mcp-server, verbatim from the recorded run: both inputs are
+        unresolved import specifiers with name=None, so there is no path/name
+        boundary anywhere in the pair. What collides them is that '.' and '_'
+        both slug to '-'. Under the old predicate this was labelled
+        separator-vs-path while the write-up's own finding explained it as the
+        slug charset -- the table and the prose disagreeing about one offender.
+
+        Counterfactual: the old predicate's dead `(a.name is None) != (b.name
+        is None)` clause never fires inside an ident group (entity type is
+        fixed, and module always has name=None), so the label came purely from
+        the paths differing, and this assert fails.
+        """
+        members = [
+            EntityInput("module", "import", "mcp.server", None),
+            EntityInput("module", "import", "mcp_server", None),
+        ]
+        assert current_ident(members[0]) == current_ident(members[1])
+        assert classify_shapes(members) == {"other"}
 
     def test_import_and_in_tree_module_are_cross_producer(self):
         members = [
@@ -194,6 +262,51 @@ class TestClassifyShapes:
     def test_every_emitted_label_is_declared_in_SHAPES(self):
         members = [_fn("a/b.py", "_foo"), _fn("a/b.py", "foo")]
         assert classify_shapes(members) <= set(SHAPES)
+
+
+class TestSlugParityWithProduction:
+    """_slug_current is a hand copy of _canonical_ident's slug, and R2 and R5
+    are built on it while the BASELINE is built on the real _code_ident. If the
+    two ever drift, every candidate rule is repriced against a slug production
+    does not use, silently -- the residual and rename columns would still look
+    like measurements.
+
+    Pinned by equality over adversarial values rather than by re-importing the
+    regex, because a copied regex that has drifted still compares equal to
+    itself. Counterfactual: change either side's charset or drop either
+    `re.sub` and these fail.
+    """
+
+    ADVERSARIAL = [
+        "",
+        "::",
+        "---",
+        "_leading",
+        "trailing_",
+        "__dunder__",
+        "mcp.server",
+        "mcp_server",
+        "tests/test_mcp_server.py::_commit",
+        "tests/test_mcp_server.py::commit",
+        "MixedCase/Path.PY::HelperName",
+        "a//b..c__d--e::f",
+        "a/b.py::Cls._x",
+        "9lives/2fast.py::_3d",
+        "evals/at_scale/probe.py::__init__",
+    ]
+
+    @pytest.mark.parametrize("value", ADVERSARIAL)
+    def test_the_hand_copied_slug_still_equals_canonical_ident(self, value):
+        assert f":x/{_slug_current(value)}" == mcp_server._canonical_ident("x", value)
+
+    def test_the_baseline_ident_is_the_hand_copy_over_the_same_raw_value(self):
+        """The other half of the parity: the baseline uses _code_ident, which
+        composes _canonical_ident over raw_value. Counterfactual: a raw_value
+        that built its input with a different separator passes the parametrized
+        test above and fails this one.
+        """
+        inp = _fn("tests/test_mcp_server.py", "_commit")
+        assert current_ident(inp) == f":function/{_slug_current(raw_value(inp))}"
 
 
 def _known_collision_inputs():
