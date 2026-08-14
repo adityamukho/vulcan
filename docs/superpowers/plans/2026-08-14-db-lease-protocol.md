@@ -934,8 +934,8 @@ class TestNoDirectDbGlobalAssignment:
             ["grep", "-n", r"\._db\s*=", str(tmp_path / "canary.py")],
             capture_output=True, text=True,
         ).stdout.strip()
-        assert "canary" not in hits or hits, "the guard's own pattern is broken"
         assert hits, "the guard's pattern matches nothing -- it would fail open"
+        assert "canary.py" in hits, hits
 ```
 
 - [ ] **Step 6: Run the full suite**
