@@ -1202,7 +1202,18 @@ Refs #255"
 
 ---
 
-### Task 5: Convert the synchronous handlers and reshape `open_db`
+### Task 5: Convert every consumer to leases (handlers, `call_tool`, `open_db`, the hook)
+
+> **Tasks 5 and 6 were merged after a sequencing defect was found during
+> execution.** They cannot land separately in either order. Converting handlers
+> first leaves `call_tool` still calling `await _ensure_db_async()`, which
+> populates the `_db` global with a live handle — and the handler's own
+> `db_lease()` then calls `MiniGrafDb.open` on a file already open in this
+> process, which raises. Converting `call_tool` first fails symmetrically: the
+> handler's `get_db()` sees `_db is None`, opens through `_open_db_at_with_retry`,
+> and collides with the handle the manager is already holding. Ten tests drive
+> `call_tool` and would fail either way. The two conversions are one atomic
+> change to a single ownership boundary.
 
 **Files:**
 - Modify: `mcp_server.py:3566`, `:3867`, `:3886`, `:3909`, `:3943`, `:6533`, `:6668`, `:6756`, `:11198` (the nine `get_db()` callers); `:3078` (`open_db`); `:3335-3357` (`get_db`, deleted)
@@ -1425,7 +1436,8 @@ Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestHandlersLeaseRath
 Expected: all 6 PASS.
 
 Run: `.venv/bin/python -m pytest tests/test_mcp_server.py -q`
-Expected: **1357 passed, 1 xfailed** — 1351 entering, plus 4 parametrisations
+Expected: **1360 passed, 1 xfailed** (this task now carries Task 6's three
+`call_tool` tests as well) — 1351 entering, plus 4 parametrisations
 of the handler test, `test_open_db_leaves_no_handle_open`, `test_get_db_is_gone`
 and `test_reset_cannot_interleave_inside_an_acquire`, minus the deleted
 `TestGetDbConcurrentResetRace`. Investigate any other difference rather than
@@ -1459,7 +1471,13 @@ Refs #255"
 
 ---
 
-### Task 6: Convert `call_tool` and `handle_memory_finalize_turn`
+### Task 6: MERGED INTO TASK 5 — do not dispatch separately
+
+See the note at the head of Task 5. The steps below are Task 5's Steps 6-9 and
+are reproduced here only so the interfaces they define stay findable; the work
+lands in Task 5's commit.
+
+#### (folded into Task 5) `call_tool` and `handle_memory_finalize_turn`
 
 **Files:**
 - Modify: `mcp_server.py:11472-11538` (`call_tool`), `:7109-7111` (`handle_memory_finalize_turn`), `:3303-3332` (`_ensure_db_async`, deleted)
@@ -1625,12 +1643,12 @@ Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestCallToolAcquiresO
 Expected: all 3 PASS.
 
 Run: `.venv/bin/python -m pytest tests/test_mcp_server.py -q`
-Expected: 1354 passed, 1 xfailed.
+Expected: covered by Task 5's single suite run above.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 8: Commit — folded into Task 5's commit**
 
 ```bash
-git add mcp_server.py tests/test_mcp_server.py
+# (Task 5 commits both halves together; message below is merged into its own)
 git commit -m "Convert call_tool and memory_finalize_turn to leases
 
 call_tool's nine 'await _ensure_db_async()' calls and its 'finally: _db =
