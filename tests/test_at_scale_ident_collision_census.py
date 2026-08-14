@@ -11,6 +11,7 @@ against a degenerate stub as well as against the real implementation proves
 nothing and does not belong here.
 """
 
+import re
 import subprocess
 import sys
 
@@ -264,17 +265,29 @@ class TestClassifyShapes:
         assert classify_shapes(members) <= set(SHAPES)
 
 
-class TestSlugParityWithProduction:
-    """_slug_current is a hand copy of _canonical_ident's slug, and R2 and R5
-    are built on it while the BASELINE is built on the real _code_ident. If the
-    two ever drift, every candidate rule is repriced against a slug production
-    does not use, silently -- the residual and rename columns would still look
-    like measurements.
+def _pre_263_slug(value):
+    """The slug rule as it stood when the #263 audit ran, inlined as the frozen
+    reference. Deliberately NOT imported from the probe -- a copy that has
+    drifted still compares equal to itself."""
+    slug = re.sub(r"[^a-z0-9-]", "-", value.lower())
+    return re.sub(r"-+", "-", slug).strip("-")
 
-    Pinned by equality over adversarial values rather than by re-importing the
-    regex, because a copied regex that has drifted still compares equal to
-    itself. Counterfactual: change either side's charset or drop either
-    `re.sub` and these fail.
+
+class TestSlugFrozenAtPre263:
+    """This probe is FROZEN at the pre-#263 rule and no longer tracks
+    production.
+
+    It used to assert parity with `_canonical_ident`, which was right while the
+    audit was choosing a rule: a drifted copy would have repriced every
+    candidate against a slug production did not use. Once #263 shipped R3 that
+    inverted. This artifact's PREDICTIONS were registered before any data
+    existed, and P3/P4 are claims about R5 and R2 as measured against the OLD
+    baseline -- re-pointing it at production would re-evaluate pre-registered
+    predictions against a different experiment while still printing "held".
+
+    So the assertion flips: the copy must equal the frozen historical rule, and
+    must NOT equal production, which has moved. Forward regression cover for the
+    shipped rule is TestIdentCollisionRegression263 in tests/test_mcp_server.py.
     """
 
     ADVERSARIAL = [
@@ -296,17 +309,35 @@ class TestSlugParityWithProduction:
     ]
 
     @pytest.mark.parametrize("value", ADVERSARIAL)
-    def test_the_hand_copied_slug_still_equals_canonical_ident(self, value):
-        assert f":x/{_slug_current(value)}" == mcp_server._canonical_ident("x", value)
+    def test_the_hand_copied_slug_still_equals_the_frozen_pre_263_rule(self, value):
+        assert _slug_current(value) == _pre_263_slug(value)
 
     def test_the_baseline_ident_is_the_hand_copy_over_the_same_raw_value(self):
-        """The other half of the parity: the baseline uses _code_ident, which
-        composes _canonical_ident over raw_value. Counterfactual: a raw_value
-        that built its input with a different separator passes the parametrized
-        test above and fails this one.
-        """
+        """The other half: the baseline must compose the FROZEN slug over
+        raw_value. Counterfactual: a raw_value that built its input with a
+        different separator passes the parametrized test above and fails this
+        one."""
         inp = _fn("tests/test_mcp_server.py", "_commit")
         assert current_ident(inp) == f":function/{_slug_current(raw_value(inp))}"
+
+    def test_the_frozen_rule_is_no_longer_productions_rule(self):
+        """The freeze is the point, so it is asserted rather than assumed. If
+        this ever passes by accident -- production reverting to the old slug --
+        #263 has been undone and the collision census is live again."""
+        collided = "tests/test_mcp_server.py::_commit"
+        assert f":function/{_slug_current(collided)}" != mcp_server._code_ident(
+            "function", "tests/test_mcp_server.py", "_commit"
+        )
+
+    def test_the_frozen_baseline_still_reproduces_a_known_audit_collision(self):
+        """What the freeze buys: the recorded measurement stays reproducible.
+        `_commit` and `commit` must still land on ONE ident here, exactly as
+        they did when the audit ran -- while production now separates them."""
+        import mcp_server as _m
+        a, b = _fn("tests/test_mcp_server.py", "_commit"), _fn("tests/test_mcp_server.py", "commit")
+        assert current_ident(a) == current_ident(b)
+        assert (_m._code_ident("function", a.file_path, a.name)
+                != _m._code_ident("function", b.file_path, b.name))
 
 
 def _known_collision_inputs():
