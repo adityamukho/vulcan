@@ -117,6 +117,38 @@ Three, one per existing retry policy:
 handle; this manager governs *lifetime*. Conflating them is what made the old
 comment at mcp_server.py:71-73 necessary.
 
+### What a lease hands out: `_LeasedDb`
+
+**Added 2026-08-14 during implementation, after Task 2 measured the failure.**
+
+`with db_lease() as db:` does **not** unbind `db` at block exit — that is plain
+Python, not a quirk. So the caller's surviving binding keeps the real handle
+alive past its own lease, the count reaches zero with the handle still
+referenced, and the next acquire opens a SECOND handle on the same file.
+Measured: it raises `Database is already open in this process` on the **second
+iteration of any loop**, which is exactly the shape of `_run_ingestion`'s
+per-commit loop.
+
+So a lease does not yield the `MiniGrafDb` itself. It yields `_LeasedDb`, a
+`__slots__` wrapper that forwards attribute access via `__getattr__` and drops
+its reference to the real handle at `__exit__`. Verified: the lock file is gone
+after every block across a three-iteration loop, despite the caller's binding
+surviving, and a use-after-release raises
+`graph handle used after its lease ended` instead of silently succeeding
+against a handle nobody is leasing.
+
+This is what makes "a release genuinely releases" a property of the protocol
+rather than of caller discipline. Without it, every lease block would have to
+end by dropping its own binding — the same invisible ordering rule that
+produced #251/#253, merely relocated.
+
+Cost: one `__getattr__` hop per call, negligible beside the native call it
+wraps. There are no `isinstance(..., MiniGrafDb)` checks in `mcp_server.py` to
+break — the six occurrences are type annotations, which do not enforce at
+runtime. The manager still holds and weakrefs the **real** handle, so the leak
+detector below is unaffected; the proxy narrows what it can catch to a caller
+that deliberately reaches through to the underlying object.
+
 ### The leak detector
 
 The check **cannot** run at `__exit__`: the caller's `as db` name is still bound

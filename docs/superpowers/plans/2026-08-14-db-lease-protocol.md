@@ -272,11 +272,50 @@ class TestDbLeaseManager:
 
         with mcp_server.db_lease() as outer:
             with mcp_server.db_lease() as inner:
-                assert inner is outer, "the nested lease must reuse the live handle"
+                # Each lease yields its own _LeasedDb, so compare what they
+                # wrap, not the wrappers.
+                assert inner._handle is outer._handle, (
+                    "the nested lease must reuse the live handle, not open a second"
+                )
                 assert mcp_server._lease_manager.lease_count == 2
             assert mcp_server._lease_manager.lease_count == 1
         assert mcp_server._lease_manager.lease_count == 0
         assert len(opens) == 1, f"expected exactly one open, got {len(opens)}: {opens}"
+
+    def test_a_lease_in_a_loop_does_not_double_open(self, tmp_path, monkeypatch):
+        """The regression that produced _LeasedDb, and the shape
+        _run_ingestion's per-commit loop actually uses.
+
+        `with ... as db:` does not unbind `db`, so before the proxy the second
+        iteration found the previous handle still referenced and opened a
+        SECOND one -- raising "Database is already open in this process".
+        """
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+
+        for i in range(3):
+            with mcp_server.db_lease() as db:
+                mcp_server._db_execute(db, "(query [:find ?e :where [?e :ident ?v]])")
+            assert not os.path.exists(graph + ".lock"), (
+                f"iteration {i}: the caller's surviving `db` binding kept the "
+                f"handle alive past the end of its lease"
+            )
+
+    def test_using_a_handle_after_its_lease_raises(self, tmp_path, monkeypatch):
+        """Use-after-release is loud, not a silent success against a handle
+        nobody holds a lease on."""
+        import mcp_server
+
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
+        mcp_server._reset_db_state()
+
+        with mcp_server.db_lease() as db:
+            pass
+        with pytest.raises(RuntimeError, match="after its lease ended"):
+            mcp_server._db_execute(db, "(query [:find ?e :where [?e :ident ?v]])")
 
     def test_release_actually_releases_the_file_lock(self, tmp_path, monkeypatch):
         """The inversion of the old
@@ -332,7 +371,7 @@ class TestDbLeaseManager:
 
         async with mcp_server.db_lease_async() as outer:
             with mcp_server.db_lease() as inner:
-                assert inner is outer
+                assert inner._handle is outer._handle
                 assert mcp_server._lease_manager.lease_count == 2
         assert mcp_server._lease_manager.lease_count == 0
 ```
@@ -356,6 +395,50 @@ import weakref
 Insert into `mcp_server.py` immediately after `_open_db_at_with_extended_retry` ends (after line 3300, before `async def _ensure_db_async`):
 
 ```python
+class _LeasedDb:
+    """What a lease hands out. Forwards to the real MiniGrafDb, and severs
+    that link the moment the lease ends.
+
+    `with db_lease() as db:` does NOT unbind `db` at block exit -- that is
+    plain Python. Without this wrapper the caller's surviving binding keeps the
+    real handle alive past its own lease: the count reaches zero with the
+    handle still referenced, and the next acquire opens a SECOND handle on the
+    same file. Measured, that raises "Database is already open in this process"
+    on the second iteration of any loop -- precisely the shape of
+    _run_ingestion's per-commit loop.
+
+    Severing here is what makes "a release genuinely releases" a property of
+    the protocol rather than of caller discipline. Without it every lease block
+    would have to end by dropping its own binding, which is the same invisible
+    ordering rule that produced #251/#253, merely relocated.
+
+    __getattr__ fires only for attributes not found normally, so `_handle`
+    (a slot) and `_sever` resolve directly and never recurse.
+    """
+
+    __slots__ = ("_handle",)
+
+    def __init__(self, handle: MiniGrafDb) -> None:
+        object.__setattr__(self, "_handle", handle)
+
+    def _sever(self) -> None:
+        object.__setattr__(self, "_handle", None)
+
+    def __getattr__(self, name: str) -> Any:
+        handle = object.__getattribute__(self, "_handle")
+        if handle is None:
+            raise RuntimeError(
+                f"graph handle used after its lease ended (attribute {name!r}) "
+                f"-- take a new lease with db_lease() rather than holding one "
+                f"past its block"
+            )
+        return getattr(handle, name)
+
+    def __repr__(self) -> str:
+        live = object.__getattribute__(self, "_handle") is not None
+        return f"<_LeasedDb {'live' if live else 'released'}>"
+
+
 def _open_for_lease(path: str) -> MiniGrafDb:
     """Open a handle FOR THE LEASE MANAGER, self-healing a stale lock.
 
@@ -561,10 +644,16 @@ def db_lease(extended: bool = False):
                 f"{_LOCK_RETRY_MAX} attempts: the file lock is held by another "
                 f"process"
             )
+    leased = _LeasedDb(handle)
+    handle = None  # this frame must not outlive the lease either
     try:
-        yield handle
+        yield leased
     finally:
-        handle = None  # drop this frame's reference before the count goes to 0
+        # Sever BEFORE releasing: the caller's `as db` name is still bound at
+        # this point, and severing is what stops it keeping the real handle
+        # alive past the count reaching zero.
+        leased._sever()
+        leased = None
         _lease_manager.release()
 
 
@@ -592,10 +681,13 @@ async def db_lease_async():
             f"could not acquire a lease on {path!r} after {_LOCK_RETRY_MAX} "
             f"attempts: the file lock is held by another process"
         )
+    leased = _LeasedDb(handle)
+    handle = None
     try:
-        yield handle
+        yield leased
     finally:
-        handle = None
+        leased._sever()
+        leased = None
         _lease_manager.release()
 
 
@@ -625,12 +717,12 @@ Note: `_detect_leaked_handle` is referenced above and is implemented in Task 3. 
 - [ ] **Step 5: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestDbLeaseManager -v`
-Expected: all 5 PASS.
+Expected: all 7 PASS.
 
 - [ ] **Step 6: Confirm nothing regressed**
 
 Run: `.venv/bin/python -m pytest tests/test_mcp_server.py -q`
-Expected: 1334 passed, 1 xfailed. The manager is not wired to anything yet, so the count must be unchanged apart from the 5 new tests — i.e. **1339 passed, 1 xfailed**.
+Expected: the manager is not wired to anything yet, so the count must be unchanged apart from the 7 new tests — i.e. **1343 passed, 1 xfailed** against the 1336 baseline Task 1 left.
 
 - [ ] **Step 7: Commit**
 
