@@ -782,7 +782,11 @@ class TestDbLeaseLeakDetector:
         mcp_server._reset_db_state()
 
         with mcp_server.db_lease() as db:
-            escaped = db          # exactly the #255 mistake
+            # Reach THROUGH the proxy: holding `db` itself is not a leak,
+            # because _LeasedDb severs its own reference at block exit. Only a
+            # reference to the real handle survives, which is what the
+            # detector exists to catch.
+            escaped = db._handle
         assert mcp_server._lease_manager.lease_count == 0
 
         with pytest.raises(RuntimeError, match="DB lease leak") as exc_info:
@@ -818,11 +822,37 @@ class TestDbLeaseLeakDetector:
         mcp_server._reset_db_state()
 
         with mcp_server.db_lease() as db:
-            escaped = db
+            escaped = db._handle
         with pytest.raises(RuntimeError, match="DB lease leak"):
             mcp_server._reset_db_state()
         del escaped
         mcp_server._reset_db_state()
+
+    def test_holding_the_proxy_past_its_block_is_not_a_leak(self, tmp_path, monkeypatch):
+        """The interaction between _LeasedDb and the detector, pinned.
+
+        Keeping `db` itself past the block -- the mistake a caller is most
+        likely to make -- is NOT a leak: the proxy severed its reference at
+        __exit__, so the real handle already died. This is why the detector's
+        reach narrowed once leases stopped yielding the raw handle, and it is
+        worth pinning: if _LeasedDb ever stopped severing, this test keeps
+        passing but test_a_lease_in_a_loop_does_not_double_open fails, which
+        is the pair that localises the fault.
+        """
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+
+        with mcp_server.db_lease() as db:
+            pass
+        still_bound = db                      # the proxy, already severed
+
+        with mcp_server.db_lease():           # must NOT raise
+            pass
+        assert not os.path.exists(graph + ".lock")
+        del still_bound
 
     def test_strict_can_be_switched_off_for_a_deliberate_ablation(
         self, tmp_path, monkeypatch, capsys
@@ -837,7 +867,7 @@ class TestDbLeaseLeakDetector:
         monkeypatch.setattr(mcp_server._lease_manager, "strict_leak_detection", False)
 
         with mcp_server.db_lease() as db:
-            escaped = db
+            escaped = db._handle
         with mcp_server.db_lease():
             pass                                   # must NOT raise
         assert "DB lease leak" in capsys.readouterr().err
@@ -920,14 +950,14 @@ def _describe_referrers(obj: Any, limit: int = 6) -> str:
 - [ ] **Step 4: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestDbLeaseLeakDetector -v`
-Expected: all 4 PASS.
+Expected: all 5 PASS.
 
 If `test_a_handle_that_escaped_its_lease_is_reported` fails on the `"escaped" in str(...)` assertion, the referrer is being reported as a bare frame rather than by name. Do not weaken the assertion — it is the positive control, and a detector that reports `<no named holder found>` for the commonest case is the "verification fails open" failure mode. Fix `_describe_referrers` instead.
 
 - [ ] **Step 5: Run the full suite**
 
 Run: `.venv/bin/python -m pytest tests/test_mcp_server.py -q`
-Expected: 1343 passed, 1 xfailed.
+Expected: 1348 passed, 1 xfailed.
 
 - [ ] **Step 6: Commit**
 
