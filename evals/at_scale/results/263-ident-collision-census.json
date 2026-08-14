@@ -1,0 +1,333 @@
+{
+  "repo_path": ".",
+  "branch": "master",
+  "head_commit": "14166d19c7126ad869500d6c864d1b541858f7d3",
+  "ignore_patterns": [
+    "3rdParty/",
+    "third_party/",
+    "vendor/",
+    "node_modules/",
+    "dist/",
+    "build/",
+    "*.min.js",
+    "*.map"
+  ],
+  "commits": 674,
+  "extraction_failures": 0,
+  "failed_commits": [],
+  "triples_total": 2789,
+  "idents_total": 2780,
+  "offenders": {
+    "module": {
+      "idents_total": 133,
+      "count": 1,
+      "idents": {
+        ":module/mcp-server": [
+          {
+            "producer": "import",
+            "file_path": "mcp.server",
+            "name": null
+          },
+          {
+            "producer": "import",
+            "file_path": "mcp_server",
+            "name": null
+          }
+        ]
+      }
+    },
+    "function": {
+      "idents_total": 2058,
+      "count": 7,
+      "idents": {
+        ":function/evals-at-scale-profile-forward-reconcile-attribution-py-main": [
+          {
+            "producer": "code",
+            "file_path": "evals/at_scale/profile_forward_reconcile_attribution.py",
+            "name": "_main"
+          },
+          {
+            "producer": "code",
+            "file_path": "evals/at_scale/profile_forward_reconcile_attribution.py",
+            "name": "main"
+          }
+        ],
+        ":function/tests-test-mcp-server-py-init": [
+          {
+            "producer": "code",
+            "file_path": "tests/test_mcp_server.py",
+            "name": "__init__"
+          },
+          {
+            "producer": "code",
+            "file_path": "tests/test_mcp_server.py",
+            "name": "_init"
+          }
+        ],
+        ":function/tests-test-mcp-server-py-boom": [
+          {
+            "producer": "code",
+            "file_path": "tests/test_mcp_server.py",
+            "name": "_boom"
+          },
+          {
+            "producer": "code",
+            "file_path": "tests/test_mcp_server.py",
+            "name": "boom"
+          }
+        ],
+        ":function/tests-test-mcp-server-py-commit": [
+          {
+            "producer": "code",
+            "file_path": "tests/test_mcp_server.py",
+            "name": "_commit"
+          },
+          {
+            "producer": "code",
+            "file_path": "tests/test_mcp_server.py",
+            "name": "commit"
+          }
+        ],
+        ":function/tests-test-mcp-server-py-parse": [
+          {
+            "producer": "code",
+            "file_path": "tests/test_mcp_server.py",
+            "name": "_parse"
+          },
+          {
+            "producer": "code",
+            "file_path": "tests/test_mcp_server.py",
+            "name": "parse"
+          }
+        ],
+        ":function/tests-test-mcp-server-py-results": [
+          {
+            "producer": "code",
+            "file_path": "tests/test_mcp_server.py",
+            "name": "_results"
+          },
+          {
+            "producer": "code",
+            "file_path": "tests/test_mcp_server.py",
+            "name": "results"
+          }
+        ],
+        ":function/tests-test-mcp-server-py-snapshot": [
+          {
+            "producer": "code",
+            "file_path": "tests/test_mcp_server.py",
+            "name": "_snapshot"
+          },
+          {
+            "producer": "code",
+            "file_path": "tests/test_mcp_server.py",
+            "name": "snapshot"
+          }
+        ]
+      }
+    },
+    "class": {
+      "idents_total": 290,
+      "count": 1,
+      "idents": {
+        ":class/tests-test-mcp-server-py-fakedb": [
+          {
+            "producer": "code",
+            "file_path": "tests/test_mcp_server.py",
+            "name": "FakeDb"
+          },
+          {
+            "producer": "code",
+            "file_path": "tests/test_mcp_server.py",
+            "name": "_FakeDb"
+          }
+        ]
+      }
+    },
+    "variable": {
+      "idents_total": 232,
+      "count": 0,
+      "idents": {}
+    },
+    "field": {
+      "idents_total": 67,
+      "count": 0,
+      "idents": {}
+    }
+  },
+  "offenders_total": 9,
+  "offenders_by_shape": {
+    "leading-underscore": 7,
+    "case-only": 0,
+    "separator-vs-path": 0,
+    "cross-producer": 0,
+    "other": 2
+  },
+  "candidates": {
+    "R1": {
+      "residual": 0,
+      "renames": 2710,
+      "description": "keep underscores: charset becomes [^a-z0-9_-]",
+      "renames_by_entity_type": {
+        "module": {
+          "renamed": 74,
+          "total": 133
+        },
+        "function": {
+          "renamed": 2049,
+          "total": 2058
+        },
+        "class": {
+          "renamed": 289,
+          "total": 290
+        },
+        "variable": {
+          "renamed": 231,
+          "total": 232
+        },
+        "field": {
+          "renamed": 67,
+          "total": 67
+        }
+      }
+    },
+    "R2": {
+      "residual": 1,
+      "renames": 2649,
+      "description": "no hyphen collapse: drop re.sub(r'-+', '-', slug)",
+      "renames_by_entity_type": {
+        "module": {
+          "renamed": 2,
+          "total": 133
+        },
+        "function": {
+          "renamed": 2058,
+          "total": 2058
+        },
+        "class": {
+          "renamed": 290,
+          "total": 290
+        },
+        "variable": {
+          "renamed": 232,
+          "total": 232
+        },
+        "field": {
+          "renamed": 67,
+          "total": 67
+        }
+      }
+    },
+    "R3": {
+      "residual": 0,
+      "renames": 2721,
+      "description": "R1 + R2: keep underscores and drop the collapse",
+      "renames_by_entity_type": {
+        "module": {
+          "renamed": 74,
+          "total": 133
+        },
+        "function": {
+          "renamed": 2058,
+          "total": 2058
+        },
+        "class": {
+          "renamed": 290,
+          "total": 290
+        },
+        "variable": {
+          "renamed": 232,
+          "total": 232
+        },
+        "field": {
+          "renamed": 67,
+          "total": 67
+        }
+      }
+    },
+    "R4": {
+      "residual": 0,
+      "renames": 2780,
+      "description": "hash suffix: current slug + '-' + sha256(raw value)[:8]",
+      "renames_by_entity_type": {
+        "module": {
+          "renamed": 133,
+          "total": 133
+        },
+        "function": {
+          "renamed": 2058,
+          "total": 2058
+        },
+        "class": {
+          "renamed": 290,
+          "total": 290
+        },
+        "variable": {
+          "renamed": 232,
+          "total": 232
+        },
+        "field": {
+          "renamed": 67,
+          "total": 67
+        }
+      }
+    },
+    "R5": {
+      "residual": 9,
+      "renames": 2647,
+      "description": "CONTROL, expected to still collide: slug file_path and name independently, join with '--'",
+      "renames_by_entity_type": {
+        "module": {
+          "renamed": 0,
+          "total": 133
+        },
+        "function": {
+          "renamed": 2058,
+          "total": 2058
+        },
+        "class": {
+          "renamed": 290,
+          "total": 290
+        },
+        "variable": {
+          "renamed": 232,
+          "total": 232
+        },
+        "field": {
+          "renamed": 67,
+          "total": 67
+        }
+      }
+    }
+  },
+  "timestamp": "2026-08-14T02:21:03Z",
+  "predictions": {
+    "P1": {
+      "statement": "The true collision count exceeds the 3 #257's census found, because that census can only see collisions whose loser was closed and reopened.",
+      "outcome": "held",
+      "evidence": "offenders_total=9"
+    },
+    "P2": {
+      "statement": "leading-underscore STRICTLY outnumbers every other named shape among all offenders.",
+      "outcome": "held",
+      "evidence": "leading-underscore=7, runner-up separator-vs-path=0"
+    },
+    "P3": {
+      "statement": "R5, the control, reports a nonzero residual at least as large as the leading-underscore offender count.",
+      "outcome": "held",
+      "evidence": "R5 residual=9, leading-underscore offenders=7"
+    },
+    "P4": {
+      "statement": "R2's rename cost falls on named entities, not on module idents: a module input has no '::' separator to produce an adjacent hyphen run, so R2 renames a strictly smaller FRACTION of module idents than of function idents.",
+      "outcome": "held",
+      "evidence": "R2 renames module 2/133 = 0.015, function 2058/2058 = 1.000"
+    }
+  },
+  "self_checks": {
+    "S1": {
+      "statement": "R4 appends a hash suffix to every ident by construction, so its rename count must equal the total ident count. If it does not, score_rule's rename accounting is broken and every other rule's rename number in this table is suspect.",
+      "outcome": "held",
+      "evidence": "R4 renames=2780, idents_total=2780"
+    }
+  }
+}
