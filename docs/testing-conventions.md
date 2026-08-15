@@ -164,3 +164,23 @@ Two things such a test needs:
 
 If a timing assertion genuinely cannot be avoided, its margin must be
 justified in a comment against measured numbers, not tuned until it passes.
+
+## Never hold a graph handle past its lease
+
+`mcp_server` opens at most one `MiniGrafDb` handle per process, owned by
+`_DbLeaseManager`. Take one with `with db_lease() as db:` (off the event loop)
+or `async with db_lease_async() as db:` (on it), and let the block end.
+
+Do not stash the handle anywhere that outlives the block — not in a module
+global, not on `self`, not in a closure, not in a default argument. The manager
+drops its own reference when the lease count reaches zero, but the handle only
+dies when the LAST reference goes; a stray one keeps the graph file lock held
+while the count says released. That is #255, and before minigraf 1.2.2 it was
+silent graph corruption (#251, #253).
+
+The leak detector will catch it at the next acquire and name the variable still
+holding it, but it blames one step late — the next test, not yours — unless
+your test calls `mcp_server._reset_db_state()` at teardown. Call it.
+
+In tests, use `mcp_server._reset_db_state()` rather than assigning any module
+global. A grep guard enforces this and will fail the suite.

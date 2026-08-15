@@ -3360,6 +3360,22 @@ class _DbLeaseManager:
                     # The detector's input. If this weakref is still live at the
                     # next 0 -> 1 acquire, someone escaped their lease.
                     self._prev_ref = weakref.ref(handle)
+                    # `handle` is a real strong reference sitting in THIS frame,
+                    # not just in self._handle. self._handle = None above drops
+                    # the manager's own reference, but that alone does not free
+                    # the object while this local still names it -- and this
+                    # local survives until the `with self._lock:` block exits
+                    # and release() returns. Under contention, the lock can wake
+                    # a waiting acquirer (which runs _detect_leaked_handle) in
+                    # that gap, before this frame is torn down: the lock says
+                    # "free" but the weakref is still live, and the detector
+                    # reports a leak that isn't one -- <no named holder found>,
+                    # since the only holder is this dead-but-not-yet-cleared
+                    # local, invisible to gc.get_referrers by the time it looks.
+                    # Delete it here, still under the lock, so the reference
+                    # count actually reaches zero before anyone can observe the
+                    # lock as free. Do not "simplify" this away.
+                    del handle
 
     def reset(self) -> None:
         """Force the manager back to its initial state.

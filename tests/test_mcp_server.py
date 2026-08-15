@@ -22988,3 +22988,97 @@ class TestNoDirectDbGlobalAssignment:
             f"all match, got {len(hit_lines)}: {hits}"
         )
         assert all("canary.py" in line for line in hit_lines), hits
+
+
+class TestConcurrentPollerDoesNotForceASecondOpen:
+    """#255, and the reason it stopped being 'important but not urgent': this
+    broke PR #262's CI as `test (3.11)`, 'Database is already open in this
+    process'.
+
+    Mechanism: run_ingestion_benchmark runs _run_ingestion concurrently with a
+    poller whose handle_minigraf_query -> get_db() opened a handle whenever the
+    global was None. get_db()'s own docstring named the precondition its safety
+    rested on -- 'event-loop call sites always await _ensure_db_async() first'
+    -- and a thread-executor poller is not one.
+
+    Built as a direct reconstruction of the mechanism rather than a repeated
+    sampling run: making the bug deterministic is what solved #251, where a
+    20x20 statistical A/B had zero power.
+    """
+
+    def _drive(self, mcp_server, graph, rounds=40):
+        """A poller thread querying while the main thread holds a lease and
+        releases it between rounds -- the ingestion/poller interleaving."""
+        import threading
+
+        errors = []
+        stop = threading.Event()
+
+        def poll():
+            while not stop.is_set():
+                try:
+                    mcp_server.handle_minigraf_query(
+                        "[:find ?e :where [?e :ident ?v]]"
+                    )
+                except Exception as e:      # noqa: BLE001 - recording, not handling
+                    errors.append(e)
+
+        poller = threading.Thread(target=poll, daemon=True)
+        poller.start()
+        try:
+            for _ in range(rounds):
+                with mcp_server.db_lease() as db:
+                    mcp_server._db_execute(
+                        db, "(query [:find ?e :where [?e :ident ?v]])"
+                    )
+                time.sleep(0.001)
+        finally:
+            stop.set()
+            poller.join(timeout=5)
+        return errors
+
+    def test_a_polling_thread_never_forces_a_second_handle(self, tmp_path, monkeypatch):
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(graph)
+
+        errors = self._drive(mcp_server, graph)
+
+        assert not errors, (
+            f"{len(errors)} error(s) from the polling thread; first: {errors[0]}"
+        )
+        assert mcp_server._lease_manager.lease_count == 0
+
+    def test_the_old_release_idiom_still_reproduces_the_failure(self, tmp_path, monkeypatch):
+        """THE ABLATION. Without it the test above proves only that the current
+        code passes, not that it fixed anything.
+
+        Reconstructs the pre-#255 idiom -- clear the module's handle while
+        another caller still holds one -- and requires the failure back.
+        """
+        import mcp_server
+        from minigraf import MiniGrafDb
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+        # This ablation deliberately strands a handle, which is precisely what
+        # the leak detector exists to catch. Opt out for this test only.
+        monkeypatch.setattr(
+            mcp_server._lease_manager, "strict_leak_detection", False
+        )
+
+        held = MiniGrafDb.open(graph)        # _run_ingestion's local `db`
+        try:
+            with pytest.raises(Exception) as exc_info:
+                MiniGrafDb.open(graph)       # the poller's get_db(), _db being None
+            assert "already open in this process" in str(exc_info.value), (
+                "the ablation did not reproduce the #255 failure, so the test "
+                f"above proves nothing: {exc_info.value}"
+            )
+        finally:
+            del held
+            mcp_server._reset_db_state()
