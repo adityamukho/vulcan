@@ -2055,14 +2055,19 @@ class TestStaleHandlesAreStructurallyImpossible:
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
         mcp_server._reset_db_state()
 
-        mcp_server.handle_minigraf_transact(
-            '[[:decision/mtime-probe :decision/description "written between leases"]]',
+        # `:description`, NOT `:decision/description` -- MINIGRAF_SCHEMA's
+        # `decision` type requires the bare attribute, and a transact using the
+        # namespaced form is REJECTED, so the query below would find nothing
+        # and the test would fail for a reason unrelated to leases.
+        result = mcp_server.handle_minigraf_transact(
+            '[[:decision/mtime-probe :description "written between leases"]]',
             "stale-handle regression",
         )
+        assert result["ok"], result
         assert mcp_server._lease_manager.lease_count == 0
 
         result = mcp_server.handle_minigraf_query(
-            '[:find ?d :where [?e :decision/description ?d]]'
+            '[:find ?d :where [?e :description ?d]]'
         )
         assert result["ok"], result
         assert any("written between leases" in str(r) for r in result["results"]), result
