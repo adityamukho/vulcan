@@ -245,8 +245,15 @@ def real_db(monkeypatch, tmp_path):
     )
     import mcp_server
 
+    # Unlike test_mcp_server.py's real_db, this file has no autouse fixture
+    # calling _reset_db_state() between tests -- without resetting on both
+    # sides, the get_db() shim's lease from one test is still outstanding
+    # when the next test's open_db() tries to bind a different path, and
+    # bind_path correctly refuses (#255).
+    mcp_server._reset_db_state()
     mcp_server.open_db(str(tmp_path / "t.graph"))
     yield mcp_server.get_db()
+    mcp_server._reset_db_state()
 
 
 class TestLoadDescriptionFacts:

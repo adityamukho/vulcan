@@ -619,8 +619,18 @@ class TestLeaseAcquireCannotBeRacedByReset:
         monkeypatch.setattr(mcp_server, "_open_for_lease", slow_open)
 
         def acquirer():
-            with mcp_server.db_lease() as db:
-                outcome["handle"] = db._handle
+            # try_acquire() directly, not db_lease(): db_lease()'s context
+            # manager would release the lease the instant this function
+            # returns, which races the resetter thread below for the
+            # manager lock -- both become eligible for it the moment
+            # try_acquire's own `with self._lock:` exits, and if reset()
+            # wins that race it zeroes the count before this thread's
+            # release() runs, which then finds no outstanding lease and
+            # raises (a real bug this test hit 5/5 runs as an unhandled
+            # background-thread exception -- unrelated to what this test is
+            # actually pinning). Holding the lease open here sidesteps it;
+            # the test's own trailing _reset_db_state() cleans it up.
+            outcome["handle"] = mcp_server._lease_manager.try_acquire(graph)
 
         t = threading.Thread(target=acquirer)
         t.start()
@@ -836,6 +846,90 @@ class TestDbLeaseManager:
                 assert inner._handle is outer._handle
                 assert mcp_server._lease_manager.lease_count == 2
         assert mcp_server._lease_manager.lease_count == 0
+
+
+class TestDbLeaseExtendedRetry:
+    """#106: _load_ingestion_preload_state runs off the event loop and can
+    afford to wait out a typical orphan-process cleanup window rather than
+    giving up after the standard budget's ~1.55s (_LOCK_RETRY_MAX=5 attempts)
+    and leaving _run_ingestion permanently stuck in an "error" state.
+    db_lease(extended=True) is the only thing that provides that -- and had
+    zero tests anywhere (`_open_db_at_with_extended_retry`, which this task
+    deleted, was the last one covering it). Pins BEHAVIOUR (how many attempts
+    survive) rather than the real 120s wall-clock budget."""
+
+    def test_extended_lease_outlives_the_standard_attempt_count(self, tmp_path, monkeypatch):
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+        # No real backoff wait -- this pins attempt count, not timing.
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda s: None)
+
+        # Deliberately more failures than the standard budget's _LOCK_RETRY_MAX
+        # (5) attempts would survive -- see test_standard_lease_gives_up_at_the
+        # _same_failure_count below for the control that proves 5 is really
+        # the standard ceiling.
+        fail_until = mcp_server._LOCK_RETRY_MAX + 3
+        attempts = {"n": 0}
+        real_open = mcp_server._open_for_lease
+
+        def flaky_open(path):
+            attempts["n"] += 1
+            if attempts["n"] <= fail_until:
+                raise MiniGrafError(
+                    "Database is locked by another process (lock file: x.graph.lock, holder PID: 1)."
+                )
+            return real_open(path)
+
+        monkeypatch.setattr(mcp_server, "_open_for_lease", flaky_open)
+
+        with mcp_server.db_lease(extended=True) as db:
+            raw = mcp_server._db_execute(db, "(query [:find ?e :where [?e :ident ?v]])")
+            assert "out of bounds" not in raw
+
+        assert attempts["n"] == fail_until + 1, (
+            f"expected the extended lease to keep retrying past the standard "
+            f"{mcp_server._LOCK_RETRY_MAX}-attempt budget ({fail_until} induced "
+            f"failures), got {attempts['n']} real open attempts"
+        )
+        mcp_server._reset_db_state()
+
+    def test_standard_lease_gives_up_at_the_same_failure_count(self, tmp_path, monkeypatch):
+        """Control: the SAME induced-failure count that the extended lease
+        survives above must exhaust the standard lease's budget -- otherwise
+        the first test would prove nothing about the two budgets differing."""
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+        monkeypatch.setattr(mcp_server.time, "sleep", lambda s: None)
+
+        fail_until = mcp_server._LOCK_RETRY_MAX + 3
+        attempts = {"n": 0}
+        real_open = mcp_server._open_for_lease
+
+        def flaky_open(path):
+            attempts["n"] += 1
+            if attempts["n"] <= fail_until:
+                raise MiniGrafError(
+                    "Database is locked by another process (lock file: x.graph.lock, holder PID: 1)."
+                )
+            return real_open(path)
+
+        monkeypatch.setattr(mcp_server, "_open_for_lease", flaky_open)
+
+        with pytest.raises(RuntimeError, match="could not acquire a lease"):
+            with mcp_server.db_lease():
+                pass
+
+        assert attempts["n"] == mcp_server._LOCK_RETRY_MAX, (
+            f"expected the standard lease to give up after exactly "
+            f"{mcp_server._LOCK_RETRY_MAX} attempts, got {attempts['n']}"
+        )
+        mcp_server._reset_db_state()
 
 
 class TestDbLeaseLeakDetector:
