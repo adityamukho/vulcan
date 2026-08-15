@@ -1204,8 +1204,22 @@ Refs #255"
 
 ### Task 5: Convert every consumer to leases (handlers, `call_tool`, `open_db`, the hook)
 
-> **Tasks 5 and 6 were merged after a sequencing defect was found during
-> execution.** They cannot land separately in either order. Converting handlers
+> **Tasks 5, 6 AND 7 are merged. Handle ownership cannot be converted
+> incrementally.**
+>
+> This was established twice, the hard way. Splitting handlers from `call_tool`
+> leaves one of them on the `_db` global while the other holds a lease, and the
+> second opener raises. Splitting ingestion out repeats it one layer down: the
+> `real_db` fixture holds the shim's lease while `_run_ingestion` still opens
+> through `_db`, and because that fixture patches `MiniGrafDb.open` to return
+> in-memory graphs, the result is not a lock error but **two disconnected
+> graphs** — silent wrong answers. The bridge alternative fails too: ingestion's
+> own `finally: _db = None` clears any bridged global mid-run.
+>
+> Handle ownership is one global property. Any partial conversion leaves two
+> owners. So this task converts every consumer and deletes `_db` in one commit.
+>
+> **Original merge note (Tasks 5 and 6), still accurate:** They cannot land separately in either order. Converting handlers
 > first leaves `call_tool` still calling `await _ensure_db_async()`, which
 > populates the `_db` global with a live handle — and the handler's own
 > `db_lease()` then calls `MiniGrafDb.open` on a file already open in this
@@ -1519,14 +1533,45 @@ In `hooks/prepare_hook.py`, replace lines 30-35 with:
             context = mcp_server.handle_memory_prepare_turn(prompt)
 ```
 
+- [ ] **Step 6b: Re-baseline the lease-count assertions the shim invalidates**
+
+Task 4 converted several `assert mcp_server._db is None` sites to
+`assert lease_count == 0`. Under the old code `_db is None` was true even while
+the `real_db` fixture held a handle, because clearing the global never dropped
+the handle. It is not true now: `real_db` calls `get_db()`, which holds a lease
+for the whole test, so the count is 1 and never 0.
+
+Two of these fail concretely — `test_db_released_between_commits` and
+`test_run_ingestion_writes_last_run_when_no_commits`. Find every such site
+(`grep -n "lease_count == 0" tests/test_mcp_server.py`) and, for any that runs
+inside a test taking the `real_db` fixture, assert against a **captured
+baseline** rather than zero:
+
+```python
+        baseline = mcp_server._lease_manager.lease_count
+        ...
+        assert mcp_server._lease_manager.lease_count == baseline, (
+            "ingestion did not release its own lease; the fixture's lease is a "
+            "separate, legitimate holder and is not what this asserts"
+        )
+```
+
+This preserves what each test actually meant — "ingestion released ITS lease"
+— rather than the stronger "no lease exists anywhere", which was never what
+`_db is None` proved. Do not simply delete these assertions.
+
 - [ ] **Step 7: Run the tests**
 
 Run: `.venv/bin/python -m pytest tests/test_mcp_server.py::TestHandlersLeaseRatherThanHold -v`
 Expected: all 6 PASS.
 
 Run: `.venv/bin/python -m pytest tests/test_mcp_server.py -q`
-Expected: **1360 passed, 1 xfailed** (this task now carries Task 6's three
-`call_tool` tests as well) — 1351 entering, plus 4 parametrisations
+Expected: green. This task now carries Tasks 6 and 7 as well, so report the
+**actual** number with a full accounting: 1351 entering, plus every test added,
+minus every test deleted (`TestGetDbConcurrentResetRace` and, from the folded
+Task 7 steps, the replaced `test_release_idiom_does_not_drop_a_handle_others_still_hold`).
+Any residual difference is a real regression — investigate it, do not adjust
+the expectation. — 1351 entering, plus 4 parametrisations
 of the handler test, `test_open_db_leaves_no_handle_open`, `test_get_db_is_gone`
 and `test_reset_cannot_interleave_inside_an_acquire`, minus the deleted
 `TestGetDbConcurrentResetRace`. Investigate any other difference rather than
@@ -1716,20 +1761,17 @@ with:
 
 and indent the remainder of the function body into that block. This handler is the one call_tool does **not** pre-acquire for, so its lease is the only one — it must cover every `_transact_extracted_facts` call in all three strategy branches, including the LLM path's fallback to heuristic.
 
-- [ ] **Step 6: Leave `_ensure_db_async` in place — its deletion moves to Task 7**
+- [ ] **Step 6: Delete `_ensure_db_async` (its ingestion callers convert in this same task)**
 
-**Changed during execution.** `_run_ingestion` still has **6 live callers**, and
-ingestion is explicitly out of scope here. Deleting it now breaks every
-ingestion test.
-
-Remove only `call_tool`'s uses of it (Step 4 above). Verify what remains:
+Ingestion is now IN scope for this task, so its ~5-6 `_ensure_db_async` callers
+convert to `async with db_lease_async()` here — see the folded Task 7 steps
+below. Once they are converted, delete the function and confirm:
 
 ```bash
 grep -n "_ensure_db_async" mcp_server.py
 ```
 
-Expected: the definition plus exactly 6 calls, all inside `_run_ingestion`.
-Any hit outside `_run_ingestion` means a call site was missed — stop and report. Update any comment that still names it — `_load_ingestion_preload_state`'s docstring (around line 8422) mentions both `get_db()` and `_ensure_db_async()` and is rewritten in Task 7.
+Expected: no hits outside comments. Update any comment that still names it — `_load_ingestion_preload_state`'s docstring (around line 8422) mentions both `get_db()` and `_ensure_db_async()` and is rewritten in Task 7.
 
 - [ ] **Step 7: Run the tests**
 
@@ -1767,7 +1809,12 @@ Refs #255"
 
 ---
 
-### Task 7: Convert `_run_ingestion`, the preload, and the startup backfill; delete `_db`
+### Task 7: MERGED INTO TASK 5 — do not dispatch separately
+
+See the note at the head of Task 5. These steps land in Task 5's commit; they
+are kept here so their call-site table and interfaces stay findable.
+
+#### (folded into Task 5) `_run_ingestion`, the preload, the startup backfill, and deleting `_db`
 
 The largest task, and the one that closes the actual CI failure.
 
