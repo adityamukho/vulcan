@@ -23004,6 +23004,18 @@ class TestConcurrentPollerDoesNotForceASecondOpen:
     Built as a direct reconstruction of the mechanism rather than a repeated
     sampling run: making the bug deterministic is what solved #251, where a
     20x20 statistical A/B had zero power.
+
+    The ablation below used to be a test that opened two raw `MiniGrafDb`
+    handles and asserted they collide. That is minigraf's own single-handle
+    enforcement (see TestSingleHandlePerProcess) -- it never touched
+    `mcp_server`, `db_lease`, or `_lease_manager`, and its docstring's claim of
+    "reconstructing the pre-#255 idiom" was impossible: the `_db` global that
+    idiom names was deleted two tasks before this one landed. It would have
+    passed identically with the lease protocol deleted outright, so it proved
+    nothing about `test_a_polling_thread_never_forces_a_second_handle` below.
+    The real ablation instead disables the protocol's actual defect axis --
+    `_DbLeaseManager.try_acquire`'s reuse branch (`count > 0 -> return the
+    live handle`) -- and drives the same interleaving through it.
     """
 
     def _drive(self, mcp_server, graph, rounds=40):
@@ -23035,6 +23047,10 @@ class TestConcurrentPollerDoesNotForceASecondOpen:
         finally:
             stop.set()
             poller.join(timeout=5)
+            assert not poller.is_alive(), (
+                "poller thread did not stop within the join timeout -- it is "
+                "hung, not merely slow, and continuing would silently mask that"
+            )
         return errors
 
     def test_a_polling_thread_never_forces_a_second_handle(self, tmp_path, monkeypatch):
@@ -23052,33 +23068,134 @@ class TestConcurrentPollerDoesNotForceASecondOpen:
         )
         assert mcp_server._lease_manager.lease_count == 0
 
-    def test_the_old_release_idiom_still_reproduces_the_failure(self, tmp_path, monkeypatch):
-        """THE ABLATION. Without it the test above proves only that the current
-        code passes, not that it fixed anything.
+    def test_disabling_try_acquire_reuse_reproduces_the_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """THE ABLATION. Without it, the test above proves only that the
+        current code passes, not that it fixed anything.
 
-        Reconstructs the pre-#255 idiom -- clear the module's handle while
-        another caller still holds one -- and requires the failure back.
+        Targets the protocol's actual defect axis: try_acquire's reuse branch
+        (count > 0 -> return the live handle). Disabling just that branch
+        forces the poller's acquisition to attempt a fresh open while the main
+        thread's lease is still live, which collides with it exactly as the
+        pre-#255 `_db = None` idiom did. Manually verified (not asserted here,
+        to avoid doubling this test's runtime every run) that commenting out
+        the `try_acquire` monkeypatch below makes this test fail -- see
+        task-9-report.md.
+
+        The handshake below is a real rendezvous (two `threading.Event`s), not
+        a sleep. A fixed sleep after the main thread's open (tried first) was
+        20/20 in isolation and 10/10 under 8 busy loops, but missed once
+        inside the full suite after ~1060 preceding tests -- evidence that a
+        fixed window, however generous, is still a bet on scheduling rather
+        than a guarantee. The events make it a guarantee: the main thread's
+        open does not return (so its lease cannot end) until the poller has
+        provably attempted its own open while that handle was live, and the
+        poller does not attempt until the main thread has provably opened
+        first. `timeout=2.0` on both waits is a deadlock backstop, not the
+        synchronisation mechanism -- it should never be hit in a passing run.
         """
         import mcp_server
-        from minigraf import MiniGrafDb
+        import threading
 
         graph = str(tmp_path / "t.graph")
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
         mcp_server._reset_db_state()
-        # This ablation deliberately strands a handle, which is precisely what
-        # the leak detector exists to catch. Opt out for this test only.
+        mcp_server.open_db(graph)
+
+        # This ablation deliberately strands handles -- every "reuse" it
+        # defeats leaves the previous handle referenced only by whichever
+        # caller already holds it, which is precisely what the leak detector
+        # watches for. Opt out for this test only; the default stays strict.
         monkeypatch.setattr(
             mcp_server._lease_manager, "strict_leak_detection", False
         )
 
-        held = MiniGrafDb.open(graph)        # _run_ingestion's local `db`
+        main_has_opened = threading.Event()
+        poller_has_tried = threading.Event()
+        mgr = mcp_server._lease_manager
+
+        def try_acquire_without_reuse(path):
+            """`_DbLeaseManager.try_acquire` with the reuse branch (`count >
+            0 -> return self._handle`) removed, so every acquisition attempts
+            a fresh `MiniGrafDb.open()` -- including a second one while the
+            first is still live. Otherwise faithful (locking, leak detection,
+            session rule registration). Does NOT catch the resulting
+            "already open in this process" the way `_open_for_lease`'s
+            self-heal path effectively re-raises it when the reported holder
+            is our own live PID: it must propagate to the caller uncaught,
+            exactly as the pre-#255 idiom let it, not be absorbed by
+            db_lease()'s outer retry loop.
+
+            Patched onto the `_lease_manager` INSTANCE, not the
+            `_DbLeaseManager` CLASS, and closes over `mgr` rather than taking
+            `self`/`path` the way the real method does. That is not a style
+            choice: `TestCallToolAcquiresOnlyForDbTools.
+            test_ingest_status_acquires_only_when_not_running` monkeypatches
+            `mcp_server._lease_manager.try_acquire` earlier in this same file
+            with a plain `lambda p: ...` (no `self`), and `monkeypatch`'s
+            undo does `setattr(instance, name, getattr(instance, name))`
+            captured *before* that patch -- which was the CLASS's bound
+            method, obtained via descriptor lookup through the instance. That
+            "restore" plants a real INSTANCE attribute, permanently shadowing
+            the class method on this singleton for the rest of the test
+            session. A class-level monkeypatch here is silently ineffective
+            once that shadow exists (confirmed: this test alone was 20/20
+            green, but failed inside the full suite -- `caught == []` -- with
+            debug prints showing the patched function was never even called).
+            Patching the instance directly sidesteps the shadow instead of
+            fighting it: whatever is currently shadowing gets overridden for
+            this test's duration and monkeypatch's teardown restores exactly
+            that prior (possibly already-shadowed) state, same as it already
+            was.
+            """
+            is_main = threading.current_thread() is threading.main_thread()
+            if not is_main:
+                # Block until this round's handle is provably open before
+                # attempting a second one.
+                main_has_opened.wait(timeout=2.0)
+            with mgr._lock:
+                mgr._detect_leaked_handle(path)
+                try:
+                    handle = mcp_server._open_for_lease(path)
+                finally:
+                    if not is_main:
+                        # Fires whether the open collided (the expected
+                        # case) or not, so a lucky non-collision cannot hang
+                        # the main thread waiting for a signal that never
+                        # comes.
+                        poller_has_tried.set()
+                for rule in mcp_server.SESSION_RULES:
+                    mcp_server._db_execute(handle, rule)
+                for rule in mcp_server._user_rules:
+                    mcp_server._db_execute(handle, rule)
+                mgr._handle = handle
+                mgr._path = path
+                mgr._count += 1
+            if is_main:
+                poller_has_tried.clear()
+                main_has_opened.set()
+                # Hold the lease open until the poller has provably attempted
+                # its own -- the actual synchronisation, not a delay.
+                poller_has_tried.wait(timeout=2.0)
+                main_has_opened.clear()
+            return handle
+
+        monkeypatch.setattr(mgr, "try_acquire", try_acquire_without_reuse)
+
+        caught = []
         try:
-            with pytest.raises(Exception) as exc_info:
-                MiniGrafDb.open(graph)       # the poller's get_db(), _db being None
-            assert "already open in this process" in str(exc_info.value), (
-                "the ablation did not reproduce the #255 failure, so the test "
-                f"above proves nothing: {exc_info.value}"
-            )
+            caught.extend(self._drive(mcp_server, graph, rounds=100))
+        except Exception as e:  # noqa: BLE001 - the main thread's own lease can
+            caught.append(e)    # be the one that collides, not just the poller's
         finally:
-            del held
             mcp_server._reset_db_state()
+
+        assert caught, (
+            "the ablation did not reproduce the #255 failure -- try_acquire's "
+            "reuse branch was removed but the drive still completed cleanly, "
+            "so it says nothing about whether the test above depends on it"
+        )
+        assert any("already open in this process" in str(e) for e in caught), (
+            f"failure(s) came back but not the #255 one: {caught}"
+        )
