@@ -94,14 +94,6 @@ _db_native_lock = threading.Lock()
 # `with db_lease()` block. That cannot be prevented in Python, so it is
 # DETECTED: see _DbLeaseManager._detect_leaked_handle.
 
-# _db_mtime is now vestigial: it was paired with the module-level _graph_path
-# global (deleted, #255) to detect external modification of the graph file
-# and reopen transparently (_refresh_if_stale, now permanently inert -- see
-# its own docstring for why reactivating it is unsafe under the lease
-# protocol). Left declared, unused, rather than threaded out of every
-# variable-shadowing site that never actually needed it.
-_db_mtime: float = 0.0
-
 # Module-level server reference — set after server creation for MCP sampling
 _server_ref: Optional[Server] = None
 
@@ -3019,36 +3011,6 @@ def open_db(graph_path: Optional[str] = None) -> None:
     _lease_manager.bind_path(graph_path or _get_graph_path())
 
 
-def _update_mtime() -> None:
-    """Permanently inert (#255): a no-op left in place only so its call sites
-    don't need to be touched.
-
-    Paired with _refresh_if_stale below -- see that docstring for why
-    reactivating either of these is unsafe under the lease protocol. Real
-    mtime-based stale-page-table detection for a lease-managed handle is
-    unimplemented; this is not it.
-    """
-    return
-
-
-def _refresh_if_stale() -> None:
-    """Permanently inert (#255), not merely inert-by-empty-path as it was
-    mid-conversion.
-
-    Used to reopen the DB directly (_open_db_at, now deleted) if the graph
-    file's mtime showed an external modification -- minigraf's Drop impl
-    writes to the file even for read-only handles, so another process
-    opening the same path could invalidate this process's in-memory page
-    table. That reopen bypassed the lease manager entirely: reactivating it
-    would open a SECOND handle outside the manager's count, exactly the
-    #251/#253 mechanism this whole protocol removes. A lease-aware
-    replacement (reopening under db_lease() when count == 0) is real future
-    work, not a mechanical port of the old body -- left undone here rather
-    than done unsafely.
-    """
-    return
-
-
 def _is_lock_error(exc: Exception) -> bool:
     """True for the two "someone else has the graph" opens, both retryable.
 
@@ -3766,7 +3728,6 @@ def _checkpoint_after_write(db: Any, tool_name: str, result: Dict[str, Any]) -> 
     """
     try:
         _db_checkpoint(db)
-        _update_mtime()
     except MiniGrafError as e:
         print(f"[{tool_name}] checkpoint failed after successful write: {e}", file=sys.stderr)
         if result.get("ok"):
@@ -4102,7 +4063,6 @@ def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
         violations = _validate_facts(parsed)
         if violations:
             return {"ok": False, "error": f"schema violations: {'; '.join(violations)}"}
-    _refresh_if_stale()
     with db_lease() as db:
         valid_from = _now_utc_ms()
         try:
@@ -4121,7 +4081,6 @@ def handle_minigraf_retract(facts: str, reason: str) -> Dict[str, Any]:
     """Retract facts from the graph. reason is required."""
     if not reason or not reason.strip():
         return {"ok": False, "error": "reason is required for retract"}
-    _refresh_if_stale()
     with db_lease() as db:
         try:
             raw = _retract(db, facts)
@@ -4178,7 +4137,6 @@ def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
 
     Ported from Schema.audit_as_of() in minigraf-examples minigraf-schema crate.
     """
-    _refresh_if_stale()
     audited = 0
     retracted = 0
     all_violations: List[Dict[str, Any]] = []
@@ -4293,7 +4251,6 @@ def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
                             retracted += 1
                             try:
                                 _db_checkpoint(db)
-                                _update_mtime()
                             except Exception as e:
                                 print(
                                     f"[minigraf_audit] checkpoint failed after retracting "
@@ -6987,7 +6944,6 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
     -- :alias, :rationale, :date -- whenever it arrived as its own triple
     rather than bundled into the same dict as :description.)
     """
-    _refresh_if_stale()
     stored = 0
 
     entity_groups: Dict[str, List[Dict[str, Any]]] = {}
@@ -7033,7 +6989,6 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
                 continue
         if stored:
             _db_checkpoint(db)
-            _update_mtime()
     return stored
 
 
@@ -7324,7 +7279,6 @@ async def _agent_extract_and_transact(conversation_delta: str) -> Dict[str, Any]
         # rather than transacting the sampled model's raw text directly --
         # that raw text is unconstrained model output (an injection surface,
         # see #146) and skips schema validation entirely (#153).
-        _refresh_if_stale()
         parsed = _parse_transact_facts(datalog)
         stored_count = _transact_extracted_facts(parsed, valid_from=valid_at)
         return {"ok": True, "stored_count": stored_count, "strategy": "agent"}

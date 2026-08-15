@@ -156,6 +156,18 @@ class TestOpenDb:
         assert mcp_server._lease_manager.path == custom_path
 
 
+def _transact_and_assert_ok(m):
+    """`:description`, NOT `:decision/description` -- MINIGRAF_SCHEMA's
+    `decision` type requires the bare attribute, and a transact using the
+    namespaced form is REJECTED. Without asserting ok here, this parametrize
+    case would silently exercise a rejected transact while still passing --
+    it only checks that the lease is released, which happens whether or not
+    the write lands."""
+    result = m.handle_minigraf_transact('[[:decision/x :description "d"]]', "r")
+    assert result["ok"], result
+    return result
+
+
 class TestHandlersLeaseRatherThanHold:
     """#255: a handler that returns while still holding the handle is the leak.
     Every handler must have released by the time it returns, whether it
@@ -164,7 +176,7 @@ class TestHandlersLeaseRatherThanHold:
     @pytest.mark.parametrize("call", [
         lambda m: m.handle_minigraf_query("[:find ?e :where [?e :ident ?v]]"),
         lambda m: m.handle_minigraf_query("[:find ?e :where"),          # malformed
-        lambda m: m.handle_minigraf_transact('[[:decision/x :decision/description "d"]]', "r"),
+        _transact_and_assert_ok,
         lambda m: m.handle_minigraf_audit(),
     ])
     def test_handler_releases_its_lease_before_returning(self, tmp_path, monkeypatch, call):
@@ -1005,6 +1017,73 @@ class TestDbLeaseExtendedRetry:
             f"{mcp_server._LOCK_RETRY_MAX} attempts, got {attempts['n']}"
         )
         mcp_server._reset_db_state()
+
+
+class TestStaleHandlesAreStructurallyImpossible:
+    """#255: _refresh_if_stale existed because a handle held across turns could
+    go stale when another process wrote the graph. Under leases neither state
+    it handled can occur:
+
+      * count == 0  -> there is no handle, so the next acquire reads current
+                       bytes anyway;
+      * count > 0   -> we hold the file lock, so no other process can open the
+                       graph, and the only writer is us.
+
+    It also carried a live bug: _open_db_at(force=True) evaluated
+    MiniGrafDb.open() while the old handle was still bound, which raises on
+    minigraf >= 1.2.2.
+    """
+
+    def test_no_handle_survives_a_zero_count(self, tmp_path, monkeypatch):
+        """The invariant the whole deletion rests on: count == 0 implies no
+        live handle, which the lock file's absence proves."""
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+
+        for _ in range(3):
+            with mcp_server.db_lease() as db:
+                mcp_server._db_execute(db, "(query [:find ?e :where [?e :ident ?v]])")
+            assert mcp_server._lease_manager.lease_count == 0
+            assert not os.path.exists(graph + ".lock")
+
+    def test_a_lease_sees_writes_made_between_leases(self, tmp_path, monkeypatch):
+        """What _refresh_if_stale was FOR: a change landing while we held no
+        handle must be visible to the next lease. Opening fresh at 0 -> 1 is
+        what makes the mtime check unnecessary, so pin the behaviour, not the
+        mechanism."""
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+
+        # `:description`, NOT `:decision/description` -- MINIGRAF_SCHEMA's
+        # `decision` type requires the bare attribute, and a transact using the
+        # namespaced form is REJECTED, so the query below would find nothing
+        # and the test would fail for a reason unrelated to leases.
+        result = mcp_server.handle_minigraf_transact(
+            '[[:decision/mtime-probe :description "written between leases"]]',
+            "stale-handle regression",
+        )
+        assert result["ok"], result
+        assert mcp_server._lease_manager.lease_count == 0
+
+        result = mcp_server.handle_minigraf_query(
+            '[:find ?d :where [?e :description ?d]]'
+        )
+        assert result["ok"], result
+        assert any("written between leases" in str(r) for r in result["results"]), result
+
+    def test_the_stale_refresh_helpers_are_gone(self):
+        import mcp_server
+        for name in ("_refresh_if_stale", "_update_mtime", "_db_mtime"):
+            assert not hasattr(mcp_server, name), (
+                f"{name} survived; it has no reachable state under the lease "
+                f"protocol and its force-reopen raises on minigraf >= 1.2.2"
+            )
 
 
 class TestDbLeaseLeakDetector:
@@ -22841,28 +22920,32 @@ class TestWriteExecutorIsShutDownOnEarlyFailure:
 class TestNoDirectDbGlobalAssignment:
     """#255: assigning to a module attribute that no longer exists is silently
     accepted by Python. Without this grep, code that still assigns directly
-    to a legacy global (`_db`, `_graph_path` -- both deleted) would keep
-    "working" -- doing nothing -- and state it was meant to clear would leak
-    into the next test. `_graph_path` was the fourth fail-open on this
-    branch: the guard originally covered only `_db`, and 54 dead
+    to a legacy global (`_db`, `_graph_path`, `_db_mtime` -- all deleted)
+    would keep "working" -- doing nothing -- and state it was meant to clear
+    would leak into the next test. `_graph_path` was the fourth fail-open on
+    this branch: the guard originally covered only `_db`, and 54 dead
     `_graph_path = X` assignments survived undetected in tests/ and evals/
-    until the pattern widened to catch it too.
+    until the pattern widened to catch it too. `_db_mtime` (deleted in the
+    same commit that added it here, #255 task 8) widens the pattern again on
+    the same reasoning: it is a third module global whose only remaining
+    reader was itself deleted, so a resurrected assignment to it would be
+    exactly as silent and exactly as stray.
 
     Note for anyone editing this class: writing the literal assignment this
-    guard hunts for (module-dot-underscore-db-or-graph_path-space-equals)
-    anywhere in this docstring or in the positive control below makes the
-    guard match itself, since git grep scans this very file. Both are
-    phrased/built to avoid that -- see test_the_grep_itself_matches_something's
-    string concatenation.
+    guard hunts for (module-dot-underscore-db-or-graph_path-or-db_mtime-
+    space-equals) anywhere in this docstring or in the positive control below
+    makes the guard match itself, since git grep scans this very file. Both
+    are phrased/built to avoid that -- see
+    test_the_grep_itself_matches_something's string concatenation.
 
-    Covers mcp_server.py too, not just tests/ and evals/: both globals are
-    deleted as of the commit that introduced this class, so any surviving
-    direct assignment anywhere is dead code that silently creates a stray
-    module attribute instead of raising -- exactly the failure mode this
-    guard exists to catch.
+    Covers mcp_server.py too, not just tests/ and evals/: all three globals
+    are deleted as of the commit that introduced/widened this class, so any
+    surviving direct assignment anywhere is dead code that silently creates a
+    stray module attribute instead of raising -- exactly the failure mode
+    this guard exists to catch.
     """
 
-    _PATTERN = r"\._(db|graph_path)\s*="
+    _PATTERN = r"\._(db|graph_path|db_mtime)\s*="
 
     def test_no_test_or_eval_assigns_the_db_global_directly(self):
         import subprocess
@@ -22881,14 +22964,18 @@ class TestNoDirectDbGlobalAssignment:
     def test_the_grep_itself_matches_something(self, tmp_path):
         """Positive control. A pattern that matches nothing reports 'all clear'
         forever; validate it against a known-positive before trusting a clean
-        result. Covers BOTH identifiers the widened pattern hunts for -- a
-        control that only exercised one would not have caught the other's
-        fail-open."""
+        result. Covers ALL THREE identifiers the widened pattern hunts for --
+        a control that only exercised some of them would not have caught the
+        others' fail-open."""
         import subprocess
         # Built by concatenation, not a literal, so these lines themselves are
         # not a second hit when the guard above scans this file (see class
         # docstring).
-        canary_line = "mcp_server." + "_db = None\n" + "mcp_server." + "_graph_path = None\n"
+        canary_line = (
+            "mcp_server." + "_db = None\n"
+            + "mcp_server." + "_graph_path = None\n"
+            + "mcp_server." + "_db_mtime = 0.0\n"
+        )
         (tmp_path / "canary.py").write_text(canary_line)
         hits = subprocess.run(
             ["grep", "-nHE", self._PATTERN, str(tmp_path / "canary.py")],
@@ -22896,8 +22983,8 @@ class TestNoDirectDbGlobalAssignment:
         ).stdout.strip()
         assert hits, "the guard's pattern matches nothing -- it would fail open"
         hit_lines = hits.splitlines()
-        assert len(hit_lines) == 2, (
-            f"expected both the _db and _graph_path canary lines to match, "
-            f"got {len(hit_lines)}: {hits}"
+        assert len(hit_lines) == 3, (
+            f"expected the _db, _graph_path, and _db_mtime canary lines to "
+            f"all match, got {len(hit_lines)}: {hits}"
         )
         assert all("canary.py" in line for line in hit_lines), hits
