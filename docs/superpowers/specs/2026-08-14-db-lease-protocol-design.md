@@ -181,7 +181,8 @@ is the opposite of a reuse candidate — it is the error signal.
 
 | Site | Becomes |
 |---|---|
-| `get_db()` and its 9 in-module callers | deleted; each caller wraps its DB work in `with db_lease() as db:` |
+| `get_db()`'s 9 in-module callers | each wraps its DB work in `with db_lease() as db:` |
+| `get_db()` itself | **kept**, re-implemented as a lease-backed shim — see below |
 | `_ensure_db_async()` | deleted; folded into `db_lease_async()` |
 | `call_tool`'s 9 `await _ensure_db_async()` + `finally: _db = None` | one `AsyncExitStack` entering `db_lease_async()` only for the tools that open the DB today |
 | `_run_ingestion`'s 7 release sites | 6 `async with db_lease_async() as db:` scopes + the preload's own extended lease |
@@ -201,6 +202,18 @@ and `minigraf_ingest_status` **only when** `_ingest_progress["status"] !=
 "running"`. `minigraf_report_issue`, `memory_finalize_turn` and
 `minigraf_ingest_git` are excluded from `call_tool`'s pre-acquire, and that
 conditional on `minigraf_ingest_status` must be carried across verbatim.
+
+**Corrected 2026-08-14, during execution: `get_db()` is kept, not deleted.**
+Measured against the real tree it has ~65 call sites in `tests/` and `evals/`
+(59 direct, 4 bare, 2 elsewhere) plus the central `real_db` fixture, none of
+which this spec accounted for. It is re-implemented over the manager: it
+acquires a lease held until `_reset_db_state()` and returns the leased handle.
+
+That removes the hazard without the churn. What made `get_db()` unsafe was
+returning a handle **nobody held a lease on**, so nothing could say when it was
+finished; backed by the manager, a handler taking its own lease nests at
+count 1→2 instead of opening a second handle. No production path calls it after
+this change — it survives as a test-facing helper.
 
 **Corrected 2026-08-14, during planning:** "excluded" above means excluded from
 `call_tool`'s pre-acquire, **not** that the tool never opens the graph.

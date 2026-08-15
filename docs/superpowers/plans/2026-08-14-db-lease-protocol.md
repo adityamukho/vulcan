@@ -1413,9 +1413,98 @@ Demonstrate it by temporarily making `_DbLeaseManager.reset()` skip its
 `test_reset_cannot_interleave_inside_an_acquire` FAILS with the "window ... is
 open again" message, then restoring it. Paste both outputs.
 
-- [ ] **Step 5: Delete `get_db`**
+- [ ] **Step 5: Re-implement `get_db` as a lease-backed shim (NOT deleted)**
 
-Delete `mcp_server.py:3335-3357` entirely. Its "reads the global exactly once" guarantee (#122) is now structural: the manager returns the handle from under its own lock, so there is no global for a background thread to race.
+**Changed during execution.** The plan said delete it. Measured against the real
+tree, `get_db()` has **~65 call sites in `tests/` and `evals/`** (59 direct, 4
+bare, 2 in other files) plus the central `real_db` fixture — none of which the
+plan accounted for. User's decision: keep it, backed by a lease.
+
+It stops being the hazard #255 describes. What made it unsafe was returning a
+handle **nobody held a lease on**, so nothing could say when it was finished.
+Backed by the manager it returns a genuinely leased handle, and a handler
+taking its own lease nests at count 1→2 instead of opening a second one.
+
+Replace its body with:
+
+```python
+# The shim's lease. get_db() is no longer called by any production path -- the
+# nine former call sites take scoped leases -- but ~65 tests and evals call it
+# directly, and converting them is churn with no correctness gain.
+_get_db_stack: Optional[contextlib.ExitStack] = None
+_get_db_handle: Optional["_LeasedDb"] = None
+
+
+def get_db() -> "_LeasedDb":
+    """Return the graph handle, acquiring a long-lived lease if none is held.
+
+    DEPRECATED for production use; no production path calls it. It survives for
+    tests and evals, and it is no longer #255's hazard: the handle it returns is
+    LEASED, held by this module until _reset_db_state() releases it. A handler
+    that takes its own lease therefore nests at count 1->2 rather than opening a
+    second handle on the same file.
+
+    The old #122 guarantee -- read the `_db` global exactly once -- is gone
+    because the global is gone from this path: try_acquire does its check, open
+    and count increment under one lock, so there is no window to race. See
+    TestLeaseAcquireCannotBeRacedByReset.
+    """
+    global _get_db_stack, _get_db_handle
+    if _get_db_stack is None:
+        _get_db_stack = contextlib.ExitStack()
+        _get_db_handle = _get_db_stack.enter_context(db_lease())
+    return _get_db_handle
+```
+
+and extend `_reset_db_state()` to release that lease **before** resetting the
+manager, or the shim's lease would outlive the reset and the count would never
+reach zero:
+
+```python
+def _reset_db_state() -> None:
+    global _db, _get_db_stack, _get_db_handle
+    if _get_db_stack is not None:
+        _get_db_handle = None      # drop the proxy before the stack severs it
+        _get_db_stack.close()
+        _get_db_stack = None
+    _db = None                     # TRANSITIONAL, removed with the global
+    _lease_manager.reset()
+```
+
+**Drop `test_get_db_is_gone`** from Step 1 and add in its place:
+
+```python
+    def test_get_db_returns_a_leased_handle(self, tmp_path, monkeypatch):
+        """get_db survives as a shim, but what it returns must be LEASED.
+
+        Returning an unleased handle is the whole of #255: nobody can say when
+        it is finished, so the release never happens. A handler called while
+        the shim's lease is open must nest, not open a second handle.
+        """
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(graph)
+
+        db = mcp_server.get_db()
+        assert mcp_server._lease_manager.lease_count == 1, (
+            "get_db must hold a lease on what it hands out"
+        )
+        result = mcp_server.handle_minigraf_query("[:find ?e :where [?e :ident ?v]]")
+        assert result["ok"], result
+        assert mcp_server._lease_manager.lease_count == 1, (
+            "the handler nested and released; the shim's lease must survive it"
+        )
+
+        mcp_server._reset_db_state()
+        assert mcp_server._lease_manager.lease_count == 0
+        assert not os.path.exists(graph + ".lock")
+```
+
+**Do NOT convert the ~65 existing `get_db()` call sites.** They keep working
+unchanged, which is the point of the shim.
 
 - [ ] **Step 6: Update the hook**
 
@@ -1627,15 +1716,20 @@ with:
 
 and indent the remainder of the function body into that block. This handler is the one call_tool does **not** pre-acquire for, so its lease is the only one — it must cover every `_transact_extracted_facts` call in all three strategy branches, including the LLM path's fallback to heuristic.
 
-- [ ] **Step 6: Delete `_ensure_db_async`**
+- [ ] **Step 6: Leave `_ensure_db_async` in place — its deletion moves to Task 7**
 
-Delete `mcp_server.py:3303-3332`. Confirm no callers remain:
+**Changed during execution.** `_run_ingestion` still has **6 live callers**, and
+ingestion is explicitly out of scope here. Deleting it now breaks every
+ingestion test.
+
+Remove only `call_tool`'s uses of it (Step 4 above). Verify what remains:
 
 ```bash
-grep -rn "_ensure_db_async" mcp_server.py tests/ evals/ hooks/
+grep -n "_ensure_db_async" mcp_server.py
 ```
 
-Expected: no hits outside comments. Update any comment that still names it — `_load_ingestion_preload_state`'s docstring (around line 8422) mentions both `get_db()` and `_ensure_db_async()` and is rewritten in Task 7.
+Expected: the definition plus exactly 6 calls, all inside `_run_ingestion`.
+Any hit outside `_run_ingestion` means a call site was missed — stop and report. Update any comment that still names it — `_load_ingestion_preload_state`'s docstring (around line 8422) mentions both `get_db()` and `_ensure_db_async()` and is rewritten in Task 7.
 
 - [ ] **Step 7: Run the tests**
 
