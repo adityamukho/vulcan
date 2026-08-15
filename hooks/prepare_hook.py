@@ -29,10 +29,10 @@ def main() -> None:
     if prompt:
         try:
             import mcp_server
-            # get_db() retries with backoff and self-heals a stale lock left by
-            # a crashed background-ingestion or hook subprocess (see mcp_server
-            # _open_db_at_with_retry).
-            mcp_server.get_db()
+            # No explicit open: handle_memory_prepare_turn takes its own lease,
+            # which carries the same retry/backoff and stale-lock self-heal
+            # get_db() used to provide, and releases when it returns so the
+            # next turn's hook process can acquire the file lock (#255).
             context = mcp_server.handle_memory_prepare_turn(prompt)
         except Exception:
             pass  # Never block the turn on memory errors

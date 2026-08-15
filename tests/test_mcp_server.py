@@ -97,11 +97,14 @@ class TestOpenDb:
         import mcp_server
         path = str(tmp_path / "t.graph")
 
-        result = mcp_server.open_db(path)
-
-        assert result is not None
-        assert mcp_server._graph_path == path
+        # open_db binds the path but returns None by design (#255) -- it does
+        # not hand back an unleased handle. mcp_server._graph_path (the legacy
+        # global) is intentionally left stale by the lease-based open_db/get_db;
+        # mcp_server._lease_manager.path is the source of truth now.
+        assert mcp_server.open_db(path) is None
+        assert mcp_server._lease_manager.path == path
         # A real handle can execute — proof it's a live db, not a stub.
+        result = mcp_server.get_db()
         assert json.loads(result.execute("(query [:find ?e :where [?e :foo ?v]])"))["results"] == []
 
     def test_registers_session_rules(self, real_db):
@@ -128,7 +131,9 @@ class TestOpenDb:
         result = mcp_server.get_db()
 
         assert result is not None
-        assert mcp_server._graph_path == str(tmp_path / "auto.graph")
+        # mcp_server._lease_manager.path is the source of truth now; the legacy
+        # _graph_path global is intentionally left stale (#255).
+        assert mcp_server._lease_manager.path == str(tmp_path / "auto.graph")
 
     def test_get_db_returns_instance_after_open(self, real_db):
         import mcp_server
@@ -147,7 +152,147 @@ class TestOpenDb:
 
         mcp_server.get_db()
 
-        assert mcp_server._graph_path == custom_path
+        # mcp_server._lease_manager.path is the source of truth now; the legacy
+        # _graph_path global is intentionally left stale (#255).
+        assert mcp_server._lease_manager.path == custom_path
+
+
+class TestHandlersLeaseRatherThanHold:
+    """#255: a handler that returns while still holding the handle is the leak.
+    Every handler must have released by the time it returns, whether it
+    succeeded or raised."""
+
+    @pytest.mark.parametrize("call", [
+        lambda m: m.handle_minigraf_query("[:find ?e :where [?e :ident ?v]]"),
+        lambda m: m.handle_minigraf_query("[:find ?e :where"),          # malformed
+        lambda m: m.handle_minigraf_transact('[[:decision/x :decision/description "d"]]', "r"),
+        lambda m: m.handle_minigraf_audit(),
+    ])
+    def test_handler_releases_its_lease_before_returning(self, tmp_path, monkeypatch, call):
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(graph)
+
+        call(mcp_server)
+
+        assert mcp_server._lease_manager.lease_count == 0
+        assert not os.path.exists(graph + ".lock"), (
+            "the handler returned still holding the graph file lock, so the "
+            "prepare_hook subprocess cannot open the DB between turns"
+        )
+
+    def test_open_db_leaves_no_handle_open(self, tmp_path, monkeypatch):
+        """open_db binds the path; it must not leave an unleased handle, which
+        is the #255 bug in its purest form."""
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+
+        assert mcp_server.open_db(graph) is None
+        assert mcp_server._lease_manager.lease_count == 0
+        assert mcp_server._lease_manager.path == graph
+        assert not os.path.exists(graph + ".lock")
+
+    def test_get_db_returns_a_leased_handle(self, tmp_path, monkeypatch):
+        """get_db survives as a shim, but what it returns must be LEASED.
+
+        Returning an unleased handle is the whole of #255: nobody can say when
+        it is finished, so the release never happens. A handler called while
+        the shim's lease is open must nest, not open a second handle.
+        """
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(graph)
+
+        db = mcp_server.get_db()
+        assert mcp_server._lease_manager.lease_count == 1, (
+            "get_db must hold a lease on what it hands out"
+        )
+        result = mcp_server.handle_minigraf_query("[:find ?e :where [?e :ident ?v]]")
+        assert result["ok"], result
+        assert mcp_server._lease_manager.lease_count == 1, (
+            "the handler nested and released; the shim's lease must survive it"
+        )
+
+        mcp_server._reset_db_state()
+        assert mcp_server._lease_manager.lease_count == 0
+        assert not os.path.exists(graph + ".lock")
+
+
+class TestCallToolAcquiresOnlyForDbTools:
+    """#255: call_tool's pre-acquire exists so the synchronous handler's own
+    lease nests at count 1->2 and never runs blocking backoff on the event
+    loop (#99). Converting nine `await _ensure_db_async()` calls into one
+    wrapper is where the DB-opening tool SET silently changes -- pin it."""
+
+    def test_report_issue_never_opens_the_graph(self, tmp_path, monkeypatch):
+        import mcp_server
+        from minigraf import MiniGrafDb
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(graph)
+
+        opens = []
+        real_open = MiniGrafDb.open
+        monkeypatch.setattr(
+            MiniGrafDb, "open",
+            staticmethod(lambda p: (opens.append(p), real_open(p))[1]),
+        )
+        asyncio.run(mcp_server.call_tool(
+            "minigraf_report_issue",
+            {"issue_type": "bug", "description": "d"},
+        ))
+        assert opens == [], (
+            "minigraf_report_issue does not await _ensure_db_async today and "
+            "must not acquire a lease either"
+        )
+
+    def test_ingest_status_acquires_only_when_not_running(self, tmp_path, monkeypatch):
+        """The conditional that is easiest to lose in the conversion."""
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(graph)
+
+        seen = []
+        real_try = mcp_server._lease_manager.try_acquire
+        monkeypatch.setattr(
+            mcp_server._lease_manager, "try_acquire",
+            lambda p: (seen.append(p), real_try(p))[1],
+        )
+
+        mcp_server._ingest_progress["status"] = "running"
+        asyncio.run(mcp_server.call_tool("minigraf_ingest_status", {}))
+        assert seen == [], "a running ingest must not have its handle contended"
+
+        mcp_server._ingest_progress["status"] = "idle"
+        asyncio.run(mcp_server.call_tool("minigraf_ingest_status", {}))
+        assert seen, "an idle ingest status must acquire, as it does today"
+
+    def test_call_tool_releases_even_when_the_handler_raises(self, tmp_path, monkeypatch):
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(graph)
+
+        with pytest.raises(ValueError, match="Unknown tool"):
+            asyncio.run(mcp_server.call_tool("no_such_tool", {}))
+        assert mcp_server._lease_manager.lease_count == 0
+        assert not os.path.exists(graph + ".lock")
 
 
 @contextlib.contextmanager
@@ -235,7 +380,7 @@ class TestGetDbLockRetry:
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
         mcp_server._reset_db_state()
-        mcp_server._graph_path = graph_path
+        mcp_server.open_db(graph_path)
 
         # Real backoff (not mocked) — the subprocess needs genuine wall-clock
         # time to hold the lock and then exit before a later retry attempt
@@ -250,10 +395,13 @@ class TestGetDbLockRetry:
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
         mcp_server._reset_db_state()
-        mcp_server._graph_path = graph_path
+        mcp_server.open_db(graph_path)
 
+        # db_lease() (which the get_db() shim now goes through) wraps
+        # exhausted-retry failures in its own diagnostic RuntimeError rather
+        # than re-raising the underlying MiniGrafError directly (#255).
         with _hold_lock_subprocess(graph_path):
-            with pytest.raises(MiniGrafError):
+            with pytest.raises(RuntimeError, match="could not acquire a lease"):
                 mcp_server.get_db()
 
     def test_non_lock_errors_are_not_retried(self, tmp_path, monkeypatch):
@@ -265,7 +413,7 @@ class TestGetDbLockRetry:
         graph_path = str(tmp_path / "adir")
         os.makedirs(graph_path)
         mcp_server._reset_db_state()
-        mcp_server._graph_path = graph_path
+        mcp_server.open_db(graph_path)
 
         with pytest.raises(MiniGrafError) as exc_info:
             mcp_server.get_db()
@@ -292,7 +440,7 @@ class TestGetDbLockRetry:
         graph_path = str(tmp_path / "t.graph")
         lock_path = graph_path + ".lock"
         mcp_server._reset_db_state()
-        mcp_server._graph_path = graph_path
+        mcp_server.open_db(graph_path)
 
         with _hold_lock_subprocess(graph_path, exit_immediately=True) as dead_pid:
             pass  # holder opened, printed its PID, and is confirmed reaped/dead
@@ -312,11 +460,13 @@ class TestGetDbLockRetry:
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
         mcp_server._reset_db_state()
-        mcp_server._graph_path = graph_path
+        mcp_server.open_db(graph_path)
         lock_path = graph_path + ".lock"
 
+        # See test_gives_up_after_max_attempts: db_lease() wraps the
+        # exhausted-retry failure in its own RuntimeError (#255).
         with _hold_lock_subprocess(graph_path):
-            with pytest.raises(MiniGrafError):
+            with pytest.raises(RuntimeError, match="could not acquire a lease"):
                 mcp_server.get_db()
             assert os.path.exists(lock_path)  # untouched — real holder still alive
 
@@ -343,7 +493,7 @@ class TestGetDbLockRetry:
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
         mcp_server._reset_db_state()
-        mcp_server._graph_path = graph_path
+        mcp_server.open_db(graph_path)
 
         open_calls = {"n": 0}
         real_open = mcp_server.MiniGrafDb.open
@@ -430,126 +580,75 @@ class TestClearStaleLockReverifiesCurrentHolder:
         assert mcp_server._clear_stale_lock(graph_path, 999999) is False
 
 
-class TestTryOpenWithSelfHealReuse:
-    """Regression test for #107: minigraf_ingest_status incorrectly reported
-    "Database is locked by another process" while minigraf_ingest_git was
-    actively running. Root cause: _try_open_with_self_heal always called
-    _open_db_at(path) unconditionally, even when another thread had already
-    opened the db and populated _db in the window between this thread's
-    None-check and its own open attempt (e.g. the ingestion preload thread,
-    which opens its own handle on a worker thread, racing against an
-    _ensure_db_async() caller like minigraf_ingest_status during the
-    "starting" phase, before _run_ingestion flips status to "running").
-    That produced a second, redundant MiniGrafDb.open() from this same
-    process, which collides with the first handle's still-live lock file and
-    surfaces as "locked by another process" with the lock file's own PID
-    equal to our own."""
+class TestLeaseAcquireCannotBeRacedByReset:
+    """Replaces TestGetDbConcurrentResetRace, which pinned #122 against
+    get_db()'s internals.
 
-    def test_concurrent_open_attempts_only_open_db_once(self, tmp_path, monkeypatch):
-        import mcp_server
+    #122 was: get_db() read the `_db` global TWICE -- once in `if _db is None`,
+    once again in `return _db` -- so a reset landing between those two reads
+    returned None while a live handle existed. Reading the global exactly once
+    was the fix.
+
+    Under the lease manager that stops being a read-discipline and becomes
+    structural: try_acquire does its check, its open and its count increment
+    inside ONE `with self._lock:`, and reset() takes the same lock, so no reset
+    can land inside the window at all. This pins the SERIALIZATION rather than
+    the read count, because the read count is no longer what makes it safe.
+    """
+
+    def test_reset_cannot_interleave_inside_an_acquire(self, tmp_path, monkeypatch):
         import threading
-        import time as _time
-        from minigraf import MiniGrafDb
+        import mcp_server
 
-        path = str(tmp_path / "race.graph")
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
         mcp_server._reset_db_state()
-        mcp_server._graph_path = ""
 
-        real_open_in_memory = MiniGrafDb.open_in_memory
-        open_call_count = {"n": 0}
-        open_lock = threading.Lock()
-
-        def slow_open(p):
-            with open_lock:
-                open_call_count["n"] += 1
-            _time.sleep(0.05)  # widen the race window so racers overlap
-            return real_open_in_memory()
-
-        monkeypatch.setattr(MiniGrafDb, "open", staticmethod(slow_open))
-
-        results = []
-        results_lock = threading.Lock()
-
-        def worker():
-            db = mcp_server._try_open_with_self_heal(path)
-            with results_lock:
-                results.append(db)
-
-        threads = [threading.Thread(target=worker) for _ in range(5)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=5)
-
-        assert open_call_count["n"] == 1, (
-            f"MiniGrafDb.open() called {open_call_count['n']} times for concurrent "
-            "open attempts racing on the same None _db -- _try_open_with_self_heal "
-            "must recheck _db under _db_native_lock before opening a second handle (#107)"
-        )
-        assert len(results) == 5
-        assert all(r is results[0] for r in results)
-
-
-class TestGetDbConcurrentResetRace:
-    """Regression test for #122: IndexCache._rebuild calls get_db() from a
-    background thread. get_db() used to read the module-level _db global
-    twice -- once in `if _db is None`, once again in `return _db` -- so if
-    call_tool()'s finally block reset _db to None in the window between
-    those two reads, get_db() returned None even though a live db existed
-    when it was called, producing "'NoneType' object has no attribute
-    'execute'" in _rebuild."""
-
-    def test_returns_live_db_despite_concurrent_reset_before_return(self):
-        import inspect
-        import sys as _sys
-        import threading
-        import mcp_server
-        from minigraf import MiniGrafDb
-
-        real_db = MiniGrafDb.open_in_memory()
-        mcp_server._db = real_db
-
-        target_code = mcp_server.get_db.__code__
-        src_lines, start_line = inspect.getsourcelines(mcp_server.get_db)
-        return_line = start_line + len(src_lines) - 1
-
-        paused = threading.Event()
-        resume = threading.Event()
+        inside = threading.Event()
+        release = threading.Event()
         outcome = {}
+        real_open = mcp_server._open_for_lease
 
-        def local_trace(frame, event, arg):
-            if event == "line" and frame.f_lineno == return_line:
-                paused.set()
-                resume.wait(timeout=2)
-            return local_trace
+        def slow_open(path):
+            # Runs inside try_acquire, with the manager lock held.
+            handle = real_open(path)
+            inside.set()
+            release.wait(timeout=5)
+            return handle
 
-        def global_trace(frame, event, arg):
-            if event == "call" and frame.f_code is target_code:
-                return local_trace
-            return None
+        monkeypatch.setattr(mcp_server, "_open_for_lease", slow_open)
 
-        def rebuild_worker():
-            _sys.settrace(global_trace)
-            try:
-                outcome["db"] = mcp_server.get_db()
-            finally:
-                _sys.settrace(None)
+        def acquirer():
+            with mcp_server.db_lease() as db:
+                outcome["handle"] = db._handle
 
-        t = threading.Thread(target=rebuild_worker)
+        t = threading.Thread(target=acquirer)
         t.start()
         try:
-            assert paused.wait(timeout=2), "tracer never reached get_db's return line"
-            # Simulate call_tool's finally block racing in between get_db()'s
-            # None-check and its return.
-            mcp_server._reset_db_state()
-            resume.set()
-        finally:
-            t.join(timeout=2)
+            assert inside.wait(timeout=5), "never reached the open inside try_acquire"
+            reset_done = threading.Event()
 
-        assert outcome.get("db") is real_db, (
-            "get_db() returned a stale/None value after a concurrent reset "
-            "of the global between its None-check and its return (#122)"
+            def resetter():
+                mcp_server._reset_db_state()
+                reset_done.set()
+
+            r = threading.Thread(target=resetter)
+            r.start()
+            assert not reset_done.wait(timeout=0.5), (
+                "reset() completed while try_acquire held the manager lock -- "
+                "the window #122 was about is open again"
+            )
+            release.set()
+            r.join(timeout=5)
+            assert reset_done.is_set(), "reset never completed once the lock freed"
+        finally:
+            release.set()
+            t.join(timeout=5)
+
+        assert outcome.get("handle") is not None, (
+            "the acquiring thread got no handle despite holding a live lease"
         )
+        mcp_server._reset_db_state()
 
 
 class TestDbNativeCallSerialization:
@@ -607,80 +706,6 @@ class TestDbNativeCallSerialization:
             "concurrent threads executed native db calls at the same time -- "
             "_db_execute/_db_checkpoint must serialize via _db_native_lock (#110)"
         )
-
-
-class TestOpenDbAtWithExtendedRetry:
-    """Unit tests for _open_db_at_with_extended_retry — the longer,
-    time-budgeted backoff used only for ingestion startup lock acquisition,
-    separate from get_db()'s ~1.55s budget (#106)."""
-
-    def test_succeeds_after_retries_within_budget(self, tmp_path, monkeypatch):
-        import mcp_server
-        graph_path = str(tmp_path / "t.graph")
-
-        # Real backoff (not mocked) — the subprocess needs genuine wall-clock
-        # time to hold the lock and then exit before a later retry attempt
-        # observes it free again. The extended retry's 120s budget is real
-        # wall-clock time too, so this stays far inside it.
-        with _hold_lock_subprocess(graph_path, hold_seconds=0.1):
-            result = mcp_server._open_db_at_with_extended_retry(graph_path)
-
-        assert result is not None
-
-    def test_gives_up_after_budget_exhausted(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
-        # Shrink the 120s real-time budget so the test doesn't actually wait
-        # two minutes — the budget is real wall-clock time (time.monotonic
-        # is not mocked), so this must be a real constant, not a faked clock.
-        import mcp_server
-        monkeypatch.setattr(mcp_server, "_INGEST_LOCK_RETRY_BUDGET", 0.3)
-        graph_path = str(tmp_path / "t.graph")
-
-        with _hold_lock_subprocess(graph_path):
-            with pytest.raises(MiniGrafError):
-                mcp_server._open_db_at_with_extended_retry(graph_path)
-
-    def test_non_lock_error_propagates_immediately(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
-        import mcp_server
-        # A real, deterministic non-lock MiniGrafError: pointing the graph
-        # path at a directory (not a file) fails with "Is a directory" on
-        # the very first open() attempt — no fabricated exception, no mock.
-        graph_path = str(tmp_path / "adir")
-        os.makedirs(graph_path)
-
-        with pytest.raises(MiniGrafError) as exc_info:
-            mcp_server._open_db_at_with_extended_retry(graph_path)
-        assert "locked" not in str(exc_info.value).lower()
-
-    def test_self_heals_dead_holder_mid_loop(self, tmp_path, monkeypatch):
-        """NOTE: as documented on _hold_lock_subprocess (see TestGetDbLockRetry
-        for the full rationale), a real open() call never actually raises
-        "locked" for a lock file naming an already-dead PID on this
-        platform/minigraf build — it self-heals silently inside
-        MiniGrafDb.open() itself. This test therefore (a) exercises the real
-        _clear_stale_lock function directly against a real stale lock file
-        naming a real, verifiably-dead PID, and (b) separately confirms the
-        practically-important end-to-end guarantee: the extended retry must
-        not get stuck just because a stale lock file is lying around.
-        """
-        monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
-        import mcp_server
-        graph_path = str(tmp_path / "t.graph")
-        lock_path = graph_path + ".lock"
-
-        with _hold_lock_subprocess(graph_path, exit_immediately=True) as dead_pid:
-            pass  # holder opened, printed its PID, and is confirmed reaped/dead
-
-        with open(lock_path, "w") as f:
-            f.write(str(dead_pid))
-        assert mcp_server._clear_stale_lock(graph_path, dead_pid) is True
-        assert not os.path.exists(lock_path)
-
-        with open(lock_path, "w") as f:
-            f.write(str(dead_pid))
-        result = mcp_server._open_db_at_with_extended_retry(graph_path)
-        assert result is not None
 
 
 class TestDbLeaseManager:
@@ -1101,7 +1126,7 @@ class TestMinigrafTransact:
         mcp_server.handle_minigraf_transact(
             '[[:decision/use-redis :description "use redis for caching"]]', reason="test"
         )
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "redis caching", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[0] == ":decision/use-redis" for r in results)
 
@@ -1124,7 +1149,7 @@ class TestMinigrafTransact:
         )
         assert result["ok"] is True
 
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[1] == ":status" and r[2] == "reviewed" for r in results)
 
@@ -1214,7 +1239,7 @@ class TestMinigrafRetract:
         mcp_server.handle_minigraf_retract(
             '[[:service/use-redis :description "use redis for caching"]]', reason="cleanup"
         )
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "redis caching", top_n=10, boost=2.0, historical_discount=1.0)
         assert results == []
 
@@ -1239,7 +1264,7 @@ class TestMinigrafRetract:
         )
         assert result["ok"] is True
 
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0)
         assert results == []
 
@@ -1345,7 +1370,7 @@ class TestUuidIdentBoostResolution:
         )
         assert result["ok"] is True
 
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(
             index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0
         )
@@ -1372,7 +1397,7 @@ class TestUuidIdentBoostResolution:
         )
         assert result["ok"] is True
 
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(
             index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0
         )
@@ -1404,7 +1429,7 @@ class TestUuidIdentBoostResolution:
         )
         assert result["ok"] is True
 
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(
             index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0
         )
@@ -1487,7 +1512,7 @@ class TestUuidIdentBoostResolution:
         )
         assert result["ok"] is True
 
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(
             index_path, "reviewed", top_n=10, boost=2.0, historical_discount=1.0
         )
@@ -1633,7 +1658,7 @@ class TestTransactRetractChokePoint:
         mcp_server._transact(
             real_db, '[[:decision/x :description "hello"]]', "2026-01-01T00:00:00.000Z",
         )
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0, historical_discount=1.0)
         assert results == [[":decision/x", ":description", "hello", "2026-01-01T00:00:00.000Z", None]]
 
@@ -1654,7 +1679,7 @@ class TestTransactRetractChokePoint:
             real_db, '[[:decision/x :description "hello"]]',
             "2025-01-01T00:00:00.000Z", valid_to="2025-06-01T00:00:00.000Z",
         )
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0, historical_discount=1.0)
         assert len(results) == 1
         assert results[0][0] == ":decision/x"
@@ -1666,7 +1691,7 @@ class TestTransactRetractChokePoint:
         import fact_index
         mcp_server._transact(real_db, '[[:decision/x :description "hello"]]', "2026-01-01T00:00:00.000Z")
         mcp_server._retract(real_db, '[[:decision/x :description "hello"]]')
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0, historical_discount=1.0)
         assert results == []
 
@@ -1687,7 +1712,7 @@ class TestTransactRetractChokePoint:
             real_db, '[[:decision/x :description "hello"]]', "2026-01-01T00:00:00.000Z",
             index_triples=[(":decision/explicit-override", ":description", "hello")],
         )
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "hello", top_n=10, boost=2.0, historical_discount=1.0)
         assert results == [[":decision/explicit-override", ":description", "hello", "2026-01-01T00:00:00.000Z", None]]
 
@@ -1709,7 +1734,7 @@ class TestBookkeepingWritesFactIndex:
         import mcp_server
         import fact_index
         mcp_server._watermark_update(real_db, "abc123", "2026-01-01T00:00:00.000Z", "test")
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "abc123", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[2] == "abc123" for r in results)
 
@@ -1718,7 +1743,7 @@ class TestBookkeepingWritesFactIndex:
         import fact_index
         mcp_server._watermark_update(real_db, "abc123", "2026-01-01T00:00:00.000Z", "test")
         mcp_server._watermark_update(real_db, "def456", "2026-01-02T00:00:00.000Z", "test")
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "abc123", top_n=10, boost=2.0, historical_discount=1.0)
         assert not any(r[2] == "abc123" for r in results)
 
@@ -1726,7 +1751,7 @@ class TestBookkeepingWritesFactIndex:
         import mcp_server
         import fact_index
         mcp_server._last_run_write(real_db, "abc123", "2026-01-01T00:00:00.000Z", 42)
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "abc123", top_n=10, boost=2.0, historical_discount=1.0)
         assert results
 
@@ -1738,7 +1763,7 @@ class TestBookkeepingWritesFactIndex:
             lambda repo_path: [("v1.0.0", "a" * 40, "2026-01-01T00:00:00Z")],
         )
         mcp_server._ingest_tags(real_db, str(tmp_path), "2026-01-01T00:00:00.000Z")
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "v1.0.0", top_n=10, boost=2.0, historical_discount=1.0)
         assert results
 
@@ -2545,7 +2570,7 @@ class TestConversationalMemoryFactIndex:
         mcp_server._transact_extracted_facts([
             {"entity": ":decision/x", "entity_type": "decision", "attribute": ":description", "value": "use redis"},
         ])
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "redis", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[0] == ":decision/x" for r in results)
 
@@ -2582,7 +2607,7 @@ class TestConversationalMemoryFactIndex:
         monkeypatch.setattr(mcp_server, "_query_canonical_entities", lambda: "")
         result = _asyncio.run(mcp_server._agent_extract_and_transact("we should use redis"))
         assert result["ok"] is True
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "redis", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[0] == ":decision/x" for r in results)
 
@@ -2704,11 +2729,17 @@ class TestMcpToolWiring:
         import asyncio
         import mcp_server
 
+        # real_db itself holds a lease for the test's duration (the shim's
+        # own, released by _reset_db_state()) -- that is a separate,
+        # legitimate holder, not what this asserts. What this proves is that
+        # call_tool's OWN lease was released, i.e. the count returns to
+        # whatever it was before call_tool ran, not to zero.
+        baseline = mcp_server._lease_manager.lease_count
         asyncio.run(mcp_server.call_tool(
             "minigraf_query", {"datalog": "[:find ?x :where [?e :x ?x]]"}
         ))
 
-        assert mcp_server._lease_manager.lease_count == 0, (
+        assert mcp_server._lease_manager.lease_count == baseline, (
             "every lease must be released after call_tool so prepare_hook can "
             "open the DB between turns"
         )
@@ -2730,12 +2761,12 @@ class TestMcpToolWiring:
         Uses a real subprocess (_hold_lock_subprocess, see TestGetDbLockRetry)
         to manufacture genuine cross-process lock contention rather than
         mocking MiniGrafDb.open, since this test specifically exercises the
-        real lock-retry backoff path (_ensure_db_async), not general dispatch."""
+        real lock-retry backoff path (db_lease_async), not general dispatch."""
         import asyncio
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
         mcp_server._reset_db_state()
-        mcp_server._graph_path = graph_path
+        mcp_server.open_db(graph_path)
 
         def fail_if_called(_delay):
             raise AssertionError("time.sleep() must not be called on the event-loop retry path (see #99)")
@@ -3412,7 +3443,7 @@ class TestMinigrafAudit:
         result = mcp_server.handle_minigraf_audit()
         assert result["ok"] is True
         assert result["retracted"] >= 1
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "decision bad", top_n=10, boost=2.0, historical_discount=1.0)
         assert not any(r[0] == ":decision/bad" for r in results)
 
@@ -7237,7 +7268,7 @@ class TestEntityIntroducedByValuesQuery:
     async def test_run_ingestion_resets_the_budget(self, tmp_path, monkeypatch):
         """The reset must be wired into the run, not merely available."""
         import mcp_server
-        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+        mcp_server.open_db(str(tmp_path / "g.graph"))
         repo = tmp_path / "repo"
         repo.mkdir()
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -9297,7 +9328,7 @@ class TestIngestCloseFactIndex:
             real_db, '[[:module/foo :description "the foo module"]]',
             "2026-01-01T00:00:00.000Z",
         )
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         # Sanity: the seed genuinely indexed the fact. If this fails, the
         # assertion below would be vacuous (nothing there to remove).
         seeded = fact_index.query_facts(index_path, "foo module", top_n=10, boost=2.0, historical_discount=1.0)
@@ -9328,7 +9359,7 @@ class TestIngestCloseFactIndex:
             real_db, '[[:module/foo :description "the foo module"]]',
             "2026-01-01T00:00:00.000Z",
         )
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         con = fact_index.open_reader(index_path)
         try:
             seeded_rows = con.execute(
@@ -9426,7 +9457,7 @@ class TestIngestCloseFactIndex:
             real_db, ['[:module/foo :description "the foo module"]'],
             "2024-01-01T00:00:00.000Z", "2025-01-01T00:00:00.000Z", "test",
         )
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         con = fact_index.open_reader(index_path)
         try:
             rows = con.execute(
@@ -9454,7 +9485,7 @@ class TestIngestCloseFactIndex:
         mcp_server._transact(
             real_db, '[[:module/foo :description "the foo module"]]', "2025-06-01T00:00:00.000Z",
         )
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         con = fact_index.open_reader(index_path)
         try:
             rows = con.execute(
@@ -9502,7 +9533,7 @@ class TestIngestCloseFactIndex:
             '[[:module/bar :ident ":module/bar"]])'
         )
         # Now delete the index to simulate a recovered pre-index graph
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         if os.path.exists(index_path):
             os.remove(index_path)
         # Rebuild from graph
@@ -11464,6 +11495,9 @@ class TestPreloadStateLinearizationWiring:
         assert mcp_server._ingest_progress["status"] == "complete"
 
         mcp_server._reset_db_state()
+        # _reset_db_state() clears the lease manager's bound path too (#255);
+        # rebind before the direct preload call below.
+        mcp_server.open_db(str(git_repo / "memory.graph"))
         linearization = frontier_registry.build_linearization(str(git_repo), "HEAD")
         commit_metadata = mcp_server._git_commits(str(git_repo), None, "HEAD")
         result = mcp_server._load_ingestion_preload_state(
@@ -11482,9 +11516,7 @@ class TestPreloadStateLinearizationWiring:
         worse than the misattribution _reverse_apply's own check prevents."""
         import mcp_server
         mcp_server._reset_db_state()
-        mcp_server._graph_path = None
         mcp_server.open_db(str(git_repo / "memory.graph"))
-        mcp_server._reset_db_state()
         with pytest.raises(ValueError, match="positionally aligned"):
             mcp_server._load_ingestion_preload_state(
                 str(git_repo), ["a" * 40, "b" * 40], [("a" * 40, "2026-01-01T00:00:00Z", "e", "s")],
@@ -11504,9 +11536,7 @@ class TestPreloadStateLinearizationWiring:
         preload without ever raising."""
         import mcp_server
         mcp_server._reset_db_state()
-        mcp_server._graph_path = None
         mcp_server.open_db(str(git_repo / "memory.graph"))
-        mcp_server._reset_db_state()
         linearization = ["a" * 40, "b" * 40]
         # Same length as linearization, but positions 0 and 1 are swapped.
         commit_metadata = [
@@ -11523,7 +11553,7 @@ class TestIngestTransactFactIndex:
     def test_ingest_transact_writes_to_index_with_explicit_con(self, real_db):
         import mcp_server
         import fact_index
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         con = fact_index.open_writer(index_path)
         try:
             mcp_server._ingest_transact(
@@ -11616,18 +11646,32 @@ class TestRunIngestion:
         list, this wraps the real (in-memory-backed) MiniGrafDb.open that
         real_db already installed — same technique as
         TestGetDbLockRetry.test_retries_open_after_clearing_stale_lock_on_final_attempt
-        — so the very first post-preload reacquire raises a genuine
-        MiniGrafError('...locked...') once, then every subsequent call opens
-        a real handle normally."""
+        — so a per-commit reacquire raises a genuine MiniGrafError('...locked...')
+        once, then every subsequent call opens a real handle normally.
+
+        Under the lease protocol the target call count shifted from 1 to 3:
+        real_db's own lease must be released first (below) or every
+        acquisition inside _run_ingestion would just REUSE its still-open
+        handle -- count > 0 never calls MiniGrafDb.open() at all, so
+        flaky_open would never fire. Released, the preload (call 1) and the
+        stamp/frontier_load phase (call 2) each now do a genuine fresh open
+        of their own -- neither is what this test is about -- so the first
+        per-commit reacquire is the 3rd real open, not the 1st.
+        """
         import mcp_server
         from minigraf import MiniGrafDb
 
+        # See docstring: must be released so _run_ingestion's own
+        # acquisitions are genuine opens rather than reusing this handle.
+        mcp_server._reset_db_state()
+
         base_open = MiniGrafDb.open
         call_count = {"n": 0}
+        FAIL_ON_CALL = 3  # first per-commit reacquire -- see docstring
 
         def flaky_open(path):
             call_count["n"] += 1
-            if call_count["n"] == 1:
+            if call_count["n"] == FAIL_ON_CALL:
                 raise MiniGrafError(
                     "Database is locked by another process (lock file: x.graph.lock, holder PID: 1)."
                 )
@@ -11700,16 +11744,31 @@ class TestRunIngestion:
             "status": "idle", "processed": 0, "total": 0,
             "current_commit": "", "error": None,
         }
+        # real_db holds its own lease for the test's duration (the shim's,
+        # released by _reset_db_state()) -- a separate, legitimate holder.
+        # What this proves is that _run_ingestion released ITS OWN lease at
+        # every yield point, i.e. the count returns to this baseline, not
+        # that no lease exists anywhere (which real_db's presence would
+        # falsify trivially).
+        baseline = mcp_server._lease_manager.lease_count
         db_none_snapshots = []
 
         original_sleep = asyncio.sleep
         async def patched_sleep(t):
-            db_none_snapshots.append(mcp_server._lease_manager.lease_count == 0)
+            # Stage B (phase == "sweeping") deliberately holds ONE lease
+            # across its whole batch rather than releasing between its own
+            # internal commits -- confirmed unchanged from the pre-#255 code
+            # (it held the old `_db` global the same way). This test's name
+            # and intent are about Stage A's per-commit release cadence, so
+            # only snapshot outside Stage B.
+            if mcp_server._ingest_progress.get("phase") != "sweeping":
+                db_none_snapshots.append(mcp_server._lease_manager.lease_count == baseline)
             await original_sleep(t)
 
         with patch("mcp_server.asyncio.sleep", patched_sleep):
             await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
+        assert db_none_snapshots, "expected at least one per-commit yield to check"
         assert all(db_none_snapshots), f"_db was not None at yield: {db_none_snapshots}"
 
     @pytest.mark.asyncio
@@ -12269,7 +12328,7 @@ class TestRunIngestionCommitFaultIsolation:
         # since real_db's MiniGrafDb.open() patch hands back a brand-new
         # isolated store on every reopen -- _run_ingestion reopens the db
         # between commits, so only index/DB-external assertions survive.
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "models", top_n=50, boost=2.0, historical_discount=1.0)
         subjects = {r[2] for r in results if r[1] == ":subject"}
         assert "add models" in subjects
@@ -12309,7 +12368,7 @@ class TestRunIngestionCommitFaultIsolation:
         # Second commit (models.py) still got ingested despite the first
         # commit's write-phase failure -- proves isolation, not just that
         # the run avoided "error" status.
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "models", top_n=50, boost=2.0, historical_discount=1.0)
         subjects = {r[2] for r in results if r[1] == ":subject"}
         assert "add models" in subjects
@@ -12562,7 +12621,7 @@ class TestRunIngestionParentEdgeFactIndex:
             "current_commit": "", "error": None,
         }
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "parent", top_n=50, boost=2.0, historical_discount=1.0)
         parent_rows = [r for r in results if r[1] == ":parent"]
         assert parent_rows, "no :parent-attribute rows found in the fact index after ingestion"
@@ -12667,6 +12726,10 @@ class TestRunIngestionConcurrency:
     async def test_worker_count_env_var_is_respected(self, real_db, git_repo, monkeypatch):
         monkeypatch.setenv("MINIGRAF_INGEST_WORKERS", "1")
         import mcp_server
+        # real_db is only here for its MiniGrafDb.open -> open_in_memory patch;
+        # its own lease must be released before rebinding to a different path,
+        # or bind_path refuses the switch while a lease is outstanding (#255).
+        mcp_server._reset_db_state()
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -12688,6 +12751,10 @@ class TestRunIngestionConcurrency:
         <hash>:auth.py` genuinely fail inside the worker, exercising the
         same try/except continue path the old monkeypatch used to reach."""
         import mcp_server
+        # real_db is only here for its MiniGrafDb.open -> open_in_memory patch;
+        # its own lease must be released before rebinding to a different path,
+        # or bind_path refuses the switch while a lease is outstanding (#255).
+        mcp_server._reset_db_state()
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -12750,6 +12817,10 @@ class TestRunIngestionEventLoopResponsiveness:
         _subprocess.run(["git", "commit", "-m", "add big file"], cwd=repo, check=True, capture_output=True)
 
         import mcp_server
+        # real_db is only here for its MiniGrafDb.open -> open_in_memory patch;
+        # its own lease must be released before rebinding to a different path,
+        # or bind_path refuses the switch while a lease is outstanding (#255).
+        mcp_server._reset_db_state()
         mcp_server.open_db(str(repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -12790,6 +12861,10 @@ class TestRunIngestionShutdown:
         the loop must stop cleanly with status 'stopped' and only 1 commit
         durably processed."""
         import mcp_server
+        # real_db is only here for its MiniGrafDb.open -> open_in_memory patch;
+        # its own lease must be released before rebinding to a different path,
+        # or bind_path refuses the switch while a lease is outstanding (#255).
+        mcp_server._reset_db_state()
         mcp_server.open_db(str(git_repo / "memory.graph"))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -12874,6 +12949,12 @@ class TestRunIngestionShutdown:
         # is the test putting the process into a state the server never is.
         del db
         mcp_server._reset_db_state()
+        # _reset_db_state() clears the lease manager's bound path too (by
+        # design, so one test's path can't leak into the next one that never
+        # binds its own -- see _DbLeaseManager.reset()'s docstring). Under the
+        # old _graph_path global that survived a reset; under the lease
+        # protocol it does not, so run 2 needs its own bind.
+        mcp_server.open_db(str(git_repo / "memory.graph"))
 
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0,
@@ -13161,15 +13242,18 @@ class TestRunStartupBackfillDbLockRelease:
         import fact_index
         import os
 
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         if os.path.exists(index_path):
             os.remove(index_path)
 
-        assert mcp_server._db is not None  # real_db fixture already opened it
+        # real_db fixture already opened it and holds its own lease -- a
+        # separate, legitimate holder, not what the assertion below is about.
+        baseline = mcp_server._lease_manager.lease_count
+        assert baseline > 0
 
         await mcp_server._run_startup_backfill()
 
-        assert mcp_server._lease_manager.lease_count == 0
+        assert mcp_server._lease_manager.lease_count == baseline
 
     @pytest.mark.asyncio
     async def test_releases_db_lock_even_when_no_rebuild_needed(self, real_db):
@@ -13182,15 +13266,18 @@ class TestRunStartupBackfillDbLockRelease:
 
         # Seed an already-complete index so needs_backfill() is False and
         # _rebuild_index_from_graph (hence get_db()) is never invoked.
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         fact_index.rebuild_index(index_path, [])
         assert fact_index.needs_backfill(index_path) is False
 
-        assert mcp_server._db is not None  # real_db fixture already opened it
+        # real_db fixture already opened it and holds its own lease -- a
+        # separate, legitimate holder, not what the assertion below is about.
+        baseline = mcp_server._lease_manager.lease_count
+        assert baseline > 0
 
         await mcp_server._run_startup_backfill()
 
-        assert mcp_server._lease_manager.lease_count == 0
+        assert mcp_server._lease_manager.lease_count == baseline
 
 
 class TestMainStartupBackfill:
@@ -13496,7 +13583,7 @@ class TestHandleMemoryPrepareTurnFts5:
         mcp_server.handle_minigraf_transact(
             '[[:decision/use-redis :description "use redis for caching"]]', reason="test"
         )
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         os.remove(index_path)
         result = mcp_server.handle_memory_prepare_turn("redis caching")
         assert "use redis for caching" in result
@@ -13508,7 +13595,7 @@ class TestHandleMemoryPrepareTurnFts5:
             '[[:decision/prefer-sqlite :description "prefer sqlite over postgres for embedded use"]]',
             reason="test",
         )
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         os.remove(index_path)
         result = mcp_server.handle_memory_prepare_turn("prefer sqlite over postgres for embedded use")
         assert "prefer sqlite over postgres for embedded use" in result
@@ -13522,7 +13609,7 @@ class TestHandleMemoryPrepareTurnFts5:
             '[:decision/use-redis :ident ":decision/use-redis"]]',
             reason="test",
         )
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         os.remove(index_path)
         result = mcp_server.handle_memory_prepare_turn("use redis for caching layer")
         assert "use redis for caching layer" in result
@@ -13732,7 +13819,7 @@ class TestIndexCacheInvalidation:
         mcp_server.handle_minigraf_transact(
             '[[:decision/test :description "test"]]', reason="test"
         )
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "test", top_n=10, boost=2.0, historical_discount=1.0)
         assert any(r[0] == ":decision/test" for r in results)
 
@@ -13742,7 +13829,7 @@ class TestIndexCacheInvalidation:
         bad_facts = '[[:decision/leaky :description "should not be indexed"]] ('
         result = mcp_server.handle_minigraf_transact(bad_facts, reason="test")
         assert result["ok"] is False
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         try:
             results = fact_index.query_facts(index_path, "leaky", top_n=10, boost=2.0, historical_discount=1.0)
         except sqlite3.OperationalError:
@@ -13760,7 +13847,7 @@ class TestIndexCacheInvalidation:
         mcp_server.handle_minigraf_retract(
             '[[:decision/test :description "test"]]', reason="cleanup"
         )
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "test", top_n=10, boost=2.0, historical_discount=1.0)
         assert results == []
 
@@ -13779,7 +13866,7 @@ class TestIndexCacheInvalidation:
         bad_facts = '[[:decision/leaky :description "should not be indexed"]] ('
         result = mcp_server.handle_minigraf_retract(bad_facts, reason="cleanup")
         assert result["ok"] is False
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "leaky", top_n=10, boost=2.0, historical_discount=1.0)
         # The entry must still be present -- a failed retract must not remove
         # anything from the index.
@@ -13803,7 +13890,7 @@ class TestIndexCacheInvalidation:
         }
         asyncio.run(mcp_server._run_ingestion(str(git_repo), "HEAD"))
         assert mcp_server._ingest_progress["status"] == "complete"
-        index_path = fact_index.index_path_for(mcp_server._graph_path)
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
         results = fact_index.query_facts(index_path, "auth", top_n=10, boost=2.0, historical_discount=1.0)
         assert results, (
             "ingested commit/module facts must be queryable via the fact "
@@ -17809,6 +17896,11 @@ class TestReverseApplyWriteBudget:
         call, so open_db here is cheap and isolated."""
         import mcp_server
         import frontier_registry
+        # Called twice per test (two repos, two graphs). A lease from the
+        # PRIOR call (get_db()'s shim holds one until _reset_db_state())
+        # would make the second open_db() here refuse to rebind to a
+        # different path (#255's "cannot bind: lease(s) outstanding").
+        mcp_server._reset_db_state()
         real_db = mcp_server.open_db(str(tmp_path / graph_name)) or mcp_server.get_db()
         linearization = frontier_registry.build_linearization(str(repo))
         commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
@@ -19600,7 +19692,7 @@ class TestStageAInterleave:
         from minigraf import MiniGrafDb
         repo = self._repo(tmp_path)
         graph = tmp_path / "g.graph"
-        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        mcp_server.open_db(str(graph))
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
 
         await mcp_server._run_ingestion(str(repo), "master")
@@ -19622,7 +19714,7 @@ class TestStageAInterleave:
         from minigraf import MiniGrafDb
         repo = self._repo(tmp_path, n_commits=8)
         graph = tmp_path / "g.graph"
-        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        mcp_server.open_db(str(graph))
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "3:1")
 
         await mcp_server._run_ingestion(str(repo), "master")
@@ -19643,7 +19735,7 @@ class TestStageAInterleave:
         from minigraf import MiniGrafDb
         repo = self._repo(tmp_path)
         graph = tmp_path / "g.graph"
-        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        mcp_server.open_db(str(graph))
         await mcp_server._run_ingestion(str(repo), "master")
         mcp_server._reset_db_state()
 
@@ -19655,7 +19747,7 @@ class TestStageAInterleave:
     async def test_single_commit_repo(self, tmp_path, monkeypatch):
         import mcp_server
         repo = self._repo(tmp_path, n_commits=1)
-        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+        mcp_server.open_db(str(tmp_path / "g.graph"))
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete"
 
@@ -19665,9 +19757,10 @@ class TestStageAInterleave:
         spin or re-process."""
         import mcp_server
         repo = self._repo(tmp_path)
-        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+        mcp_server.open_db(str(tmp_path / "g.graph"))
         await mcp_server._run_ingestion(str(repo), "master")
         mcp_server._reset_db_state()
+        mcp_server.open_db(str(tmp_path / "g.graph"))
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete"
 
@@ -19706,7 +19799,7 @@ class TestStageBCorrectionSweep:
         from minigraf import MiniGrafDb
         repo = self._repo(tmp_path)
         graph = tmp_path / "g.graph"
-        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        mcp_server.open_db(str(graph))
         await mcp_server._run_ingestion(str(repo), "master")
         mcp_server._reset_db_state()
 
@@ -19719,7 +19812,7 @@ class TestStageBCorrectionSweep:
         from minigraf import MiniGrafDb
         repo = self._repo(tmp_path)
         graph = tmp_path / "g.graph"
-        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        mcp_server.open_db(str(graph))
         await mcp_server._run_ingestion(str(repo), "master")
         mcp_server._reset_db_state()
 
@@ -19735,7 +19828,7 @@ class TestStageBCorrectionSweep:
         from minigraf import MiniGrafDb
         repo = self._repo(tmp_path)
         graph = tmp_path / "g.graph"
-        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        mcp_server.open_db(str(graph))
         await mcp_server._run_ingestion(str(repo), "master")
         mcp_server._reset_db_state()
 
@@ -19751,7 +19844,7 @@ class TestStageBCorrectionSweep:
         "sweeping"} for the entire remaining life of the server process."""
         import mcp_server
         repo = self._repo(tmp_path)
-        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+        mcp_server.open_db(str(tmp_path / "g.graph"))
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete"
@@ -19783,7 +19876,7 @@ class TestStageBCorrectionSweep:
         from minigraf import MiniGrafDb
         repo = self._repo(tmp_path)
         graph = tmp_path / "g.graph"
-        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        mcp_server.open_db(str(graph))
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
 
         swept: list = []
@@ -19971,8 +20064,12 @@ class TestStageBRepairsLifecycleFacts:
     async def _ingest(self, repo, graph_path, monkeypatch, ratio):
         import mcp_server
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", ratio)
-        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
+        # Reset BEFORE binding, not after: _reset_db_state() clears the lease
+        # manager's bound path too (#255), so binding first and resetting
+        # second would wipe the very path just set, leaving _run_ingestion to
+        # fall back to the env var/default instead of graph_path.
         mcp_server._reset_db_state()
+        mcp_server.open_db(str(graph_path))
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
@@ -20287,8 +20384,8 @@ class TestNoDuplicateIntroducedByAfterFullIngest:
         graph_path = tmp_path / "memory.graph"
 
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
-        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
         mcp_server._reset_db_state()
+        mcp_server.open_db(str(graph_path))
         self._reset_progress()
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
@@ -20328,8 +20425,8 @@ class TestNoDuplicateIntroducedByAfterFullIngest:
         _shutdown_requested itself, so the resuming run needs no cleanup."""
         import mcp_server
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
-        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
         mcp_server._reset_db_state()
+        mcp_server.open_db(str(graph_path))
         self._reset_progress()
 
         real_forward = mcp_server._forward_apply
@@ -20400,7 +20497,7 @@ class TestNoDuplicateIntroducedByAfterFullIngest:
 
         # Resume. Stage A completes, then Stage B sweeps and repairs.
         self._reset_progress()
-        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
+        mcp_server.open_db(str(graph_path))
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
         mcp_server._reset_db_state()
@@ -20571,8 +20668,8 @@ class TestMultiStreamParityWithForwardOnly:
     async def _ingest(self, repo, graph_path, monkeypatch, ratio):
         import mcp_server
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", ratio)
-        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
         mcp_server._reset_db_state()
+        mcp_server.open_db(str(graph_path))
         self._reset_progress()
         await mcp_server._run_ingestion(str(repo), "master")
         assert mcp_server._ingest_progress["status"] == "complete", mcp_server._ingest_progress
@@ -20584,8 +20681,8 @@ class TestMultiStreamParityWithForwardOnly:
         stream's claims persisted and its lineage still provisional."""
         import mcp_server
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:1")
-        monkeypatch.setattr(mcp_server, "_graph_path", str(graph_path))
         mcp_server._reset_db_state()
+        mcp_server.open_db(str(graph_path))
         self._reset_progress()
 
         real_forward = mcp_server._forward_apply
@@ -20987,7 +21084,7 @@ class TestStagingAndShutdown:
         """
         import mcp_server
         repo = self._repo(tmp_path)
-        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+        mcp_server.open_db(str(tmp_path / "g.graph"))
 
         observed_sweeping = False
         real_apply = mcp_server._correction_sweep_apply
@@ -21015,7 +21112,7 @@ class TestStagingAndShutdown:
         from minigraf import MiniGrafDb
         repo = self._repo(tmp_path)
         graph = tmp_path / "g.graph"
-        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        mcp_server.open_db(str(graph))
 
         observed = []
         real_apply = mcp_server._correction_sweep_apply
@@ -21035,7 +21132,7 @@ class TestStagingAndShutdown:
         from minigraf import MiniGrafDb
         repo = self._repo(tmp_path, n_commits=10)
         graph = tmp_path / "g.graph"
-        monkeypatch.setattr(mcp_server, "_graph_path", str(graph))
+        mcp_server.open_db(str(graph))
 
         real_forward = mcp_server._forward_apply
         calls = {"n": 0}
@@ -21057,6 +21154,10 @@ class TestStagingAndShutdown:
         assert mcp_server._lineage_confirmed_through_query(db) != linearization[-1]
         db = None
         mcp_server._reset_db_state()
+        # _reset_db_state() clears the lease manager's bound path too (#255);
+        # the resumed run below needs its own bind, unlike the old _graph_path
+        # global which survived a reset.
+        mcp_server.open_db(str(graph))
 
         monkeypatch.setattr(mcp_server, "_forward_apply", real_forward)
         await mcp_server._run_ingestion(str(repo), "master")
@@ -21092,7 +21193,7 @@ class TestStagingAndShutdown:
         writes into one executor-schedulable unit."""
         import mcp_server
         repo = self._repo(tmp_path)
-        monkeypatch.setattr(mcp_server, "_graph_path", str(tmp_path / "g.graph"))
+        mcp_server.open_db(str(tmp_path / "g.graph"))
 
         for name in (
             "_correction_sweep_claim_and_process",
@@ -22451,35 +22552,32 @@ class TestSingleHandlePerProcess:
         finally:
             del first
 
-    def test_release_idiom_does_not_drop_a_handle_others_still_hold(self, tmp_path, monkeypatch):
-        """Pins the precondition that makes the above reachable.
+    def test_a_released_lease_genuinely_drops_the_handle(self, tmp_path, monkeypatch):
+        """Replaces test_release_idiom_does_not_drop_a_handle_others_still_hold,
+        which pinned the broken semantics: `_db = None` released only when it
+        dropped the LAST reference, so `_db is None` was never evidence the
+        graph file lock had been released.
 
-        This is the half we control: `_db = None` does not destroy the handle
-        while another caller still references it, so `_db is None` is NOT
-        evidence that the graph file lock was released.
+        Under the lease protocol the count is authoritative, so the assertion
+        inverts -- the lock file MUST be gone. Kept in this class because the
+        #253 interleaving it enabled is what this whole protocol removes.
         """
         import mcp_server
 
         graph = str(tmp_path / "t.graph")
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
         mcp_server._reset_db_state()
-        mcp_server._graph_path = ""
 
-        held = mcp_server._open_db_at(graph)          # _run_ingestion's local `db`
-        mcp_server._reset_db_state()                          # call_tool's finally
-        assert mcp_server._db is None
+        with mcp_server.db_lease() as db:
+            raw = mcp_server._db_execute(db, "(query [:find ?e :where [?e :ident ?v]])")
+            assert "out of bounds" not in raw
+            assert os.path.exists(graph + ".lock")
 
-        # The handle is still fully usable, which is exactly the problem: the
-        # lock is still held, so the next open is a second handle, not a reopen.
-        raw = mcp_server._db_execute(held, "(query [:find ?e :where [?e :ident ?v]])")
-        assert "out of bounds" not in raw
-        assert os.path.exists(graph + ".lock"), (
-            "_db = None released the lock even though a reference is still held "
-            "-- if this ever becomes true, the #253 interleaving is gone"
+        assert not os.path.exists(graph + ".lock"), (
+            "a released lease left the lock file behind, so the handle is still "
+            "alive and the next open is a second handle -- the #253 interleaving"
         )
-
-        del held
-        mcp_server._reset_db_state()
+        assert mcp_server._lease_manager.lease_count == 0
 
 
 class TestLockErrorRecognisesSameProcessOpen:
@@ -22629,28 +22727,11 @@ class TestNoDirectDbGlobalAssignment:
     since git grep scans this very file. Both are phrased/built to avoid that
     -- see test_the_grep_itself_matches_something's string concatenation.
 
-    Scoped to tests/ and evals/ for now; mcp_server.py joins the scan in the
-    commit that deletes the global.
+    Covers mcp_server.py too, not just tests/ and evals/: the global itself
+    is deleted as of this commit, so any surviving direct assignment anywhere
+    is dead code that silently creates a stray module attribute instead of
+    raising -- exactly the failure mode this guard exists to catch.
     """
-
-    # TestGetDbConcurrentResetRace (#122) assigns a live handle directly to
-    # the raw `_db` global to manufacture a race inside get_db()'s own
-    # implementation, which still reads/writes `_db` directly at this point
-    # in #255 (production code is not converted by this task). It is not a
-    # reset -- _reset_db_state() only knows how to clear the slot, not set it
-    # to a caller-supplied handle -- so this one site is expected to remain
-    # until get_db() itself converts. Anchored to the exact statement (both
-    # ends: no trailing comment, no other right-hand side) so a future site
-    # whose right-hand-side variable merely starts with the same four
-    # letters as the fixture this exception names is NOT swallowed by
-    # accident. Task 5 deletes both this exception and the test it excuses.
-    #
-    # Built by concatenation, like the positive control's canary line, so
-    # the pattern text itself is not a second hit when this class's own
-    # guard scans this file (see the class docstring).
-    _KNOWN_EXCEPTION = re.compile(
-        r"^tests/test_mcp_server\.py:\d+:\s*mcp_server\." + r"_db = real_db\s*$"
-    )
 
     def test_no_test_or_eval_assigns_the_db_global_directly(self):
         import subprocess
@@ -22658,13 +22739,9 @@ class TestNoDirectDbGlobalAssignment:
         repo = Path(__file__).resolve().parent.parent
         hits = subprocess.run(
             ["git", "grep", "-n", r"\._db\s*=", "--",
-             "tests/", "evals/at_scale/"],
+             "mcp_server.py", "tests/", "evals/at_scale/"],
             cwd=repo, capture_output=True, text=True,
         ).stdout.strip()
-        hits = "\n".join(
-            line for line in hits.splitlines()
-            if not self._KNOWN_EXCEPTION.match(line)
-        )
         assert not hits, (
             "these sites still assign the DB global directly; they must call "
             f"mcp_server._reset_db_state() instead:\n{hits}"

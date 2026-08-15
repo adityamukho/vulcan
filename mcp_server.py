@@ -56,9 +56,6 @@ SESSION_RULES = [
 # these are accumulated at runtime via minigraf_rule and re-applied on every open).
 _user_rules: List[str] = []
 
-# Module-level DB instance — opened once, held for the session lifetime
-_db: Optional[MiniGrafDb] = None
-
 # Serializes every native call into the shared MiniGrafDb handle across the
 # threads that can touch it concurrently: the event-loop thread (call_tool
 # handlers), the ingestion write_executor thread, and worker threads used
@@ -75,54 +72,34 @@ _db: Optional[MiniGrafDb] = None
 # distinct internal mutexes. See the single-handle invariant below.
 _db_native_lock = threading.Lock()
 
-# THE SINGLE-HANDLE INVARIANT (#253, #251, project-minigraf/minigraf#304)
+# THE SINGLE-HANDLE INVARIANT (#255, #253, #251, project-minigraf/minigraf#304)
 #
-# Everything below assumes at most one live MiniGrafDb handle per process.
-# Nothing in this module enforces that. minigraf did not either until 1.2.2
-# (project-minigraf/minigraf#304); this project now requires >= 1.2.3, so the
-# corruption path below is closed at the source rather than here.
+# At most one live MiniGrafDb handle per process. _DbLeaseManager enforces it:
+# the handle is opened at lease count 0 -> 1, reused by every acquisition in
+# between, and dropped at 1 -> 0. There is no window in which the module says
+# "no handle" while a caller still holds one, which is what `_db = None` could
+# never promise -- it released only when it dropped the LAST reference.
 #
-# `_db = None` is this module's "release the graph file lock" idiom, but it
-# only releases when it drops the LAST reference. Any local `db` still on a
-# stack keeps the handle — and its lock — alive: _run_ingestion holds one
-# across the awaits in its per-commit loop, and a concurrent call_tool's
-# `finally: _db = None` clears the global underneath it.
+# Two handles on one file each cache their own FileHeader.page_count, allocate
+# from it, and bounds-check read_page against it, which is where the flaky
+# "Page N out of bounds (total pages: M)" came from. Since minigraf 1.2.2 a
+# second same-process open raises instead of corrupting, and this project
+# requires >= 1.2.3 -- so that path is closed at the source as well as here.
 #
-# The next MiniGrafDb.open() then does NOT fail. minigraf's FileLock::acquire
-# (src/storage/backend/file.rs) removes the lock file and retries whenever the
-# holder PID equals our own:
+# _db_native_lock (above) is a DIFFERENT concern and is deliberately separate:
+# it serializes calls INTO one handle; the manager governs the handle's
+# LIFETIME. Conflating them is what made the old comment here necessary.
 #
-#     if pid == our_pid || !Self::is_process_alive(pid) {
-#         let _ = std::fs::remove_file(&lock_path);
-#         return Self::acquire(db_path);
-#     }
-#
-# So we silently get two live handles on one file. Each FileBackend caches its
-# own FileHeader.page_count, allocates new pages from it, and bounds-checks
-# read_page against it — which is exactly where the flaky
-# "Page N out of bounds (total pages: M)" comes from (#253, #251,
-# project-minigraf/minigraf#304). Worse, whichever handle drops first runs
-# FileLock::drop, deleting the lock file that by then belongs to the survivor,
-# leaving a live handle with no lock at all and letting other *processes* in.
-#
-# Since minigraf 1.2.2, FileLock::acquire steals only a DEAD holder's lock, so
-# the second open fails loudly with "Database is already open in this process"
-# instead of silently corrupting. That converts this from data
-# corruption into a lock error on the retry path — the right trade, but it does
-# not make the interleaving above correct. Clearing _db while another caller
-# still holds the handle is still a bug here; it is now merely a visible one.
-#
-# Enforcing the invariant in Python was tried and rejected (#253): a weakref
-# guard that reuses the still-live handle instead of opening a second one fixes
-# the corruption but changes handle LIFETIME, resurrecting handles whose backing
-# file is gone — it segfaulted the suite reproducibly. The durable local fix is
-# an explicit lease/refcount protocol replacing the `_db = None` idiom.
+# The remaining hole is a caller that keeps its handle past the end of its
+# `with db_lease()` block. That cannot be prevented in Python, so it is
+# DETECTED: see _DbLeaseManager._detect_leaked_handle.
 
-# Track graph path and last-known mtime so we can detect external modifications.
-# minigraf's Drop impl writes to the file even for read-only handles, which
-# invalidates any other open handle's in-memory page table.  Reopening on
-# mtime change is the workaround until the upstream bug is fixed.
-_graph_path: str = ""
+# _db_mtime is now vestigial: it was paired with the module-level _graph_path
+# global (deleted, #255) to detect external modification of the graph file
+# and reopen transparently (_refresh_if_stale, now permanently inert -- see
+# its own docstring for why reactivating it is unsafe under the lease
+# protocol). Left declared, unused, rather than threaded out of every
+# variable-shadowing site that never actually needed it.
 _db_mtime: float = 0.0
 
 # Module-level server reference — set after server creation for MCP sampling
@@ -3032,85 +3009,44 @@ def _get_graph_path() -> str:
     return os.environ.get("MINIGRAF_GRAPH_PATH", str(Path.cwd() / "memory.graph"))
 
 
-def _open_db_at(path: str, *, force: bool = True) -> MiniGrafDb:
-    """Open MiniGrafDb at path, register session rules, update mtime tracking.
+def open_db(graph_path: Optional[str] = None) -> None:
+    """Point this module at a graph. Does NOT leave a handle open.
 
-    force=False reuses an already-open _db instead of opening a second handle,
-    checked atomically under _db_native_lock. Without this, two threads that
-    both observe _db as None (e.g. the ingestion preload thread and an
-    _ensure_db_async() caller racing during the "starting" phase, before
-    _run_ingestion flips status to "running") each call MiniGrafDb.open() on
-    the same path from this same process (#107). force=True (the default) is
-    for callers that need a genuine reopen regardless of any existing handle,
-    e.g. _refresh_if_stale().
-
-    #107 recorded that second open as surfacing loudly — "Database is locked by
-    another process", with the lock file's PID equal to *our* PID. That was not
-    true of minigraf 1.2.1 and earlier, and assuming it was is what let
-    #253/#251 hide: FileLock::acquire treated a lock held by our own PID as
-    stale, deleted it, and opened anyway, so the second handle was created
-    silently and the two corrupted each other. Fixed in minigraf 1.2.2
-    (project-minigraf/minigraf#304), which now raises "Database is already open
-    in this process".
-
-    NOTE: neither branch below can currently detect a handle that is live but
-    no longer reachable through _db — see the module comment on the
-    single-handle invariant. Guarding that in Python was tried and rejected
-    (#253): reusing a still-referenced handle changes its lifetime, which
-    resurrects handles whose backing file is gone. The enforcement belongs in
-    minigraf's FileLock, where the fix is one condition.
+    Returns None by design: handing back a handle nobody holds a lease on is
+    exactly the #255 bug -- the caller has no way to say when it is finished,
+    so the release never happens. Callers that need a handle take a lease.
     """
-    global _db, _graph_path, _db_mtime
-    with _db_native_lock:
-        if not force and _db is not None:
-            return _db
-        _db = MiniGrafDb.open(path)
-    for rule in SESSION_RULES:
-        _db_execute(_db, rule)
-    for rule in _user_rules:
-        _db_execute(_db, rule)
-    _graph_path = path
-    try:
-        _db_mtime = os.path.getmtime(path)
-    except OSError:
-        _db_mtime = 0.0
-    return _db
-
-
-def open_db(graph_path: Optional[str] = None) -> MiniGrafDb:
-    """Open MiniGrafDb and register session-scoped rules. Called once at startup."""
-    return _open_db_at(graph_path or _get_graph_path())
+    _lease_manager.bind_path(graph_path or _get_graph_path())
 
 
 def _update_mtime() -> None:
-    """Record the graph file mtime after our own checkpoint so we don't
-    treat our own write as an external modification on the next call."""
-    global _db_mtime
-    if not _graph_path:
-        return
-    try:
-        _db_mtime = os.path.getmtime(_graph_path)
-    except OSError:
-        pass
+    """Permanently inert (#255): a no-op left in place only so its call sites
+    don't need to be touched.
+
+    Paired with _refresh_if_stale below -- see that docstring for why
+    reactivating either of these is unsafe under the lease protocol. Real
+    mtime-based stale-page-table detection for a lease-managed handle is
+    unimplemented; this is not it.
+    """
+    return
 
 
 def _refresh_if_stale() -> None:
-    """Reopen the DB if the graph file was modified externally since last open.
+    """Permanently inert (#255), not merely inert-by-empty-path as it was
+    mid-conversion.
 
-    minigraf's Drop impl writes to the file even for read-only handles (upstream
-    bug).  Any subprocess that opens the same file — including the prepare/finalize
-    hooks — will change the mtime and invalidate this process's in-memory page
-    table.  Detect this via mtime and reopen transparently.
+    Used to reopen the DB directly (_open_db_at, now deleted) if the graph
+    file's mtime showed an external modification -- minigraf's Drop impl
+    writes to the file even for read-only handles, so another process
+    opening the same path could invalidate this process's in-memory page
+    table. That reopen bypassed the lease manager entirely: reactivating it
+    would open a SECOND handle outside the manager's count, exactly the
+    #251/#253 mechanism this whole protocol removes. A lease-aware
+    replacement (reopening under db_lease() when count == 0) is real future
+    work, not a mechanical port of the old body -- left undone here rather
+    than done unsafely.
     """
-    global _db_mtime
-    if not _graph_path:
-        return
-    try:
-        current_mtime = os.path.getmtime(_graph_path)
-    except OSError:
-        return
-    if current_mtime != _db_mtime:
-        _open_db_at(_graph_path)
+    return
 
 
 def _is_lock_error(exc: Exception) -> bool:
@@ -3205,9 +3141,9 @@ def _live_lock_holder_pid(path: str) -> Optional[int]:
     live session for the same lock instead of losing that race (#108).
 
     Best-effort / racy by nature (the holder can appear or disappear
-    between this check and the real open attempt) — existing retry/self-heal
-    logic (_try_open_with_self_heal, _ensure_db_async) still runs as the
-    fallback if the race is lost anyway.
+    between this check and the real open attempt) — the lease manager's own
+    retry/self-heal (_open_for_lease, via db_lease/db_lease_async) still runs
+    as the fallback if the race is lost anyway.
     """
     holder = _read_lock_holder_raw(path)
     if holder is None:
@@ -3218,88 +3154,6 @@ def _live_lock_holder_pid(path: str) -> Optional[int]:
     if pid == os.getpid():
         return None  # our own leaked handle, not another process
     return pid if _pid_is_alive(pid) else None
-
-
-def _try_open_with_self_heal(path: str) -> MiniGrafDb:
-    """Attempt one open, self-healing a stale lock (holder process no longer
-    running) by removing it and retrying once, instead of surfacing a
-    permanent error.
-
-    Reuses an already-open _db instead of opening a redundant second handle
-    (force=False) — see _open_db_at's docstring (#107).
-
-    Raises the lock-contention exception if the lock is still held by a live
-    process (caller decides whether to back off and retry); raises any
-    non-lock exception immediately.
-    """
-    try:
-        return _open_db_at(path, force=False)
-    except Exception as e:
-        if not _is_lock_error(e):
-            raise
-        holder_pid = _stale_lock_holder_pid(e)
-        if holder_pid is not None and _clear_stale_lock(path, holder_pid):
-            try:
-                return _open_db_at(path, force=False)
-            except Exception as e2:
-                if not _is_lock_error(e2):
-                    raise
-                raise e2 from None
-        raise
-
-
-def _open_db_at_with_retry(path: str) -> MiniGrafDb:
-    """Open MiniGrafDb at path, retrying with blocking backoff on lock contention.
-
-    Only safe off the asyncio event-loop thread: the backoff uses
-    time.sleep(), which would otherwise freeze the single-threaded event
-    loop for the whole retry budget — see _ensure_db_async for the
-    event-loop-safe equivalent (issue #99).
-    """
-    delay = _LOCK_RETRY_BASE
-    last_exc: Optional[Exception] = None
-    for attempt in range(_LOCK_RETRY_MAX):
-        try:
-            return _try_open_with_self_heal(path)
-        except Exception as e:
-            if not _is_lock_error(e):
-                raise
-            last_exc = e
-            if attempt < _LOCK_RETRY_MAX - 1:
-                time.sleep(delay)
-                delay *= 2
-    assert last_exc is not None
-    raise last_exc
-
-
-def _open_db_at_with_extended_retry(path: str) -> MiniGrafDb:
-    """Open MiniGrafDb at path, retrying lock contention with a much longer
-    time-budgeted backoff than _open_db_at_with_retry.
-
-    Used only by _load_ingestion_preload_state, which runs on a dedicated
-    worker thread (see issue #103) and can afford to wait out a typical
-    orphan-process cleanup window instead of giving up after ~1.55s and
-    leaving _run_ingestion permanently stuck in an "error" state (#106).
-    Self-heals a dead holder's lock on every attempt via
-    _try_open_with_self_heal, exactly like _open_db_at_with_retry.
-    """
-    deadline = time.monotonic() + _INGEST_LOCK_RETRY_BUDGET
-    delay = _INGEST_LOCK_RETRY_BASE
-    last_exc: Optional[Exception] = None
-    while True:
-        try:
-            return _try_open_with_self_heal(path)
-        except Exception as e:
-            if not _is_lock_error(e):
-                raise
-            last_exc = e
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(delay, remaining))
-            delay = min(delay * 2, _INGEST_LOCK_RETRY_CAP)
-    assert last_exc is not None
-    raise last_exc
 
 
 class _LeasedDb:
@@ -3349,18 +3203,16 @@ class _LeasedDb:
 def _open_for_lease(path: str) -> MiniGrafDb:
     """Open a handle FOR THE LEASE MANAGER, self-healing a stale lock.
 
-    Deliberately does not go through _open_db_at / _try_open_with_self_heal,
-    and the difference is the entire point. _open_db_at's contract is to
-    PUBLISH the handle into the module global `_db` -- which is precisely the
-    stray reference the lease protocol exists to remove. Routed through it,
-    release() could never drop the last reference: the lease count would reach
-    zero while `_db` still held the handle, so the lock file would survive
-    every lease and the next open would be a second handle.
+    Deliberately never publishes into a module global -- that publication was
+    _open_db_at's contract, and it was precisely the stray reference the
+    lease protocol exists to remove: release() could never drop the last
+    reference while a global also held the handle, so the lock file would
+    survive every lease and the next open would be a second handle.
 
-    The self-heal logic below mirrors _try_open_with_self_heal minus that
-    publication. The duplication is deliberate and TEMPORARY: the task that
-    deletes `_db` also deletes _open_db_at, _try_open_with_self_heal and the
-    two retry wrappers, leaving this as the only opener.
+    This is now the ONLY opener. `_db`, `_open_db_at`, `_try_open_with_self_heal`
+    and the two retry wrappers (_open_db_at_with_retry,
+    _open_db_at_with_extended_retry) are deleted -- the self-heal logic below
+    is what remains of them, minus the global publication.
     """
     try:
         return MiniGrafDb.open(path)
@@ -3701,75 +3553,47 @@ def _graph_path_current() -> str:
 def _reset_db_state() -> None:
     """Force the module's DB state back to its initial condition.
 
-    Replaces the `mcp_server._db = None` idiom at every test and eval call
-    site. Strictly stronger: it clears the lease COUNT too, so a test that
-    leaks a lease cannot poison its successor -- with the bare global there was
-    no way to reset the count at all.
+    Replaces the old "clear the `_db` global directly" idiom (now deleted,
+    #255) at every test and eval call site. Strictly stronger: it clears the
+    lease COUNT too, so a test that leaks a lease cannot poison its successor
+    -- with the bare global there was no way to reset the count at all.
     """
-    global _db
-    # TRANSITIONAL (removed in the commit that deletes `_db`): the legacy
-    # global and the manager coexist while call sites are converted, so a
-    # reset must clear both or a stale global would outlive the lease it
-    # shadowed.
-    _db = None
+    global _get_db_stack, _get_db_handle
+    # Release the get_db() shim's own lease BEFORE resetting the manager, or
+    # its lease would outlive the reset and the count would never reach zero.
+    if _get_db_stack is not None:
+        _get_db_handle = None      # drop the proxy before the stack severs it
+        _get_db_stack.close()
+        _get_db_stack = None
     _lease_manager.reset()
 
 
-async def _ensure_db_async() -> MiniGrafDb:
-    """Ensure the DB is open, retrying lock contention without blocking the
-    event loop.
+# The shim's lease. get_db() is no longer called by any production path -- the
+# nine former call sites take scoped leases -- but ~65 tests and evals call it
+# directly, and converting them is churn with no correctness gain.
+_get_db_stack: Optional[contextlib.ExitStack] = None
+_get_db_handle: Optional["_LeasedDb"] = None
 
-    Await this from any event-loop coroutine (call_tool, _run_ingestion)
-    before code that will call the synchronous get_db() — once _db is
-    populated, get_db() just returns it, so its own blocking retry path never
-    runs on the event-loop thread. Backs off with asyncio.sleep instead of
-    time.sleep so a lock held by another coroutine on this same event loop
-    (e.g. ingestion mid-commit) gets a chance to be released during the wait,
-    instead of the retry deterministically exhausting itself against a lock
-    state its own blocking sleep prevented from changing (issue #99).
+
+def get_db() -> "_LeasedDb":
+    """Return the graph handle, acquiring a long-lived lease if none is held.
+
+    DEPRECATED for production use; no production path calls it. It survives for
+    tests and evals, and it is no longer #255's hazard: the handle it returns is
+    LEASED, held by this module until _reset_db_state() releases it. A handler
+    that takes its own lease therefore nests at count 1->2 rather than opening a
+    second handle on the same file.
+
+    The old #122 guarantee -- read the `_db` global exactly once -- is gone
+    because the global is gone from this path: try_acquire does its check, open
+    and count increment under one lock, so there is no window to race. See
+    TestLeaseAcquireCannotBeRacedByReset.
     """
-    if _db is not None:
-        return _db
-    path = _graph_path or _get_graph_path()
-    delay = _LOCK_RETRY_BASE
-    last_exc: Optional[Exception] = None
-    for attempt in range(_LOCK_RETRY_MAX):
-        try:
-            return _try_open_with_self_heal(path)
-        except Exception as e:
-            if not _is_lock_error(e):
-                raise
-            last_exc = e
-            if attempt < _LOCK_RETRY_MAX - 1:
-                await asyncio.sleep(delay)
-                delay *= 2
-    assert last_exc is not None
-    raise last_exc
-
-
-def get_db() -> MiniGrafDb:
-    """Return the open DB instance, opening it if not currently held.
-
-    The DB is opened per-operation and released after each call_tool() invocation
-    so that the prepare_hook subprocess can acquire the file lock between turns.
-    Opening retries with a blocking backoff on lock contention (see
-    _open_db_at_with_retry) — safe here only because event-loop call sites
-    (call_tool, _run_ingestion) always await _ensure_db_async() first, so _db
-    is already populated by the time they reach this function.
-
-    Reads the module-level _db global into a local exactly once. A
-    background thread calling this function concurrently with call_tool()'s
-    finally block resetting _db to None — reading the global a second time
-    for the return would let that reset race in between the None-check and
-    the return, yielding None even though _db was live at call time (issue
-    #122; the original background caller that surfaced this, IndexCache's
-    rebuild thread, was deleted in #118, but the exactly-once read remains a
-    general defensive guarantee against any future background caller).
-    """
-    db = _db
-    if db is None:
-        db = _open_db_at_with_retry(_graph_path or _get_graph_path())
-    return db
+    global _get_db_stack, _get_db_handle
+    if _get_db_stack is None:
+        _get_db_stack = contextlib.ExitStack()
+        _get_db_handle = _get_db_stack.enter_context(db_lease())
+    return _get_db_handle
 
 
 def _db_execute(db: Any, datalog: str) -> str:
@@ -3978,12 +3802,12 @@ def _parse_tx_result(raw_json: str) -> Dict[str, Any]:
 
 def handle_minigraf_query(datalog: str) -> Dict[str, Any]:
     """Query the graph. Returns {ok, results} or {ok, error}."""
-    db = get_db()
-    try:
-        raw = _db_execute(db, f"(query {datalog})")
-        return _parse_query_result(raw)
-    except MiniGrafError as e:
-        return {"ok": False, "error": str(e)}
+    with db_lease() as db:
+        try:
+            raw = _db_execute(db, f"(query {datalog})")
+            return _parse_query_result(raw)
+        except MiniGrafError as e:
+            return {"ok": False, "error": str(e)}
 
 
 _TAGGED_LITERAL = r'#(?:uuid|inst)\s+"[^"\\]*"'
@@ -4101,7 +3925,7 @@ def _index_write(
                 index_con, triples
             )
             return
-        path = fact_index.index_path_for(_graph_path or _get_graph_path())
+        path = fact_index.index_path_for(_graph_path_current())
         con = fact_index.open_writer(path)
         try:
             (fact_index.insert_facts if action == "insert" else fact_index.delete_facts)(
@@ -4117,7 +3941,7 @@ def _index_write(
 def _open_index_writer_safe(path: str) -> Optional[Any]:
     """Open the batched fact-index writer connection used by _run_ingestion,
     never raising (#150). Retries lock contention with the same blocking
-    backoff _open_db_at_with_retry uses (_LOCK_RETRY_MAX/_LOCK_RETRY_BASE) --
+    backoff constants db_lease() uses (_LOCK_RETRY_MAX/_LOCK_RETRY_BASE) --
     the eager startup backfill (#147) can hold fact_index.rebuild_index()'s
     write transaction open for a whole historical rescan, and giving up on
     the first "database is locked" would otherwise silently downgrade this
@@ -4279,18 +4103,18 @@ def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
         if violations:
             return {"ok": False, "error": f"schema violations: {'; '.join(violations)}"}
     _refresh_if_stale()
-    db = get_db()
-    valid_from = _now_utc_ms()
-    try:
-        raw = _transact(db, facts, valid_from)
-    except MiniGrafError as e:
-        return {"ok": False, "error": str(e)}
-    result = _parse_tx_result(raw)
-    if result["ok"]:
-        result["reason"] = reason
-        _ensure_memory_idents(db, facts, valid_from)
-    _checkpoint_after_write(db, "minigraf_transact", result)
-    return result
+    with db_lease() as db:
+        valid_from = _now_utc_ms()
+        try:
+            raw = _transact(db, facts, valid_from)
+        except MiniGrafError as e:
+            return {"ok": False, "error": str(e)}
+        result = _parse_tx_result(raw)
+        if result["ok"]:
+            result["reason"] = reason
+            _ensure_memory_idents(db, facts, valid_from)
+        _checkpoint_after_write(db, "minigraf_transact", result)
+        return result
 
 
 def handle_minigraf_retract(facts: str, reason: str) -> Dict[str, Any]:
@@ -4298,16 +4122,16 @@ def handle_minigraf_retract(facts: str, reason: str) -> Dict[str, Any]:
     if not reason or not reason.strip():
         return {"ok": False, "error": "reason is required for retract"}
     _refresh_if_stale()
-    db = get_db()
-    try:
-        raw = _retract(db, facts)
-    except MiniGrafError as e:
-        return {"ok": False, "error": str(e)}
-    result = _parse_tx_result(raw)
-    if result["ok"]:
-        result["reason"] = reason
-    _checkpoint_after_write(db, "minigraf_retract", result)
-    return result
+    with db_lease() as db:
+        try:
+            raw = _retract(db, facts)
+        except MiniGrafError as e:
+            return {"ok": False, "error": str(e)}
+        result = _parse_tx_result(raw)
+        if result["ok"]:
+            result["reason"] = reason
+        _checkpoint_after_write(db, "minigraf_retract", result)
+        return result
 
 
 def handle_minigraf_rule(rule: str) -> Dict[str, Any]:
@@ -4321,15 +4145,15 @@ def handle_minigraf_rule(rule: str) -> Dict[str, Any]:
     Example: [(ancestor ?a ?d) [?a :parent ?d]]
     """
     global _user_rules
-    db = get_db()
-    try:
-        _db_execute(db, f"(rule {rule})")
-        rule_expr = f"(rule {rule})"
-        if rule_expr not in _user_rules:
-            _user_rules.append(rule_expr)
-        return {"ok": True, "rule": rule}
-    except MiniGrafError as e:
-        return {"ok": False, "error": str(e)}
+    with db_lease() as db:
+        try:
+            _db_execute(db, f"(rule {rule})")
+            rule_expr = f"(rule {rule})"
+            if rule_expr not in _user_rules:
+                _user_rules.append(rule_expr)
+            return {"ok": True, "rule": rule}
+        except MiniGrafError as e:
+            return {"ok": False, "error": str(e)}
 
 
 def handle_minigraf_report_issue(
@@ -4355,7 +4179,6 @@ def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
     Ported from Schema.audit_as_of() in minigraf-examples minigraf-schema crate.
     """
     _refresh_if_stale()
-    db = get_db()
     audited = 0
     retracted = 0
     all_violations: List[Dict[str, Any]] = []
@@ -4363,119 +4186,120 @@ def handle_minigraf_audit(as_of: Optional[int] = None) -> Dict[str, Any]:
 
     as_of_clause = f":as-of {as_of} " if as_of is not None else ""
 
-    for entity_type in MINIGRAF_SCHEMA:
-        # Step 1: Find all entity UUIDs of this type.
-        type_query = (
-            f"[:find ?e {as_of_clause}"
-            f":where [?e :entity-type :type/{entity_type}]]"
-        )
-        try:
-            type_result = handle_minigraf_query(type_query)
-            type_rows = type_result.get("results", [])
-        except Exception as e:
-            print(
-                f"[minigraf_audit] type query failed for {entity_type}: {e}",
-                file=sys.stderr,
-            )
-            skipped.append({"entity_type": entity_type, "stage": "type_query", "error": str(e)})
-            continue
-
-        for row in type_rows:
-            if not row:
-                continue
-            entity_uuid = row[0]
-            audited += 1
-
-            # Step 2: Fetch all attributes using #uuid tagged literal.
-            # minigraf's EDN parser treats #uuid "..." as EdnValue::Uuid and routes
-            # it through edn_to_entity_id directly — no keyword-to-UUID derivation
-            # needed and no join-variable round-trip problem.
-            attr_query = (
-                f'[:find ?a ?v {as_of_clause}'
-                f':where [#uuid "{entity_uuid}" ?a ?v]]'
+    with db_lease() as db:
+        for entity_type in MINIGRAF_SCHEMA:
+            # Step 1: Find all entity UUIDs of this type.
+            type_query = (
+                f"[:find ?e {as_of_clause}"
+                f":where [?e :entity-type :type/{entity_type}]]"
             )
             try:
-                attr_result = handle_minigraf_query(attr_query)
-                attr_rows = attr_result.get("results", [])
+                type_result = handle_minigraf_query(type_query)
+                type_rows = type_result.get("results", [])
             except Exception as e:
                 print(
-                    f"[minigraf_audit] attr query failed for {entity_uuid} "
-                    f"({entity_type}): {e}",
+                    f"[minigraf_audit] type query failed for {entity_type}: {e}",
                     file=sys.stderr,
                 )
-                skipped.append({
-                    "entity": entity_uuid,
-                    "entity_type": entity_type,
-                    "stage": "attr_query",
-                    "error": str(e),
-                })
+                skipped.append({"entity_type": entity_type, "stage": "type_query", "error": str(e)})
                 continue
 
-            # Extract keyword ident from the stored :ident datom for reporting.
-            # Falls back to the UUID string if :ident was not written.
-            kw_ident = next(
-                (v for a, v in attr_rows if a == ":ident" and isinstance(v, str)),
-                entity_uuid,
-            )
+            for row in type_rows:
+                if not row:
+                    continue
+                entity_uuid = row[0]
+                audited += 1
 
-            # Exclude system attributes from schema validation.
-            attr_facts = [
-                {
-                    "entity": kw_ident,
-                    "entity_type": entity_type,
-                    "attribute": a,
-                    "value": v,
-                }
-                for a, v in attr_rows
-                if a not in _SYSTEM_ATTRS
-            ]
+                # Step 2: Fetch all attributes using #uuid tagged literal.
+                # minigraf's EDN parser treats #uuid "..." as EdnValue::Uuid and routes
+                # it through edn_to_entity_id directly — no keyword-to-UUID derivation
+                # needed and no join-variable round-trip problem.
+                attr_query = (
+                    f'[:find ?a ?v {as_of_clause}'
+                    f':where [#uuid "{entity_uuid}" ?a ?v]]'
+                )
+                try:
+                    attr_result = handle_minigraf_query(attr_query)
+                    attr_rows = attr_result.get("results", [])
+                except Exception as e:
+                    print(
+                        f"[minigraf_audit] attr query failed for {entity_uuid} "
+                        f"({entity_type}): {e}",
+                        file=sys.stderr,
+                    )
+                    skipped.append({
+                        "entity": entity_uuid,
+                        "entity_type": entity_type,
+                        "stage": "attr_query",
+                        "error": str(e),
+                    })
+                    continue
 
-            if not attr_facts:
-                attr_facts = [{"entity": kw_ident, "entity_type": entity_type,
-                               "attribute": ":__no_attributes__", "value": ""}]
+                # Extract keyword ident from the stored :ident datom for reporting.
+                # Falls back to the UUID string if :ident was not written.
+                kw_ident = next(
+                    (v for a, v in attr_rows if a == ":ident" and isinstance(v, str)),
+                    entity_uuid,
+                )
 
-            violations = _validate_facts(attr_facts)
-            if violations:
-                for v in violations:
-                    all_violations.append({"entity": kw_ident, "detail": v})
+                # Exclude system attributes from schema validation.
+                attr_facts = [
+                    {
+                        "entity": kw_ident,
+                        "entity_type": entity_type,
+                        "attribute": a,
+                        "value": v,
+                    }
+                    for a, v in attr_rows
+                    if a not in _SYSTEM_ATTRS
+                ]
 
-                if as_of is None:
-                    # Retract using #uuid tagged literal — works even without knowing
-                    # the original keyword ident. History preserved (bi-temporal).
-                    try:
-                        retract_triples = [
-                            f'[#uuid "{entity_uuid}" :entity-type :type/{entity_type}]',
-                        ]
-                        for a, v in attr_rows:
-                            if isinstance(v, str):
-                                escaped = v.replace('"', '\\"')
-                                retract_triples.append(
-                                    f'[#uuid "{entity_uuid}" {a} "{escaped}"]'
-                                )
-                        retract_facts = "[" + " ".join(retract_triples) + "]"
-                        index_triples = [
-                            (kw_ident, ":entity-type", f":type/{entity_type}"),
-                        ] + [
-                            (kw_ident, a, v) for a, v in attr_rows if isinstance(v, str)
-                        ]
-                        _retract(db, retract_facts, index_triples=index_triples)
-                    except Exception as e:
-                        print(f"[minigraf_audit] retract failed for {kw_ident}: {e}", file=sys.stderr)
-                    else:
-                        # The retract (graph + fact index) already applied above --
-                        # count it regardless of whether the checkpoint that follows
-                        # succeeds (#176), and never let a checkpoint failure raise
-                        # out of this loop and abort the rest of the audit.
-                        retracted += 1
+                if not attr_facts:
+                    attr_facts = [{"entity": kw_ident, "entity_type": entity_type,
+                                   "attribute": ":__no_attributes__", "value": ""}]
+
+                violations = _validate_facts(attr_facts)
+                if violations:
+                    for v in violations:
+                        all_violations.append({"entity": kw_ident, "detail": v})
+
+                    if as_of is None:
+                        # Retract using #uuid tagged literal — works even without knowing
+                        # the original keyword ident. History preserved (bi-temporal).
                         try:
-                            _db_checkpoint(db)
-                            _update_mtime()
+                            retract_triples = [
+                                f'[#uuid "{entity_uuid}" :entity-type :type/{entity_type}]',
+                            ]
+                            for a, v in attr_rows:
+                                if isinstance(v, str):
+                                    escaped = v.replace('"', '\\"')
+                                    retract_triples.append(
+                                        f'[#uuid "{entity_uuid}" {a} "{escaped}"]'
+                                    )
+                            retract_facts = "[" + " ".join(retract_triples) + "]"
+                            index_triples = [
+                                (kw_ident, ":entity-type", f":type/{entity_type}"),
+                            ] + [
+                                (kw_ident, a, v) for a, v in attr_rows if isinstance(v, str)
+                            ]
+                            _retract(db, retract_facts, index_triples=index_triples)
                         except Exception as e:
-                            print(
-                                f"[minigraf_audit] checkpoint failed after retracting "
-                                f"{kw_ident}: {e}",
-                                file=sys.stderr,
-                            )
+                            print(f"[minigraf_audit] retract failed for {kw_ident}: {e}", file=sys.stderr)
+                        else:
+                            # The retract (graph + fact index) already applied above --
+                            # count it regardless of whether the checkpoint that follows
+                            # succeeds (#176), and never let a checkpoint failure raise
+                            # out of this loop and abort the rest of the audit.
+                            retracted += 1
+                            try:
+                                _db_checkpoint(db)
+                                _update_mtime()
+                            except Exception as e:
+                                print(
+                                    f"[minigraf_audit] checkpoint failed after retracting "
+                                    f"{kw_ident}: {e}",
+                                    file=sys.stderr,
+                                )
 
     return {
         "ok": True,
@@ -6945,17 +6769,17 @@ def _rebuild_index_from_graph() -> None:
     (valid_to=ISO(?vt)). ms->ISO conversion reuses the exact pattern
     _preload_known_deps already uses, rather than duplicating it.
     """
-    db = get_db()
-    ident_raw = _db_execute(
-        db, '(query [:find ?e ?ident :any-valid-time :where [?e :ident ?ident]])'
-    )
+    with db_lease() as db:
+        ident_raw = _db_execute(
+            db, '(query [:find ?e ?ident :any-valid-time :where [?e :ident ?ident]])'
+        )
+        facts_raw = _db_execute(
+            db,
+            "(query [:find ?e ?a ?v ?vf ?vt :any-valid-time "
+            ":where [?e ?a ?v] [?e :db/valid-from ?vf] [?e :db/valid-to ?vt]])",
+        )
     ident_map = {e: ident for e, ident in json.loads(ident_raw).get("results", [])}
 
-    facts_raw = _db_execute(
-        db,
-        "(query [:find ?e ?a ?v ?vf ?vt :any-valid-time "
-        ":where [?e ?a ?v] [?e :db/valid-from ?vf] [?e :db/valid-to ?vt]])",
-    )
     triples = []
     for e, a, v, vf_ms, vt_ms in json.loads(facts_raw).get("results", []):
         entity = ident_map.get(str(e), str(e))
@@ -6971,7 +6795,7 @@ def _rebuild_index_from_graph() -> None:
                 .strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
             )
         triples.append((entity, str(a), str(v), vf_iso, vt_iso))
-    path = fact_index.index_path_for(_graph_path or _get_graph_path())
+    path = fact_index.index_path_for(_graph_path_current())
     fact_index.rebuild_index(path, triples)
 
 
@@ -6987,16 +6811,13 @@ async def _run_startup_backfill() -> None:
     slow rescan there trips the timeout and retry-storms on every subsequent
     turn instead of ever completing.
 
-    Releases the graph's file lock (_db = None) once done, unconditionally --
-    mirroring call_tool's own finally block -- so the prepare_hook subprocess
-    can still acquire it between turns. Without this, a rebuild triggered
-    here would leave the persistent server process holding the lock open
-    indefinitely (never reset the way a single call_tool invocation is),
-    reproducing this issue's own failure mode -- a hook unable to get the
-    lock in time -- by lock contention instead of a slow rescan.
+    The lease taken by _rebuild_index_from_graph releases the graph's file lock
+    when the rebuild returns, so the prepare_hook subprocess can still acquire
+    it between turns. Without that, a rebuild triggered here would leave the
+    persistent server process holding the lock indefinitely -- reproducing this
+    issue's own failure mode by lock contention instead of a slow rescan.
     """
-    global _db
-    path = fact_index.index_path_for(_graph_path or _get_graph_path())
+    path = fact_index.index_path_for(_graph_path_current())
     loop = asyncio.get_running_loop()
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as backfill_executor:
@@ -7005,8 +6826,6 @@ async def _run_startup_backfill() -> None:
                 await loop.run_in_executor(backfill_executor, _rebuild_index_from_graph)
     except Exception as e:
         print(f"[fact_index] startup backfill failed: {e}", file=sys.stderr)
-    finally:
-        _db = None
 
 
 _NAV_TASK_VERBS = re.compile(
@@ -7063,7 +6882,7 @@ def handle_memory_prepare_turn(user_message: str) -> str:
     scan_limit = int(os.environ.get("MINIGRAF_PREPARE_SCAN_LIMIT", "50"))
     boost = float(os.environ.get("MINIGRAF_MEMORY_BOOST", "2.0"))
     historical_discount = float(os.environ.get("MINIGRAF_HISTORICAL_DISCOUNT", "0.5"))
-    path = fact_index.index_path_for(_graph_path or _get_graph_path())
+    path = fact_index.index_path_for(_graph_path_current())
     memory_block = ""
     try:
         if fact_index.needs_backfill(path):
@@ -7080,8 +6899,9 @@ def handle_memory_prepare_turn(user_message: str) -> str:
     nav_nudge = ""
     if _looks_like_navigation_task(user_message):
         try:
-            if _count_commit_entities(get_db()) > 0:
-                nav_nudge = _NAV_NUDGE
+            with db_lease() as db:
+                if _count_commit_entities(db) > 0:
+                    nav_nudge = _NAV_NUDGE
         except Exception as e:
             print(f"[prepare_turn] navigation nudge check failed: {e}", file=sys.stderr)
 
@@ -7168,7 +6988,6 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
     rather than bundled into the same dict as :description.)
     """
     _refresh_if_stale()
-    db = get_db()
     stored = 0
 
     entity_groups: Dict[str, List[Dict[str, Any]]] = {}
@@ -7178,42 +6997,43 @@ def _transact_extracted_facts(facts: List[Dict[str, str]], valid_from: Optional[
         entity for entity, group in entity_groups.items() if _validate_facts(group)
     }
 
-    for fact in facts:
-        entity = fact["entity"]
-        entity_type = fact.get("entity_type", "")
-        attribute = fact["attribute"]
-        value = fact["value"]
-        # Schema validation — closed-world: skip facts belonging to any entity
-        # whose full fact group (across this batch) has violations.
-        if entity in invalid_entities:
-            continue
-        now_z = valid_from or _now_utc_ms()
-        try:
-            # Combine main fact, :entity-type tag, and :ident into one transact so
-            # all triples are written atomically — a single (transact [...]) is one
-            # transaction. :ident stores the keyword ident as a string value so that
-            # handle_minigraf_audit and _query_canonical_entities can surface it for
-            # display without knowing the UUID (audits retract via #uuid "..." syntax).
-            escaped_value = _edn_escape(value)
-            if entity_type:
-                triples = (
-                    f'[{entity} {attribute} "{escaped_value}"]'
-                    f' [{entity} :entity-type :type/{entity_type}]'
-                    f' [{entity} :ident "{entity}"]'
+    with db_lease() as db:
+        for fact in facts:
+            entity = fact["entity"]
+            entity_type = fact.get("entity_type", "")
+            attribute = fact["attribute"]
+            value = fact["value"]
+            # Schema validation — closed-world: skip facts belonging to any entity
+            # whose full fact group (across this batch) has violations.
+            if entity in invalid_entities:
+                continue
+            now_z = valid_from or _now_utc_ms()
+            try:
+                # Combine main fact, :entity-type tag, and :ident into one transact so
+                # all triples are written atomically — a single (transact [...]) is one
+                # transaction. :ident stores the keyword ident as a string value so that
+                # handle_minigraf_audit and _query_canonical_entities can surface it for
+                # display without knowing the UUID (audits retract via #uuid "..." syntax).
+                escaped_value = _edn_escape(value)
+                if entity_type:
+                    triples = (
+                        f'[{entity} {attribute} "{escaped_value}"]'
+                        f' [{entity} :entity-type :type/{entity_type}]'
+                        f' [{entity} :ident "{entity}"]'
+                    )
+                else:
+                    triples = f'[{entity} {attribute} "{escaped_value}"]'
+                _transact(db, "[" + triples + "]", now_z)
+                stored += 1
+            except MiniGrafError as e:
+                print(
+                    f"[_transact_extracted_facts] dropped fact for {entity} {attribute}: {e}",
+                    file=sys.stderr,
                 )
-            else:
-                triples = f'[{entity} {attribute} "{escaped_value}"]'
-            _transact(db, "[" + triples + "]", now_z)
-            stored += 1
-        except MiniGrafError as e:
-            print(
-                f"[_transact_extracted_facts] dropped fact for {entity} {attribute}: {e}",
-                file=sys.stderr,
-            )
-            continue
-    if stored:
-        _db_checkpoint(db)
-        _update_mtime()
+                continue
+        if stored:
+            _db_checkpoint(db)
+            _update_mtime()
     return stored
 
 
@@ -7522,47 +7342,48 @@ async def handle_memory_finalize_turn(conversation_delta: str) -> Dict[str, Any]
     Strategy selected via MINIGRAF_EXTRACTION_STRATEGY env var (default: heuristic).
     """
     strategy = os.environ.get("MINIGRAF_EXTRACTION_STRATEGY", "heuristic")
-    if strategy in ("heuristic", "llm", "agent"):
-        await _ensure_db_async()
+    async with contextlib.AsyncExitStack() as stack:
+        if strategy in ("heuristic", "llm", "agent"):
+            await stack.enter_async_context(db_lease_async())
 
-    if strategy == "heuristic":
-        facts = heuristic_extract(conversation_delta)
-        stored = _transact_extracted_facts(facts)
-        return {"ok": True, "stored_count": stored, "strategy": "heuristic"}
+        if strategy == "heuristic":
+            facts = heuristic_extract(conversation_delta)
+            stored = _transact_extracted_facts(facts)
+            return {"ok": True, "stored_count": stored, "strategy": "heuristic"}
 
-    if strategy == "llm":
-        # _llm_extract_and_transact makes a blocking network call (_call_llm);
-        # run it in a worker thread so it can't freeze the shared event loop
-        # for other concurrent tool calls (#180), mirroring the executor
-        # pattern already used for fact-index rebuild and git ingestion.
-        loop = asyncio.get_running_loop()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as llm_executor:
-            result = await loop.run_in_executor(
-                llm_executor, _llm_extract_and_transact, conversation_delta
-            )
-        if result["ok"]:
-            return result
-        # LLM failed — fall back to heuristic and surface a warning so the user
-        # can see what went wrong (e.g. missing package, bad API key).
-        llm_error = result.get("error", "")
-        warning = _llm_missing_package_warning(llm_error)
-        facts = heuristic_extract(conversation_delta)
-        stored = _transact_extracted_facts(facts)
-        response: Dict[str, Any] = {
-            "ok": True,
-            "stored_count": stored,
-            "strategy": "heuristic (llm fallback)",
-        }
-        if warning:
-            response["warning"] = warning
-        elif llm_error:
-            response["warning"] = f"LLM extraction failed ({llm_error}); fell back to heuristic."
-        return response
+        if strategy == "llm":
+            # _llm_extract_and_transact makes a blocking network call (_call_llm);
+            # run it in a worker thread so it can't freeze the shared event loop
+            # for other concurrent tool calls (#180), mirroring the executor
+            # pattern already used for fact-index rebuild and git ingestion.
+            loop = asyncio.get_running_loop()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as llm_executor:
+                result = await loop.run_in_executor(
+                    llm_executor, _llm_extract_and_transact, conversation_delta
+                )
+            if result["ok"]:
+                return result
+            # LLM failed — fall back to heuristic and surface a warning so the user
+            # can see what went wrong (e.g. missing package, bad API key).
+            llm_error = result.get("error", "")
+            warning = _llm_missing_package_warning(llm_error)
+            facts = heuristic_extract(conversation_delta)
+            stored = _transact_extracted_facts(facts)
+            response: Dict[str, Any] = {
+                "ok": True,
+                "stored_count": stored,
+                "strategy": "heuristic (llm fallback)",
+            }
+            if warning:
+                response["warning"] = warning
+            elif llm_error:
+                response["warning"] = f"LLM extraction failed ({llm_error}); fell back to heuristic."
+            return response
 
-    if strategy == "agent":
-        return await _agent_extract_and_transact(conversation_delta)
+        if strategy == "agent":
+            return await _agent_extract_and_transact(conversation_delta)
 
-    return {"ok": False, "error": f"Unknown strategy: {strategy}"}
+        return {"ok": False, "error": f"Unknown strategy: {strategy}"}
 
 
 def _precompute_file_triples(
@@ -8833,13 +8654,12 @@ def _load_ingestion_preload_state(
     queries contain no internal awaits, so running them directly on the event
     loop thread starves the stdio handshake for as long as they take — on a
     large enough graph, longer than a client's connection timeout (issue #103).
-    Uses _open_db_at_with_extended_retry's much longer blocking lock-retry
-    (rather than get_db()'s ~1.55s budget or _ensure_db_async()'s
-    event-loop-safe variant) precisely because this runs off that thread and
-    can afford to wait out a typical orphan cleanup window instead of
-    entering a permanent "error" state (#106). Mirrors get_db()'s
-    "reuse the already-open handle" short-circuit rather than reopening
-    unconditionally.
+
+    Takes an extended lease (db_lease(extended=True)): this runs off the event
+    loop, so blocking backoff is correct here, and it can afford to wait out a
+    typical orphan-process cleanup window rather than giving up in ~1.55s and
+    entering a permanent "error" state (#106). The lease -- not a manual
+    `_db = None` -- is what releases the graph file lock when this returns.
 
     linearization and commit_metadata are #238's resume bound. They are
     supplied by the caller rather than built here because the git enumeration
@@ -8859,138 +8679,138 @@ def _load_ingestion_preload_state(
     invocations, so a ref moving between them can keep lengths equal while
     permuting hashes across positions.
     """
-    db = _db if _db is not None else _open_db_at_with_extended_retry(_graph_path or _get_graph_path())
-    # FIRST thing after the handle exists, and deliberately here rather than
-    # anywhere later: this is the earliest point in a run that has a db, and
-    # everything below it (and every write in _frontier_load and the walks
-    # after it) would be written under the current ident rule. A refusal that
-    # fired later would leave a graph half-written under two rules. Read-only;
-    # the matching stamp write is _run_ingestion's first write. Raises
-    # GraphFormatVersionError, which _run_ingestion surfaces as a failed run.
-    _graph_format_version_verify(db)
-    watermark = _watermark_query(db)
-    if len(commit_metadata) != len(linearization):
-        raise ValueError(
-            "commit_metadata must be positionally aligned with linearization "
-            f"(got {len(commit_metadata)} entries vs {len(linearization)}); "
-            "a misaligned pair mis-filters the entire preload (#238)"
-        )
-    # Length equality alone does not rule out a PERMUTATION: build_linearization
-    # and _git_commits(repo_path, None, branch) are two separate `git log`
-    # invocations, so a ref moving between them can keep both lists the same
-    # length while reordering hashes across positions -- silently shifting
-    # T_hi(W) (_resume_envelope reads commit_metadata by index) and
-    # mis-filtering the whole preload without ever raising. Mirrors
-    # _reverse_apply's own per-position `commit_hash != linearization[pos]`
-    # check, generalized to every position since this function has no single
-    # `pos` to check -- it consumes the full lists up front.
-    for i, (meta_hash, linearization_hash) in enumerate(zip(
-        (h for h, _t, _a, _s in commit_metadata), linearization,
-    )):
-        if meta_hash != linearization_hash:
+    with db_lease(extended=True) as db:
+        # FIRST thing after the handle exists, and deliberately here rather than
+        # anywhere later: this is the earliest point in a run that has a db, and
+        # everything below it (and every write in _frontier_load and the walks
+        # after it) would be written under the current ident rule. A refusal that
+        # fired later would leave a graph half-written under two rules. Read-only;
+        # the matching stamp write is _run_ingestion's first write. Raises
+        # GraphFormatVersionError, which _run_ingestion surfaces as a failed run.
+        _graph_format_version_verify(db)
+        watermark = _watermark_query(db)
+        if len(commit_metadata) != len(linearization):
             raise ValueError(
-                f"commit_metadata[{i}] is {meta_hash}, but linearization[{i}] is "
-                f"{linearization_hash}: the two must be positionally aligned "
-                "(#238) -- a ref move between the two git-log invocations can "
-                "keep lengths equal while permuting hashes"
+                "commit_metadata must be positionally aligned with linearization "
+                f"(got {len(commit_metadata)} entries vs {len(linearization)}); "
+                "a misaligned pair mis-filters the entire preload (#238)"
             )
-    hash_to_pos = {h: i for i, h in enumerate(linearization)}
-    watermark_pos = hash_to_pos.get(watermark) if watermark is not None else None
+        # Length equality alone does not rule out a PERMUTATION: build_linearization
+        # and _git_commits(repo_path, None, branch) are two separate `git log`
+        # invocations, so a ref moving between them can keep both lists the same
+        # length while reordering hashes across positions -- silently shifting
+        # T_hi(W) (_resume_envelope reads commit_metadata by index) and
+        # mis-filtering the whole preload without ever raising. Mirrors
+        # _reverse_apply's own per-position `commit_hash != linearization[pos]`
+        # check, generalized to every position since this function has no single
+        # `pos` to check -- it consumes the full lists up front.
+        for i, (meta_hash, linearization_hash) in enumerate(zip(
+            (h for h, _t, _a, _s in commit_metadata), linearization,
+        )):
+            if meta_hash != linearization_hash:
+                raise ValueError(
+                    f"commit_metadata[{i}] is {meta_hash}, but linearization[{i}] is "
+                    f"{linearization_hash}: the two must be positionally aligned "
+                    "(#238) -- a ref move between the two git-log invocations can "
+                    "keep lengths equal while permuting hashes"
+                )
+        hash_to_pos = {h: i for i, h in enumerate(linearization)}
+        watermark_pos = hash_to_pos.get(watermark) if watermark is not None else None
 
-    # #238/#245: two DIFFERENT bounds now, deliberately.
-    #
-    # resume_valid_at is ts(W), the watermark commit's own :date. As of #245,
-    # :depends-on and :pinned-commit are ALSO position-filtered -- both via
-    # the inversion of their own :db/valid-from/:db/valid-to, the same
-    # mechanism entities use, not by adopting the envelope as their date
-    # bound. resume_valid_at survives only for two callers:
-    # _preload_unresolved_dep_idents (position-unaware by design, see its own
-    # docstring), and as the degraded-path bound _preload_known_deps /
-    # _preload_pinned_commits fall back to when watermark_pos is None (see
-    # the t_hi_ms guard ~12 lines below). It is no longer true that deps/pins
-    # "admit no position clause" -- see how ts_positions/watermark_pos/
-    # t_hi_ms are threaded into both calls below.
-    #
-    # entity_valid_at is the monotone envelope T_hi(W) = max(ts[0..W]), which
-    # is safe only because _preload_known_entities pairs it with the
-    # conjunctive position clause below. A None watermark_pos (fresh graph, or
-    # a watermark absent from this linearization -- a rewritten history)
-    # degrades both to the pre-#222 unrestricted queries rather than to an
-    # empty state.
-    resume_valid_at = _commit_date_query(db, watermark)
-    resume_valid_at_ms = _iso_to_epoch_ms(resume_valid_at)
-    ts_positions = _build_ts_positions(commit_metadata)
+        # #238/#245: two DIFFERENT bounds now, deliberately.
+        #
+        # resume_valid_at is ts(W), the watermark commit's own :date. As of #245,
+        # :depends-on and :pinned-commit are ALSO position-filtered -- both via
+        # the inversion of their own :db/valid-from/:db/valid-to, the same
+        # mechanism entities use, not by adopting the envelope as their date
+        # bound. resume_valid_at survives only for two callers:
+        # _preload_unresolved_dep_idents (position-unaware by design, see its own
+        # docstring), and as the degraded-path bound _preload_known_deps /
+        # _preload_pinned_commits fall back to when watermark_pos is None (see
+        # the t_hi_ms guard ~12 lines below). It is no longer true that deps/pins
+        # "admit no position clause" -- see how ts_positions/watermark_pos/
+        # t_hi_ms are threaded into both calls below.
+        #
+        # entity_valid_at is the monotone envelope T_hi(W) = max(ts[0..W]), which
+        # is safe only because _preload_known_entities pairs it with the
+        # conjunctive position clause below. A None watermark_pos (fresh graph, or
+        # a watermark absent from this linearization -- a rewritten history)
+        # degrades both to the pre-#222 unrestricted queries rather than to an
+        # empty state.
+        resume_valid_at = _commit_date_query(db, watermark)
+        resume_valid_at_ms = _iso_to_epoch_ms(resume_valid_at)
+        ts_positions = _build_ts_positions(commit_metadata)
 
-    # #238/#245: membership at all four sites is decided by POSITION.
-    #
-    # t_hi_ms is derived from _resume_envelope BEFORE entity_valid_at's
-    # fallback below, and stays None whenever watermark_pos is None. That
-    # guard is load-bearing: a watermark that exists but is absent from this
-    # linearization leaves resume_valid_at a real ts(W) while disabling the
-    # position filter, and letting that become t_hi_ms would hand the deps and
-    # pins queries a WIDENED prefilter with no position clause -- exactly the
-    # widening #245 forbids. With t_hi_ms None they keep the ts(W) date
-    # window, which is strictly no worse than today.
-    #
-    # resume_valid_at (the ISO string) survives for _preload_unresolved_dep_idents
-    # only. resume_valid_at_ms (derived above) is different: it remains the
-    # degraded-path bound for _preload_known_deps and _preload_pinned_commits,
-    # used whenever position_mode is off in either.
-    entity_valid_at = _resume_envelope(commit_metadata, watermark_pos)
-    t_hi_ms = _iso_to_epoch_ms(entity_valid_at)
-    assert watermark_pos is not None or t_hi_ms is None, (
-        "t_hi_ms must stay None whenever watermark_pos is None -- callees "
-        "only read t_hi_ms inside their own position_mode branch, which "
-        "already requires watermark_pos is not None (#245); a non-None "
-        "t_hi_ms here would hand a widened prefilter to a callee with its "
-        "position filter off, exactly the 'add-back union' #238 forbids"
-    )
-    if entity_valid_at is None:
-        entity_valid_at = resume_valid_at
-    position_stats: Dict[str, int] = {}
-    prior_ingested = _count_commit_entities(db)
-    (
-        entity_valid_from, entity_descriptions, entity_introduced_by,
-        file_entities, submodule_paths,
-    ) = _preload_known_entities(
-        db, repo_path, valid_at=entity_valid_at,
-        hash_to_pos=hash_to_pos, watermark_pos=watermark_pos,
-        ts_positions=ts_positions, t_hi_ms=t_hi_ms, stats=position_stats,
-    )
-    file_deps, dep_valid_from = _preload_known_deps(
-        db, file_entities, valid_at_ms=resume_valid_at_ms,
-        ts_positions=ts_positions, watermark_pos=watermark_pos,
-        t_hi_ms=t_hi_ms, stats=position_stats,
-    )
-    pinned_commit_state = _preload_pinned_commits(
-        db, valid_at_ms=resume_valid_at_ms,
-        ts_positions=ts_positions, watermark_pos=watermark_pos,
-        t_hi_ms=t_hi_ms, stats=position_stats,
-    )
-    _announce_unplaceable_facts(position_stats)
-    field_class_ident = _preload_field_class_idents(db)
-    field_static_ident = _preload_field_static_idents(db)
-    # Independent of _preload_known_entities' bound now (#238): the subtrahend
-    # is that function's own unbounded :path query, so stub classification no
-    # longer moves with the resume position. Keeps ts(W), not the envelope --
-    # see its docstring for why narrower is safer for this set.
-    unresolved_dep_idents = _preload_unresolved_dep_idents(
-        db, valid_at=resume_valid_at,
-    )
-    # No provisional-ident preload (#235): the forward walk's reconciliation
-    # gate is _lineage_is_provisional(db, ident), queried per ident at the
-    # moment it matters. A run-start snapshot cannot serve that purpose -- it
-    # is empty on a fresh ingest, where Stream 2 writes its guesses during
-    # this same run -- so preloading one only invites a future maintainer to
-    # re-derive a gate from it. _preload_provisional_idents still exists for
-    # whole-graph assertions ("no markers left after a full ingest"); it is
-    # deliberately not part of the walk's state.
-    return (
-        watermark, prior_ingested, entity_valid_from, entity_descriptions,
-        entity_introduced_by, file_entities, file_deps, dep_valid_from,
-        pinned_commit_state, field_class_ident, field_static_ident,
-        submodule_paths, unresolved_dep_idents,
-    )
+        # #238/#245: membership at all four sites is decided by POSITION.
+        #
+        # t_hi_ms is derived from _resume_envelope BEFORE entity_valid_at's
+        # fallback below, and stays None whenever watermark_pos is None. That
+        # guard is load-bearing: a watermark that exists but is absent from this
+        # linearization leaves resume_valid_at a real ts(W) while disabling the
+        # position filter, and letting that become t_hi_ms would hand the deps and
+        # pins queries a WIDENED prefilter with no position clause -- exactly the
+        # widening #245 forbids. With t_hi_ms None they keep the ts(W) date
+        # window, which is strictly no worse than today.
+        #
+        # resume_valid_at (the ISO string) survives for _preload_unresolved_dep_idents
+        # only. resume_valid_at_ms (derived above) is different: it remains the
+        # degraded-path bound for _preload_known_deps and _preload_pinned_commits,
+        # used whenever position_mode is off in either.
+        entity_valid_at = _resume_envelope(commit_metadata, watermark_pos)
+        t_hi_ms = _iso_to_epoch_ms(entity_valid_at)
+        assert watermark_pos is not None or t_hi_ms is None, (
+            "t_hi_ms must stay None whenever watermark_pos is None -- callees "
+            "only read t_hi_ms inside their own position_mode branch, which "
+            "already requires watermark_pos is not None (#245); a non-None "
+            "t_hi_ms here would hand a widened prefilter to a callee with its "
+            "position filter off, exactly the 'add-back union' #238 forbids"
+        )
+        if entity_valid_at is None:
+            entity_valid_at = resume_valid_at
+        position_stats: Dict[str, int] = {}
+        prior_ingested = _count_commit_entities(db)
+        (
+            entity_valid_from, entity_descriptions, entity_introduced_by,
+            file_entities, submodule_paths,
+        ) = _preload_known_entities(
+            db, repo_path, valid_at=entity_valid_at,
+            hash_to_pos=hash_to_pos, watermark_pos=watermark_pos,
+            ts_positions=ts_positions, t_hi_ms=t_hi_ms, stats=position_stats,
+        )
+        file_deps, dep_valid_from = _preload_known_deps(
+            db, file_entities, valid_at_ms=resume_valid_at_ms,
+            ts_positions=ts_positions, watermark_pos=watermark_pos,
+            t_hi_ms=t_hi_ms, stats=position_stats,
+        )
+        pinned_commit_state = _preload_pinned_commits(
+            db, valid_at_ms=resume_valid_at_ms,
+            ts_positions=ts_positions, watermark_pos=watermark_pos,
+            t_hi_ms=t_hi_ms, stats=position_stats,
+        )
+        _announce_unplaceable_facts(position_stats)
+        field_class_ident = _preload_field_class_idents(db)
+        field_static_ident = _preload_field_static_idents(db)
+        # Independent of _preload_known_entities' bound now (#238): the subtrahend
+        # is that function's own unbounded :path query, so stub classification no
+        # longer moves with the resume position. Keeps ts(W), not the envelope --
+        # see its docstring for why narrower is safer for this set.
+        unresolved_dep_idents = _preload_unresolved_dep_idents(
+            db, valid_at=resume_valid_at,
+        )
+        # No provisional-ident preload (#235): the forward walk's reconciliation
+        # gate is _lineage_is_provisional(db, ident), queried per ident at the
+        # moment it matters. A run-start snapshot cannot serve that purpose -- it
+        # is empty on a fresh ingest, where Stream 2 writes its guesses during
+        # this same run -- so preloading one only invites a future maintainer to
+        # re-derive a gate from it. _preload_provisional_idents still exists for
+        # whole-graph assertions ("no markers left after a full ingest"); it is
+        # deliberately not part of the walk's state.
+        return (
+            watermark, prior_ingested, entity_valid_from, entity_descriptions,
+            entity_introduced_by, file_entities, file_deps, dep_valid_from,
+            pinned_commit_state, field_class_ident, field_static_ident,
+            submodule_paths, unresolved_dep_idents,
+        )
 
 
 # Tag attributes whose value is a keyword reference, not an EDN string literal
@@ -10991,7 +10811,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     Ordinary exceptions (bad git ref, unreadable blob, unsupported syntax)
     are unaffected and still fail only the one commit as before.
     """
-    global _db, _ingest_progress, _ingest_checkpoint_policy
+    global _ingest_progress, _ingest_checkpoint_policy
     # Safe to clear unconditionally: handle_minigraf_ingest_git refuses to start a
     # new run while one is already active, so no in-flight shutdown signal is ever
     # stomped on here; main()'s finally block re-sets the flag on exit regardless,
@@ -11009,8 +10829,8 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     try:
         # Enumerated BEFORE the preload (#238), which needs the positions to
         # bound its queries. Above the DB open too, not merely above the
-        # `_db = None` lock release, so the graph file lock is held for no
-        # longer than it was. These are git subprocesses and touch no DB.
+        # lease release, so the graph file lock is held for no longer than
+        # it was. These are git subprocesses and touch no DB.
         linearization = frontier_registry.build_linearization(repo_path, branch)
         # FULL history, positionally aligned with linearization. Both
         # _reverse_apply and _correction_sweep_select_position index it
@@ -11035,12 +10855,6 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 preload_executor, _load_ingestion_preload_state,
                 repo_path, linearization, commit_metadata,
             )
-        # minigraf exposes no explicit close(): the file lock is only released once
-        # every reference to the handle is gone — the worker thread's own `db`
-        # local already went out of scope when it returned above, so clearing
-        # the global here is enough to release the lock.
-        _db = None  # release file lock now that the preload has read what it needs
-
         state = _ForwardWalkState(
             entity_valid_from=entity_valid_from,
             entity_descriptions=entity_descriptions,
@@ -11093,7 +10907,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # concurrent call_tool() requests while a write's fsync is in flight,
         # instead of blocking the whole loop for that call. A single worker keeps
         # writes strictly one-at-a-time, matching the existing invariant that only
-        # one commit's write section ever holds _db/db at once. Also reused below
+        # one commit's write section ever holds the leased handle at once. Also reused below
         # (#116) to run the extraction ProcessPoolExecutor's blocking shutdown()
         # off the event-loop thread — that reuse is only safe because this pool
         # isn't shut down itself until the outer `finally` further down, after
@@ -11119,7 +10933,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # per-commit (#241) -- the two are unrelated costs (sqlite commit
         # vs minigraf WAL compaction) and only the latter was found to be
         # super-linear in graph size.
-        index_path = fact_index.index_path_for(_graph_path or _get_graph_path())
+        index_path = fact_index.index_path_for(_graph_path_current())
         index_con = await loop.run_in_executor(write_executor, _open_index_writer_safe, index_path)
 
         # #222 phase 2d: the two streams share one gap. _frontier_load WRITES
@@ -11129,18 +10943,16 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         run_ts_iso = datetime.datetime.now(datetime.timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%S.%f"
         )[:-3] + "Z"
-        db = await _ensure_db_async()
-        # The run's FIRST write, ahead of _frontier_load's own migrations: a
-        # fresh graph that got ingestion state without its stamp would look
-        # exactly like a pre-#263 graph on the next run and be refused (#263).
-        await loop.run_in_executor(
-            write_executor, _graph_format_version_stamp_if_new, db, run_ts_iso, index_con,
-        )
-        allocator = await loop.run_in_executor(
-            write_executor, _frontier_load, db, linearization, run_ts_iso, index_con,
-        )
-        db = None
-        _db = None
+        async with db_lease_async() as db:
+            # The run's FIRST write, ahead of _frontier_load's own migrations: a
+            # fresh graph that got ingestion state without its stamp would look
+            # exactly like a pre-#263 graph on the next run and be refused (#263).
+            await loop.run_in_executor(
+                write_executor, _graph_format_version_stamp_if_new, db, run_ts_iso, index_con,
+            )
+            allocator = await loop.run_in_executor(
+                write_executor, _frontier_load, db, linearization, run_ts_iso, index_con,
+            )
         claimer = _RoundRobinClaimer(
             allocator, *_parse_stream_ratio(os.environ.get("MINIGRAF_INGEST_STREAM_RATIO"))
         )
@@ -11243,54 +11055,43 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     last_hash = commit_hash
                     _ingest_progress["current_commit"] = commit_hash
 
-                    # Acquire DB fresh each commit — never hold across yield
-                    db = await _ensure_db_async()
-                    try:
-                        if tag == "fwd":
-                            await loop.run_in_executor(
-                                write_executor, _forward_apply, db, repo_path, state,
-                                commit_metadata[pos],
-                                (extracted_files, gitlink_changes, gitmodules_map, renamed_pairs),
-                                index_con, linearization, pos,
-                            )
-                        else:
-                            await loop.run_in_executor(
-                                write_executor, _reverse_apply, db, repo_path, linearization,
-                                commit_metadata, pos, extracted_files, index_con,
-                            )
+                    # A lease, not a manual acquire/release pair. The old code
+                    # cleared the local before the global because a concurrent
+                    # thread calling get_db() inside that window would open a
+                    # SECOND handle (#251/#253). There is no window now: the
+                    # count is authoritative and the handle drops exactly when
+                    # it reaches zero.
+                    async with db_lease_async() as db:
+                        try:
+                            if tag == "fwd":
+                                await loop.run_in_executor(
+                                    write_executor, _forward_apply, db, repo_path, state,
+                                    commit_metadata[pos],
+                                    (extracted_files, gitlink_changes, gitmodules_map, renamed_pairs),
+                                    index_con, linearization, pos,
+                                )
+                            else:
+                                await loop.run_in_executor(
+                                    write_executor, _reverse_apply, db, repo_path, linearization,
+                                    commit_metadata, pos, extracted_files, index_con,
+                                )
 
-                    except Exception as e:
-                        # Ordinary per-commit write failure (malformed EDN, a
-                        # transient constraint violation, ...) -- isolate it to
-                        # this one commit rather than aborting every commit
-                        # still pending, matching this function's own
-                        # documented "fail only the one commit" contract and
-                        # the extraction-phase isolation above. Opening the DB
-                        # itself (_ensure_db_async, just above this try) is
-                        # deliberately NOT covered here -- that failure is
-                        # unrecoverable for every remaining commit too, so it
-                        # still propagates to the outer handler.
-                        print(
-                            f"[_run_ingestion] skipping commit {commit_hash} "
-                            f"({subject!r}): write failed: {e}",
-                            file=sys.stderr,
-                        )
-                    finally:
-                        # Order matters, and it is not cosmetic. Clearing _db
-                        # first leaves a window in which the global says "no
-                        # handle" while this frame's `db` still holds one --
-                        # and other OS THREADS (the ingestion status/query
-                        # poller, any call_tool worker) can call get_db() inside
-                        # it. They see _db is None, open a second handle on the
-                        # same file, and since minigraf 1.2.2 that raises
-                        # "Database is already open in this process"; before it
-                        # silently corrupted the graph, which is the #251
-                        # mechanism. No await separates these two statements,
-                        # so no other *coroutine* interleaves -- but threads do.
-                        # Dropping the local first makes the clearing of _db the
-                        # moment the handle is genuinely released.
-                        db = None   # drop local reference FIRST
-                        _db = None  # now this actually releases the file lock
+                        except Exception as e:
+                            # Ordinary per-commit write failure (malformed EDN, a
+                            # transient constraint violation, ...) -- isolate it to
+                            # this one commit rather than aborting every commit
+                            # still pending, matching this function's own
+                            # documented "fail only the one commit" contract and
+                            # the extraction-phase isolation above. Opening the DB
+                            # itself (the lease acquire, just above this try) is
+                            # deliberately NOT covered here -- that failure is
+                            # unrecoverable for every remaining commit too, so it
+                            # still propagates to the outer handler.
+                            print(
+                                f"[_run_ingestion] skipping commit {commit_hash} "
+                                f"({subject!r}): write failed: {e}",
+                                file=sys.stderr,
+                            )
 
                     _ingest_progress["processed"] += 1
                     await asyncio.sleep(0)  # yield to event loop
@@ -11318,8 +11119,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         for i, (h, _t, _a, _s) in enumerate(commit_metadata)
                     }
                     skipped = 0
-                    db = await _ensure_db_async()
-                    try:
+                    async with db_lease_async() as db:
                         while not _shutdown_requested.is_set():
                             selected = await loop.run_in_executor(
                                 write_executor, _correction_sweep_select_position,
@@ -11408,18 +11208,12 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 db, linearization[-1], commit_metadata[-1][1], index_con,
                             )
                             await loop.run_in_executor(write_executor, _db_checkpoint_gated, db)
-                    finally:
-                        # Local first, then the global -- see the per-commit
-                        # finally above for why the order is load-bearing.
-                        db = None
-                        _db = None
 
                 # Call _ingest_tags and _last_run_write before closing index_con
                 # so they use the batched connection instead of opening new ones
                 if completed_all:
                     now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-                    db = await _ensure_db_async()
-                    try:
+                    async with db_lease_async() as db:
                         await loop.run_in_executor(write_executor, _ingest_tags, db, repo_path, now, index_con)
                         await loop.run_in_executor(
                             write_executor, _last_run_write, db, last_hash, now, _ingest_progress["processed"], index_con
@@ -11428,23 +11222,9 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         # checkpoint in the outer finally below (#241)
                         # already covers this path. A checkpoint here would
                         # be a full ungated compaction immediately followed
-                        # by _db = None, a reopen, and another compaction
-                        # with nothing dirty in between -- the same
+                        # by the lease release, a reopen, and another
+                        # compaction with nothing dirty in between -- the same
                         # structural duplicate #241 removed from Stage B.
-                    finally:
-                        # `db` must be cleared too, and before `_db`. This block
-                        # was the one release site that cleared only the global,
-                        # so the handle stayed alive in this coroutine's frame
-                        # all the way into the outer finally below -- whose
-                        # _ensure_db_async() then tried to open a SECOND handle
-                        # on the same file. Since minigraf 1.2.2 that raises and
-                        # the final WAL compaction is skipped; before it, it
-                        # silently produced the two divergent page tables of
-                        # #251. Confirmed by instrumenting the outer finally:
-                        # the sole live handle was reachable from this frame's
-                        # `db`.
-                        db = None
-                        _db = None
             finally:
                 # Compact the WAL on EVERY terminal path, not just
                 # completed_all. Under the duty-cycle cadence an interrupted
@@ -11461,19 +11241,10 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # one already covers it; see the comment left at its old
                 # call site.)
                 try:
-                    final_db = await _ensure_db_async()
-                    await loop.run_in_executor(write_executor, _db_checkpoint, final_db)
+                    async with db_lease_async() as final_db:
+                        await loop.run_in_executor(write_executor, _db_checkpoint, final_db)
                 except Exception as e:
                     print(f"[_run_ingestion] final checkpoint failed: {e}", file=sys.stderr)
-                finally:
-                    # Clear the local before the global, as everywhere else in
-                    # this function: `final_db` outliving `_db = None` leaves a
-                    # live handle unreachable through the global, and the
-                    # ingestion status poller -- which runs on its own thread
-                    # and is still polling until this run returns -- then sees
-                    # _db is None and opens a second handle on the same file.
-                    final_db = None
-                    _db = None
                 # ProcessPoolExecutor.shutdown(wait=True) blocks joining the
                 # worker OS processes — measured ~90ms even for a pool that
                 # never did any real work, entirely from process-exit
@@ -11521,7 +11292,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         _ingest_progress["status"] = "error"
         _ingest_progress["error"] = str(e)
         _ingest_progress["error_at"] = _now_utc_ms()
-        _db = None
+        _reset_db_state()
     finally:
         # The checkpoint policy is a separate story from write_executor
         # above: it is installed just after write_executor is created,
@@ -11562,7 +11333,7 @@ async def handle_minigraf_ingest_git(
     # Proactive check-before-attempt: if another live process already owns
     # the graph lock, don't start ingestion here rather than racing for it
     # and losing (#108).
-    holder_pid = _live_lock_holder_pid(_graph_path or _get_graph_path())
+    holder_pid = _live_lock_holder_pid(_graph_path_current())
     if holder_pid is not None:
         _ingest_progress["phase"] = None
         _ingest_progress["status"] = "skipped"
@@ -11618,34 +11389,34 @@ def handle_minigraf_ingest_status() -> Dict[str, Any]:
             result["stale"] = not _pid_is_alive(owner_pid)
     if _ingest_progress["status"] != "running":
         try:
-            db = get_db()
-            # :any-valid-time is needed since valid-from is the run's own
-            # timestamp, not real wall-clock time (see _total_ingested_query),
-            # but it also surfaces already-closed historical rows -- bind and
-            # filter :db/valid-to to the open-fact sentinel on each attribute
-            # so only the current run's own (?t, ?h) pair is returned, not a
-            # cross-product with a different historical run's value (#186).
-            raw = _db_execute(
-                db,
-                "(query [:find ?t ?h :any-valid-time "
-                ":where [:ingestion/last-run-at :last-run-at ?t] "
-                "[:ingestion/last-run-at :db/valid-to ?vt1] [(= ?vt1 9223372036854775807)] "
-                "[:ingestion/last-run-at :last-commit ?h] "
-                "[:ingestion/last-run-at :db/valid-to ?vt2] [(= ?vt2 9223372036854775807)]])"
-            )
-            rows = json.loads(raw).get("results", [])
-            if rows:
-                result["last_run_at"] = rows[0][0]
-                result["last_commit"] = rows[0][1]
-            else:
-                result["last_run_at"] = None
-                result["last_commit"] = None
-            # True persisted count, not the :total-ingested watermark — the
-            # watermark is only written on clean completion, so it drifts
-            # arbitrarily far from reality after a run is interrupted
-            # mid-way (see issue #85).
-            n = _count_commit_entities(db)
-            result["total_ingested"] = n if n > 0 else None
+            with db_lease() as db:
+                # :any-valid-time is needed since valid-from is the run's own
+                # timestamp, not real wall-clock time (see _total_ingested_query),
+                # but it also surfaces already-closed historical rows -- bind and
+                # filter :db/valid-to to the open-fact sentinel on each attribute
+                # so only the current run's own (?t, ?h) pair is returned, not a
+                # cross-product with a different historical run's value (#186).
+                raw = _db_execute(
+                    db,
+                    "(query [:find ?t ?h :any-valid-time "
+                    ":where [:ingestion/last-run-at :last-run-at ?t] "
+                    "[:ingestion/last-run-at :db/valid-to ?vt1] [(= ?vt1 9223372036854775807)] "
+                    "[:ingestion/last-run-at :last-commit ?h] "
+                    "[:ingestion/last-run-at :db/valid-to ?vt2] [(= ?vt2 9223372036854775807)]])"
+                )
+                rows = json.loads(raw).get("results", [])
+                if rows:
+                    result["last_run_at"] = rows[0][0]
+                    result["last_commit"] = rows[0][1]
+                else:
+                    result["last_run_at"] = None
+                    result["last_commit"] = None
+                # True persisted count, not the :total-ingested watermark — the
+                # watermark is only written on clean completion, so it drifts
+                # arbitrarily far from reality after a run is interrupted
+                # mid-way (see issue #85).
+                n = _count_commit_entities(db)
+                result["total_ingested"] = n if n > 0 else None
         except Exception:
             result["last_run_at"] = None
             result["last_commit"] = None
@@ -11892,27 +11663,46 @@ async def list_tools() -> List[Tool]:
     return _TOOLS
 
 
+# Exactly the tools that await _ensure_db_async() today. call_tool pre-acquires
+# for these and only these: the acquisition must be ASYNC so the synchronous
+# handler's own lease nests at count 1->2 and never runs blocking backoff on
+# the event-loop thread (#99). minigraf_report_issue and minigraf_ingest_git
+# are absent because they touch no graph here; memory_finalize_turn is absent
+# because it takes its own lease internally, conditional on the extraction
+# strategy (see handle_memory_finalize_turn).
+_DB_LEASE_TOOLS = frozenset({
+    "minigraf_query", "minigraf_transact", "minigraf_retract", "minigraf_rule",
+    "memory_prepare_turn", "minigraf_audit",
+})
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
-    global _db
-    try:
+    needs_db = name in _DB_LEASE_TOOLS or (
+        name == "minigraf_ingest_status" and _ingest_progress["status"] != "running"
+    )
+    async with contextlib.AsyncExitStack() as stack:
+        if needs_db:
+            # Acquired here, asynchronously, purely so the synchronous handler
+            # below nests at count 1->2 and never runs blocking backoff on the
+            # event loop (#99). The lease ends when this block does, which is
+            # what lets the prepare_hook subprocess open the DB between turns
+            # -- the job `finally: _db = None` used to do, badly.
+            await stack.enter_async_context(db_lease_async())
+
         if name == "minigraf_query":
-            await _ensure_db_async()
             result = handle_minigraf_query(arguments["datalog"])
             return [TextContent(type="text", text=json.dumps(result))]
 
         if name == "minigraf_transact":
-            await _ensure_db_async()
             result = handle_minigraf_transact(arguments["facts"], arguments["reason"])
             return [TextContent(type="text", text=json.dumps(result))]
 
         if name == "minigraf_retract":
-            await _ensure_db_async()
             result = handle_minigraf_retract(arguments["facts"], arguments["reason"])
             return [TextContent(type="text", text=json.dumps(result))]
 
         if name == "minigraf_rule":
-            await _ensure_db_async()
             result = handle_minigraf_rule(arguments["rule"])
             return [TextContent(type="text", text=json.dumps(result))]
 
@@ -11926,7 +11716,6 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             return [TextContent(type="text", text=json.dumps(result))]
 
         if name == "memory_prepare_turn":
-            await _ensure_db_async()
             block = handle_memory_prepare_turn(arguments["user_message"])
             return [TextContent(type="text", text=block)]
 
@@ -11935,7 +11724,6 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
             return [TextContent(type="text", text=json.dumps(result))]
 
         if name == "minigraf_audit":
-            await _ensure_db_async()
             as_of = arguments.get("as_of")
             result = handle_minigraf_audit(as_of=as_of)
             return [TextContent(type="text", text=json.dumps(result))]
@@ -11949,16 +11737,10 @@ async def call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
 
 
         if name == "minigraf_ingest_status":
-            if _ingest_progress["status"] != "running":
-                await _ensure_db_async()
             result = handle_minigraf_ingest_status()
             return [TextContent(type="text", text=json.dumps(result))]
 
         raise ValueError(f"Unknown tool: {name}")
-    finally:
-        # Release the file lock after every tool call so that the prepare_hook
-        # subprocess can open the DB between turns. get_db() re-opens on demand.
-        _db = None
 
 
 async def _orphan_watchdog() -> None:
