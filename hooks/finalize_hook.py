@@ -55,9 +55,12 @@ def main() -> None:
     if conversation_delta:
         try:
             import mcp_server
-            # get_db() retries with backoff and self-heals a stale lock left by
-            # a crashed background-ingestion or hook subprocess.
-            mcp_server.get_db()
+            # No explicit open: handle_memory_finalize_turn takes its own
+            # lease (db_lease_async(), conditional on
+            # MINIGRAF_EXTRACTION_STRATEGY), which carries the same
+            # retry/backoff and stale-lock self-heal, and releases when it
+            # returns so the next turn's hook process can acquire the file
+            # lock (#255).
             asyncio.run(mcp_server.handle_memory_finalize_turn(conversation_delta))
         except Exception:
             pass  # Never block on memory errors

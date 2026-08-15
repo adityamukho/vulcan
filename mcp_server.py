@@ -11288,11 +11288,19 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # calls above the inner try (_open_index_writer_safe, _frontier_load).
         # The comment that used to sit here asserted the inner finally already
         # covered them; it did not, and that is #250.
+        #
+        # No _reset_db_state() here (#255): every ingestion lease is now
+        # `with`-scoped, so by the time an exception reaches this handler
+        # there is nothing of THIS run's to clean up. Calling it anyway is
+        # actively wrong on two counts -- it desyncs the count if some OTHER
+        # caller (e.g. a concurrent call_tool request) holds a legitimate
+        # lease right now, and it zeroes the count without setting
+        # _prev_ref, which would silently defeat _detect_leaked_handle for
+        # exactly the failure path most likely to leak one.
         _ingest_progress["phase"] = None
         _ingest_progress["status"] = "error"
         _ingest_progress["error"] = str(e)
         _ingest_progress["error_at"] = _now_utc_ms()
-        _reset_db_state()
     finally:
         # The checkpoint policy is a separate story from write_executor
         # above: it is installed just after write_executor is created,
@@ -11663,7 +11671,7 @@ async def list_tools() -> List[Tool]:
     return _TOOLS
 
 
-# Exactly the tools that await _ensure_db_async() today. call_tool pre-acquires
+# Exactly the tools whose handler touches the graph. call_tool pre-acquires
 # for these and only these: the acquisition must be ASYNC so the synchronous
 # handler's own lease nests at count 1->2 and never runs blocking backoff on
 # the event-loop thread (#99). minigraf_report_issue and minigraf_ingest_git
