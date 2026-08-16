@@ -12,10 +12,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import concurrent.futures
+import contextlib
 import json
 import os
 import resource
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -219,6 +221,37 @@ def _exit_code(metrics: dict[str, Any]) -> int:
     return 1 if metrics.get("final_status") == "error" else 0
 
 
+@contextlib.contextmanager
+def resolve_graph_path(graph_path_arg: Optional[str]):
+    """Yield the graph path for one run.
+
+    Without --graph-path this is a TemporaryDirectory, exactly as before
+    (#120) -- the recurring benchmark's behaviour must not change. With it,
+    the graph persists so a probe can query it after the run (#256); #251's
+    occurrences were never inspectable precisely because the graph was
+    already deleted.
+
+    Refuses an existing path. run_ingestion_benchmark's own docstring states
+    that precondition, and CLAUDE.md's standing rule is that graphs are
+    rebuilt into a fresh path, never re-ingested in place -- re-running over
+    an existing file repairs nothing and silently doubles the history.
+    """
+    if graph_path_arg is None:
+        with tempfile.TemporaryDirectory(prefix="minigraf-at-scale-") as tmpdir:
+            yield Path(tmpdir) / "bench.graph"
+        return
+
+    path = Path(graph_path_arg)
+    if path.exists():
+        raise SystemExit(
+            f"--graph-path {path} already exists. Each run needs a fresh "
+            f"graph -- re-ingesting into an existing one is never correct. "
+            f"Pick a new path or delete this one deliberately."
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    yield path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the at-scale ingestion benchmark (#120).")
     parser.add_argument("--repo-path", default=".")
@@ -230,11 +263,15 @@ def main() -> int:
              "bounding the instrument's share of _db_native_lock (#242).",
     )
     parser.add_argument("--compare-ignore", action="store_true")
+    parser.add_argument(
+        "--graph-path", default=None,
+        help="Persist the graph at this path instead of using a temporary "
+             "directory. Must not already exist. Required for the #256 "
+             "provisional-residue probe, which queries the surviving graph.",
+    )
     args = parser.parse_args()
 
-    import tempfile
-    with tempfile.TemporaryDirectory(prefix="minigraf-at-scale-") as tmpdir:
-        graph_path = Path(tmpdir) / "bench.graph"
+    with resolve_graph_path(args.graph_path) as graph_path:
         metrics = asyncio.run(
             run_ingestion_benchmark(
                 args.repo_path,

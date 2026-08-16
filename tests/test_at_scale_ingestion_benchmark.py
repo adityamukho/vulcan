@@ -3,7 +3,11 @@ import subprocess as _subprocess
 
 import pytest
 
-from evals.at_scale.run_ingestion_benchmark import _exit_code, run_ingestion_benchmark
+from evals.at_scale.run_ingestion_benchmark import (
+    _exit_code,
+    resolve_graph_path,
+    run_ingestion_benchmark,
+)
 
 
 class TestExitCode:
@@ -195,3 +199,36 @@ class TestPollerDoesNotStarveTheEventLoop:
 
         assert len(poll_offsets) == len(status_latencies) == len(query_latencies)
         assert poll_offsets == sorted(poll_offsets)
+
+
+class TestResolveGraphPath:
+    def test_without_an_argument_yields_a_temp_path_that_is_cleaned_up(self):
+        """Omitting --graph-path must behave exactly as before this change --
+        the recurring benchmark must not change."""
+        with resolve_graph_path(None) as path:
+            tmpdir = path.parent
+            assert tmpdir.exists()
+            assert path.name == "bench.graph"
+        assert not tmpdir.exists()
+
+    def test_with_an_argument_yields_that_path_and_keeps_it(self, tmp_path):
+        target = tmp_path / "persistent" / "run.graph"
+        with resolve_graph_path(str(target)) as path:
+            assert path == target
+            path.write_text("graph bytes")
+        assert target.exists(), "a persistent graph must survive the context"
+
+    def test_creates_the_parent_directory(self, tmp_path):
+        target = tmp_path / "nested" / "deeper" / "run.graph"
+        with resolve_graph_path(str(target)) as path:
+            assert path.parent.is_dir()
+
+    def test_refuses_an_existing_path(self, tmp_path):
+        """CLAUDE.md's standing rule: graphs are rebuilt, never re-ingested in
+        place. run_ingestion_benchmark's docstring states the same
+        precondition; this enforces it."""
+        target = tmp_path / "already.graph"
+        target.write_text("pre-existing")
+        with pytest.raises(SystemExit, match="already exists"):
+            with resolve_graph_path(str(target)):
+                pass
