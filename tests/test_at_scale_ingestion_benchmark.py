@@ -1,14 +1,29 @@
 # tests/test_at_scale_ingestion_benchmark.py
+import contextlib
 import subprocess as _subprocess
 from pathlib import Path
 
 import pytest
 
+import evals.at_scale.run_ingestion_benchmark as rib
 from evals.at_scale.run_ingestion_benchmark import (
     _exit_code,
     resolve_graph_path,
     run_ingestion_benchmark,
 )
+from evals.at_scale.stderr_capture import TeeStderrFailure
+
+# Every key run_ingestion_benchmark returns on a clean run. Shared with the
+# tee-failure tests below, whose whole point is that the failure path produces
+# the SAME dict plus its two diagnostic keys, not a truncated one.
+_EXPECTED_METRIC_KEYS = {
+    "repo_path", "branch", "commits_ingested", "wall_clock_seconds",
+    "throughput_per_minute", "peak_rss_kb", "graph_size_bytes",
+    "index_size_bytes", "status_latency", "query_latency", "final_status",
+    "poll_count", "poll_duty_fraction", "poll_offsets", "checkpoint_summary",
+    "skipped_commits", "error_signals", "correction_sweep_summaries",
+    "correction_sweep_skipped", "stderr_capture_complete",
+}
 
 
 class TestExitCode:
@@ -20,6 +35,81 @@ class TestExitCode:
 
     def test_zero_when_status_missing(self):
         assert _exit_code({}) == 0
+
+
+class TestExitCodeGate:
+    def test_clean_run_exits_zero(self):
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+        }) == 0
+
+    def test_a_skipped_commit_fails_the_run(self):
+        """processed and final_status are both blind to this -- the gate is
+        the only thing that turns a dropped commit into a failure."""
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": ["abc123"],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+        }) == 1
+
+    def test_a_251_signature_fails_the_run(self):
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [{"pattern": "page_out_of_bounds", "line": "..."}],
+            "stderr_capture_complete": True,
+        }) == 1
+
+    def test_error_status_still_fails(self):
+        assert _exit_code({
+            "final_status": "error",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+        }) == 1
+
+    def test_missing_keys_are_treated_as_clean_for_old_metrics(self):
+        """Pre-#256 metrics files carry none of these keys; _exit_code must
+        not crash reading them, and must not fail them either."""
+        assert _exit_code({"final_status": "complete"}) == 0
+
+    def test_a_tee_failure_fails_the_run(self):
+        """run_ingestion_benchmark CATCHES TeeStderrFailure so a broken tee
+        does not destroy a 25-minute run's metrics. Without this clause that
+        catch silently converts the failure back into exit 0."""
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": False,
+            "tee_failure": "TeeStderrFailure('pump did not complete cleanly')",
+        }) == 1
+
+    def test_an_incomplete_capture_fails_even_with_empty_signal_lists(self):
+        """The discriminating case: a truncated capture yields EMPTY
+        skipped_commits/error_signals, which are byte-identical to a clean
+        run's. They are lower bounds, so the emptiness proves nothing and the
+        flag alone must fail the run -- even with no tee_failure string."""
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": False,
+        }) == 1
+
+    def test_a_complete_capture_with_no_signals_is_still_clean(self):
+        """Counterpart to the above: the flag must fail only when explicitly
+        False, or it would fail every clean run too."""
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+        }) == 0
 
 
 @pytest.fixture
@@ -44,12 +134,21 @@ class TestRunIngestionBenchmark:
     async def test_returns_expected_metric_keys(self, git_repo, tmp_path):
         graph_path = tmp_path / "bench.graph"
         metrics = await run_ingestion_benchmark(str(git_repo), "HEAD", graph_path, poll_interval=0.05)
-        assert set(metrics.keys()) == {
-            "repo_path", "branch", "commits_ingested", "wall_clock_seconds",
-            "throughput_per_minute", "peak_rss_kb", "graph_size_bytes",
-            "index_size_bytes", "status_latency", "query_latency", "final_status",
-            "poll_count", "poll_duty_fraction", "poll_offsets", "checkpoint_summary",
-        }
+        assert set(metrics.keys()) == _EXPECTED_METRIC_KEYS
+
+    @pytest.mark.asyncio
+    async def test_a_clean_run_reports_a_complete_capture_and_no_signals(self, git_repo, tmp_path):
+        """The tee spans the whole run, so a healthy two-commit ingestion must
+        come back with a complete capture and empty signal lists -- and pass
+        the gate."""
+        graph_path = tmp_path / "bench.graph"
+        metrics = await run_ingestion_benchmark(str(git_repo), "HEAD", graph_path, poll_interval=0.05)
+        assert metrics["stderr_capture_complete"] is True
+        assert metrics["skipped_commits"] == []
+        assert metrics["error_signals"] == []
+        assert metrics["correction_sweep_skipped"] == 0
+        assert "tee_failure" not in metrics
+        assert _exit_code(metrics) == 0
 
     @pytest.mark.asyncio
     async def test_checkpoint_summary_is_present_and_self_consistent(self, git_repo, tmp_path):
@@ -128,6 +227,93 @@ class TestCompareIgnore:
         graph_path = tmp_path / "bench.graph"
         metrics = await run_ingestion_benchmark(str(git_repo), "HEAD", graph_path, poll_interval=0.05)
         assert "ignore_comparison" not in metrics
+
+
+class TestTeeFailureDoesNotDestroyTheRun:
+    """tee_stderr() raises TeeStderrFailure from its own teardown, which runs
+    AFTER _run_ingestion has returned. If run_ingestion_benchmark let that
+    propagate, a ~25-minute run would end in a traceback with no metrics JSON
+    and no report row -- the instrument's failure destroying the measurement.
+    It must instead produce the full metrics dict, flagged and failing."""
+
+    @staticmethod
+    def _failing_tee(exc_factory=lambda: TeeStderrFailure("simulated pump failure")):
+        """A tee_stderr() stand-in that captures for real, then raises on exit
+        exactly where the real one does -- in its own finally, after the body
+        has completed."""
+        real_tee = rib.tee_stderr
+
+        @contextlib.contextmanager
+        def failing_tee():
+            try:
+                with real_tee() as capture:
+                    yield capture
+            finally:
+                raise exc_factory()
+
+        return failing_tee
+
+    @pytest.mark.asyncio
+    async def test_full_metrics_survive_a_tee_failure(self, git_repo, tmp_path, monkeypatch):
+        monkeypatch.setattr(rib, "tee_stderr", self._failing_tee())
+        graph_path = tmp_path / "bench.graph"
+
+        metrics = await rib.run_ingestion_benchmark(
+            str(git_repo), "HEAD", graph_path, poll_interval=0.05
+        )
+
+        # Nothing is actually lost on this path: the raise lands after
+        # _run_ingestion returned, so every metric below was still readable.
+        assert _EXPECTED_METRIC_KEYS <= set(metrics)
+        assert metrics["commits_ingested"] == 2
+        assert metrics["final_status"] == "complete"
+        assert metrics["wall_clock_seconds"] > 0
+        assert metrics["graph_size_bytes"] > 0
+        assert metrics["checkpoint_summary"] is not None
+
+    @pytest.mark.asyncio
+    async def test_a_tee_failure_is_flagged_and_fails_the_run(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(rib, "tee_stderr", self._failing_tee())
+        graph_path = tmp_path / "bench.graph"
+
+        metrics = await rib.run_ingestion_benchmark(
+            str(git_repo), "HEAD", graph_path, poll_interval=0.05
+        )
+
+        assert metrics["stderr_capture_complete"] is False
+        assert "simulated pump failure" in metrics["tee_failure"]
+        # The lists are lower bounds here, so their emptiness must NOT read as
+        # a clean run. This is the whole point of the third _exit_code clause.
+        assert metrics["skipped_commits"] == []
+        assert metrics["error_signals"] == []
+        assert _exit_code(metrics) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_body_exception_displaced_by_the_tee_raise_is_preserved(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        """A raise from the context manager's finally DISPLACES whatever the
+        body was raising: the real ingestion crash comes out only as
+        TeeStderrFailure.__context__. A handler that recorded the tee failure
+        alone would hide a genuine crash behind an instrument fault."""
+        import mcp_server
+
+        async def boom(*_args, **_kwargs):
+            raise RuntimeError("ingestion exploded")
+
+        monkeypatch.setattr(mcp_server, "_run_ingestion", boom)
+        monkeypatch.setattr(rib, "tee_stderr", self._failing_tee())
+        graph_path = tmp_path / "bench.graph"
+
+        metrics = await rib.run_ingestion_benchmark(
+            str(git_repo), "HEAD", graph_path, poll_interval=0.05
+        )
+
+        assert "ingestion exploded" in metrics["tee_failure_context"]
+        assert metrics["stderr_capture_complete"] is False
+        assert _exit_code(metrics) == 1
 
 
 import asyncio

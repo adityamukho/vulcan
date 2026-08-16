@@ -54,8 +54,17 @@ _SWEEP_SUMMARY_RE = re.compile(
 # the marker to a partial line and this scanner reported zero error signals.
 # The emitter now prepends its own newline; the missing anchor is the second,
 # independent half of that fix, for any text that reaches a consumer already
-# concatenated. Nothing in minigraf or mcp_server emits this literal, so the
-# anchor bought no protection against spurious matches.
+# concatenated.
+#
+# Dropping the anchor is not free, and an earlier version of this comment
+# overstated the case by claiming it "bought no protection against spurious
+# matches". It did protect one real path: both _run_ingestion skip lines embed
+# the commit subject as `{subject!r}` (mcp_server.py:11107 and 11154), so a
+# commit whose subject contained this literal would now match mid-line where
+# `^\[` would have rejected it. The trade-off still favours the unanchored
+# pattern -- that requires an adversarial commit subject, while a pump dying
+# mid-run is the ordinary EMFILE timing -- but it is a trade-off, not a
+# free win.
 _ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("page_out_of_bounds", re.compile(r"Page \d+ out of bounds")),
     ("serde_deserialization_error", re.compile(r"Serde Deserialization Error")),
@@ -355,6 +364,17 @@ def tee_stderr():
         # only after the pump has been signalled, joined, and its fds closed.
         try:
             guard.restore()
+        except BaseException as exc:
+            # record_error, not just `raise` (#256 Task 4). On a compound
+            # failure -- restore()'s dup2 raises while the pump has also died
+            # -- the TeeStderrFailure raised at the bottom of this `finally`
+            # displaces this OSError into its __context__ only: it appears in
+            # neither str(exc) nor capture.errors, so a consumer that logs
+            # str(exc) loses the single most consequential thing this module
+            # can report, that fd 2 was never handed back. Recording it puts
+            # it in both.
+            capture.record_error(exc)
+            raise
         finally:
             os.close(devnull_fd)  # safe: guard disarmed, valve never touches it again
             with contextlib.suppress(OSError):

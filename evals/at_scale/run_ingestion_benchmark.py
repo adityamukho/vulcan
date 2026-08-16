@@ -14,11 +14,13 @@ import asyncio
 import concurrent.futures
 import contextlib
 import json
+import multiprocessing.resource_tracker
 import os
 import resource
 import sys
 import tempfile
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Optional
 
@@ -27,6 +29,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from evals.at_scale.metrics import latency_stats, throughput_per_minute  # noqa: E402
+from evals.at_scale.stderr_capture import (  # noqa: E402
+    TeeStderrFailure,
+    scan_ingestion_stderr,
+    tee_stderr,
+)
 
 _STATUS_QUERY = "[:find (count ?e) :where [?e :entity-type :type/commit]]"
 
@@ -138,22 +145,79 @@ async def run_ingestion_benchmark(
 
     resolved_branch = branch or mcp_server._default_git_branch(repo_path)
 
+    # Start the spawn-context resource_tracker BEFORE arming the tee (#256).
+    # _run_ingestion builds a spawn ProcessPoolExecutor, and multiprocessing
+    # starts the tracker lazily on that pool's first use -- i.e. INSIDE the
+    # `with` below, where it would inherit the tee pipe's write end as its
+    # fd 2 and hold that duplicate open for the parent's entire remaining
+    # lifetime (the same hazard tee_stderr's docstring documents for its own
+    # shutdown). Starting it here makes it inherit the real fd 2, which also
+    # means its "leaked semaphore objects" warning -- a genuine signal for a
+    # spawn-heavy 25-minute run -- reaches the real log instead of a pipe
+    # that stops being drained at teardown.
+    multiprocessing.resource_tracker.ensure_running()
+
+    # Pre-bound, because the tee's teardown can raise on a path where the body
+    # never finished. tee_stderr() raises TeeStderrFailure from its own
+    # `finally`, which DISPLACES whatever the body was already raising
+    # (verified: a RuntimeError inside the `with` comes out as
+    # TeeStderrFailure, with the real cause reachable only via __context__).
+    # The handler below still has to build a full metrics dict in that case.
+    status_latencies: list[float] = []
+    query_latencies: list[float] = []
+    poll_offsets: list[float] = []
+    captured = None
+    tee_failure: Optional[TeeStderrFailure] = None
+
     start = time.perf_counter()
-    ingest_task = asyncio.create_task(mcp_server._run_ingestion(repo_path, resolved_branch))
     try:
-        status_latencies, query_latencies, poll_offsets = await _poll_during_ingestion(
-            ingest_task, poll_interval, duty_factor
-        )
-        await ingest_task
-    except BaseException:
-        if not ingest_task.done():
-            ingest_task.cancel()
+        # The tee spans the WHOLE run on purpose. Narrowing its scope to dodge
+        # the teardown raise would also narrow what it can see, and a commit
+        # dropped outside the narrowed window is exactly the event #256 exists
+        # to catch.
+        with tee_stderr() as captured:
+            ingest_task = asyncio.create_task(
+                mcp_server._run_ingestion(repo_path, resolved_branch)
+            )
             try:
+                status_latencies, query_latencies, poll_offsets = await _poll_during_ingestion(
+                    ingest_task, poll_interval, duty_factor
+                )
                 await ingest_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        raise
-    wall_clock = time.perf_counter() - start
+            except BaseException:
+                if not ingest_task.done():
+                    ingest_task.cancel()
+                    try:
+                        await ingest_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                raise
+    except TeeStderrFailure as exc:
+        # Caught deliberately, and deliberately not re-raised. The raise
+        # happens in tee_stderr()'s teardown, AFTER _run_ingestion has
+        # returned, so _ingest_progress, the graph/index sizes and the latency
+        # lists are all still readable -- letting it propagate would destroy a
+        # ~25-minute run's entire record (no metrics JSON, no report row) to
+        # report a failure of the instrument. It is recorded in the metrics
+        # instead, and _exit_code() turns it into exit 1: catching it without
+        # that clause would convert this failure back into a green run, which
+        # is the precise fail-open #256 exists to close.
+        tee_failure = exc
+        # Print __context__ too, not just the TeeStderrFailure. The teardown
+        # raise displaces any in-flight body exception, so a genuine ingestion
+        # crash is reachable ONLY through the chain; a handler that reported
+        # the tee failure alone would hide it. print_exception walks the chain
+        # by default. fd 2 is the caller's real stderr again by now.
+        print(
+            "[run_ingestion_benchmark] stderr capture did not complete; "
+            "skipped_commits/error_signals below are LOWER BOUNDS:",
+            file=sys.stderr,
+        )
+        traceback.print_exception(exc)
+    finally:
+        wall_clock = time.perf_counter() - start
+
+    scanned = scan_ingestion_stderr(captured.text() if captured is not None else "")
 
     poll_seconds = sum(status_latencies) + sum(query_latencies)
     poll_duty_fraction = (poll_seconds / wall_clock) if wall_clock > 0 else 0.0
@@ -187,7 +251,23 @@ async def run_ingestion_benchmark(
         "poll_duty_fraction": poll_duty_fraction,
         "poll_offsets": poll_offsets,
         "checkpoint_summary": checkpoint_summary,
+        # #256. Not derivable from commits_ingested or final_status: the
+        # per-commit handler isolates failures and increments `processed`
+        # anyway, so both are blind to a dropped commit.
+        **scanned,
+        # Whether the capture those four keys were scanned from ran to
+        # completion. It matters independently of `tee_failure`: on False,
+        # skipped_commits and error_signals are LOWER BOUNDS, and a downstream
+        # reader must not read an empty list as proof of a clean run.
+        "stderr_capture_complete": tee_failure is None,
     }
+    if tee_failure is not None:
+        result["tee_failure"] = repr(tee_failure)
+        if tee_failure.__context__ is not None:
+            # The body exception the teardown raise displaced. Kept in the
+            # metrics, not only in the log, because the JSON is the artifact
+            # that survives the run.
+            result["tee_failure_context"] = repr(tee_failure.__context__)
 
     if compare_ignore:
         no_ignore_graph_path = graph_path.parent / f"{graph_path.stem}-no-ignore{graph_path.suffix}"
@@ -217,8 +297,31 @@ async def run_ingestion_benchmark(
 
 
 def _exit_code(metrics: dict[str, Any]) -> int:
-    """Return 1 if ingestion ended in an error state, else 0."""
-    return 1 if metrics.get("final_status") == "error" else 0
+    """Return 1 if ingestion ended in an error state, dropped any commit,
+    logged a #251 signature, or could not be verified at all; else 0.
+
+    Clauses 2 and 3 matter because `final_status` cannot see either --
+    _run_ingestion isolates per-commit failures by design rather than
+    propagating them, so a run that skipped commits still reports "complete".
+
+    Clause 4 is what keeps the verification from failing open. Catching
+    TeeStderrFailure in run_ingestion_benchmark (so a tee failure does not
+    destroy a 25-minute run's metrics) would otherwise turn an unverifiable
+    run into a green one: with an incomplete capture, `skipped_commits ==
+    []` means "nothing was seen", not "nothing happened".
+
+    Every key is read with .get() so pre-#256 metrics files, which carry none
+    of them, still evaluate. `is False` rather than `not ...` for
+    stderr_capture_complete, so an ABSENT key (old file) stays clean while an
+    explicit False fails.
+    """
+    if metrics.get("final_status") == "error":
+        return 1
+    if metrics.get("skipped_commits") or metrics.get("error_signals"):
+        return 1
+    if metrics.get("tee_failure") or metrics.get("stderr_capture_complete") is False:
+        return 1
+    return 0
 
 
 @contextlib.contextmanager

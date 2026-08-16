@@ -342,3 +342,73 @@ class TestTeeStderr:
             "the pattern only matches the marker at a line start -- an anchor "
             "the emitter can defeat"
         )
+
+
+class TestFailingRestoreIsRecorded:
+    """`guard.restore()` is the one teardown step whose failure means fd 2 was
+    never handed back -- the most consequential thing this module can report.
+    Its exception is raised INSIDE teardown's try/finally, so the
+    TeeStderrFailure raised at the bottom of that same finally displaces it
+    into __context__ only. Unless it is also recorded on the capture, a
+    consumer logging str(exc) (or reading cap.errors) never sees it."""
+
+    def test_a_failing_restore_survives_a_compound_failure(self, monkeypatch):
+        """The COMPOUND case, which is the only one where the restore failure
+        is genuinely lost: the pump has also died, so capture.errors is
+        already non-empty and teardown's finally raises TeeStderrFailure --
+        which DISPLACES the propagating restore OSError into __context__.
+        With a dead pump alone in .errors, str(exc) names only the pump."""
+        real_default_selector = selectors.DefaultSelector
+
+        class _FailsImmediately:
+            def __init__(self) -> None:
+                self._real = real_default_selector()
+
+            def register(self, *args, **kwargs):
+                return self._real.register(*args, **kwargs)
+
+            def select(self, *args, **kwargs):
+                raise OSError(24, "Too many open files")
+
+            def close(self) -> None:
+                self._real.close()
+
+        # Our own copy of the real stderr, taken before anything is patched. A
+        # failed restore can leave fd 2 pointing at the tee pipe whose read end
+        # teardown then closes, so every later write to stderr -- including
+        # pytest's own -- would raise BrokenPipeError. Repaired below, before
+        # any assertion runs.
+        rescue_fd = os.dup(2)
+        real_dup2 = os.dup2
+        armed = {"value": False}
+
+        def flaky_dup2(fd, fd2, *args, **kwargs):
+            if armed["value"] and fd2 == 2:
+                raise OSError(9, "simulated restore failure")
+            return real_dup2(fd, fd2, *args, **kwargs)
+
+        monkeypatch.setattr(selectors, "DefaultSelector", _FailsImmediately)
+        monkeypatch.setattr(os, "dup2", flaky_dup2)
+
+        cap = None
+        try:
+            with pytest.raises(TeeStderrFailure) as excinfo:
+                with tee_stderr() as cap:
+                    # Armed only now: setup's own dup2(write_fd, 2) must
+                    # succeed, or this tests the setup path instead.
+                    armed["value"] = True
+        finally:
+            armed["value"] = False
+            real_dup2(rescue_fd, 2)
+            os.close(rescue_fd)
+
+        assert cap is not None
+        assert "Too many open files" in str(excinfo.value), "the pump did not die"
+        assert "simulated restore failure" in str(excinfo.value), (
+            "the restore failure -- fd 2 was never handed back, the worst thing "
+            "this module can report -- is reachable only via __context__, so a "
+            f"consumer logging str(exc) loses it: {excinfo.value}"
+        )
+        assert any(
+            "simulated restore failure" in repr(err) for err in cap.errors
+        ), f"not recorded on the capture either: {cap.errors}"
