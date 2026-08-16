@@ -96,12 +96,13 @@ dict:
 | Key | Source | Meaning |
 |---|---|---|
 | `skipped_commits` | lines matching `[_run_ingestion] skipping commit` / `skipping unreadable commit` | commits the per-commit handler dropped |
-| `error_signals` | lines matching the three #251 patterns | see below |
+| `error_signals` | lines matching any of the four error patterns — the three #251 signatures, plus `tee_stderr`'s own pump-failure marker | see below |
 | `correction_sweep_skipped` | the `[_correction_sweep] N entities left provisional/unreconciled this run` line | N, consumed by the probe |
 
-The three #251 patterns are **regexes, not literals** — the page error carries
-live numbers (`Page 130 out of bounds (total pages: 113)` is the form #251
-actually reproduced), so a literal `Page N out of bounds` would match nothing:
+The first three are the #251 signatures, and they are **regexes, not
+literals** — the page error carries live numbers (`Page 130 out of bounds
+(total pages: 113)` is the form #251 actually reproduced), so a literal `Page N
+out of bounds` would match nothing:
 
 - `Page \d+ out of bounds`
 - `Serde Deserialization Error`
@@ -109,6 +110,21 @@ actually reproduced), so a literal `Page N out of bounds` would match nothing:
 
 Matching a literal where a regex is needed is the fail-open case the scanner
 positive controls exist to catch.
+
+The fourth pattern, `\[tee_stderr\] pump failed:`, is **not** a #251 signature
+— it is a health signal for the capture apparatus itself, saying "the tee
+broke", not "the graph broke". If the pump thread dies, the marker it appends
+to the captured text is the only evidence left; without a pattern for it a
+marker-only capture scans byte-identically to a clean run. It is deliberately
+**unanchored**: the pump appends the marker directly after an arbitrary 64 KiB
+`os.read()` slice that need not end at a line boundary, so an anchored pattern
+was defeated by the emitter itself whenever the pump died mid-run rather than
+at iteration 0. The emitter also prepends its own newline; the two halves are
+independent, and each is separately ablation-proven by
+`test_a_mid_run_pump_death_is_still_scannable`.
+
+`_exit_code` treats this signal like the others — a run whose stderr capture
+failed is not a run that verified anything.
 
 `_exit_code` extends to return non-zero when `skipped_commits` or
 `error_signals` is non-empty. `correction_sweep_skipped` is an observation, not

@@ -33,18 +33,29 @@ _SWEEP_SUMMARY_RE = re.compile(
     re.MULTILINE,
 )
 
-# The three #251 signatures. REGEXES, NOT LITERALS: the page error carries
-# live numbers ("Page 130 out of bounds (total pages: 113)" is the form #251
+# Four patterns: the three #251 signatures, then one tee-health signal.
+#
+# The #251 three are REGEXES, NOT LITERALS: the page error carries live
+# numbers ("Page 130 out of bounds (total pages: 113)" is the form #251
 # actually reproduced), so a literal would match nothing and report all-clear.
 #
-# The fourth entry is tee_stderr()'s own pump-failure marker (#256 review
-# round 3, New Important): without it, a dead pump's synthetic
-# "[tee_stderr] pump failed: ..." line -- the ONLY signal left in the
-# captured text once the pump has died -- matched none of the other three
-# patterns, so this scanner (the sole text-only consumer) read a
-# marker-only capture as indistinguishable from a clean run. The marker is
-# a repr() of an fd-level Python exception; it cannot collide with
-# minigraf's own output or the other three patterns.
+# The fourth entry is NOT a #251 signature -- it is tee_stderr()'s own
+# pump-failure marker (#256 review round 3, New Important): without it, a
+# dead pump's synthetic "[tee_stderr] pump failed: ..." line -- the ONLY
+# signal left in the captured text once the pump has died -- matched none of
+# the other three patterns, so this scanner (the sole text-only consumer)
+# read a marker-only capture as indistinguishable from a clean run. It says
+# "the capture apparatus broke", not "the graph broke".
+#
+# UNANCHORED, deliberately (#256 review round 4, Important 1). It was `^\[`
+# through round 3, which the emitter itself defeated: the marker is appended
+# after an arbitrary 64 KiB os.read() slice that frequently does not end at a
+# line boundary, so a pump dying MID-RUN (the likelier EMFILE timing) glued
+# the marker to a partial line and this scanner reported zero error signals.
+# The emitter now prepends its own newline; the missing anchor is the second,
+# independent half of that fix, for any text that reaches a consumer already
+# concatenated. Nothing in minigraf or mcp_server emits this literal, so the
+# anchor bought no protection against spurious matches.
 _ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("page_out_of_bounds", re.compile(r"Page \d+ out of bounds")),
     ("serde_deserialization_error", re.compile(r"Serde Deserialization Error")),
@@ -52,7 +63,7 @@ _ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "stream_all_entries_expected_leaf_page",
         re.compile(r"stream_all_entries: expected leaf page"),
     ),
-    ("tee_stderr_pump_failed", re.compile(r"^\[tee_stderr\] pump failed:")),
+    ("tee_stderr_pump_failed", re.compile(r"\[tee_stderr\] pump failed:")),
 )
 
 
@@ -164,10 +175,19 @@ class _RedirectGuard:
 
     def restore(self) -> None:
         """Called exactly once, by teardown. Hands fd 2 back to the caller
-        and permanently disarms the valve."""
+        and permanently disarms the valve.
+
+        try/finally, not a bare sequence: os.dup2 can raise (EBADF if
+        saved_fd was clobbered, EMFILE under the fd pressure this module is
+        built for), and if it did, `_restored` stayed False forever -- the
+        valve remained armed for the rest of the process even though teardown
+        had run. The disarm is unconditional; the failure still propagates to
+        teardown, which has its own try/finally (#256 review round 4)."""
         with self._lock:
-            os.dup2(self._saved_fd, 2)
-            self._restored = True
+            try:
+                os.dup2(self._saved_fd, 2)
+            finally:
+                self._restored = True
 
 
 @contextlib.contextmanager
@@ -270,7 +290,16 @@ def tee_stderr():
                 # a dedicated pattern for exactly this line (#256 review
                 # round 3), so a scan of an otherwise-empty capture reads as
                 # a pump failure, not a clean run.
-                marker = f"[tee_stderr] pump failed: {exc!r}\n".encode(
+                #
+                # LEADING newline, not just a trailing one (#256 review round
+                # 4, Important 1). The last thing appended before this is an
+                # arbitrary 64 KiB os.read() slice, which frequently does not
+                # end at a line boundary; without the leading "\n" a pump that
+                # dies mid-run glues its marker onto a partial line, and
+                # anything reading the capture line-by-line loses the marker
+                # as a line of its own. The scanner's pattern is also
+                # unanchored now -- two independent halves, on purpose.
+                marker = f"\n[tee_stderr] pump failed: {exc!r}\n".encode(
                     "utf-8", errors="replace"
                 )
                 capture.append(marker)
@@ -316,30 +345,40 @@ def tee_stderr():
         # control pipe; not by closing anything, since resource_tracker's
         # own duplicate of the write end means closing ours is not
         # sufficient to produce EOF. See the docstring.
-        guard.restore()
-        os.close(devnull_fd)  # safe: the guard is disarmed, valve never touches it again
-        with contextlib.suppress(OSError):
-            os.write(ctrl_write_fd, b"x")
-        pump_thread.join(timeout=10)
-        alive = pump_thread.is_alive()  # snapshot once -- see review round 2, cheap fix 1
-        if alive:
-            # The pump is still touching saved_fd/read_fd/ctrl_read_fd, and
-            # its selector still owns an epoll fd (pump()'s own `finally`
-            # never got to run sel.close()). Closing any of these now would
-            # recycle the fd number under a live thread -- a leaked fd is
-            # strictly better than a corrupted one.
-            capture.record_error(
-                TimeoutError("tee_stderr: pump thread did not exit within 10s")
-            )
-        else:
-            os.close(saved_fd)
-            os.close(read_fd)
-        os.close(ctrl_write_fd)
-        if not alive:
-            os.close(ctrl_read_fd)
+        #
+        # try/finally around restore(), NOT contextlib.suppress (#256 review
+        # round 4, Minor 3): its os.dup2 can itself raise, and an unguarded
+        # call here would skip the control-pipe write and the join below,
+        # leaving fd 2 pointing at a pipe nobody drains -- the very hang this
+        # module exists to prevent. suppress() would hide a genuinely
+        # unrecoverable fd failure; try/finally still lets it propagate, but
+        # only after the pump has been signalled, joined, and its fds closed.
+        try:
+            guard.restore()
+        finally:
+            os.close(devnull_fd)  # safe: guard disarmed, valve never touches it again
+            with contextlib.suppress(OSError):
+                os.write(ctrl_write_fd, b"x")
+            pump_thread.join(timeout=10)
+            alive = pump_thread.is_alive()  # snapshot once -- review round 2, cheap fix 1
+            if alive:
+                # The pump is still touching saved_fd/read_fd/ctrl_read_fd, and
+                # its selector still owns an epoll fd (pump()'s own `finally`
+                # never got to run sel.close()). Closing any of these now would
+                # recycle the fd number under a live thread -- a leaked fd is
+                # strictly better than a corrupted one.
+                capture.record_error(
+                    TimeoutError("tee_stderr: pump thread did not exit within 10s")
+                )
+            else:
+                os.close(saved_fd)
+                os.close(read_fd)
+            os.close(ctrl_write_fd)
+            if not alive:
+                os.close(ctrl_read_fd)
 
-        if capture.errors:
-            raise TeeStderrFailure(
-                "tee_stderr pump did not complete cleanly: "
-                + "; ".join(repr(exc) for exc in capture.errors)
-            )
+            if capture.errors:
+                raise TeeStderrFailure(
+                    "tee_stderr pump did not complete cleanly: "
+                    + "; ".join(repr(exc) for exc in capture.errors)
+                )

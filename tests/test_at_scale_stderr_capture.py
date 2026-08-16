@@ -247,5 +247,98 @@ class TestTeeStderr:
                 pass
 
         assert cap is not None
-        assert any(isinstance(exc, OSError) for exc in cap.errors)
+        # The PLANTED error, not merely "an OSError" (#256 review round 4,
+        # Important 2): TimeoutError is an OSError subclass, so teardown's own
+        # join-timeout TimeoutError satisfied the loose form -- the test would
+        # have passed on a run where the planted failure never happened at all.
+        assert [
+            exc for exc in cap.errors if getattr(exc, "errno", None) == 24
+        ], f"planted EMFILE not recorded; errors={cap.errors!r}"
+        # The marker must carry the exception, not just the prefix: dropping
+        # {exc!r} from the emitter would keep a prefix-only assertion green
+        # while destroying the only diagnostic a text-only consumer gets.
         assert "[tee_stderr] pump failed:" in cap.text()
+        assert "Too many open files" in cap.text()
+        # The missing link: assert the marker the pump ACTUALLY emits is seen
+        # by the pattern that ACTUALLY exists. Everything above this line is a
+        # hand-written literal agreeing with the emitter by eye only.
+        assert scan_ingestion_stderr(cap.text())["error_signals"], cap.text()
+
+    def test_a_mid_run_pump_death_is_still_scannable(self, monkeypatch):
+        """THE discriminating regression test for #256 review round 4,
+        Important 1: the emitter defeating the scanner's own anchor.
+
+        Every earlier test killed the pump at iteration 0, where the marker
+        happens to land at the start of the capture. Mid-run EMFILE under fd
+        pressure is the LIKELIER timing, and there the marker was appended
+        straight after an arbitrary 64 KiB os.read() slice that need not end
+        at a line boundary -- gluing it onto a partial line, which the then-
+        anchored `^\\[tee_stderr\\]` pattern did not match. A pump death
+        scanned as a clean run: the exact fail-open shape #256 exists to
+        catch.
+
+        Two independent halves of the fix, and this test discriminates both.
+        Ablation-proven -- see the #256 fix-round-4 report for the counts:
+        removing the emitter's leading newline breaks the "marker is its own
+        line" assertion; restoring the `^` anchor breaks the final
+        concatenated-text assertion.
+        """
+        real_default_selector = selectors.DefaultSelector
+
+        class _FailsOnTheSecondSelect:
+            """A real selector for one iteration, then EMFILE. Real, not a
+            stub: the pump must genuinely read and append one chunk first, or
+            this degenerates into the iteration-0 case again."""
+
+            def __init__(self) -> None:
+                self._real = real_default_selector()
+                self._selects = 0
+
+            def register(self, *args, **kwargs):
+                return self._real.register(*args, **kwargs)
+
+            def select(self, *args, **kwargs):
+                self._selects += 1
+                if self._selects > 1:
+                    raise OSError(24, "Too many open files")
+                return self._real.select(*args, **kwargs)
+
+            def close(self) -> None:
+                self._real.close()
+
+        # Patched before entry: the pump builds its selector as soon as the
+        # thread starts, which is inside tee_stderr()'s setup.
+        monkeypatch.setattr(selectors, "DefaultSelector", _FailsOnTheSecondSelect)
+
+        cap = None
+        with pytest.raises(TeeStderrFailure):
+            with tee_stderr() as cap:
+                # Deliberately no trailing newline -- os.read() returns
+                # whatever fits in 64 KiB, so a partial final line is the
+                # normal case, not a contrived one. The pump's select #1
+                # blocks until this arrives, reads it, loops, and dies on
+                # select #2: mid-run by construction, not by timing luck.
+                os.write(2, b"[_run_ingestion] MID_RUN_PARTIAL")
+
+        assert cap is not None
+        text = cap.text()
+        assert "MID_RUN_PARTIAL" in text, "the pump never got mid-run"
+
+        signals = scan_ingestion_stderr(text)["error_signals"]
+        assert [s["pattern"] for s in signals] == ["tee_stderr_pump_failed"], text
+        marker_line = signals[0]["line"]
+        assert marker_line.startswith("[tee_stderr] pump failed:"), (
+            "the marker was glued onto the preceding partial line instead of "
+            f"starting one of its own: {text!r}"
+        )
+        assert "Too many open files" in marker_line
+
+        # Feed the pump's OWN marker back in, concatenated onto a partial
+        # line. The pattern must not depend on the emitter's newline: any
+        # consumer can receive this text already merged with another writer's
+        # output on the shared fd.
+        glued = "[_run_ingestion] a partial line with no trailing newline" + marker_line
+        assert scan_ingestion_stderr(glued)["error_signals"], (
+            "the pattern only matches the marker at a line start -- an anchor "
+            "the emitter can defeat"
+        )
