@@ -446,12 +446,9 @@ class TestLoadModulePathFacts:
         _branch, status = await _ingest_into(str(git_repo), "HEAD", graph_path)
         assert status == "complete"
 
-        # db_lease() resolves its path from _lease_manager.path, which
-        # _ingest_into's mcp_server.open_db(str(graph_path)) never set --
-        # open_db doesn't touch the (not-yet-wired) lease manager. Bind it
-        # explicitly or the lease falls back to _get_graph_path()'s default
-        # and silently opens the wrong graph.
-        mcp_server._lease_manager.bind_path(str(graph_path))
+        # _ingest_into's own open_db(str(graph_path)) call already bound the
+        # lease manager's path, and nothing since has reset it -- db_lease()
+        # below resolves to it without needing another explicit bind (#255).
         with mcp_server.db_lease() as db:
             facts = load_module_path_facts(db)
 

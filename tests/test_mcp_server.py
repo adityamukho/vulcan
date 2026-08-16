@@ -36,7 +36,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 @pytest.fixture(autouse=True)
 def reset_mcp_server_db():
-    """Reset the module-level _db singleton and grammar cache between tests.
+    """Reset the DB lease manager and grammar cache between tests.
+
+    There is no module-level `_db` singleton to reset -- it was deleted with
+    the lease protocol (#255). `_reset_db_state()` releases the `get_db()`
+    shim's own lease (if any) and resets `_lease_manager` (count, handle,
+    path) back to its initial state, running the leak detector on the way.
 
     The fact index needs no equivalent reset: real_db's tmp_path already
     gives each test an isolated graph path, and fact_index.index_path_for()
@@ -99,9 +104,9 @@ class TestOpenDb:
         path = str(tmp_path / "t.graph")
 
         # open_db binds the path but returns None by design (#255) -- it does
-        # not hand back an unleased handle. mcp_server._graph_path (the legacy
-        # global) is intentionally left stale by the lease-based open_db/get_db;
-        # mcp_server._lease_manager.path is the source of truth now.
+        # not hand back an unleased handle. The legacy `_graph_path` global
+        # is deleted, not stale (#255); mcp_server._lease_manager.path is
+        # the only source of truth now.
         assert mcp_server.open_db(path) is None
         assert mcp_server._lease_manager.path == path
         # A real handle can execute — proof it's a live db, not a stub.
@@ -131,8 +136,9 @@ class TestOpenDb:
         result = mcp_server.get_db()
 
         assert result is not None
-        # mcp_server._lease_manager.path is the source of truth now; the legacy
-        # _graph_path global is intentionally left stale (#255).
+        # mcp_server._lease_manager.path is the only source of truth now; the
+        # legacy `_graph_path` global is deleted, not stale (#255) -- reading
+        # it raises AttributeError.
         assert mcp_server._lease_manager.path == str(tmp_path / "auto.graph")
 
     def test_get_db_returns_instance_after_open(self, real_db):
@@ -151,8 +157,9 @@ class TestOpenDb:
 
         mcp_server.get_db()
 
-        # mcp_server._lease_manager.path is the source of truth now; the legacy
-        # _graph_path global is intentionally left stale (#255).
+        # mcp_server._lease_manager.path is the only source of truth now; the
+        # legacy `_graph_path` global is deleted, not stale (#255) -- reading
+        # it raises AttributeError.
         assert mcp_server._lease_manager.path == custom_path
 
 
@@ -281,7 +288,11 @@ class TestCallToolAcquiresOnlyForDbTools:
         real_try = mcp_server._lease_manager.try_acquire
         monkeypatch.setattr(
             mcp_server._lease_manager, "try_acquire",
-            lambda p: (seen.append(p), real_try(p))[1],
+            # p=None, matching try_acquire's own signature (#255 review:
+            # db_lease/db_lease_async now call try_acquire() with no
+            # argument, resolving the path inside the lock instead of
+            # reading it outside).
+            lambda p=None: (seen.append(p), real_try(p))[1],
         )
 
         mcp_server._ingest_progress["status"] = "running"
@@ -895,6 +906,30 @@ class TestDbLeaseManager:
             "which is exactly the #255 failure the lease protocol exists to remove"
         )
 
+    def test_bind_path_refuses_a_switch_while_leased(self, tmp_path, monkeypatch):
+        """bind_path's own conflict guard, distinct from try_acquire's (the
+        test right below): open_db()/bind_path() is the entry point every
+        caller not already holding a lease uses to point the manager at a
+        graph, and it had no test anywhere -- only try_acquire's identically-
+        worded conflict (reached through db_lease()) was covered.
+        """
+        import mcp_server
+
+        graph_a = str(tmp_path / "a.graph")
+        graph_b = str(tmp_path / "b.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph_a)
+        mcp_server._reset_db_state()
+
+        with mcp_server.db_lease():
+            with pytest.raises(RuntimeError, match="cannot bind"):
+                mcp_server._lease_manager.bind_path(graph_b)
+        # The refused bind must not have partially applied -- the manager
+        # still resolves to graph_a once the lease that blocked it is gone.
+        assert mcp_server._lease_manager.path == graph_a
+        mcp_server._lease_manager.bind_path(graph_b)  # count is 0 now: allowed
+        assert mcp_server._lease_manager.path == graph_b
+        mcp_server._reset_db_state()
+
     def test_a_second_path_while_leased_is_refused(self, tmp_path, monkeypatch):
         """_open_db_at(path, force=False) returned _db without ever comparing
         paths. Not reachable from today's callers; nothing stopped it becoming
@@ -918,6 +953,72 @@ class TestDbLeaseManager:
         mcp_server._reset_db_state()
         with pytest.raises(RuntimeError, match="no outstanding lease"):
             mcp_server._lease_manager.release()
+
+    def test_registration_failure_does_not_strand_the_handle(self, tmp_path, monkeypatch):
+        """try_acquire opens the real handle, THEN registers SESSION_RULES /
+        _user_rules under the same lock, before the count goes 0 -> 1. A raise
+        partway through that registration used to leave the function without
+        ever setting self._handle/_count/_prev_ref -- count stays 0 (as if
+        nothing happened), but `handle` is real, open, and alive in this
+        frame via the propagating traceback: count 0, handle alive, lock
+        held, which is exactly the state the lease protocol exists to
+        abolish. Worse, _prev_ref was never set, so _detect_leaked_handle
+        silently no-ops at the next acquire instead of naming the holder --
+        the failure that most needs the detector was the one it couldn't see.
+
+        Ablation: reverting try_acquire's try/except around rule registration
+        makes this test fail at the second `with db_lease()` -- no "DB lease
+        leak" is raised, the acquire instead fails on minigraf's own lock
+        error because the stray handle is still holding the file lock, with
+        no diagnostic naming why.
+        """
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+
+        real_db_execute = mcp_server._db_execute
+
+        def failing_db_execute(handle, code):
+            if code == mcp_server.SESSION_RULES[0]:
+                raise RuntimeError("simulated rule registration failure")
+            return real_db_execute(handle, code)
+
+        monkeypatch.setattr(mcp_server, "_db_execute", failing_db_execute)
+
+        # Captured with `as`, not through pytest.raises() -- pytest.raises()
+        # does not keep the caught exception's traceback alive past its own
+        # `with` block, so nothing would pin the handle and this test would
+        # falsely show a clean release. An explicit `except ... as held`
+        # local is what actually keeps the traceback (and, through it, the
+        # handle) alive, matching how a real caller loses track of one.
+        held = None
+        try:
+            with mcp_server.db_lease():
+                pass
+        except RuntimeError as e:
+            assert "simulated rule registration failure" in str(e)
+            held = e
+
+        # Registration failed before the count went positive -- as if this
+        # acquire had never started.
+        assert mcp_server._lease_manager.lease_count == 0
+
+        # Restore real _db_execute so the NEXT acquire's own rule
+        # registration succeeds; what we are pinning is that it first
+        # reports the stranded handle from the failed attempt above.
+        monkeypatch.setattr(mcp_server, "_db_execute", real_db_execute)
+        with pytest.raises(RuntimeError, match="DB lease leak") as exc_info:
+            with mcp_server.db_lease():
+                pass
+        holders = str(exc_info.value).split("Still held by:", 1)[1]
+        assert holders.strip() != "<no named holder found>", (
+            "the stranded handle from the failed registration must be "
+            "named, not silently missed -- got holders=" + holders
+        )
+        del held
+        mcp_server._reset_db_state()
 
     async def test_async_lease_nests_under_a_sync_lease(self, tmp_path, monkeypatch):
         """call_tool acquires asynchronously and the sync handler nests inside
@@ -1014,6 +1115,47 @@ class TestDbLeaseExtendedRetry:
 
         assert attempts["n"] == mcp_server._LOCK_RETRY_MAX, (
             f"expected the standard lease to give up after exactly "
+            f"{mcp_server._LOCK_RETRY_MAX} attempts, got {attempts['n']}"
+        )
+        mcp_server._reset_db_state()
+
+    async def test_async_lease_gives_up_at_the_same_failure_count(self, tmp_path, monkeypatch):
+        """db_lease_async()'s own give-up RuntimeError, which had no test
+        anywhere -- only the synchronous twin above
+        (test_standard_lease_gives_up_at_the_same_failure_count) was covered.
+        Same shape, asyncio.sleep patched instead of time.sleep since
+        db_lease_async backs off with the former (#99)."""
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+
+        async def no_sleep(s):
+            return None
+
+        monkeypatch.setattr(mcp_server.asyncio, "sleep", no_sleep)
+
+        fail_until = mcp_server._LOCK_RETRY_MAX + 3
+        attempts = {"n": 0}
+        real_open = mcp_server._open_for_lease
+
+        def flaky_open(path):
+            attempts["n"] += 1
+            if attempts["n"] <= fail_until:
+                raise MiniGrafError(
+                    "Database is locked by another process (lock file: x.graph.lock, holder PID: 1)."
+                )
+            return real_open(path)
+
+        monkeypatch.setattr(mcp_server, "_open_for_lease", flaky_open)
+
+        with pytest.raises(RuntimeError, match="could not acquire a lease"):
+            async with mcp_server.db_lease_async():
+                pass
+
+        assert attempts["n"] == mcp_server._LOCK_RETRY_MAX, (
+            f"expected the async lease to give up after exactly "
             f"{mcp_server._LOCK_RETRY_MAX} attempts, got {attempts['n']}"
         )
         mcp_server._reset_db_state()
@@ -13153,10 +13295,11 @@ class TestRunIngestionShutdown:
 
         async def stop_after_first(t):
             # Only the per-commit yield, `asyncio.sleep(0)`, marks a commit
-            # boundary. _ensure_db_async's lock-contention backoff also sleeps,
-            # with a non-zero delay, and tripping the shutdown on that would
-            # stop the run at an arbitrary point instead of after commit 1 --
-            # see the same guard in TestResumeWithInvertedAuthorDates.
+            # boundary. db_lease_async()'s lock-contention backoff (via
+            # try_acquire's retry loop) also sleeps, with a non-zero delay,
+            # and tripping the shutdown on that would stop the run at an
+            # arbitrary point instead of after commit 1 -- see the same
+            # guard in TestResumeWithInvertedAuthorDates.
             if t:
                 await original_sleep(t)
                 return
@@ -21564,7 +21707,7 @@ class TestResumeWithInvertedAuthorDates:
         async def stop_after_fourth(t):
             # Count only the per-commit yield, `asyncio.sleep(0)`. Counting
             # every sleep made this a proxy for "commits processed" that any
-            # other sleeper could perturb -- notably _ensure_db_async's
+            # other sleeper could perturb -- notably db_lease_async()'s
             # lock-contention backoff, which sleeps with a non-zero delay. Once
             # the same-process open became retryable (#253), a single retry
             # under load consumed one of these counts and tripped the shutdown
@@ -21772,7 +21915,7 @@ class TestResumeWithInvertedAuthorDatesAndDeps:
         Runs 1 and 2 are interrupted by the same sleep-count trick
         TestResumeWithInvertedAuthorDates._run_resume uses, including its
         `if t: await original_sleep(t); return` guard -- without it
-        _ensure_db_async's lock-contention backoff consumes a count and the
+        db_lease_async()'s lock-contention backoff consumes a count and the
         run stops one step early, which was a real CI-only failure on this
         fixture.
 
@@ -22786,8 +22929,8 @@ class TestLockErrorRecognisesSameProcessOpen:
     and only one contains the word "locked".
 
     `_is_lock_error` gates the retry/backoff path in `try_acquire` (via
-    `_open_for_lease`, reached from both `db_lease` and `db_lease_async`) and
-    in `_ensure_db_async` (still used by `_run_ingestion`, #255 Task 7).
+    `_open_for_lease`, reached from both `db_lease` and `db_lease_async`,
+    which `_run_ingestion` uses -- `_ensure_db_async` is deleted, #255).
     Matching only "locked" made the same-process message fall through as a
     fatal non-lock error, aborting the caller on the first attempt instead of
     backing off -- which turned a momentary handle overlap into a failed
@@ -23115,17 +23258,19 @@ class TestConcurrentPollerDoesNotForceASecondOpen:
         poller_has_tried = threading.Event()
         mgr = mcp_server._lease_manager
 
-        def try_acquire_without_reuse(path):
+        def try_acquire_without_reuse(path=None):
             """`_DbLeaseManager.try_acquire` with the reuse branch (`count >
             0 -> return self._handle`) removed, so every acquisition attempts
             a fresh `MiniGrafDb.open()` -- including a second one while the
             first is still live. Otherwise faithful (locking, leak detection,
-            session rule registration). Does NOT catch the resulting
-            "already open in this process" the way `_open_for_lease`'s
-            self-heal path effectively re-raises it when the reported holder
-            is our own live PID: it must propagate to the caller uncaught,
-            exactly as the pre-#255 idiom let it, not be absorbed by
-            db_lease()'s outer retry loop.
+            session rule registration, and -- #255 review -- resolving
+            path=None from mgr._path the same way the real method does, since
+            db_lease() calls try_acquire() with no argument now). Does NOT
+            catch the resulting "already open in this process" the way
+            `_open_for_lease`'s self-heal path effectively re-raises it when
+            the reported holder is our own live PID: it must propagate to the
+            caller uncaught, exactly as the pre-#255 idiom let it, not be
+            absorbed by db_lease()'s outer retry loop.
 
             Patched onto the `_lease_manager` INSTANCE, not the
             `_DbLeaseManager` CLASS, and closes over `mgr` rather than taking
@@ -23155,6 +23300,8 @@ class TestConcurrentPollerDoesNotForceASecondOpen:
                 # attempting a second one.
                 main_has_opened.wait(timeout=2.0)
             with mgr._lock:
+                if path is None:
+                    path = mgr._path or mcp_server._get_graph_path()
                 mgr._detect_leaked_handle(path)
                 try:
                     handle = mcp_server._open_for_lease(path)

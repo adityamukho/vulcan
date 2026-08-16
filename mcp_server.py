@@ -90,9 +90,23 @@ _db_native_lock = threading.Lock()
 # it serializes calls INTO one handle; the manager governs the handle's
 # LIFETIME. Conflating them is what made the old comment here necessary.
 #
-# The remaining hole is a caller that keeps its handle past the end of its
-# `with db_lease()` block. That cannot be prevented in Python, so it is
-# DETECTED: see _DbLeaseManager._detect_leaked_handle.
+# The remaining hole is broader than "a caller keeps its `as db` name past
+# the block": it is ANY retained reference to a frame that touched the
+# handle, including a retained traceback. Verified empirically -- retaining
+# an exception raised INSIDE a native call pins the real handle even though
+# _LeasedDb severed its own reference right on schedule, because the
+# traceback's `execute` frame holds the raw MiniGrafDb as `self`:
+#
+#   with db_lease() as db:
+#       try: _db_execute(db, "(query [:find ?e :where")   # malformed
+#       except Exception as e: held = e
+#   # count == 0, but a second open is REFUSED until `held` is dropped
+#
+# None of this can be prevented in Python, so it is DETECTED, not closed: see
+# _DbLeaseManager._detect_leaked_handle. Detection turns it into a named
+# diagnostic plus a retry failure at the next acquire, not corruption -- which
+# is why _run_ingestion's `e.__traceback__ = None` (Stage B) is still
+# load-bearing rather than a leftover from the pre-proxy mechanism.
 
 # Module-level server reference — set after server creation for MCP sampling
 _server_ref: Optional[Server] = None
@@ -3130,10 +3144,19 @@ class _LeasedDb:
     on the second iteration of any loop -- precisely the shape of
     _run_ingestion's per-commit loop.
 
-    Severing here is what makes "a release genuinely releases" a property of
-    the protocol rather than of caller discipline. Without it every lease block
-    would have to end by dropping its own binding, which is the same invisible
-    ordering rule that produced #251/#253, merely relocated.
+    Severing here removes ONE specific way a release fails to genuinely
+    release: the caller's surviving `as db` binding. Without it every lease
+    block would have to end by dropping its own binding, which is the same
+    invisible ordering rule that produced #251/#253, merely relocated.
+
+    It does NOT make release a property of the protocol in full generality.
+    A reference to the real handle can still survive through a channel this
+    class does not touch -- concretely, an exception raised inside a native
+    call keeps the raw MiniGrafDb alive via its traceback's `execute` frame
+    (that frame's `self`), and severing `_handle` here changes nothing about
+    that. See "THE SINGLE-HANDLE INVARIANT" comment (below `_db_native_lock`,
+    near the top of this module) for the empirical case and what catches it
+    (the leak detector, at the next acquire -- not this class).
 
     __getattr__ fires only for attributes not found normally, so `_handle`
     (a slot) and `_sever` resolve directly and never recurse.
@@ -3307,14 +3330,27 @@ class _DbLeaseManager:
                 )
             self._path = path
 
-    def try_acquire(self, path: str) -> Optional[MiniGrafDb]:
+    def try_acquire(self, path: Optional[str] = None) -> Optional[MiniGrafDb]:
         """One acquisition attempt.
+
+        path=None resolves the target from self._path (falling back to
+        _get_graph_path()) INSIDE this method's lock, which is what
+        db_lease()/db_lease_async() pass -- resolving it themselves first and
+        handing in the result would read self._path OUTSIDE the lock, and a
+        bind_path(new) landing at count 0 in the gap between that read and
+        this call would silently target the stale path instead of the
+        current one. _get_graph_path() is a cheap env lookup, so resolving it
+        on every attempt costs nothing. Callers that need to request or
+        verify a SPECIFIC path (tests, the path-conflict check itself) still
+        pass one explicitly, unaffected by this default.
 
         Returns the leased handle, or None if the graph file lock is currently
         held by another PROCESS -- the caller backs off and retries. Raises for
         any non-lock error and for a path conflict.
         """
         with self._lock:
+            if path is None:
+                path = self._path or _get_graph_path()
             if self._count > 0:
                 if path != self._path:
                     raise RuntimeError(
@@ -3335,10 +3371,27 @@ class _DbLeaseManager:
             # Rules are registered under the lock, before the count goes
             # positive: a thread joining at count > 0 must never observe a
             # handle whose session rules are half-registered.
-            for rule in SESSION_RULES:
-                _db_execute(handle, rule)
-            for rule in _user_rules:
-                _db_execute(handle, rule)
+            try:
+                for rule in SESSION_RULES:
+                    _db_execute(handle, rule)
+                for rule in _user_rules:
+                    _db_execute(handle, rule)
+            except Exception:
+                # A raise here leaves self._handle/_count/_prev_ref untouched
+                # -- count stays 0, exactly as if this acquire had never
+                # started. But `handle` itself is real and open right now,
+                # and it survives in THIS frame via the propagating
+                # traceback, so the file lock is still held: count 0, handle
+                # alive, which is the state the whole protocol exists to
+                # abolish (see _LeasedDb's docstring and the module's
+                # SINGLE-HANDLE INVARIANT comment). Feed it to the detector
+                # ourselves -- _prev_ref would otherwise stay None, and
+                # _detect_leaked_handle silently no-ops on None, so the very
+                # failure most likely to strand a handle would also be the
+                # one the detector stays blind to.
+                self._prev_ref = weakref.ref(handle)
+                del handle
+                raise
 
             self._handle = handle
             self._path = path
@@ -3380,12 +3433,37 @@ class _DbLeaseManager:
     def reset(self) -> None:
         """Force the manager back to its initial state.
 
-        For tests and for _run_ingestion's error path. Runs the leak detector
-        first, so a test that leaks a handle and then resets is blamed at its
-        own teardown rather than at its successor's first acquire.
+        Test-only. _run_ingestion's error path deliberately does NOT call
+        this -- see the comment at its `except Exception as e:` handler
+        (mcp_server.py, near _ingest_progress["status"] = "error") for why:
+        every ingestion lease is `with`-scoped, so by the time an exception
+        reaches that handler there is nothing of THIS run's to clean up, and
+        calling reset() there would desync the count if some OTHER caller
+        holds a legitimate concurrent lease. Runs the leak detector first,
+        so a test that leaks a handle and then resets is blamed at its own
+        teardown rather than at its successor's first acquire.
         """
         with self._lock:
             self._detect_leaked_handle(self._path or "<reset>")
+            # Tempting to weakref self._handle into _prev_ref here (when it
+            # is not None) before discarding it, the same way release() does
+            # -- otherwise a leak that straddles a reset() is permanently
+            # undetectable: nothing else will ever check on this handle
+            # again. Tried it; reverted. It makes TestLeaseAcquireCannotBe
+            # RacedByReset.test_reset_cannot_interleave_inside_an_acquire
+            # fail: that test deliberately races reset() against a real
+            # outstanding try_acquire() (not through db_lease(), so nothing
+            # releases it), keeps the handle alive in `outcome["handle"]`
+            # afterward to assert it's real, and cleans up with a SECOND
+            # _reset_db_state() at the end -- which would see the first
+            # reset's weakref still live (outcome["handle"] pins it) and
+            # raise a spurious "DB lease leak" from teardown, not from a
+            # bug. Reset() is a "force back to zero" escape hatch, not a
+            # release -- there is no reliable way from inside it to tell a
+            # caller who's mid-flight through a legitimate try_acquire from
+            # an actually-abandoned handle. Left undetected; #255 already
+            # narrows this to test/eval-only code (reset() is never called
+            # in production, see this method's own docstring).
             self._handle = None
             self._count = 0
             self._prev_ref = None
@@ -3440,17 +3518,25 @@ def db_lease(extended: bool = False):
     _load_ingestion_preload_state needs to survive an orphan-process cleanup
     window (#106) instead of giving up in ~1.55s.
     """
-    path = _lease_manager.path or _get_graph_path()
+    # No path resolved here: try_acquire(None) resolves self._path (falling
+    # back to _get_graph_path()) itself, INSIDE its own lock, on every
+    # attempt. Resolving it once here instead -- outside the lock -- would
+    # leave a window between that read and the first try_acquire() call in
+    # which a bind_path(new) landing at count 0 silently targets the stale
+    # path (#255 review). `path` below is for the error messages only, and
+    # is deliberately re-read fresh at raise time rather than cached from
+    # before the retry loop, for the same reason.
     handle = None
     if extended:
         deadline = time.monotonic() + _INGEST_LOCK_RETRY_BUDGET
         delay = _INGEST_LOCK_RETRY_BASE
         while True:
-            handle = _lease_manager.try_acquire(path)
+            handle = _lease_manager.try_acquire()
             if handle is not None:
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                path = _lease_manager.path or _get_graph_path()
                 raise RuntimeError(
                     f"could not acquire a lease on {path!r} within "
                     f"{_INGEST_LOCK_RETRY_BUDGET}s: the graph file lock did not "
@@ -3462,13 +3548,14 @@ def db_lease(extended: bool = False):
     else:
         delay = _LOCK_RETRY_BASE
         for attempt in range(_LOCK_RETRY_MAX):
-            handle = _lease_manager.try_acquire(path)
+            handle = _lease_manager.try_acquire()
             if handle is not None:
                 break
             if attempt < _LOCK_RETRY_MAX - 1:
                 time.sleep(delay)
                 delay *= 2
         if handle is None:
+            path = _lease_manager.path or _get_graph_path()
             raise RuntimeError(
                 f"could not acquire a lease on {path!r} after "
                 f"{_LOCK_RETRY_MAX} attempts: the graph file lock did not clear "
@@ -3497,17 +3584,22 @@ async def db_lease_async():
     retry budget, and worse, would prevent the very coroutine holding the lock
     from ever releasing it during the wait (#99).
     """
-    path = _lease_manager.path or _get_graph_path()
+    # See db_lease()'s matching comment: try_acquire(None) resolves the path
+    # itself, inside its own lock, on every attempt -- resolving it once here
+    # instead would read _lease_manager.path outside the lock and leave a
+    # window for a bind_path(new) at count 0 to silently redirect this
+    # acquire to a stale path (#255 review).
     handle = None
     delay = _LOCK_RETRY_BASE
     for attempt in range(_LOCK_RETRY_MAX):
-        handle = _lease_manager.try_acquire(path)
+        handle = _lease_manager.try_acquire()
         if handle is not None:
             break
         if attempt < _LOCK_RETRY_MAX - 1:
             await asyncio.sleep(delay)
             delay *= 2
     if handle is None:
+        path = _lease_manager.path or _get_graph_path()
         raise RuntimeError(
             f"could not acquire a lease on {path!r} after {_LOCK_RETRY_MAX} "
             f"attempts: the graph file lock did not clear -- see the preceding "
@@ -11150,16 +11242,23 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     file=sys.stderr,
                                 )
                                 # Drop the traceback before leaving the loop.
-                                # It chains back through _WorkItem.run to the
-                                # frame that raised, and that frame's argument
-                                # tuple still holds `db` -- so the handle stays
-                                # alive no matter how carefully the finallys
-                                # below clear their locals. The outer finally's
-                                # final checkpoint then cannot open the graph
-                                # ("Database is already open in this process")
-                                # and an interrupted run silently skips its WAL
-                                # compaction. Only the message is used above, so
-                                # nothing is lost by dropping the traceback.
+                                # It chains back through _WorkItem.run to
+                                # wherever `db` (a _LeasedDb, post-proxy) was
+                                # passed into the failing call -- but severing
+                                # THAT reference doesn't help: inside the
+                                # native call, `db.__getattr__` already
+                                # unwrapped it to the real MiniGrafDb, and the
+                                # native `execute` frame in the traceback
+                                # holds THAT as its own `self`, not the proxy.
+                                # So the raw handle stays alive no matter how
+                                # carefully the finallys below clear their
+                                # locals or how faithfully _LeasedDb severs.
+                                # The outer finally's final checkpoint then
+                                # cannot open the graph ("Database is already
+                                # open in this process") and an interrupted
+                                # run silently skips its WAL compaction. Only
+                                # the message is used above, so nothing is
+                                # lost by dropping the traceback.
                                 e.__traceback__ = None
                                 completed_all = False
                                 break

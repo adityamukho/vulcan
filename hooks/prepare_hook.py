@@ -29,10 +29,13 @@ def main() -> None:
     if prompt:
         try:
             import mcp_server
-            # No explicit open: handle_memory_prepare_turn takes its own lease,
-            # which carries the same retry/backoff and stale-lock self-heal
-            # get_db() used to provide, and releases when it returns so the
-            # next turn's hook process can acquire the file lock (#255).
+            # No explicit open: on the common path, handle_memory_prepare_turn
+            # takes NO lease at all -- it answers from the sqlite fact index
+            # (fact_index.query_facts), never opening the graph. It only
+            # takes a lease (db_lease(), released before it returns so the
+            # next turn's hook process can acquire the file lock) when the
+            # prompt looks navigation-shaped and the nav-nudge check runs
+            # (#255).
             context = mcp_server.handle_memory_prepare_turn(prompt)
         except Exception:
             pass  # Never block the turn on memory errors

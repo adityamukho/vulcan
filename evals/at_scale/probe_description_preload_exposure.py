@@ -567,9 +567,13 @@ def main() -> int:
         linearization = frontier_registry.build_linearization(
             args.repo_path, branch
         )
-        # db_lease() opens on demand -- no separate open_db() needed, and
-        # doing one here would race the lease's own open against the
-        # single-handle invariant (CLAUDE.md).
+        # This branch never calls _ingest_into (no ingestion happens against
+        # a pre-existing --graph-path graph), so nothing has bound the lease
+        # manager's path yet -- unlike the _ingest_into branch below, this
+        # bind is NOT redundant. open_db(str(graph_path)) would do the same
+        # thing (it IS _lease_manager.bind_path -- #255), but calling
+        # bind_path directly says what actually happens: this only points
+        # the manager at a path, it does not open a handle.
         mcp_server._lease_manager.bind_path(str(graph_path))
         with mcp_server.db_lease() as db:
             raw = mcp_server._db_execute(
@@ -605,11 +609,10 @@ def main() -> int:
                     + "). Refusing to sweep a partial or failed graph."
                 )
                 return 1
-            # _ingest_into's open_db() doesn't touch the (not-yet-wired)
-            # lease manager, so db_lease() needs the path bound explicitly
-            # or it falls back to _get_graph_path()'s default and opens the
-            # wrong graph.
-            mcp_server._lease_manager.bind_path(str(graph_path))
+            # _ingest_into's own open_db(str(graph_path)) call already bound
+            # the lease manager's path, and nothing since has reset it --
+            # db_lease() below resolves to it without needing another
+            # explicit bind (#255).
             with mcp_server.db_lease() as db:
                 report = _run_sweep(db, branch, ingest_status)
 
