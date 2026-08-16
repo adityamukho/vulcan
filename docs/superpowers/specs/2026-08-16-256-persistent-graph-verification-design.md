@@ -90,14 +90,26 @@ never re-ingested in place. When omitted, behaviour is identical to today.
 (see "Capture mechanism" below). Output still reaches real stderr live; a copy
 accumulates for scanning.
 
-After the run it scans the captured text and adds three keys to the metrics
-dict:
+After the run it scans the captured text and adds five keys to the metrics
+dict on the clean path, plus two more when the tee itself failed:
 
 | Key | Source | Meaning |
 |---|---|---|
 | `skipped_commits` | lines matching `[_run_ingestion] skipping commit` / `skipping unreadable commit` | commits the per-commit handler dropped |
 | `error_signals` | lines matching any of the four error patterns — the three #251 signatures, plus `tee_stderr`'s own pump-failure marker | see below |
-| `correction_sweep_skipped` | the `[_correction_sweep] N entities left provisional/unreconciled this run` line | N, consumed by the probe |
+| `correction_sweep_summaries` | every `[_correction_sweep] N entities left provisional/unreconciled this run` line | all values, since two loops can each emit one |
+| `correction_sweep_skipped` | the max of the above (0 when there is no such line) | N, consumed by the probe |
+| `stderr_capture_complete` | `True` iff the tee ran to a clean completion | on `False`, the two list keys are LOWER BOUNDS and prove nothing |
+| `tee_failure` | present only when the tee raised | `repr` of the `TeeStderrFailure` |
+| `tee_failure_context` | present only when that exception displaced a body exception | `repr` of the displaced exception |
+
+`stderr_capture_complete` and `tee_failure` are what keep the whole instrument
+from failing open, and both `_exit_code` and the probe's `require_complete_run`
+refuse a run that carries either signal.
+
+The metrics dict also records the resolved `graph_path` (#256 review round 5),
+so the graph↔metrics pairing is auditable from the metrics side and not only
+from whichever path the probe operator happened to type.
 
 The first three are the #251 signatures, and they are **regexes, not
 literals** — the page error carries live numbers (`Page 130 out of bounds
@@ -133,7 +145,11 @@ a failure condition — a legitimate non-zero value is normal.
 ### Component 2 — `evals/at_scale/probe_provisional_residue.py` (new, #256-specific)
 
 A separate process run after the benchmark. Takes `--graph-path` and
-`--metrics-json`. Opens the graph read-only, counts live
+`--metrics-json`. Opens the graph — **not** read-only: minigraf exposes no
+read-only open, so the probe takes the file lock and replays/compacts the WAL
+like any other opener. That is harmless for the disposable at-scale graph, but
+it means this is not a read-only probe in the sense the CLAUDE.md convention
+uses. It counts live
 `:type/lineage-marker` entities carrying `:status :provisional` (M) plus a
 per-`:entity-type` breakdown, reads N from the metrics JSON, applies `M <= N`,
 and writes `results/256-provisional-residue.json`. Exits non-zero on `M > N`.
@@ -150,9 +166,9 @@ never accounted for — state left inconsistent by something other than the
 designed fail-safe. That is the #251 signature, and it is the one condition
 this probe exists to detect.
 
-This follows the probe convention CLAUDE.md documents — read-only probes whose
+This follows the probe convention CLAUDE.md documents — one-off probes whose
 recorded measurements live under `results/` as analysis artifacts rather than
-part of the recurring benchmark run. `probe_dep_preload_exposure.py` and
+part of the recurring benchmark run (with the read-only caveat above). `probe_dep_preload_exposure.py` and
 `probe_ident_collision_census.py` are the existing precedent.
 
 ### Why two processes, not one function
@@ -231,9 +247,27 @@ requirement — see Testing.
 
 ## Failure modes handled explicitly
 
-- **Probe run against the wrong graph or a stale JSON.** The probe records the
-  graph path and the metrics filename it read into its own output, so the
-  pairing is auditable after the fact.
+- **Probe run against the wrong graph, a nonexistent one, or a stale JSON.**
+  Recording the paths is not enough on its own — the path the probe was handed
+  is not evidence about the graph behind it — so there are three mechanisms
+  (#256 review round 5):
+  1. The graph must carry a `:ingestion/format-version` stamp equal to
+     `GRAPH_FORMAT_VERSION`. minigraf's `open()` CREATES a missing file, so
+     without this a typo'd `--graph-path` yielded `provisional_entities: 0`,
+     `ok: true`, exit 0 — indistinguishable from a genuine clean result.
+     `_graph_format_version_read`, deliberately not `_graph_format_version_verify`,
+     which passes silently on a new graph because its job is to let ingestion
+     adopt one.
+  2. The graph's `:type/commit` count (the benchmark's own `_STATUS_QUERY`,
+     imported rather than re-typed) must equal `commits_ingested` from the
+     metrics. The stamp proves "ingested by this build"; this proves "the same
+     run". The count is recorded in the output JSON as `commits_in_graph`.
+  3. The metrics' recorded `graph_path` is compared to the one the probe was
+     pointed at, warning loudly but not failing — a persisted graph legitimately
+     moves, and (2) is the real evidence of pairing.
+
+  The graph path, the metrics filename, and `commits_in_graph` all land in the
+  probe's output, so the pairing is auditable after the fact as well.
 - **Metrics JSON missing `correction_sweep_skipped`.** The probe fails loudly
   rather than defaulting N to 0, which would silently turn `M <= N` into
   `M == 0` and produce a false failure.
@@ -255,9 +289,10 @@ Tests follow the existing `tests/test_at_scale_<component>.py` convention.
 - `--graph-path` refuses an existing path.
 - Omitting `--graph-path` preserves today's temp-dir behaviour exactly. This
   matters: the recurring benchmark must not change.
-- **Scanner positive controls, one per pattern.** Feed the scanner a synthetic
-  log containing each of the five strings — both `[_run_ingestion] skipping`
-  variants and all three #251 strings — and assert each is detected. Then a
+- **Scanner positive controls, one per pattern.** Four patterns, six strings:
+  feed the scanner a synthetic log containing each — both `[_run_ingestion]
+  skipping` variants, all three #251 strings, and the `[tee_stderr] pump
+  failed:` marker — and assert each is detected. Then a
   clean log asserting empty results. Without positive controls this is the
   fail-open shape: a scanner with a broken pattern reports "no errors found"
   having matched nothing, indistinguishable from a healthy run. The negative

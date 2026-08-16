@@ -67,6 +67,12 @@ _SWEEP_SUMMARY_RE = re.compile(
 # free win.
 _ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("page_out_of_bounds", re.compile(r"Page \d+ out of bounds")),
+    # Provenance: tests/test_mcp_server.py:22876, which records this string as
+    # OBSERVED against minigraf 1.2.1. Unlike the other two it is NOT confirmed
+    # against current minigraf source (file.rs:265, btree_v6.rs:514 back those);
+    # a grep of the whole tree for serde in an error/Display context finds
+    # nothing. Kept anyway -- an extra pattern that never fires cannot cause a
+    # false clean, and a 1.2.1-era string may still surface from an older graph.
     ("serde_deserialization_error", re.compile(r"Serde Deserialization Error")),
     (
         "stream_all_entries_expected_leaf_page",
@@ -109,7 +115,8 @@ def scan_ingestion_stderr(text: str) -> dict[str, Any]:
 
 
 class TeeStderrFailure(RuntimeError):
-    """Raised on `with` exit if the pump thread failed or timed out.
+    """Raised on `with` exit if the pump thread failed or timed out, or if
+    teardown's own restore() of fd 2 failed.
 
     Without this, a pump that dies at iteration 0 leaves capture.text() ==
     "", which scan_ingestion_stderr() reads as a byte-identical clean run --

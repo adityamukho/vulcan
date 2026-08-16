@@ -170,7 +170,10 @@ class TestTeeStderr:
 
     def test_restores_fd_2_even_when_the_body_raises(self):
         before = os.fstat(2)
-        with contextlib.suppress(ValueError):
+        # pytest.raises, not contextlib.suppress: suppress() passes whether the
+        # body exception propagated or tee_stderr swallowed it, so a tee that
+        # ate the caller's exception would score as a pass here.
+        with pytest.raises(ValueError, match="boom"):
             with tee_stderr():
                 raise ValueError("boom")
         after = os.fstat(2)
