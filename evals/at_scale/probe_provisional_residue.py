@@ -105,3 +105,75 @@ def residue_verdict(m: int, n: int) -> dict[str, Any]:
                  "the #251 signature."
         ),
     }
+
+
+def provisional_entity_idents(db: Any) -> list[str]:
+    """Every entity currently carrying a live provisional lineage marker.
+
+    Mirrors _lineage_is_provisional's definition (mcp_server.py:5927) --
+    a :type/lineage-marker companion entity exists for the entity -- but as
+    one set-returning query instead of one existence check per entity.
+    _lineage_confirm retracts the marker's facts wholesale, so "marker
+    present" and "provisional" are the same predicate.
+    """
+    import mcp_server
+
+    raw = mcp_server._db_execute(
+        db,
+        "(query [:find ?e :where "
+        f"[?m :entity-type {mcp_server._LINEAGE_MARKER_ENTITY_TYPE}] "
+        "[?m :status :provisional] "
+        "[?m :entity ?e]])",
+    )
+    return sorted(row[0] for row in json.loads(raw).get("results", []))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Cross-check a persisted graph's provisional residue "
+                    "against the correction sweep's accounting (#256).",
+    )
+    parser.add_argument(
+        "--graph-path", required=True,
+        help="A graph produced by run_ingestion_benchmark.py --graph-path.",
+    )
+    parser.add_argument(
+        "--metrics-json", required=True,
+        help="That run's results/ingestion-<ts>.json, which carries N.",
+    )
+    args = parser.parse_args()
+
+    metrics = json.loads(Path(args.metrics_json).read_text())
+    require_complete_run(metrics)
+    n = read_sweep_total(metrics)
+
+    import mcp_server
+
+    mcp_server._reset_db_state()
+    mcp_server.open_db(args.graph_path)
+    try:
+        with mcp_server.db_lease() as db:
+            idents = provisional_entity_idents(db)
+    finally:
+        mcp_server._reset_db_state()
+
+    result = residue_verdict(len(idents), n)
+    # Record the inputs so the pairing of graph to metrics file is auditable
+    # after the fact -- a probe run against the wrong graph or a stale JSON
+    # is otherwise indistinguishable from a correct one.
+    result["graph_path"] = str(Path(args.graph_path).resolve())
+    result["metrics_json"] = str(Path(args.metrics_json).resolve())
+    result["breakdown_by_entity_type"] = breakdown_by_entity_type(idents)
+    result["correction_sweep_summaries"] = metrics.get("correction_sweep_summaries")
+
+    out_path = REPO_ROOT / "evals" / "at_scale" / "results" / "256-provisional-residue.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(result, indent=2) + "\n")
+
+    print(json.dumps(result, indent=2))
+    print(f"\nWrote {out_path}")
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

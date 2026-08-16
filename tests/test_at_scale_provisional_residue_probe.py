@@ -10,6 +10,7 @@ import pytest
 
 from evals.at_scale.probe_provisional_residue import (
     breakdown_by_entity_type,
+    provisional_entity_idents,
     read_sweep_total,
     require_complete_run,
     residue_verdict,
@@ -115,3 +116,61 @@ class TestResidueVerdict:
         verdict = residue_verdict(3, 10)
         assert verdict["provisional_entities"] == 3
         assert verdict["sweep_skipped"] == 10
+
+
+class TestProvisionalEntityIdents:
+    """M is counted from a graph with a KNOWN number of planted markers, so a
+    query that silently counts the wrong thing is visible."""
+
+    def test_counts_exactly_the_planted_markers(self, tmp_path):
+        import mcp_server
+
+        graph = str(tmp_path / "residue.graph")
+        mcp_server._reset_db_state()
+        mcp_server.open_db(graph)
+        try:
+            with mcp_server.db_lease() as db:
+                for ident in (":function/alpha", ":function/beta", ":module/gamma"):
+                    mcp_server._lineage_mark_provisional(
+                        db, ident, "2026-08-16T00:00:00Z"
+                    )
+                found = provisional_entity_idents(db)
+        finally:
+            mcp_server._reset_db_state()
+
+        assert sorted(found) == [":function/alpha", ":function/beta", ":module/gamma"]
+
+    def test_a_confirmed_entity_leaves_no_residue(self, tmp_path):
+        """_lineage_confirm retracts the marker, so a confirmed entity must
+        stop counting toward M."""
+        import mcp_server
+
+        graph = str(tmp_path / "confirmed.graph")
+        mcp_server._reset_db_state()
+        mcp_server.open_db(graph)
+        try:
+            with mcp_server.db_lease() as db:
+                mcp_server._lineage_mark_provisional(
+                    db, ":function/alpha", "2026-08-16T00:00:00Z"
+                )
+                mcp_server._lineage_mark_provisional(
+                    db, ":function/beta", "2026-08-16T00:00:00Z"
+                )
+                mcp_server._lineage_confirm(db, ":function/alpha")
+                found = provisional_entity_idents(db)
+        finally:
+            mcp_server._reset_db_state()
+
+        assert found == [":function/beta"]
+
+    def test_an_empty_graph_yields_no_residue(self, tmp_path):
+        import mcp_server
+
+        graph = str(tmp_path / "empty.graph")
+        mcp_server._reset_db_state()
+        mcp_server.open_db(graph)
+        try:
+            with mcp_server.db_lease() as db:
+                assert provisional_entity_idents(db) == []
+        finally:
+            mcp_server._reset_db_state()
