@@ -10,11 +10,14 @@ would bake each test's own name into the text, letting the scanner match the
 path instead of the planted line.
 """
 
+import concurrent.futures
 import contextlib
 import io
+import multiprocessing
 import os
 import subprocess
 import sys
+import time
 
 from evals.at_scale.stderr_capture import scan_ingestion_stderr, tee_stderr
 
@@ -161,7 +164,7 @@ class TestTeeStderr:
         after = os.fstat(2)
         assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
 
-    def test_join_is_load_bearing_for_a_large_write(self):
+    def test_join_is_load_bearing_for_a_large_write(self, capfd):
         """Regression test for #256 review round 1, Important 4: dropping or
         no-op'ing pump_thread.join() lets the `with` block return control to
         the caller before the pump has finished draining the pipe. A short
@@ -171,9 +174,34 @@ class TestTeeStderr:
         therefore reliably needs the join to actually wait. Ablation-proven:
         see the #256 fix-round-1 report for the exact pass/fail counts with
         and without the join.
+
+        Round 2 addition: also assert the passthrough half got the whole
+        payload, not just the capture -- "never swallow the run's live
+        output" (test_output_still_reaches_real_stderr's docstring) applies
+        to large writes too, and nothing previously checked that.
         """
         payload = b"L" * (128 * 1024)  # 128 KiB, comfortably > the 64 KiB pipe buffer
         with tee_stderr() as cap:
             os.write(2, payload)
         assert cap.text() == payload.decode("ascii")
         assert cap.errors == []
+        assert payload.decode("ascii") in capfd.readouterr().err
+
+    def test_shutdown_does_not_wait_for_eof_with_a_spawn_pool(self):
+        """THE discriminating regression test for the Critical-1 fix (#256
+        review round 2, New Important/coverage): all other tests in this
+        file pass even with the control-pipe mechanism reverted to the old
+        EOF design, because none of them involve a spawn-context pool whose
+        resource_tracker inherits fd 2 and outlives the pool. Ablation-
+        proven against that revert: see the #256 fix-round-2 report for the
+        exact pass/fail counts.
+        """
+        ctx = multiprocessing.get_context("spawn")
+        t0 = time.perf_counter()
+        with tee_stderr() as cap:
+            ex = concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx)
+            ex.submit(os.getpid).result()
+            ex.shutdown(wait=True)
+            os.write(2, b"AFTER_POOL\n")
+        assert time.perf_counter() - t0 < 5  # 10s on the EOF design
+        assert "AFTER_POOL" in cap.text() and cap.errors == []

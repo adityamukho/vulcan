@@ -12,7 +12,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
-import select
+import selectors
 import sys
 import threading
 from typing import Any
@@ -78,6 +78,19 @@ def scan_ingestion_stderr(text: str) -> dict[str, Any]:
     }
 
 
+class TeeStderrFailure(RuntimeError):
+    """Raised on `with` exit if the pump thread failed or timed out.
+
+    Without this, a pump that dies at iteration 0 leaves capture.text() ==
+    "", which scan_ingestion_stderr() reads as a byte-identical clean run --
+    exactly the "verification fails open" shape #256 exists to catch (#256
+    review round 2). A synthetic marker line is also appended to the
+    captured text itself (see pump()'s except clause below), so a
+    text-only consumer sees it too; this exception is the belt to that
+    suspenders, for any consumer that only checks the return value.
+    """
+
+
 class _Capture:
     """Accumulates tee'd bytes. Held by the caller for the duration of the
     `with` block and read afterwards via text()."""
@@ -91,8 +104,9 @@ class _Capture:
 
     def record_error(self, exc: BaseException) -> None:
         """Called by the pump thread (or the teardown timeout path) when the
-        tee could not run to a clean completion. Never raised -- read via
-        .errors after the `with` block exits."""
+        tee could not run to a clean completion. Never raised itself --
+        tee_stderr()'s teardown turns a non-empty list into a
+        TeeStderrFailure once the `with` block exits."""
         self._errors.append(exc)
 
     def text(self) -> str:
@@ -103,16 +117,47 @@ class _Capture:
         return list(self._errors)
 
 
-def _redirect_fd2_to_devnull() -> None:
-    """Emergency valve: point fd 2 at something that can never block. Used
-    when the pump has died and fd 2 still points at a pipe nobody is
-    draining -- without this, the next write past the kernel pipe buffer
-    (64 KiB on Linux) blocks forever (#256 review, Critical 2)."""
-    devnull_fd = os.open(os.devnull, os.O_WRONLY)
-    try:
-        os.dup2(devnull_fd, 2)
-    finally:
-        os.close(devnull_fd)
+class _RedirectGuard:
+    """Coordinates who is allowed to repoint fd 2: the pump's emergency
+    valve (on a pump failure, mid-run) and teardown's own restore (once the
+    `with` block exits) must never race, and once fd 2 has been handed back
+    to the caller as their real stderr, the valve must never touch it again.
+
+    Without this, a pump exception that lands after teardown has already
+    restored fd 2 permanently redirects the caller's real stderr to
+    /dev/null for the rest of the process -- reproduced in #256 review
+    round 2 (fd2 identity unchanged: False; fd2 now: /dev/null). The lock
+    makes emergency_redirect() and restore() mutually exclusive; the
+    `_restored` flag, checked under that same lock, makes emergency_redirect
+    a no-op for any call that loses the race.
+    """
+
+    def __init__(self, saved_fd: int, devnull_fd: int) -> None:
+        self._lock = threading.Lock()
+        self._restored = False
+        self._saved_fd = saved_fd
+        self._devnull_fd = devnull_fd
+
+    def emergency_redirect(self) -> None:
+        """Called by the pump on failure. Prefers the real saved stderr
+        (matching what fd 2 would be with no tee at all) and falls back to
+        /dev/null only if that itself fails. No-ops once teardown has
+        already restored fd 2."""
+        with self._lock:
+            if self._restored:
+                return
+            try:
+                os.dup2(self._saved_fd, 2)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.dup2(self._devnull_fd, 2)
+
+    def restore(self) -> None:
+        """Called exactly once, by teardown. Hands fd 2 back to the caller
+        and permanently disarms the valve."""
+        with self._lock:
+            os.dup2(self._saved_fd, 2)
+            self._restored = True
 
 
 @contextlib.contextmanager
@@ -138,12 +183,26 @@ def tee_stderr():
     selects on both the tee pipe and the control pipe, drains whatever is
     still buffered in the tee pipe, and only then exits once the control
     pipe fires -- deterministic regardless of who else is holding the tee
-    pipe's write end open.
+    pipe's write end open. See test_shutdown_does_not_wait_for_eof_with_a_
+    spawn_pool for the discriminating regression test.
+
+    Uses selectors.DefaultSelector(), not select.select(): select() has a
+    hard FD_SETSIZE (1024) ceiling that a 25-minute run with pool pipes, the
+    sqlite index, the WAL, and git subprocesses can exceed, raising
+    ValueError on the pump's first iteration with the whole block's stderr
+    silently going nowhere (#256 review round 2). The selectors module picks
+    epoll/kqueue/poll as available, none of which share that limit.
+
+    If the pump thread fails or does not exit within the join timeout, the
+    `with` block raises TeeStderrFailure on exit -- see that class's
+    docstring for why a silent failure is unacceptable here.
     """
     capture = _Capture()
     opened: list[int] = []
     saved_fd: int | None = None
+    devnull_fd: int | None = None
     pump_thread: threading.Thread | None = None
+    guard: _RedirectGuard | None = None
     try:
         saved_fd = os.dup(2)
         opened.append(saved_fd)
@@ -151,34 +210,56 @@ def tee_stderr():
         opened.extend((read_fd, write_fd))
         ctrl_read_fd, ctrl_write_fd = os.pipe()
         opened.extend((ctrl_read_fd, ctrl_write_fd))
+        # Pre-opened, not opened lazily inside the pump's except clause: the
+        # pump can fail with EMFILE (Important 3's own failure mode), which
+        # would make a lazy os.open(os.devnull) fail right when it's needed
+        # most and silently bring back the Critical-2 deadlock.
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        opened.append(devnull_fd)
+
+        guard = _RedirectGuard(saved_fd, devnull_fd)
 
         os.dup2(write_fd, 2)
         os.close(write_fd)
         opened.remove(write_fd)
 
         def pump() -> None:
+            sel = selectors.DefaultSelector()
+            sel.register(read_fd, selectors.EVENT_READ, "tee")
+            sel.register(ctrl_read_fd, selectors.EVENT_READ, "ctrl")
             try:
                 while True:
-                    try:
-                        readable, _, _ = select.select([read_fd, ctrl_read_fd], [], [])
-                    except InterruptedError:
-                        continue
-                    if read_fd in readable:
+                    ready = {key.data for key, _ in sel.select()}
+                    if "tee" in ready:
                         chunk = os.read(read_fd, 65536)
                         if chunk:
                             os.write(saved_fd, chunk)
                             capture.append(chunk)
                             continue
-                        # A real EOF (every writer closed) shouldn't happen in
-                        # the spawn-context/resource_tracker environment this
-                        # is designed for, but honor it if it does.
+                        # A real EOF (every writer closed) shouldn't happen
+                        # in the spawn-context/resource_tracker environment
+                        # this is designed for, but honor it if it does.
                         break
-                    if ctrl_read_fd in readable:
+                    if "ctrl" in ready:
                         break
             except BaseException as exc:  # must never die without unblocking fd 2
+                # Append a marker into the captured text itself, not just
+                # the side-channel .errors list -- a scan of an
+                # otherwise-empty capture must not read as a clean run.
+                marker = f"[tee_stderr] pump failed: {exc!r}\n".encode(
+                    "utf-8", errors="replace"
+                )
+                capture.append(marker)
                 capture.record_error(exc)
-                with contextlib.suppress(OSError):
-                    _redirect_fd2_to_devnull()
+                # Defensive: emergency_redirect() already contains its own
+                # OSError handling, but this is the pump's last chance to
+                # not die noisily -- an exception raised from inside this
+                # except clause propagates uncaught, it does not re-enter
+                # this same handler.
+                with contextlib.suppress(Exception):
+                    guard.emergency_redirect()
+            finally:
+                sel.close()
 
         pump_thread = threading.Thread(target=pump, daemon=True)
         pump_thread.start()
@@ -191,24 +272,32 @@ def tee_stderr():
                 os.close(fd)
         raise
 
-    # Setup completed without raising, so both are real by construction.
+    # Setup completed without raising, so all four are real by construction.
     assert saved_fd is not None
+    assert devnull_fd is not None
     assert pump_thread is not None
+    assert guard is not None
 
     try:
         yield capture
     finally:
         with contextlib.suppress(Exception):
             sys.stderr.flush()
-        # Restore fd 2 FIRST so no new write can enter the tee pipe, then
-        # signal the pump over the control pipe -- not by closing anything,
-        # since resource_tracker's own duplicate of the write end means
-        # closing ours is not sufficient to produce EOF. See the docstring.
-        os.dup2(saved_fd, 2)
+        # Hand fd 2 back to the caller through the guard FIRST -- this both
+        # stops new writes from entering the tee pipe and permanently
+        # disarms the pump's emergency valve, so a pump failure during the
+        # drain below can no longer clobber the caller's real stderr (#256
+        # review round 2, New Critical). Only then signal the pump over the
+        # control pipe; not by closing anything, since resource_tracker's
+        # own duplicate of the write end means closing ours is not
+        # sufficient to produce EOF. See the docstring.
+        guard.restore()
+        os.close(devnull_fd)  # safe: the guard is disarmed, valve never touches it again
         with contextlib.suppress(OSError):
             os.write(ctrl_write_fd, b"x")
         pump_thread.join(timeout=10)
-        if pump_thread.is_alive():
+        alive = pump_thread.is_alive()  # snapshot once -- see review round 2, cheap fix 1
+        if alive:
             # The pump is still touching saved_fd/read_fd/ctrl_read_fd.
             # Closing them now would recycle those fd numbers under a live
             # thread -- a leaked fd is strictly better than a corrupted one.
@@ -219,5 +308,11 @@ def tee_stderr():
             os.close(saved_fd)
             os.close(read_fd)
         os.close(ctrl_write_fd)
-        if not pump_thread.is_alive():
+        if not alive:
             os.close(ctrl_read_fd)
+
+        if capture.errors:
+            raise TeeStderrFailure(
+                "tee_stderr pump did not complete cleanly: "
+                + "; ".join(repr(exc) for exc in capture.errors)
+            )
