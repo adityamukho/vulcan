@@ -193,15 +193,27 @@ with this work. #272 remains open and deserves its own branch.
 1. run_ingestion_benchmark.py --repo-path . --graph-path <persistent>
       -> ingests master's commits (~25 min) with the poller running throughout
       -> writes results/ingestion-<ts>.json, now carrying skipped_commits,
-         error_signals, correction_sweep_skipped
+         error_signals, correction_sweep_summaries, correction_sweep_skipped,
+         stderr_capture_complete and graph_path (plus tee_failure and
+         tee_failure_context on the capture-failure path)
       -> appends the run table to benchmark.md
-      -> exit 1 if any commit was skipped or any #251 string appeared
+      -> exit 1 if any commit was skipped, any #251 string appeared, or the
+         stderr capture was incomplete
 
 2. probe_provisional_residue.py --graph-path <same> --metrics-json <that file>
+      -> refuses a run that is not final_status complete, or whose
+         stderr_capture_complete is False -- N from a truncated capture is a
+         lower bound and can read 0, which would score a false ok
       -> opens the graph (separate process, sole handle)
+      -> refuses a graph with no format-version stamp: minigraf's open()
+         CREATES the file, so an unstamped graph is one a mistyped
+         --graph-path just conjured, and it scores M=0/ok=true otherwise
+      -> requires its :type/commit count to equal the run's commits_ingested,
+         and records it as commits_in_graph -- this is what makes the artifact
+         self-evidencing rather than resting on the operator's typing
       -> M = live :type/lineage-marker entities with :status :provisional
       -> N = correction_sweep_skipped, read from the metrics JSON
-      -> writes results/256-provisional-residue.json
+      -> writes results/256-provisional-residue.json (--json-out to override)
       -> exit 1 if M > N
 ```
 

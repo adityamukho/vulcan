@@ -3,8 +3,9 @@
   "sweep_skipped": 3,
   "ok": true,
   "interpretation": "M <= N: provisional residue is within the correction sweep's own accounting.",
-  "graph_path": "/tmp/claude-1000/-home-aditya-Work-AMC-Minigraf-temporal-reasoning/9d9c2dc5-7aff-4d0e-8820-51ec2500f443/scratchpad/256-acceptance.graph",
-  "metrics_json": "/home/aditya/Work/AMC/Minigraf/temporal_reasoning/evals/at_scale/results/ingestion-20260816T185437Z.json",
+  "commits_in_graph": 732,
+  "graph_path": "/tmp/claude-1000/-home-aditya-Work-AMC-Minigraf-temporal-reasoning/9d9c2dc5-7aff-4d0e-8820-51ec2500f443/scratchpad/256-acceptance-v2.graph",
+  "metrics_json": "/home/aditya/Work/AMC/Minigraf/temporal_reasoning/evals/at_scale/results/ingestion-20260816T194720Z.json",
   "breakdown_by_entity_type": {},
   "correction_sweep_summaries": [
     3
