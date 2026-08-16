@@ -9,7 +9,11 @@ only signal. Same for the correction sweep's residue total.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
+import sys
+import threading
 from typing import Any
 
 # Both skip sites in _run_ingestion's per-commit loop (mcp_server.py:11106
@@ -71,3 +75,59 @@ def scan_ingestion_stderr(text: str) -> dict[str, Any]:
         "correction_sweep_summaries": summaries,
         "correction_sweep_skipped": max(summaries) if summaries else 0,
     }
+
+
+class _Capture:
+    """Accumulates tee'd bytes. Held by the caller for the duration of the
+    `with` block and read afterwards via text()."""
+
+    def __init__(self) -> None:
+        self._chunks: list[bytes] = []
+
+    def append(self, chunk: bytes) -> None:
+        self._chunks.append(chunk)
+
+    def text(self) -> str:
+        return b"".join(self._chunks).decode("utf-8", errors="replace")
+
+
+@contextlib.contextmanager
+def tee_stderr():
+    """Duplicate everything written to fd 2 into a buffer while still passing
+    it through to the real stderr.
+
+    Operates on the FILE DESCRIPTOR, not sys.stderr. _extract_commit runs in
+    a ProcessPoolExecutor whose workers inherit fd 2 rather than the parent's
+    sys.stderr object, and minigraf's error strings can reach fd 2 natively.
+    A sys.stderr swap is blind to both -- see the ablation in
+    tests/test_at_scale_stderr_capture.py, which fails loudly if that ceases
+    to be true.
+    """
+    capture = _Capture()
+    saved_fd = os.dup(2)
+    read_fd, write_fd = os.pipe()
+    os.dup2(write_fd, 2)
+    os.close(write_fd)
+
+    def pump() -> None:
+        while True:
+            chunk = os.read(read_fd, 65536)
+            if not chunk:
+                break
+            os.write(saved_fd, chunk)
+            capture.append(chunk)
+
+    pump_thread = threading.Thread(target=pump, daemon=True)
+    pump_thread.start()
+    try:
+        yield capture
+    finally:
+        sys.stderr.flush()
+        # Restoring fd 2 closes the pipe's write end, which is what gives the
+        # pump thread its EOF. Order matters: join before closing anything
+        # the pump thread still touches -- saved_fd (its passthrough target)
+        # and read_fd both stay open until the thread has actually stopped.
+        os.dup2(saved_fd, 2)
+        pump_thread.join(timeout=10)
+        os.close(saved_fd)
+        os.close(read_fd)

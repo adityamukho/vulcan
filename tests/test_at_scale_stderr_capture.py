@@ -10,7 +10,13 @@ would bake each test's own name into the text, letting the scanner match the
 path instead of the planted line.
 """
 
-from evals.at_scale.stderr_capture import scan_ingestion_stderr
+import contextlib
+import io
+import os
+import subprocess
+import sys
+
+from evals.at_scale.stderr_capture import scan_ingestion_stderr, tee_stderr
 
 CLEAN = (
     "[_run_ingestion] starting\n"
@@ -93,3 +99,64 @@ class TestCorrectionSweepTotal:
         scanned = scan_ingestion_stderr(text)
         assert scanned["correction_sweep_summaries"] == [5, 9]
         assert scanned["correction_sweep_skipped"] == 9
+
+
+_CHILD_WRITES_TO_FD2 = "import os; os.write(2, b'CHILD_MARKER\\n')"
+
+
+class TestTeeStderr:
+    def test_captures_parent_process_writes(self):
+        # os.write(2, ...), not print(file=sys.stderr): pytest's own default
+        # capturing monkeypatches sys.stderr to a non-fd object (see the
+        # ablation below), so a print() here would be invisible to fd-level
+        # capture for the same reason the ablation exists -- it would test
+        # pytest's capture layering, not tee_stderr.
+        with tee_stderr() as cap:
+            os.write(2, b"PARENT_MARKER\n")
+        assert "PARENT_MARKER" in cap.text()
+
+    def test_output_still_reaches_real_stderr(self, capfd):
+        """A tee that swallowed a 25-minute run's live output would be worse
+        than no tee."""
+        with tee_stderr() as cap:
+            os.write(2, b"PASSTHROUGH_MARKER\n")
+        assert "PASSTHROUGH_MARKER" in cap.text()
+        assert "PASSTHROUGH_MARKER" in capfd.readouterr().err
+
+    def test_ablation_fd_tee_catches_child_output_a_sys_stderr_swap_misses(self):
+        """THE ablation for this design choice.
+
+        _extract_commit runs in a ProcessPoolExecutor whose workers inherit
+        fd 2, not the parent's sys.stderr object, and the #251 strings are
+        minigraf's own Rust strings. If either arrives as a native write
+        rather than a caught Python exception, only fd-level capture sees it.
+
+        If the first assertion FAILS, the sys.stderr swap is sufficient and
+        the fd-level machinery is not justified -- fall back to the swap.
+        """
+        swap_buf = io.StringIO()
+        with contextlib.redirect_stderr(swap_buf):
+            subprocess.run([sys.executable, "-c", _CHILD_WRITES_TO_FD2], check=True)
+        assert "CHILD_MARKER" not in swap_buf.getvalue(), (
+            "the sys.stderr swap saw child fd-2 output -- the ablation does "
+            "not hold and the fd-level tee is unjustified"
+        )
+
+        with tee_stderr() as cap:
+            subprocess.run([sys.executable, "-c", _CHILD_WRITES_TO_FD2], check=True)
+        assert "CHILD_MARKER" in cap.text()
+
+    def test_restores_fd_2_on_exit(self):
+        before = os.fstat(2)
+        with tee_stderr():
+            pass
+        after = os.fstat(2)
+        assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+
+    def test_restores_fd_2_even_when_the_body_raises(self):
+        before = os.fstat(2)
+        with contextlib.suppress(ValueError):
+            with tee_stderr():
+                raise ValueError("boom")
+        after = os.fstat(2)
+        assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
