@@ -20,7 +20,7 @@ from evals.at_scale.stderr_capture import TeeStderrFailure
 # tee-failure tests below, whose whole point is that the failure path produces
 # the SAME dict plus its two diagnostic keys, not a truncated one.
 _EXPECTED_METRIC_KEYS = {
-    "repo_path", "branch", "commits_ingested", "wall_clock_seconds",
+    "repo_path", "branch", "graph_path", "commits_ingested", "wall_clock_seconds",
     "throughput_per_minute", "peak_rss_kb", "graph_size_bytes",
     "index_size_bytes", "status_latency", "query_latency", "final_status",
     "poll_count", "poll_duty_fraction", "poll_offsets", "checkpoint_summary",
@@ -138,6 +138,19 @@ class TestRunIngestionBenchmark:
         graph_path = tmp_path / "bench.graph"
         metrics = await run_ingestion_benchmark(str(git_repo), "HEAD", graph_path, poll_interval=0.05)
         assert set(metrics.keys()) == _EXPECTED_METRIC_KEYS
+
+    @pytest.mark.asyncio
+    async def test_records_the_resolved_graph_path(self, git_repo, tmp_path):
+        """#256 review round 5. The probe recording the path it was HANDED
+        says nothing about whether that was the right graph; the pairing is
+        only auditable if the metrics record their own side of it. Resolved,
+        so a relative invocation still pairs with the probe's resolved path.
+        """
+        graph_path = tmp_path / "bench.graph"
+        metrics = await run_ingestion_benchmark(
+            str(git_repo), "HEAD", graph_path, poll_interval=0.05
+        )
+        assert metrics["graph_path"] == str(graph_path.resolve())
 
     @pytest.mark.asyncio
     async def test_a_clean_run_reports_a_complete_capture_and_no_signals(self, git_repo, tmp_path):

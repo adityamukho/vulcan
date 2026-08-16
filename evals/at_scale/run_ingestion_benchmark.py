@@ -254,6 +254,10 @@ async def run_ingestion_benchmark(
     result = {
         "repo_path": repo_path,
         "branch": resolved_branch,
+        # #256. Recorded so the pairing of a persisted graph to this metrics
+        # file is auditable from the metrics side too: the probe recording the
+        # path it was HANDED says nothing about whether that was the right one.
+        "graph_path": str(Path(graph_path).resolve()),
         "commits_ingested": commits_ingested,
         "wall_clock_seconds": wall_clock,
         "throughput_per_minute": throughput_per_minute(commits_ingested, wall_clock),
@@ -368,7 +372,10 @@ def resolve_graph_path(graph_path_arg: Optional[str]):
     run's writes into what looks like a fresh graph. The `.lock` file is
     deliberately NOT checked here: it self-heals via minigraf's stale-PID
     check, so a stale one does not cause silent corruption the way a stale
-    .wal or index does.
+    .wal or index does. The fact index's own SQLite sidecars (`-wal`, `-shm`)
+    were considered and ruled out for the same reason: SQLite discards an
+    orphaned WAL once the main index file is gone, and the main index file IS
+    checked here, so a leftover sidecar cannot resurrect anything on its own.
     """
     if graph_path_arg is None:
         with tempfile.TemporaryDirectory(prefix="minigraf-at-scale-") as tmpdir:
