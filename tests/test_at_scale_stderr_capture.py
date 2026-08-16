@@ -160,3 +160,20 @@ class TestTeeStderr:
                 raise ValueError("boom")
         after = os.fstat(2)
         assert (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+
+    def test_join_is_load_bearing_for_a_large_write(self):
+        """Regression test for #256 review round 1, Important 4: dropping or
+        no-op'ing pump_thread.join() lets the `with` block return control to
+        the caller before the pump has finished draining the pipe. A short
+        marker barely exercises this (the pump usually wins the race by
+        luck); a write past the 64 KiB pipe buffer does not fit in one
+        os.read(), so it reliably needs more than one pump iteration and
+        therefore reliably needs the join to actually wait. Ablation-proven:
+        see the #256 fix-round-1 report for the exact pass/fail counts with
+        and without the join.
+        """
+        payload = b"L" * (128 * 1024)  # 128 KiB, comfortably > the 64 KiB pipe buffer
+        with tee_stderr() as cap:
+            os.write(2, payload)
+        assert cap.text() == payload.decode("ascii")
+        assert cap.errors == []
