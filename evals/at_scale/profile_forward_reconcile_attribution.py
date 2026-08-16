@@ -354,8 +354,7 @@ async def _watch_phase(task: "asyncio.Task[None]", t_start: float) -> None:
 
 
 async def _main() -> dict:
-    m._db = None
-    m._graph_path = None
+    m._reset_db_state()
     m.open_db(GRAPH_PATH)
     m._ingest_progress = {
         "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,

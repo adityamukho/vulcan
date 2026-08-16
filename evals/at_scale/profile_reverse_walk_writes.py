@@ -90,7 +90,7 @@ def _dbx(db, datalog):
 
 m._db_execute = _dbx
 
-db = m._open_db_at(os.environ["MINIGRAF_GRAPH_PATH"])
+db = m.MiniGrafDb.open(os.environ["MINIGRAF_GRAPH_PATH"])
 commits = m._git_commits(REPO, None, BRANCH)
 linearization = [c[0] for c in commits]
 print(f"{len(linearization)} commits in history; walking {N} from the tip")

@@ -412,7 +412,7 @@ class TestIngestIntoSurfacesStatus:
             # "complete".
             mcp_server._ingest_progress["status"] = "error"
             mcp_server._ingest_progress["error"] = "simulated failure"
-            mcp_server._db = None
+            mcp_server._reset_db_state()
 
         monkeypatch.setattr(mcp_server, "_run_ingestion", fake_run_ingestion)
 
@@ -446,9 +446,11 @@ class TestLoadModulePathFacts:
         _branch, status = await _ingest_into(str(git_repo), "HEAD", graph_path)
         assert status == "complete"
 
-        # Same handle recovery main() does: _run_ingestion may leave _db None.
-        db = mcp_server._db or mcp_server.open_db(str(graph_path))
-        facts = load_module_path_facts(db)
+        # _ingest_into's own open_db(str(graph_path)) call already bound the
+        # lease manager's path, and nothing since has reset it -- db_lease()
+        # below resolves to it without needing another explicit bind (#255).
+        with mcp_server.db_lease() as db:
+            facts = load_module_path_facts(db)
 
         assert {f["path"] for f in facts} == {"auth.py", "models.py"}
         for f in facts:

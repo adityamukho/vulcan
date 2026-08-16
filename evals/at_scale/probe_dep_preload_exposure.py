@@ -875,10 +875,12 @@ async def _ingest_into(repo_path: str, branch: Optional[str], graph_path) -> Tup
     Returns (resolved_branch, status), where status is
     mcp_server._ingest_progress["status"] read immediately after
     _run_ingestion returns. That status is the ONLY signal available:
-    _run_ingestion wraps its whole body in `except Exception` (mcp_server.py:
-    10212-10220), sets status "error" and _db = None, and returns normally --
-    it never raises. A partial run that stopped short of the frontier sets
-    "stopped" the same way (mcp_server.py:10205-10208), also without raising.
+    _run_ingestion wraps its whole body in `except Exception`, sets status
+    "error", and returns normally -- it never raises. (No explicit lease
+    cleanup on that path either, as of #255: every ingestion lease is
+    `with`-scoped, so there is nothing left open by the time the exception
+    handler runs.) A partial run that stopped short of the frontier sets
+    "stopped" the same way, also without raising.
     Either way the caller gets a graph that opened successfully and a status
     that says not to trust it; surfacing status is what makes that
     distinguishable from a genuine "complete". Mirrors the sibling pattern in
@@ -886,8 +888,7 @@ async def _ingest_into(repo_path: str, branch: Optional[str], graph_path) -> Tup
     """
     import mcp_server
 
-    mcp_server._db = None
-    mcp_server._graph_path = None
+    mcp_server._reset_db_state()
     mcp_server.open_db(str(graph_path))
     mcp_server._ingest_progress = {
         "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
@@ -962,11 +963,14 @@ def main() -> int:
 
         linearization = frontier_registry.build_linearization(args.repo_path, branch)
         commit_metadata = mcp_server._git_commits(args.repo_path, None, branch)
-        db = mcp_server._db if mcp_server._db is not None else mcp_server.open_db(str(graph_path))
-        report = sweep(
-            db, args.repo_path, linearization, commit_metadata, branch=branch,
-            verify_fix=args.verify_fix,
-        )
+        # _ingest_into's own open_db(str(graph_path)) call already bound the
+        # lease manager's path, and nothing since has reset it -- db_lease()
+        # below resolves to it without needing another explicit bind (#255).
+        with mcp_server.db_lease() as db:
+            report = sweep(
+                db, args.repo_path, linearization, commit_metadata, branch=branch,
+                verify_fix=args.verify_fix,
+            )
         report["ingest_status"] = ingest_status
 
     print(json.dumps(report, indent=2))
