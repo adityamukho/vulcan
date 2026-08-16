@@ -207,13 +207,29 @@ async def run_ingestion_benchmark(
         # raise displaces any in-flight body exception, so a genuine ingestion
         # crash is reachable ONLY through the chain; a handler that reported
         # the tee failure alone would hide it. print_exception walks the chain
-        # by default. fd 2 is the caller's real stderr again by now.
-        print(
-            "[run_ingestion_benchmark] stderr capture did not complete; "
-            "skipped_commits/error_signals below are LOWER BOUNDS:",
-            file=sys.stderr,
-        )
-        traceback.print_exception(exc)
+        # by default.
+        #
+        # Both writes are best-effort, and the suppression is NOT paranoia
+        # (#256 fix round 1, Important 2). fd 2 is usually the caller's real
+        # stderr again by the time this runs -- but not on the one path that
+        # matters most: when guard.restore()'s dup2 is itself what failed,
+        # fd 2 still points at the tee pipe, whose read end teardown then
+        # closes, so writing to it raises BrokenPipeError. Unguarded, that
+        # exception propagates out of this except clause and past the finally
+        # below, destroying the metrics dict this handler exists to preserve
+        # -- reproduced on 2 of 3 runs (racy with the pump's emergency
+        # valve). Separate suppress blocks, not one: a broken first write
+        # must not skip the traceback, which is the more informative of the
+        # two. Nothing is lost if both fail; the same information is in the
+        # returned metrics as tee_failure/tee_failure_context.
+        with contextlib.suppress(BaseException):
+            print(
+                "[run_ingestion_benchmark] stderr capture did not complete; "
+                "skipped_commits/error_signals below are LOWER BOUNDS:",
+                file=sys.stderr,
+            )
+        with contextlib.suppress(BaseException):
+            traceback.print_exception(exc)
     finally:
         wall_clock = time.perf_counter() - start
 
@@ -270,6 +286,10 @@ async def run_ingestion_benchmark(
             result["tee_failure_context"] = repr(tee_failure.__context__)
 
     if compare_ignore:
+        # Deliberately NOT tee'd (pre-existing, #256 fix round 1). This second
+        # ingestion exists only to size a graph built with the ignore patterns
+        # disabled; its stderr is not part of the measured run, and folding it
+        # into `scanned` would attribute its skips to the run reported above.
         no_ignore_graph_path = graph_path.parent / f"{graph_path.stem}-no-ignore{graph_path.suffix}"
         original_patterns = mcp_server._DEFAULT_IGNORE_PATTERNS
         mcp_server._DEFAULT_IGNORE_PATTERNS = ()

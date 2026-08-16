@@ -98,6 +98,86 @@ class TestAppendIngestionReport:
         assert "Checkpoint duty cycle (#241)" in text
         assert "not measured" in text
 
+    # --- #256 stderr-capture rows -------------------------------------
+    #
+    # benchmark.md is the DURABLE HUMAN RECORD, and it is the artifact the
+    # prior #255 acceptance claim ("no errors") actually rested on. Before
+    # these rows, a run that dropped commits, or one whose capture truncated,
+    # was rendered identically to a clean one: "Final status | complete" and
+    # nothing else. The JSON and the exit code were honest; this file was not.
+
+    def _clean_256_metrics(self):
+        return {
+            **SAMPLE_METRICS,
+            "stderr_capture_complete": True,
+            "skipped_commits": [],
+            "error_signals": [],
+            "correction_sweep_summaries": [],
+            "correction_sweep_skipped": 0,
+        }
+
+    def test_a_clean_run_reports_the_tee_active_and_the_capture_complete(self, tmp_path):
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(self._clean_256_metrics(), report_path)
+        text = report_path.read_text()
+        assert "| Stderr tee (#256) | active" in text
+        assert "| Stderr capture (#256) | complete |" in text
+        assert "| Commits dropped (#256) | 0 |" in text
+        assert "| Error signatures (#251/#256) | 0 |" in text
+
+    def test_dropped_commits_are_visible_in_the_human_record(self, tmp_path):
+        """The whole point: "Final status | complete" and "Commits ingested |
+        2" are both blind to a dropped commit, so without this row the
+        markdown cannot distinguish this run from a clean one."""
+        metrics = {**self._clean_256_metrics(), "skipped_commits": ["deadbee1", "cafe002"]}
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "| Commits dropped (#256) | **2**" in text
+        assert "deadbee1" in text and "cafe002" in text
+
+    def test_error_signatures_are_visible_in_the_human_record(self, tmp_path):
+        metrics = {
+            **self._clean_256_metrics(),
+            "error_signals": [
+                {"pattern": "page_out_of_bounds", "line": "Page 130 out of bounds"}
+            ],
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "| Error signatures (#251/#256) | **1**: page_out_of_bounds |" in text
+
+    def test_a_truncated_capture_is_flagged_and_its_counts_called_lower_bounds(self, tmp_path):
+        """The dangerous case. skipped_commits/error_signals are EMPTY here --
+        byte-identical to a clean run -- because the tee stopped collecting.
+        The markdown must say so, or an empty count reads as proof of health."""
+        metrics = {
+            **self._clean_256_metrics(),
+            "stderr_capture_complete": False,
+            "tee_failure": "TeeStderrFailure('pump did not complete cleanly')",
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "INCOMPLETE" in text
+        assert "LOWER BOUNDS" in text
+        assert "pump did not complete cleanly" in text
+
+    def test_the_256_rows_still_render_for_a_pre_fix_result(self, tmp_path):
+        """Same defensive precedent as the poll and checkpoint rows: a result
+        JSON written before 2026-08-16 carries none of these keys. Absence
+        must render as "not measured", never as zero -- nothing was captured,
+        so nothing is known."""
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(SAMPLE_METRICS, report_path)  # no #256 keys
+        text = report_path.read_text()
+        assert "| Stderr tee (#256) | none" in text
+        assert "| Stderr capture (#256) | not measured" in text
+        assert "| Commits dropped (#256) | not measured" in text
+        assert "| Error signatures (#251/#256) | not measured" in text
+        assert "NOT zero" in text
+
 
 SAMPLE_QUERY_RESULTS = [
     {

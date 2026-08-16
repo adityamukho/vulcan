@@ -1,6 +1,9 @@
 # tests/test_at_scale_ingestion_benchmark.py
 import contextlib
+import io
+import os
 import subprocess as _subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -229,6 +232,82 @@ class TestCompareIgnore:
         assert "ignore_comparison" not in metrics
 
 
+def _emit_on_fd_2_after_ingesting(monkeypatch, payload: bytes):
+    """Wrap mcp_server._run_ingestion so it runs for real and then writes
+    `payload` to fd 2.
+
+    os.write(2, ...), NOT print(file=sys.stderr): under pytest's fd capture
+    sys.stderr is not fd 2 at all, so a print would never enter the tee pipe
+    and the test would pass on a permanently blind wiring -- the exact
+    fail-open shape being tested against. mcp_server's real skip sites do
+    reach fd 2 (print(file=sys.stderr) with no capture in front of it, plus
+    the pool children which inherit fd 2 and have no sys.stderr of the
+    parent's at all), which is why the tee is fd-level in the first place.
+    """
+    import mcp_server
+
+    real_run_ingestion = mcp_server._run_ingestion
+
+    async def run_then_emit(*args, **kwargs):
+        await real_run_ingestion(*args, **kwargs)
+        os.write(2, payload)
+
+    monkeypatch.setattr(mcp_server, "_run_ingestion", run_then_emit)
+
+
+class TestCapturedStderrReachesTheMetrics:
+    """The POSITIVE direction of this task's claim: a line emitted on fd 2
+    during a tee'd run must actually arrive in the metrics.
+
+    Every other test here is satisfied by a permanently blind wiring --
+    scan_ingestion_stderr("") also yields empty lists, and a clean run's
+    empty lists are byte-identical to a blind scanner's. These two are the
+    only tests that can tell the difference, so they are what stops the
+    verification from failing open."""
+
+    @pytest.mark.asyncio
+    async def test_a_real_skip_line_on_fd_2_reaches_skipped_commits(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        _emit_on_fd_2_after_ingesting(
+            monkeypatch,
+            b"[_run_ingestion] skipping commit deadbee1 "
+            b"('some subject'): write failed: boom\n",
+        )
+        graph_path = tmp_path / "bench.graph"
+
+        metrics = await rib.run_ingestion_benchmark(
+            str(git_repo), "HEAD", graph_path, poll_interval=0.05
+        )
+
+        assert metrics["skipped_commits"] == ["deadbee1"]
+        assert metrics["stderr_capture_complete"] is True
+        # final_status and commits_ingested are both blind to this -- the
+        # scanned keys are the only thing that turns it into a failure.
+        assert metrics["final_status"] == "complete"
+        assert _exit_code(metrics) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_real_251_signature_on_fd_2_reaches_error_signals(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        # The live-numbers form #251 actually reproduced; a literal-string
+        # scanner would match nothing here and report all-clear.
+        _emit_on_fd_2_after_ingesting(
+            monkeypatch, b"Page 130 out of bounds (total pages: 113)\n"
+        )
+        graph_path = tmp_path / "bench.graph"
+
+        metrics = await rib.run_ingestion_benchmark(
+            str(git_repo), "HEAD", graph_path, poll_interval=0.05
+        )
+
+        assert [s["pattern"] for s in metrics["error_signals"]] == ["page_out_of_bounds"]
+        assert "total pages: 113" in metrics["error_signals"][0]["line"]
+        assert metrics["stderr_capture_complete"] is True
+        assert _exit_code(metrics) == 1
+
+
 class TestTeeFailureDoesNotDestroyTheRun:
     """tee_stderr() raises TeeStderrFailure from its own teardown, which runs
     AFTER _run_ingestion has returned. If run_ingestion_benchmark let that
@@ -312,6 +391,84 @@ class TestTeeFailureDoesNotDestroyTheRun:
         )
 
         assert "ingestion exploded" in metrics["tee_failure_context"]
+        assert metrics["stderr_capture_complete"] is False
+        assert _exit_code(metrics) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_handlers_own_logging_cannot_destroy_the_run(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        """The handler logs to stderr -- and on the one path that matters
+        most, that stderr is broken. When guard.restore()'s dup2 is what
+        failed, fd 2 still points at the tee pipe, whose read end teardown
+        then closes, so every write raises BrokenPipeError. Unguarded, that
+        propagates out of the except clause and destroys the metrics dict the
+        catch exists to preserve."""
+
+        class _RecordingStderr:
+            """Genuinely fd 2 (so the BrokenPipeError comes from the OS, not
+            from a stub), while recording that it really did raise -- without
+            that positive control this test would pass vacuously in any
+            environment where the write happened to succeed."""
+
+            def __init__(self) -> None:
+                self._raw = io.TextIOWrapper(
+                    io.FileIO(2, "w", closefd=False), line_buffering=True
+                )
+                self.raised: list[BaseException] = []
+
+            def write(self, s):
+                try:
+                    return self._raw.write(s)
+                except BaseException as exc:
+                    self.raised.append(exc)
+                    raise
+
+            def flush(self):
+                try:
+                    return self._raw.flush()
+                except BaseException as exc:
+                    self.raised.append(exc)
+                    raise
+
+        real_tee = rib.tee_stderr
+
+        @contextlib.contextmanager
+        def tee_that_fails_to_restore_fd_2():
+            with real_tee() as capture:
+                yield capture
+            # Exactly the state a failed guard.restore() leaves behind: fd 2
+            # points at a pipe whose read end is already closed. Done AFTER
+            # the real tee's teardown has joined its pump, so nothing can
+            # repair it behind our back -- the reviewer's reproduction was
+            # racy against the pump's emergency valve; this one is not.
+            read_fd, write_fd = os.pipe()
+            os.close(read_fd)
+            os.dup2(write_fd, 2)
+            os.close(write_fd)
+            raise TeeStderrFailure("simulated restore failure")
+
+        rescue_fd = os.dup(2)
+        recorder = _RecordingStderr()
+        monkeypatch.setattr(rib, "tee_stderr", tee_that_fails_to_restore_fd_2)
+        monkeypatch.setattr(sys, "stderr", recorder)
+        graph_path = tmp_path / "bench.graph"
+
+        try:
+            metrics = await rib.run_ingestion_benchmark(
+                str(git_repo), "HEAD", graph_path, poll_interval=0.05
+            )
+        finally:
+            # Repair fd 2 before pytest (or anything else) writes to it.
+            os.dup2(rescue_fd, 2)
+            os.close(rescue_fd)
+
+        assert any(isinstance(exc, BrokenPipeError) for exc in recorder.raised), (
+            "the handler's stderr never actually broke, so this test proved "
+            f"nothing: {recorder.raised}"
+        )
+        assert _EXPECTED_METRIC_KEYS <= set(metrics)
+        assert metrics["commits_ingested"] == 2
         assert metrics["stderr_capture_complete"] is False
         assert _exit_code(metrics) == 1
 

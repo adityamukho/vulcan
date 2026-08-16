@@ -211,14 +211,28 @@ def tee_stderr():
     tests/test_at_scale_stderr_capture.py, which fails loudly if that ceases
     to be true.
 
-    Shutdown does NOT rely on EOF. mcp_server._run_ingestion's
-    ProcessPoolExecutor uses the spawn context, whose multiprocessing
-    resource_tracker inherits fd 2 -- a duplicate of the tee pipe's write
-    end -- and holds it open for the parent process's ENTIRE lifetime, well
-    past this context manager's exit. Restoring fd 2 on our side therefore
-    never closes the last write end, so the pump would never see a real EOF
-    (measured: pump still blocked in os.read() 10s after the pool was shut
-    down). A dedicated control pipe signals shutdown instead: the pump
+    Shutdown does NOT rely on EOF. Anything that inherits fd 2 while the tee
+    is armed holds a duplicate of the tee pipe's write end, and can keep it
+    open well past this context manager's exit -- in which case restoring
+    fd 2 on our side never closes the last write end and the pump would never
+    see a real EOF. The measured case was mcp_server._run_ingestion's
+    spawn-context ProcessPoolExecutor, whose multiprocessing resource_tracker
+    holds it for the parent process's ENTIRE lifetime (pump still blocked in
+    os.read() 10s after the pool was shut down). ProcessPoolExecutor's own
+    worker children are a second such holder.
+
+    That measured case no longer applies to the at-scale harness itself: as of
+    the #256 wiring, run_ingestion_benchmark calls
+    multiprocessing.resource_tracker.ensure_running() BEFORE entering this
+    context manager, precisely so the tracker inherits the real fd 2 instead.
+    A genuine EOF is therefore reachable at teardown for that caller, and the
+    pump handles it (the drain-then-break below). The control pipe is still
+    required -- pool worker children and any other caller still hold
+    duplicates, and correctness here must not depend on who happens to have
+    forked -- but this paragraph used to state the tracker case as an
+    unconditional fact, which it is not.
+
+    A dedicated control pipe signals shutdown instead: the pump
     selects on both the tee pipe and the control pipe, drains whatever is
     still buffered in the tee pipe, and only then exits once the control
     pipe fires -- deterministic regardless of who else is holding the tee
