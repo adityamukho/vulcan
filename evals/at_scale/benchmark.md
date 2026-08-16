@@ -1082,3 +1082,25 @@ nearly every code entity in every graph already written.
 | Graph-query latency (min/p50/p99/max) | 1.2ms / 17.1ms / 1060.3ms / 1377.1ms |
 | Poll duty cycle (#242) | 6.38% over 1105 polls |
 | Checkpoint duty cycle (#241) | 4.55% over 97 checkpoints (67.01s total, 961 suppressed) |
+
+## Ingestion Run — 20260816T185437Z
+
+- Repo: `.` @ `master`
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 732 |
+| Final status | complete |
+| Wall-clock | 1581.52s |
+| Throughput | 27.8 commits/min |
+| Peak RSS | 789368 KB |
+| Graph size | 225746944 bytes |
+| Fact-index size | 97026048 bytes |
+| Status-query latency (min/p50/p99/max) | 0.1ms / 0.3ms / 6.0ms / 43.7ms |
+| Graph-query latency (min/p50/p99/max) | 1.2ms / 17.5ms / 1023.5ms / 1336.3ms |
+| Poll duty cycle (#242) | 6.32% over 1185 polls |
+| Checkpoint duty cycle (#241) | 4.60% over 102 checkpoints (72.41s total, 997 suppressed) |
+| Stderr tee (#256) | active (wall-clock and latencies measured with an fd-level tee in place) |
+| Stderr capture (#256) | complete |
+| Commits dropped (#256) | 0 |
+| Error signatures (#251/#256) | 0 |
