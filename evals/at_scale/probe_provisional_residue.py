@@ -53,7 +53,15 @@ def read_sweep_total(metrics: dict[str, Any]) -> int:
             "the #256 instrumentation. Re-run the benchmark; this probe will "
             "not guess N."
         )
-    return int(metrics["correction_sweep_skipped"])
+    try:
+        return int(metrics["correction_sweep_skipped"])
+    except (TypeError, ValueError) as e:
+        value = metrics["correction_sweep_skipped"]
+        raise SystemExit(
+            f"'correction_sweep_skipped' has invalid value {value!r} "
+            f"(type: {type(value).__name__}) -- expected an integer. "
+            f"Check the metrics JSON for corruption."
+        )
 
 
 def require_complete_run(metrics: dict[str, Any]) -> None:

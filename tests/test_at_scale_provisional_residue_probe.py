@@ -31,6 +31,16 @@ class TestReadSweepTotal:
         with pytest.raises(SystemExit, match="correction_sweep_skipped"):
             read_sweep_total({"final_status": "complete"})
 
+    def test_none_value_fails_with_diagnostic(self):
+        """A metrics writer emitting null instead of omitting the field."""
+        with pytest.raises(SystemExit, match="correction_sweep_skipped"):
+            read_sweep_total({"correction_sweep_skipped": None})
+
+    def test_non_numeric_string_fails_with_diagnostic(self):
+        """Malformed value in the metrics file."""
+        with pytest.raises(SystemExit, match="correction_sweep_skipped"):
+            read_sweep_total({"correction_sweep_skipped": "not a number"})
+
 
 class TestRequireCompleteRun:
     def test_accepts_a_complete_run(self):
@@ -57,6 +67,34 @@ class TestBreakdownByEntityType:
 
     def test_empty_input_yields_an_empty_breakdown(self):
         assert breakdown_by_entity_type([]) == {}
+
+    def test_ident_with_no_slash_buckets_under_full_string(self):
+        """Edge case: an ident without a slash."""
+        idents = ["identifier_no_slash"]
+        result = breakdown_by_entity_type(idents)
+        assert sum(result.values()) == len(idents)
+        assert result == {"identifier_no_slash": 1}
+
+    def test_ident_with_no_leading_colon(self):
+        """Edge case: an ident without leading colon."""
+        idents = ["function/foo"]
+        result = breakdown_by_entity_type(idents)
+        assert sum(result.values()) == len(idents)
+        assert result == {"function": 1}
+
+    def test_empty_string_ident(self):
+        """Edge case: an empty string ident."""
+        idents = [""]
+        result = breakdown_by_entity_type(idents)
+        assert sum(result.values()) == len(idents)
+        assert result == {"": 1}
+
+    def test_nested_namespace_ident(self):
+        """Edge case: a nested namespace with multiple slashes."""
+        idents = [":deeply/nested/type/name"]
+        result = breakdown_by_entity_type(idents)
+        assert sum(result.values()) == len(idents)
+        assert result == {"deeply": 1}
 
 
 class TestResidueVerdict:
