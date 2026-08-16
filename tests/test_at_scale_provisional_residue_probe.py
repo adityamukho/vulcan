@@ -174,3 +174,31 @@ class TestProvisionalEntityIdents:
                 assert provisional_entity_idents(db) == []
         finally:
             mcp_server._reset_db_state()
+
+    def test_an_unmarked_entity_with_ordinary_facts_is_not_counted(self, tmp_path):
+        """A query that accidentally matched on entity presence rather than
+        marker presence would sweep this in too. Neither the confirmed-entity
+        test nor the empty-graph test can catch that: this needs an entity
+        that was simply never marked, sitting right next to one that was."""
+        import mcp_server
+
+        graph = str(tmp_path / "mixed.graph")
+        mcp_server._reset_db_state()
+        mcp_server.open_db(graph)
+        try:
+            with mcp_server.db_lease() as db:
+                mcp_server._transact(
+                    db,
+                    '[[:module/untouched :entity-type :type/module] '
+                    '[:module/untouched :ident ":module/untouched"] '
+                    '[:module/untouched :description "untouched.py"]]',
+                    "2026-08-16T00:00:00Z",
+                )
+                mcp_server._lineage_mark_provisional(
+                    db, ":function/alpha", "2026-08-16T00:00:00Z"
+                )
+                found = provisional_entity_idents(db)
+        finally:
+            mcp_server._reset_db_state()
+
+        assert found == [":function/alpha"]

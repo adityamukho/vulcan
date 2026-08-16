@@ -115,6 +115,17 @@ def provisional_entity_idents(db: Any) -> list[str]:
     one set-returning query instead of one existence check per entity.
     _lineage_confirm retracts the marker's facts wholesale, so "marker
     present" and "provisional" are the same predicate.
+
+    The [?m :status :provisional] clause is redundant under the current
+    schema: confirm retracts the marker entity wholesale rather than
+    flipping its status, so existence alone already implies provisional --
+    exactly the reasoning _preload_provisional_idents' docstring
+    (mcp_server.py:8650) gives for omitting this same clause, and confirmed
+    by ablation here (dropping the clause did not change any test result).
+    It is kept anyway as defense against a future schema where confirm
+    updates :status in place instead of retracting the marker; if that ever
+    happens, dropping this clause would silently start counting confirmed
+    entities again.
     """
     import mcp_server
 
