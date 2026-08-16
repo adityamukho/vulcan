@@ -1064,3 +1064,21 @@ other row in the candidate table would have been suspect.
 change** — the cheapest rule that eliminates all 9 collisions (R1) still renames
 97.5% of existing idents, so a forward-only change would orphan the history of
 nearly every code entity in every graph already written.
+
+## Ingestion Run — 20260816T022619Z
+
+- Repo: `.` @ `master`
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 705 |
+| Final status | complete |
+| Wall-clock | 1474.66s |
+| Throughput | 28.7 commits/min |
+| Peak RSS | 772936 KB |
+| Graph size | 210964480 bytes |
+| Fact-index size | 89985024 bytes |
+| Status-query latency (min/p50/p99/max) | 0.1ms / 0.3ms / 10.6ms / 39.3ms |
+| Graph-query latency (min/p50/p99/max) | 1.2ms / 17.1ms / 1060.3ms / 1377.1ms |
+| Poll duty cycle (#242) | 6.38% over 1105 polls |
+| Checkpoint duty cycle (#241) | 4.55% over 97 checkpoints (67.01s total, 961 suppressed) |
