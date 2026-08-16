@@ -1,5 +1,6 @@
 # tests/test_at_scale_ingestion_benchmark.py
 import subprocess as _subprocess
+from pathlib import Path
 
 import pytest
 
@@ -229,6 +230,29 @@ class TestResolveGraphPath:
         precondition; this enforces it."""
         target = tmp_path / "already.graph"
         target.write_text("pre-existing")
+        with pytest.raises(SystemExit, match="already exists"):
+            with resolve_graph_path(str(target)):
+                pass
+
+    def test_refuses_a_stale_wal_even_when_the_main_file_is_absent(self, tmp_path):
+        """A crashed run can leave `<path>.wal` behind with the main graph
+        file deleted (or never renamed into place). minigraf's open()
+        replays a leftover .wal automatically, so a check that only looks at
+        the main file would silently resurrect the dead run's writes."""
+        target = tmp_path / "run.graph"
+        Path(f"{target}.wal").write_text("stale wal")
+        with pytest.raises(SystemExit, match="already exists"):
+            with resolve_graph_path(str(target)):
+                pass
+
+    def test_refuses_a_stale_index_even_when_the_main_file_is_absent(self, tmp_path):
+        """Same hazard as the .wal case, for the fact index sidecar. Uses
+        fact_index.index_path_for so this stays correct under a
+        MINIGRAF_INDEX_PATH override, same as the implementation."""
+        import fact_index
+
+        target = tmp_path / "run.graph"
+        Path(fact_index.index_path_for(str(target))).write_text("stale index")
         with pytest.raises(SystemExit, match="already exists"):
             with resolve_graph_path(str(target)):
                 pass

@@ -231,22 +231,41 @@ def resolve_graph_path(graph_path_arg: Optional[str]):
     occurrences were never inspectable precisely because the graph was
     already deleted.
 
-    Refuses an existing path. run_ingestion_benchmark's own docstring states
-    that precondition, and CLAUDE.md's standing rule is that graphs are
-    rebuilt into a fresh path, never re-ingested in place -- re-running over
-    an existing file repairs nothing and silently doubles the history.
+    Refuses an existing path -- and, as of the #256 review round, its
+    sidecars too. run_ingestion_benchmark's own docstring states the
+    no-preexisting-path precondition, and CLAUDE.md's standing rule is that
+    graphs are rebuilt into a fresh path, never re-ingested in place --
+    re-running over an existing file repairs nothing and silently doubles
+    the history. Checking only the main graph file missed that minigraf also
+    writes `<path>.wal` and a fact index (default `<path>.fts.sqlite3`, or
+    wherever MINIGRAF_INDEX_PATH points): a crashed run leaves those behind
+    deliberately, since post-mortem inspection is the point of --graph-path,
+    but minigraf's open() replays a leftover .wal automatically -- so
+    deleting only the main file and re-running silently resurrects the dead
+    run's writes into what looks like a fresh graph. The `.lock` file is
+    deliberately NOT checked here: it self-heals via minigraf's stale-PID
+    check, so a stale one does not cause silent corruption the way a stale
+    .wal or index does.
     """
     if graph_path_arg is None:
         with tempfile.TemporaryDirectory(prefix="minigraf-at-scale-") as tmpdir:
             yield Path(tmpdir) / "bench.graph"
         return
 
+    import fact_index
+
     path = Path(graph_path_arg)
-    if path.exists():
+    wal_path = Path(f"{path}.wal")
+    index_path = Path(fact_index.index_path_for(str(path)))
+    existing = [p for p in (path, wal_path, index_path) if p.exists()]
+    if existing:
+        named = ", ".join(str(p) for p in existing)
         raise SystemExit(
-            f"--graph-path {path} already exists. Each run needs a fresh "
-            f"graph -- re-ingesting into an existing one is never correct. "
-            f"Pick a new path or delete this one deliberately."
+            f"--graph-path {path} already exists (found: {named}). Each run "
+            f"needs a fully fresh graph -- re-ingesting into an existing one "
+            f"is never correct, and minigraf replays a leftover .wal "
+            f"automatically, so deleting only the main file is not enough. "
+            f"Remove all of the listed paths, or pick a new --graph-path."
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     yield path
