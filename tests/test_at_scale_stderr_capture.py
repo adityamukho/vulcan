@@ -15,11 +15,14 @@ import contextlib
 import io
 import multiprocessing
 import os
+import selectors
 import subprocess
 import sys
 import time
 
-from evals.at_scale.stderr_capture import scan_ingestion_stderr, tee_stderr
+import pytest
+
+from evals.at_scale.stderr_capture import TeeStderrFailure, scan_ingestion_stderr, tee_stderr
 
 CLEAN = (
     "[_run_ingestion] starting\n"
@@ -68,6 +71,15 @@ class TestErrorSignals:
         assert scan_ingestion_stderr(text)["error_signals"][0]["line"] == (
             "Page 7 out of bounds (total pages: 3)"
         )
+
+    def test_detects_the_tee_stderr_pump_failed_marker(self):
+        """Positive control for the fourth _ERROR_PATTERNS entry (#256
+        review round 3): tee_stderr()'s own pump-failure marker is the ONLY
+        signal left in the captured text once the pump has died, so this
+        scanner must not treat a marker-only capture as a clean run."""
+        text = "[tee_stderr] pump failed: BrokenPipeError(32, 'Broken pipe')\n"
+        signals = scan_ingestion_stderr(text)["error_signals"]
+        assert [s["pattern"] for s in signals] == ["tee_stderr_pump_failed"]
 
     def test_clean_log_yields_no_signals(self):
         assert scan_ingestion_stderr(CLEAN)["error_signals"] == []
@@ -205,3 +217,35 @@ class TestTeeStderr:
             os.write(2, b"AFTER_POOL\n")
         assert time.perf_counter() - t0 < 5  # 10s on the EOF design
         assert "AFTER_POOL" in cap.text() and cap.errors == []
+
+    def test_selector_construction_failure_is_surfaced_not_swallowed(self, monkeypatch):
+        """THE discriminating regression test for the round-3 Critical fix,
+        and the coverage gap the review called out directly: nothing
+        previously tested finding 2 (the marker + TeeStderrFailure) at all.
+
+        In round 2, selectors.DefaultSelector() and both register() calls
+        sat OUTSIDE the pump's try -- so a failure there (e.g. OSError
+        (EMFILE) from epoll allocation, exactly the fd-pressure condition
+        that motivated switching to selectors in the first place) skipped
+        the except clause entirely: no marker, no record_error, no
+        emergency_redirect, and the `with` block exited silently with
+        cap.text() == "" -- a byte-identical false all-clear. Round 3 moved
+        the construction inside the try; this test pins that directly by
+        forcing the construction itself to fail. Ablation-proven: see the
+        #256 fix-round-3 report for the exact pass/fail counts with the
+        construction moved back outside the try.
+        """
+
+        def raising_selector():
+            raise OSError(24, "Too many open files")
+
+        monkeypatch.setattr(selectors, "DefaultSelector", raising_selector)
+
+        cap = None
+        with pytest.raises(TeeStderrFailure):
+            with tee_stderr() as cap:
+                pass
+
+        assert cap is not None
+        assert any(isinstance(exc, OSError) for exc in cap.errors)
+        assert "[tee_stderr] pump failed:" in cap.text()

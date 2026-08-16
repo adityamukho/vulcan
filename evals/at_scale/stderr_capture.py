@@ -36,6 +36,15 @@ _SWEEP_SUMMARY_RE = re.compile(
 # The three #251 signatures. REGEXES, NOT LITERALS: the page error carries
 # live numbers ("Page 130 out of bounds (total pages: 113)" is the form #251
 # actually reproduced), so a literal would match nothing and report all-clear.
+#
+# The fourth entry is tee_stderr()'s own pump-failure marker (#256 review
+# round 3, New Important): without it, a dead pump's synthetic
+# "[tee_stderr] pump failed: ..." line -- the ONLY signal left in the
+# captured text once the pump has died -- matched none of the other three
+# patterns, so this scanner (the sole text-only consumer) read a
+# marker-only capture as indistinguishable from a clean run. The marker is
+# a repr() of an fd-level Python exception; it cannot collide with
+# minigraf's own output or the other three patterns.
 _ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("page_out_of_bounds", re.compile(r"Page \d+ out of bounds")),
     ("serde_deserialization_error", re.compile(r"Serde Deserialization Error")),
@@ -43,6 +52,7 @@ _ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "stream_all_entries_expected_leaf_page",
         re.compile(r"stream_all_entries: expected leaf page"),
     ),
+    ("tee_stderr_pump_failed", re.compile(r"^\[tee_stderr\] pump failed:")),
 )
 
 
@@ -183,8 +193,9 @@ def tee_stderr():
     selects on both the tee pipe and the control pipe, drains whatever is
     still buffered in the tee pipe, and only then exits once the control
     pipe fires -- deterministic regardless of who else is holding the tee
-    pipe's write end open. See test_shutdown_does_not_wait_for_eof_with_a_
-    spawn_pool for the discriminating regression test.
+    pipe's write end open. See
+    test_shutdown_does_not_wait_for_eof_with_a_spawn_pool for the
+    discriminating regression test.
 
     Uses selectors.DefaultSelector(), not select.select(): select() has a
     hard FD_SETSIZE (1024) ceiling that a 25-minute run with pool pipes, the
@@ -224,10 +235,21 @@ def tee_stderr():
         opened.remove(write_fd)
 
         def pump() -> None:
-            sel = selectors.DefaultSelector()
-            sel.register(read_fd, selectors.EVENT_READ, "tee")
-            sel.register(ctrl_read_fd, selectors.EVENT_READ, "ctrl")
+            # sel = None first, and selector construction/registration INSIDE
+            # the try: selectors.DefaultSelector() allocates an epoll fd and
+            # can raise OSError(EMFILE) under fd pressure, and register() can
+            # raise too. The whole point of switching to selectors was a
+            # 25-minute run holding >1024 fds -- the same fd pressure that
+            # makes epoll allocation itself fail. If that construction sits
+            # outside this try, the exception skips the except clause below
+            # entirely: no marker, no record_error, no emergency_redirect,
+            # fd 2 left pointing at a pipe nobody drains -- round 1's
+            # Critical 2 again (#256 review round 3, New Critical).
+            sel = None
             try:
+                sel = selectors.DefaultSelector()
+                sel.register(read_fd, selectors.EVENT_READ, "tee")
+                sel.register(ctrl_read_fd, selectors.EVENT_READ, "ctrl")
                 while True:
                     ready = {key.data for key, _ in sel.select()}
                     if "tee" in ready:
@@ -244,8 +266,10 @@ def tee_stderr():
                         break
             except BaseException as exc:  # must never die without unblocking fd 2
                 # Append a marker into the captured text itself, not just
-                # the side-channel .errors list -- a scan of an
-                # otherwise-empty capture must not read as a clean run.
+                # the side-channel .errors list -- scan_ingestion_stderr has
+                # a dedicated pattern for exactly this line (#256 review
+                # round 3), so a scan of an otherwise-empty capture reads as
+                # a pump failure, not a clean run.
                 marker = f"[tee_stderr] pump failed: {exc!r}\n".encode(
                     "utf-8", errors="replace"
                 )
@@ -259,7 +283,8 @@ def tee_stderr():
                 with contextlib.suppress(Exception):
                     guard.emergency_redirect()
             finally:
-                sel.close()
+                if sel is not None:
+                    sel.close()
 
         pump_thread = threading.Thread(target=pump, daemon=True)
         pump_thread.start()
@@ -298,9 +323,11 @@ def tee_stderr():
         pump_thread.join(timeout=10)
         alive = pump_thread.is_alive()  # snapshot once -- see review round 2, cheap fix 1
         if alive:
-            # The pump is still touching saved_fd/read_fd/ctrl_read_fd.
-            # Closing them now would recycle those fd numbers under a live
-            # thread -- a leaked fd is strictly better than a corrupted one.
+            # The pump is still touching saved_fd/read_fd/ctrl_read_fd, and
+            # its selector still owns an epoll fd (pump()'s own `finally`
+            # never got to run sel.close()). Closing any of these now would
+            # recycle the fd number under a live thread -- a leaked fd is
+            # strictly better than a corrupted one.
             capture.record_error(
                 TimeoutError("tee_stderr: pump thread did not exit within 10s")
             )
