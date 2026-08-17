@@ -371,6 +371,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     from evals.at_scale.report import append_residue_report
 
     report_path = Path(args.report_path)
+    # Mirrors the --json-out handling above: without this, a verdict that was
+    # successfully computed is lost to a missing directory instead of being
+    # written out.
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     append_residue_report(result, report_path, out_path)
 
     print(json.dumps(result, indent=2))

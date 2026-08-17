@@ -1283,7 +1283,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 Beyond the per-task gates:
 
-1. **Ablation on the delegation (Task 4).** The suite's per-clause tests prove the clauses arrive; confirm the delegation is real rather than coincidental by temporarily replacing `_ingestion_exit_code(ingestion)` with `0` in `run_query_benchmark._exit_code` and re-running `pytest tests/test_at_scale_query_benchmark.py::TestExitCode -v`. Expected: **all four clause cases fail.** Revert the edit. A guard is not a guard until you have watched it fail.
+1. **Ablation on the delegation (Task 4).** The suite's per-clause tests prove the clauses arrive; confirm the delegation is real rather than coincidental by temporarily replacing `_ingestion_exit_code(ingestion)` with `0` in `run_query_benchmark._exit_code` and re-running `pytest tests/test_at_scale_query_benchmark.py::TestExitCode -v`. Expected: **all five clause cases fail.** Revert the edit. A guard is not a guard until you have watched it fail.
 2. **A real end-to-end query-benchmark run is not required** and should not be attempted casually: it ingests this repo's full history through the pinned ground-truth commit and takes tens of minutes. The nightly workflow exercises it.
 3. **The residue probe's end-to-end path is covered** by `TestMain`, which builds real graphs — no manual run needed.
 4. **PR body carries the closing keywords**, not any commit message: `Closes #275` and `Closes #276` at the end. Verify with `gh pr view --json closingIssuesReferences` before merging, and confirm no other issue number appears in that list.

@@ -646,7 +646,9 @@ class TestMain:
     def test_the_default_report_path_is_the_committed_benchmark_md(self, tmp_path):
         """--report-path exists for the tests; the default must still be the
         real record, or a genuine run would write its verdict nowhere."""
-        from evals.at_scale.probe_provisional_residue import _DEFAULT_REPORT_PATH
+        from evals.at_scale.probe_provisional_residue import (
+            REPO_ROOT,
+            _DEFAULT_REPORT_PATH,
+        )
 
-        assert _DEFAULT_REPORT_PATH.name == "benchmark.md"
-        assert _DEFAULT_REPORT_PATH.parent.name == "at_scale"
+        assert _DEFAULT_REPORT_PATH == REPO_ROOT / "evals" / "at_scale" / "benchmark.md"

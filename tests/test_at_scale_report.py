@@ -434,3 +434,24 @@ class TestAppendResidueReport:
         report_path = tmp_path / "benchmark.md"
         append_residue_report(SAMPLE_RESIDUE, report_path)
         assert "| Residue JSON | not recorded |" in report_path.read_text()
+
+    @pytest.mark.parametrize(
+        "key,label",
+        [
+            ("graph_path", "Graph"),
+            ("metrics_json", "Metrics JSON"),
+        ],
+    )
+    def test_an_absent_result_path_renders_not_recorded(self, tmp_path, key, label):
+        """Same _residue_path_row helper as the Residue JSON row above, but
+        for the two paths that come from `result` rather than the json_out
+        argument -- untested until now, so a break in either would only show
+        up as a missing bullet in a real report, not a red test."""
+        result = {k: v for k, v in SAMPLE_RESIDUE.items() if k != key}
+        report_path = tmp_path / "benchmark.md"
+        append_residue_report(result, report_path)
+        row = next(
+            line for line in report_path.read_text().splitlines()
+            if line.startswith(f"| {label} |")
+        )
+        assert "not recorded" in row

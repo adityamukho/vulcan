@@ -55,8 +55,9 @@ that was wrong and has been corrected here.
 >
 > **2026-08-17 — what a section does and does not tell you (#275, #276).**
 > Ingestion Run sections from this date onward carry a `- Metrics JSON:`
-> bullet naming the results file they were rendered from; earlier entries
-> render `not recorded`, and their JSON has to be matched by timestamp.
+> bullet naming the results file they were rendered from; earlier sections
+> carry no such bullet at all (re-rendering their JSON today yields
+> `not recorded`), and their JSON has to be matched by timestamp.
 >
 > **A `## Provisional Residue` section is the `M <= N` verdict (#256), and it
 > is written by `probe_provisional_residue.py`, not by the benchmark.** The

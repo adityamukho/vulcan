@@ -169,3 +169,6 @@ class TestRunQueryBenchmark:
         report = await run_query_benchmark(str(git_repo), graph_path, tiny_ground_truth)
         assert "poll_offsets" not in report["ingestion"]
         assert "poll_duty_fraction" in report["ingestion"]
+
+        from evals.at_scale.run_query_benchmark import _DROPPED_INGESTION_KEYS
+        assert _DROPPED_INGESTION_KEYS == ("poll_offsets",)
