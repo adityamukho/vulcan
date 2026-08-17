@@ -52,6 +52,27 @@ that was wrong and has been corrected here.
 > the -51.9% the cross-day pair implied). Treat any entry-to-entry wall-clock
 > comparison that spans different days on this box as **directional only**;
 > a same-day A/B is required before trusting the magnitude of a percentage.
+>
+> **2026-08-17 — what a section does and does not tell you (#275, #276).**
+> Ingestion Run sections from this date onward carry a `- Metrics JSON:`
+> bullet naming the results file they were rendered from; earlier entries
+> render `not recorded`, and their JSON has to be matched by timestamp.
+>
+> **A `## Provisional Residue` section is the `M <= N` verdict (#256), and it
+> is written by `probe_provisional_residue.py`, not by the benchmark.** The
+> nightly workflow does NOT run that probe — it needs a persisted graph via
+> `--graph-path` — so most Ingestion Run sections have no residue section
+> beside them. **Read that absence as "the probe was not run", never as "the
+> residue was zero".** The comparison is `M <= N`, not `M == N` or `M == 0`: a
+> non-empty residue is the correction sweep's documented fail-safe, and N
+> counts entities left provisional *or* unreconciled, so M is a strict subset.
+>
+> **Query Correctness Run sections from this date onward carry an "Ingestion
+> phase" block.** Every earlier query entry was measured over a graph whose
+> ingestion metrics were discarded, so nothing is known about whether it
+> dropped commits — `Final status | complete` and the commit count are both
+> blind to that by design. Query latencies measured over a graph that silently
+> lost commits are not comparable to ones that were not.
 
 ## Ingestion Run — 20260719T074053Z
 
