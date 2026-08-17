@@ -3688,6 +3688,67 @@ _ingest_checkpoint_policy: Optional["_CheckpointPolicy"] = None
 _DEFAULT_CHECKPOINT_DUTY = 0.05
 
 
+def _trace_work_counters(extracted_files: Sequence[tuple]) -> Dict[str, Any]:
+    """Per-commit work size, for the #260 cost trace. Pure; len() only.
+
+    extracted_files is _extract_commit's file_results -- one
+    (status, file_path, extracted, precomputed, old_path) per changed file. A
+    "D" entry carries extracted=None and precomputed=None, so it counts as a
+    touched file and contributes nothing else: there is no module being
+    introduced and no entities to consider.
+
+    `idents_considered` is #260's frozen work metric W (see
+    docs/superpowers/specs/2026-08-17-per-commit-cost-attribution-design.md):
+    one module ident per file that has a precomputed, plus one per extracted
+    entity, plus one per RESOLVED import. It is the unit _build_code_triples
+    iterates. Unresolved imports are excluded because they take the
+    external-dependency fallback rather than an entity path;
+    n_imports_total - n_imports_resolved is kept as exploratory signal.
+
+    n_unchanged_idents (#221's body-diff narrowing) is likewise exploratory and
+    deliberately NOT subtracted from W: W counts idents CONSIDERED, and an
+    unchanged ident is considered before it is narrowed out.
+
+    W is FROZEN. Changing this arithmetic after a trace exists redefines the
+    experiment; fork it instead.
+    """
+    files_by_status: Dict[str, int] = {}
+    n_modules = n_functions = n_classes = n_globals = n_fields = 0
+    n_imports_total = n_imports_resolved = 0
+    n_unchanged_idents = 0
+
+    for status, _file_path, _extracted, precomputed, _old_path in extracted_files:
+        files_by_status[status] = files_by_status.get(status, 0) + 1
+        if not precomputed:
+            continue
+        n_modules += 1
+        n_functions += len(precomputed["function_entries"])
+        n_classes += len(precomputed["class_entries"])
+        n_globals += len(precomputed["global_entries"])
+        n_fields += len(precomputed["field_entries"])
+        for _import_name, _dep_ident, is_resolved in precomputed["resolved_imports"]:
+            n_imports_total += 1
+            if is_resolved:
+                n_imports_resolved += 1
+        n_unchanged_idents += len(precomputed.get("unchanged_idents", ()))
+
+    return {
+        "files_by_status": files_by_status,
+        "n_modules": n_modules,
+        "n_functions": n_functions,
+        "n_classes": n_classes,
+        "n_globals": n_globals,
+        "n_fields": n_fields,
+        "n_imports_total": n_imports_total,
+        "n_imports_resolved": n_imports_resolved,
+        "n_unchanged_idents": n_unchanged_idents,
+        "idents_considered": (
+            n_modules + n_functions + n_classes + n_globals + n_fields
+            + n_imports_resolved
+        ),
+    }
+
+
 def _checkpoint_duty_from_env() -> float:
     """Read MINIGRAF_INGEST_CHECKPOINT_DUTY, falling back to the default on
     anything unparseable or out of range. A typo must not crash ingestion or

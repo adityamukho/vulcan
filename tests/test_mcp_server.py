@@ -23346,3 +23346,110 @@ class TestConcurrentPollerDoesNotForceASecondOpen:
         assert any("already open in this process" in str(e) for e in caught), (
             f"failure(s) came back but not the #255 one: {caught}"
         )
+
+
+class TestTraceWorkCounters:
+    """#260: _trace_work_counters turns _extract_commit's file_results into the
+    work-size counters the per-commit trace records."""
+
+    @staticmethod
+    def _precomputed(functions=0, classes=0, globals_=0, fields=0,
+                     imports=(), unchanged=()):
+        """A _precompute_file_triples-shaped dict with the given cardinalities.
+
+        Only lengths matter to the counters, so the entries are placeholders of
+        the right arity: (ident, name, candidate_triples) for entity lists and
+        (import_name, dep_ident, is_resolved) for resolved_imports.
+        """
+        return {
+            "module_ident": ":module/x",
+            "function_entries": [(f":function/f{i}", f"f{i}", []) for i in range(functions)],
+            "class_entries": [(f":class/c{i}", f"c{i}", []) for i in range(classes)],
+            "global_entries": [(f":variable/g{i}", f"g{i}", []) for i in range(globals_)],
+            "field_entries": [(f":field/d{i}", f"d{i}", []) for i in range(fields)],
+            "resolved_imports": list(imports),
+            "unchanged_idents": set(unchanged),
+        }
+
+    def test_counts_entities_and_module_across_files(self):
+        import mcp_server
+        files = [
+            ("A", "a.py", {}, self._precomputed(functions=3, classes=1), ""),
+            ("M", "b.py", {}, self._precomputed(functions=2, globals_=4, fields=5), ""),
+        ]
+        c = mcp_server._trace_work_counters(files)
+        assert c["n_modules"] == 2
+        assert c["n_functions"] == 5
+        assert c["n_classes"] == 1
+        assert c["n_globals"] == 4
+        assert c["n_fields"] == 5
+        assert c["files_by_status"] == {"A": 1, "M": 1}
+
+    def test_deleted_file_has_no_precomputed_and_contributes_no_module(self):
+        """A 'D' entry carries extracted=None and precomputed=None. It must count
+        as a touched file but must NOT contribute a module ident -- there is no
+        module being introduced, and counting one would inflate W on exactly the
+        commits that do the least entity work."""
+        import mcp_server
+        files = [
+            ("D", "gone.py", None, None, ""),
+            ("M", "b.py", {}, self._precomputed(functions=1), ""),
+        ]
+        c = mcp_server._trace_work_counters(files)
+        assert c["files_by_status"] == {"D": 1, "M": 1}
+        assert c["n_modules"] == 1
+        assert c["idents_considered"] == 2  # 1 module + 1 function
+
+    def test_imports_split_resolved_from_total(self):
+        import mcp_server
+        files = [("M", "b.py", {}, self._precomputed(imports=[
+            ("os", ":module/os", False),
+            ("pkg.mod", ":module/pkg-mod", True),
+            ("other", ":module/other", True),
+        ]), "")]
+        c = mcp_server._trace_work_counters(files)
+        assert c["n_imports_total"] == 3
+        assert c["n_imports_resolved"] == 2
+
+    def test_idents_considered_is_the_frozen_W_formula(self):
+        """W = sum over files (1 + functions + classes + globals + fields)
+        + resolved imports. Pinned as an explicit arithmetic identity, not as a
+        recomputation of the implementation -- this is the spec's frozen work
+        metric and a drift here silently redefines the whole experiment."""
+        import mcp_server
+        files = [
+            ("A", "a.py", {}, self._precomputed(functions=3, classes=2), ""),
+            ("M", "b.py", {}, self._precomputed(globals_=1, fields=4, imports=[
+                ("x", ":module/x", True), ("y", ":module/y", False),
+            ]), ""),
+        ]
+        c = mcp_server._trace_work_counters(files)
+        assert c["idents_considered"] == (1 + 3 + 2) + (1 + 1 + 4) + 1
+        assert c["idents_considered"] == (
+            c["n_modules"] + c["n_functions"] + c["n_classes"]
+            + c["n_globals"] + c["n_fields"] + c["n_imports_resolved"]
+        )
+
+    def test_unchanged_idents_counted_but_excluded_from_W(self):
+        """unchanged_idents is #221's body-diff narrowing. It is exploratory
+        signal in the trace, NOT part of W -- W counts idents CONSIDERED, and an
+        unchanged ident is still considered before being narrowed out."""
+        import mcp_server
+        files = [("M", "b.py", {}, self._precomputed(
+            functions=4, unchanged=[":function/a", ":function/b"]), "")]
+        c = mcp_server._trace_work_counters(files)
+        assert c["n_unchanged_idents"] == 2
+        assert c["idents_considered"] == 5  # 1 module + 4 functions, unchanged not subtracted
+
+    def test_empty_file_list_is_all_zeros(self):
+        import mcp_server
+        c = mcp_server._trace_work_counters([])
+        assert c["idents_considered"] == 0
+        assert c["files_by_status"] == {}
+
+    def test_renamed_file_counts_by_its_own_status(self):
+        import mcp_server
+        files = [("R", "new.py", {}, self._precomputed(functions=2), "old.py")]
+        c = mcp_server._trace_work_counters(files)
+        assert c["files_by_status"] == {"R": 1}
+        assert c["idents_considered"] == 3
