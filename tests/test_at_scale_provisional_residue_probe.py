@@ -495,6 +495,10 @@ class TestMain:
                 "--graph-path", str(graph),
                 "--metrics-json", str(metrics_path),
                 "--json-out", str(out),
+                # Never the committed evals/at_scale/benchmark.md: main()
+                # appends unconditionally, so the default would make every
+                # test in this class edit a tracked file.
+                "--report-path", str(out.parent / "benchmark.md"),
                 *extra,
             ]
         )
@@ -602,3 +606,47 @@ class TestMain:
 
         assert self._run(graph, _metrics(graph_path=str(graph.resolve())), out) == 0
         assert "WARNING" not in capsys.readouterr().err
+
+    def test_a_verdict_is_appended_to_the_report(self, tmp_path):
+        """#276: the verdict has to reach the durable human record, not only
+        the results JSON that nothing in benchmark.md names."""
+        graph = tmp_path / "reported.graph"
+        _build_graph(graph, commits=3, provisional=[":function/alpha"])
+        out = tmp_path / "verdict.json"
+
+        assert self._run(graph, _metrics(), out) == 0
+
+        text = (tmp_path / "benchmark.md").read_text()
+        assert "## Provisional Residue" in text
+        assert "| Verdict (#256) | OK -- M <= N" in text
+        assert "| Provisional entities (M) | 1 |" in text
+        assert "| Commits in graph | 3 |" in text
+        assert "verdict.json" in text
+
+    def test_a_failing_verdict_is_appended_too(self, tmp_path):
+        """The case the record most needs. An M > N run must not be the one
+        that quietly leaves no trace."""
+        graph = tmp_path / "residue.graph"
+        _build_graph(graph, commits=3,
+                     provisional=[":function/a", ":function/b", ":function/c"])
+        out = tmp_path / "verdict.json"
+
+        assert self._run(graph, _metrics(correction_sweep_skipped=1), out) == 1
+        assert "**FAILED**" in (tmp_path / "benchmark.md").read_text()
+
+    def test_a_refused_run_appends_nothing(self, tmp_path):
+        """The guards raise before any measurement exists. A section rendered
+        from a refusal would be a verdict about a graph the probe declined to
+        read."""
+        out = tmp_path / "verdict.json"
+        with pytest.raises(SystemExit):
+            self._run(tmp_path / "typo-in-this-name.graph", _metrics(), out)
+        assert not (tmp_path / "benchmark.md").exists()
+
+    def test_the_default_report_path_is_the_committed_benchmark_md(self, tmp_path):
+        """--report-path exists for the tests; the default must still be the
+        real record, or a genuine run would write its verdict nowhere."""
+        from evals.at_scale.probe_provisional_residue import _DEFAULT_REPORT_PATH
+
+        assert _DEFAULT_REPORT_PATH.name == "benchmark.md"
+        assert _DEFAULT_REPORT_PATH.parent.name == "at_scale"

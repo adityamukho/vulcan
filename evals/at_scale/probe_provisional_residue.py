@@ -300,6 +300,7 @@ def warn_on_graph_path_mismatch(metrics: dict[str, Any], graph_path: str) -> Non
 _DEFAULT_JSON_OUT = (
     REPO_ROOT / "evals" / "at_scale" / "results" / "256-provisional-residue.json"
 )
+_DEFAULT_REPORT_PATH = REPO_ROOT / "evals" / "at_scale" / "benchmark.md"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -320,6 +321,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Where to write the verdict JSON. Defaults to the committed "
              "artifact path; override it so a re-run does not overwrite the "
              "recorded one.",
+    )
+    parser.add_argument(
+        "--report-path", default=str(_DEFAULT_REPORT_PATH),
+        help="benchmark.md to append the verdict section to (#276). "
+             "Overridable for the same reason --json-out is: the default is "
+             "a tracked file, and the tests drive main() end to end.",
     )
     args = parser.parse_args(argv)
 
@@ -356,8 +363,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(result, indent=2) + "\n")
 
+    # After the JSON, and only on a path that reached a verdict: every guard
+    # above raises SystemExit before `result` exists, and a section rendered
+    # from a refusal would be a verdict about a graph the probe declined to
+    # read. A FAILING verdict is appended too -- that is the one the record
+    # most needs (#276).
+    from evals.at_scale.report import append_residue_report
+
+    report_path = Path(args.report_path)
+    append_residue_report(result, report_path, out_path)
+
     print(json.dumps(result, indent=2))
     print(f"\nWrote {out_path}")
+    print(f"Appended to {report_path}")
     return 0 if result["ok"] else 1
 
 
