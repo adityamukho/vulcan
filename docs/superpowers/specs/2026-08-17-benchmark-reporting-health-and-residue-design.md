@@ -169,7 +169,7 @@ JSON. It writes its own dated `## Provisional Residue — <UTC ts>` section:
 | Provisional entities (M) | `provisional_entities` |
 | Sweep skipped (N) | `sweep_skipped` |
 | Commits in graph | `commits_in_graph` |
-| Provisional by entity type | `breakdown_by_entity_type` (omitted when empty) |
+| Provisional by entity type | `breakdown_by_entity_type` — `none` when empty, *not measured* when absent |
 | Graph | `graph_path` |
 | Metrics JSON | `metrics_json` |
 | Residue JSON | the probe's `--json-out` path, passed by `main()` |
@@ -187,6 +187,12 @@ must not be able to manufacture a clean verdict from missing keys.
 The probe appends unconditionally, matching both other entry points.
 `benchmark.md` is append-only by design, and `--json-out` already warns that a
 re-run overwrites the committed artifact.
+
+It gains a `--report-path` argument defaulting to
+`evals/at_scale/benchmark.md`, mirroring `--json-out`'s reason for existing:
+`tests/test_at_scale_provisional_residue_probe.py`'s `TestMain` drives `main()`
+end to end, and without an overridable path every one of those tests would
+append to the committed `benchmark.md`.
 
 ### The pairing crumb
 
