@@ -363,9 +363,51 @@ def append_residue_report(
         f.write("\n".join(lines))
 
 
-def append_query_report(results: list[dict[str, Any]], report_path: Path) -> None:
+def _query_ingestion_block(report: dict[str, Any]) -> list[str]:
+    """The ingestion-health block of a query-benchmark section (#275).
+
+    The query benchmark ingests its OWN graph, and used to discard the
+    resulting metrics -- so its section could show a clean sweep of query
+    latencies measured over a graph that had silently dropped commits.
+
+    _stderr_capture_row / _skipped_commits_row / _error_signals_row are reused
+    verbatim rather than re-rendered from the same keys. That is the point: an
+    Ingestion Run section and a Query Correctness Run section must not be able
+    to disagree about how a dirty run reads.
+    """
+    metrics = report.get("ingestion")
+    if metrics is None:
+        return [
+            "",
+            "Ingestion phase (#275): **not measured** -- this report carries no "
+            "ingestion metrics, so nothing is known about the graph these "
+            "latencies were measured over.",
+        ]
+    return [
+        "",
+        "Ingestion phase (#275) -- the graph these latencies were measured over:",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        f"| Commits ingested | {metrics.get('commits_ingested', 'not measured')} |",
+        f"| Final status | {metrics.get('final_status', 'not measured')} |",
+        _stderr_capture_row(metrics),
+        _skipped_commits_row(metrics),
+        _error_signals_row(metrics),
+    ]
+
+
+def append_query_report(report: dict[str, Any], report_path: Path) -> None:
     """Append a dated query-correctness section to report_path, creating it
-    with the shared header first if it doesn't exist yet."""
+    with the shared header first if it doesn't exist yet.
+
+    Takes the {"entries": [...], "ingestion": {...}} report run_query_benchmark
+    returns. No back-compatibility with the bare list it used to take: query
+    results have never been persisted as JSON artifacts, so unlike the
+    ingestion metrics files there is no historical input to re-render -- which
+    is why this function is defensive about the ingestion keys and not about
+    its own argument.
+    """
     if not report_path.exists():
         report_path.write_text(_REPORT_HEADER)
 
@@ -376,7 +418,7 @@ def append_query_report(results: list[dict[str, Any]], report_path: Path) -> Non
         "| ID | Category | Result | minigraf latency | baseline latency |",
         "|---|---|---|---|---|",
     ]
-    for r in results:
+    for r in report["entries"]:
         if r["passed"] is None:
             status = "SKIPPED (manual diff)"
         elif r["passed"]:
@@ -388,6 +430,7 @@ def append_query_report(results: list[dict[str, Any]], report_path: Path) -> Non
             f"{r['minigraf_latency_seconds']*1000:.1f}ms | "
             f"{r['baseline_latency_seconds']*1000:.1f}ms |"
         )
+    lines += _query_ingestion_block(report)
     lines.append("")
 
     with report_path.open("a") as f:

@@ -221,33 +221,91 @@ class TestMetricsJsonBullet:
         assert "- Metrics JSON: not recorded" in report_path.read_text()
 
 
-SAMPLE_QUERY_RESULTS = [
-    {
-        "id": 1, "category": "point-in-time", "passed": True,
-        "actual": [[8]], "expected": [[8]],
-        "minigraf_latency_seconds": 0.003, "baseline_latency_seconds": 0.015,
+SAMPLE_QUERY_REPORT = {
+    "entries": [
+        {
+            "id": 1, "category": "point-in-time", "passed": True,
+            "actual": [[8]], "expected": [[8]],
+            "minigraf_latency_seconds": 0.003, "baseline_latency_seconds": 0.015,
+        },
+        {
+            "id": 2, "category": "delta", "passed": None,
+            "actual": None, "expected": None,
+            "minigraf_latency_seconds": 0.0, "baseline_latency_seconds": 0.0,
+        },
+    ],
+    "ingestion": {
+        "commits_ingested": 12, "final_status": "complete",
+        "stderr_capture_complete": True, "skipped_commits": [], "error_signals": [],
     },
-    {
-        "id": 2, "category": "delta", "passed": None,
-        "actual": None, "expected": None,
-        "minigraf_latency_seconds": 0.0, "baseline_latency_seconds": 0.0,
-    },
-]
+}
 
 
 class TestAppendQueryReport:
     def test_creates_report_with_header_if_missing(self, tmp_path):
         report_path = tmp_path / "benchmark.md"
-        append_query_report(SAMPLE_QUERY_RESULTS, report_path)
+        append_query_report(SAMPLE_QUERY_REPORT, report_path)
         assert report_path.read_text().startswith("# At-Scale Code-Graph Benchmark")
 
     def test_reports_pass_fail_and_skipped(self, tmp_path):
         report_path = tmp_path / "benchmark.md"
-        append_query_report(SAMPLE_QUERY_RESULTS, report_path)
+        append_query_report(SAMPLE_QUERY_REPORT, report_path)
         text = report_path.read_text()
         assert "## Query Correctness Run" in text
         assert "PASS" in text
         assert "SKIPPED (manual diff)" in text
+
+    def test_a_clean_ingestion_phase_is_reported(self, tmp_path):
+        report_path = tmp_path / "benchmark.md"
+        append_query_report(SAMPLE_QUERY_REPORT, report_path)
+        text = report_path.read_text()
+        assert "Ingestion phase (#275)" in text
+        assert "| Commits ingested | 12 |" in text
+        assert "| Stderr capture (#256) | complete |" in text
+        assert "| Commits dropped (#256) | 0 |" in text
+        assert "| Error signatures (#251/#256) | 0 |" in text
+
+    def test_a_dirty_ingestion_phase_is_visible_beside_the_latencies(self, tmp_path):
+        """#275: the latencies are the reason this matters. Query numbers
+        measured over a graph that silently lost commits are not comparable to
+        ones that were not, and the section used to render them identically.
+        """
+        report = {
+            **SAMPLE_QUERY_REPORT,
+            "ingestion": {
+                **SAMPLE_QUERY_REPORT["ingestion"],
+                "skipped_commits": ["deadbee1", "cafe002"],
+            },
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_query_report(report, report_path)
+        text = report_path.read_text()
+        assert "| Commits dropped (#256) | **2**" in text
+        assert "deadbee1" in text
+
+    def test_a_truncated_capture_is_flagged_in_the_query_section_too(self, tmp_path):
+        # Rendered by the SAME helper the ingestion section uses, so the two
+        # cannot disagree about how a dirty run reads.
+        report = {
+            **SAMPLE_QUERY_REPORT,
+            "ingestion": {
+                **SAMPLE_QUERY_REPORT["ingestion"],
+                "stderr_capture_complete": False,
+                "tee_failure": "TeeStderrFailure('pump did not complete cleanly')",
+            },
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_query_report(report, report_path)
+        text = report_path.read_text()
+        assert "INCOMPLETE" in text
+        assert "LOWER BOUNDS" in text
+
+    def test_an_absent_ingestion_key_renders_not_measured(self, tmp_path):
+        report_path = tmp_path / "benchmark.md"
+        append_query_report({"entries": SAMPLE_QUERY_REPORT["entries"]}, report_path)
+        text = report_path.read_text()
+        assert "Ingestion phase (#275)" in text
+        assert "not measured" in text
 
 
 # A verdict as probe_provisional_residue.main() builds it -- keys copied

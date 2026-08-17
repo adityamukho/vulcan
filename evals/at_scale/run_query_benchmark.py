@@ -167,7 +167,7 @@ def main() -> int:
     from evals.at_scale.report import append_query_report
 
     report_path = REPO_ROOT / "evals" / "at_scale" / "benchmark.md"
-    append_query_report(report["entries"], report_path)
+    append_query_report(report, report_path)
     print(json.dumps(report, indent=2))
     print(f"\nAppended to {report_path}")
     return _exit_code(report)
