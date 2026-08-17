@@ -1060,6 +1060,170 @@ def test_concurrent_rebuild_race_against_a_corrupted_file_is_safe(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# #274: the three tests below pin the two halves of rebuild_index's recovery
+# loop that the 8-racer test above only exercises probabilistically (it failed
+# roughly 2 runs in 30 on Python 3.10 before this fix, which is why CI caught
+# it on PR #273 and local runs did not). Each drives the SAME interleaving
+# deterministically by orchestrating WHEN a real racing unlink lands, using
+# real sqlite3 connections against real files throughout -- no faked
+# exceptions, in keeping with this module's real-sqlite3-only convention.
+# ---------------------------------------------------------------------------
+
+
+def _connect_hook(monkeypatch, target_path, side_effect):
+    """Run side_effect(real_connect) immediately after rebuild_index's FIRST
+    connect to target_path -- inside the window where the connection is open
+    but has not yet executed a statement, which is where a racing process's
+    unlink lands in the real failure.
+
+    side_effect is handed the UNPATCHED connect so a racer it simulates can
+    open databases of its own without counting as one of rebuild_index's
+    attempts. Returns the list of connected paths, so a test can prove how
+    many attempts the loop made.
+    """
+    real_connect = fact_index.sqlite3.connect
+    calls = []
+
+    def hooked(path_arg, *args, **kwargs):
+        con = real_connect(path_arg, *args, **kwargs)
+        calls.append(path_arg)
+        if path_arg == target_path and len(calls) == 1:
+            side_effect(real_connect)
+        return con
+
+    monkeypatch.setattr(fact_index.sqlite3, "connect", hooked)
+    return calls
+
+
+def test_rebuild_index_does_not_remove_a_file_it_never_diagnosed(tmp_path, monkeypatch):
+    """The corruption branch's os.remove must delete only the file this
+    process actually diagnosed as corrupt, not whatever happens to sit at the
+    path by the time it gets there. A racer that recovers first replaces the
+    corrupt file with a NEW database; a straggler still in its own corruption
+    branch would otherwise unlink that replacement -- a file it never
+    inspected -- purely because it shares the path.
+
+    Ablation: with the identity guard removed, this fails because the
+    replacement's inode is gone from the path afterwards."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    corrupt_keepalive = str(tmp_path / "corrupt.keepalive")
+    with open(path, "wb") as f:
+        f.write(b"not a real sqlite file at all, just garbage bytes")
+    # A hard link keeps the corrupt inode ALIVE after the path stops pointing
+    # at it, so this process's open connection still reads real garbage and
+    # takes the corruption branch. Without it the inode would be unlinked and
+    # sqlite would raise a transient I/O error instead -- the other test's
+    # path, not this one's.
+    os.link(path, corrupt_keepalive)
+
+    replacement = str(tmp_path / "replacement.sqlite3")
+    replaced_inode = []
+
+    def racer_replaces_the_corrupt_file(real_connect):
+        # A different, valid database atomically takes the corrupt file's
+        # place -- exactly what the winning racer's rebuild leaves behind.
+        con = real_connect(replacement, isolation_level=None)
+        con.execute("CREATE TABLE marker (a)")
+        con.close()
+        os.replace(replacement, path)
+        # Recorded HERE, not after rebuild_index returns -- comparing the
+        # final inode against itself would assert nothing.
+        replaced_inode.append(os.stat(path).st_ino)
+
+    _connect_hook(monkeypatch, path, racer_replaces_the_corrupt_file)
+    fact_index.rebuild_index(
+        path, [(":decision/x", ":description", "survivor", None, None)]
+    )
+
+    # The replacement must still be the file at the path: same inode, never
+    # unlinked and re-created underneath us.
+    assert replaced_inode, "the racing replacement never ran"
+    assert os.stat(path).st_ino == replaced_inode[0]
+    con = fact_index.open_reader(path)
+    try:
+        rows = con.execute("SELECT entity FROM facts_fts").fetchall()
+    finally:
+        con.close()
+    assert rows == [(":decision/x",)]
+
+
+def test_rebuild_index_retries_when_its_file_is_unlinked_mid_attempt(tmp_path, monkeypatch):
+    """The exact #274 CI failure, driven deterministically. A racer's
+    corruption branch unlinks the brand-new empty database that THIS
+    process's connect just created; the next statement on that now-unlinked
+    inode raises OperationalError('disk I/O error') -- a message matching
+    neither 'locked'/'busy' nor the corruption substrings, so it used to
+    propagate and fail the run. It is transient: retrying recreates the file.
+
+    Note the victim here is a freshly-created EMPTY database, and the process
+    that loses it is one that found no file at the path at all -- so a guard
+    keyed on 'the file that was at this path when I started' cannot see the
+    substitution (there was no file to name). The guard must key on the file
+    the connection is actually using.
+
+    Ablation: without the fix this raises sqlite3.OperationalError."""
+    path = str(tmp_path / "t.fts.sqlite3")
+    assert not os.path.exists(path)
+
+    def racer_unlinks_our_new_file(_real_connect):
+        # connect() created the file eagerly; a racing corruption branch
+        # removes it by path before we execute anything against it.
+        os.remove(path)
+
+    calls = _connect_hook(monkeypatch, path, racer_unlinks_our_new_file)
+    fact_index.rebuild_index(
+        path, [(":decision/x", ":description", "recovered", None, None)]
+    )
+
+    assert len(calls) > 1, "expected the loop to retry after the unlink"
+    con = fact_index.open_reader(path)
+    try:
+        rows = con.execute("SELECT entity FROM facts_fts").fetchall()
+    finally:
+        con.close()
+    assert rows == [(":decision/x",)]
+
+
+def test_rebuild_index_still_raises_when_the_file_is_intact(tmp_path, monkeypatch):
+    """Negative control for the widened retry: an OperationalError whose file
+    is still exactly the file we opened is NOT transient, so it must
+    propagate on the first attempt rather than being absorbed by six
+    backoffs. A read-only database yields 'attempt to write a readonly
+    database' -- one of the very messages the retry gate now tolerates when
+    the file has been swapped -- so this proves the gate keys on file
+    identity and not on the message text."""
+    import pytest
+    if os.geteuid() == 0:
+        pytest.skip("root ignores the read-only permission bits this relies on")
+    path = str(tmp_path / "t.fts.sqlite3")
+    fact_index.rebuild_index(path, [(":decision/x", ":description", "intact", None, None)])
+    # Drop the WAL sidecars so the reopen below has to write the main file.
+    for suffix in ("-wal", "-shm"):
+        if os.path.exists(path + suffix):
+            os.remove(path + suffix)
+    os.chmod(path, 0o444)
+
+    real_connect = fact_index.sqlite3.connect
+    calls = []
+
+    def counting(path_arg, *args, **kwargs):
+        calls.append(path_arg)
+        return real_connect(path_arg, *args, **kwargs)
+
+    try:
+        monkeypatch.setattr(fact_index.sqlite3, "connect", counting)
+        with pytest.raises(sqlite3.OperationalError):
+            fact_index.rebuild_index(
+                path, [(":decision/y", ":description", "denied", None, None)]
+            )
+    finally:
+        # Restore write permission so pytest's tmp_path cleanup can remove it.
+        os.chmod(path, 0o644)
+
+    assert len(calls) == 1, f"a fatal error must not be retried, got {len(calls)} attempts"
+
+
+# ---------------------------------------------------------------------------
 # _tokenize / _MEMORY_PREFIXES -- ported (Task 13 coverage-gap fill) from the
 # deleted mcp_server.py TestBM25Tokenize, whose subject (mcp_server._tokenize
 # / mcp_server._MEMORY_PREFIXES) no longer exists: fact text is now indexed

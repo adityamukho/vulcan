@@ -1,0 +1,82 @@
+name: Fact index race stress
+
+# The #274 failure is probabilistic: rebuild_index's recovery loop only breaks
+# when several racing processes interleave a specific way, so a single run of
+# tests/test_fact_index.py proves very little. Measured on Python 3.10 before
+# the fix, the 8-racer test failed roughly 2 runs in 30 -- which is why CI
+# caught it on PR #273 while local runs (and the other interpreters in the
+# matrix) stayed green. Repeating the test many times converts that into a
+# signal a single PR run can actually rely on.
+#
+# 3.10 is not special to the bug -- the misclassified errors reproduce
+# identically on 3.12 and 3.14 -- it is simply the interpreter whose runner
+# timing surfaced the interleaving most often, so it is the cheapest place to
+# watch for a regression.
+#
+# Deliberately NOT part of the pytest.yml matrix: at ~60 repetitions this
+# takes minutes, and running it on every push to every file would tax CI for
+# a race that only fact_index.py's recovery loop can reintroduce.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "How many times to repeat the concurrency tests"
+        required: false
+        default: "60"
+      python-version:
+        description: "Interpreter to stress"
+        required: false
+        default: "3.10"
+  pull_request:
+    paths:
+      - "fact_index.py"
+      - "tests/test_fact_index.py"
+      - ".github/workflows/fact-index-race.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ github.event.inputs.python-version || '3.10' }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,git-ingestion]"
+
+      - name: Report interpreter and SQLite build
+        # The failure modes here are SQLite's, not Python's, so the SQLite
+        # version is the number worth having in the log when triaging.
+        run: |
+          python -c "import sys, sqlite3; print('python', sys.version); print('sqlite', sqlite3.sqlite_version)"
+
+      - name: Repeat the concurrency tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          RUNS: ${{ github.event.inputs.runs || '60' }}
+        run: |
+          set -u
+          failures=0
+          for i in $(seq 1 "$RUNS"); do
+            if ! python -m pytest -q -p no:randomly \
+                tests/test_fact_index.py -k "concurrent or unlinked_mid_attempt or never_diagnosed or file_is_intact" \
+                > "run_${i}.log" 2>&1; then
+              failures=$((failures + 1))
+              echo "::error::iteration ${i} failed"
+              cat "run_${i}.log"
+            fi
+          done
+          echo "iterations=$RUNS failures=$failures"
+          # Any single failure is a real defect: these tests must hold every
+          # run, not most runs.
+          test "$failures" -eq 0
