@@ -20,9 +20,9 @@ def _relative_to_report(path: Any, report_path: Path) -> str:
     benchmark.md lives at evals/at_scale/benchmark.md and the artifacts it
     names live at evals/at_scale/results/, so the useful rendering is
     `results/ingestion-<ts>.json`. Falls back to the absolute path when the
-    two share no common root -- an artifact copied off a run host, or a
-    tmp_path under test -- because a `../../../tmp/...` chain is worse than
-    an absolute path for a human reader.
+    artifact is not under the report's directory -- an artifact copied off a
+    run host, or a tmp_path under test -- because a `../../../tmp/...` chain
+    is worse than an absolute path for a human reader.
 
     Both sides are resolved first so a symlinked temp root (macOS's
     /var -> /private/var) does not defeat the relative case.
@@ -188,6 +188,74 @@ def _error_signals_row(metrics: dict[str, Any]) -> str:
     )
 
 
+def _residue_verdict_row(result: dict[str, Any]) -> str:
+    """The "Verdict" row (#256/#276): the M <= N reading, in words.
+
+    The numbers alone do not carry the verdict -- `M <= N` is not the
+    comparison a reader would guess (equality would fail on a healthy graph,
+    and so would M == 0, since a non-empty residue is the correction sweep's
+    documented fail-safe). Spelling the reading out is the point of putting
+    this in a human record at all.
+    """
+    ok = result.get("ok")
+    if ok is None:
+        return (
+            "| Verdict (#256) | not measured "
+            "(result JSON carries no `ok` key) |"
+        )
+    if ok:
+        return (
+            "| Verdict (#256) | OK -- M <= N: provisional residue is within "
+            "the correction sweep's own accounting |"
+        )
+    return (
+        "| Verdict (#256) | **FAILED** -- M > N: provisional state the sweep "
+        "never accounted for (the #251 signature) |"
+    )
+
+
+def _residue_count_row(label: str, result: dict[str, Any], key: str) -> str:
+    """One of the residue section's plain integer rows, rendered the same
+    defensive way _poll_duty_row is: an absent key says so rather than
+    rendering 0, which here would read as a clean measurement of an empty
+    graph.
+    """
+    value = result.get(key)
+    if value is None:
+        return f"| {label} | not measured (absent from the result JSON) |"
+    return f"| {label} | {value} |"
+
+
+def _residue_breakdown_row(result: dict[str, Any]) -> str:
+    """The per-entity-type breakdown of M.
+
+    Three distinct states, and collapsing any two of them loses information:
+    an ABSENT key is unmeasured; an EMPTY dict is a measured zero (the
+    healthy case, and the common one); a populated dict names where the
+    residue sits.
+    """
+    breakdown = result.get("breakdown_by_entity_type")
+    if breakdown is None:
+        return (
+            "| Provisional by entity type | not measured "
+            "(absent from the result JSON) |"
+        )
+    if not breakdown:
+        return "| Provisional by entity type | none |"
+    rendered = ", ".join(f"{name}: {count}" for name, count in sorted(breakdown.items()))
+    return f"| Provisional by entity type | {rendered} |"
+
+
+def _residue_path_row(label: str, value: Any, report_path: Path) -> str:
+    """An artifact-path row. Absence renders "not recorded", never an empty
+    cell, so a reader can tell a path that was not captured from one that was
+    captured as blank.
+    """
+    if value is None:
+        return f"| {label} | not recorded |"
+    return f"| {label} | `{_relative_to_report(value, report_path)}` |"
+
+
 def append_ingestion_report(
     metrics: dict[str, Any],
     report_path: Path,
@@ -246,6 +314,50 @@ def append_ingestion_report(
             f"| Path-ignore bloat reduction | {comp['delta_bytes']} bytes |",
         ]
     lines.append("")
+
+    with report_path.open("a") as f:
+        f.write("\n".join(lines))
+
+
+def append_residue_report(
+    result: dict[str, Any],
+    report_path: Path,
+    json_out_path: Path | None = None,
+) -> None:
+    """Append a dated provisional-residue section to report_path (#276).
+
+    Called by probe_provisional_residue.main(), which runs as a SEPARATE
+    PROCESS by design -- it opens the graph with no other handle live, the
+    hazard class #251/#253 came from -- so append_ingestion_report cannot
+    render these numbers itself: they do not exist yet when it runs. This
+    appender keeps that separation intact by consuming a plain dict, exactly
+    as append_ingestion_report consumes a metrics dict; report.py learns
+    nothing about the probe.
+
+    json_out_path is the probe's own verdict JSON. It is a parameter rather
+    than a `result` key because `result` is written to disk BEFORE the report
+    is appended, so folding the path in would either need a second write or
+    leave the on-disk artifact disagreeing with the rendered section.
+    """
+    if not report_path.exists():
+        report_path.write_text(_REPORT_HEADER)
+
+    lines = [
+        "",
+        f"## Provisional Residue — {_utc_timestamp()}",
+        "",
+        "| Metric | Value |",
+        "|---|---|",
+        _residue_verdict_row(result),
+        _residue_count_row("Provisional entities (M)", result, "provisional_entities"),
+        _residue_count_row("Sweep skipped (N)", result, "sweep_skipped"),
+        _residue_count_row("Commits in graph", result, "commits_in_graph"),
+        _residue_breakdown_row(result),
+        _residue_path_row("Graph", result.get("graph_path"), report_path),
+        _residue_path_row("Metrics JSON", result.get("metrics_json"), report_path),
+        _residue_path_row("Residue JSON", json_out_path, report_path),
+        "",
+    ]
 
     with report_path.open("a") as f:
         f.write("\n".join(lines))

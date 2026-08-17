@@ -1,8 +1,14 @@
 import json
+from pathlib import Path
 
 import pytest
 
-from evals.at_scale.report import append_ingestion_report, append_query_report, write_json_result
+from evals.at_scale.report import (
+    append_ingestion_report,
+    append_query_report,
+    append_residue_report,
+    write_json_result,
+)
 
 SAMPLE_METRICS = {
     "repo_path": "/tmp/repo", "branch": "HEAD", "commits_ingested": 2,
@@ -242,3 +248,131 @@ class TestAppendQueryReport:
         assert "## Query Correctness Run" in text
         assert "PASS" in text
         assert "SKIPPED (manual diff)" in text
+
+
+# A verdict as probe_provisional_residue.main() builds it -- keys copied
+# from the committed artifact at
+# evals/at_scale/results/256-provisional-residue.json.
+SAMPLE_RESIDUE = {
+    "provisional_entities": 0,
+    "sweep_skipped": 3,
+    "ok": True,
+    "interpretation": "M <= N: provisional residue is within the correction "
+                      "sweep's own accounting.",
+    "commits_in_graph": 732,
+    "graph_path": "/tmp/bench/at-scale.graph",
+    "metrics_json": "/repo/evals/at_scale/results/ingestion-20260816T194720Z.json",
+    "breakdown_by_entity_type": {},
+    "correction_sweep_summaries": [3],
+}
+
+
+class TestAppendResidueReport:
+    """#276: benchmark.md carried the #256 capture-health rows but not the
+    M <= N verdict those rows exist to qualify, so the durable human record
+    said a run was clean in the capture sense while saying nothing about
+    whether its provisional residue was accounted for.
+    """
+
+    def test_creates_report_with_header_if_missing(self, tmp_path):
+        report_path = tmp_path / "benchmark.md"
+        append_residue_report(SAMPLE_RESIDUE, report_path)
+        assert report_path.read_text().startswith("# At-Scale Code-Graph Benchmark")
+
+    def test_a_clean_verdict_renders_the_numbers_and_the_reading(self, tmp_path):
+        report_path = tmp_path / "benchmark.md"
+        append_residue_report(SAMPLE_RESIDUE, report_path)
+        text = report_path.read_text()
+        assert "## Provisional Residue" in text
+        assert "| Verdict (#256) | OK -- M <= N" in text
+        assert "| Provisional entities (M) | 0 |" in text
+        assert "| Sweep skipped (N) | 3 |" in text
+        assert "| Commits in graph | 732 |" in text
+
+    def test_m_above_n_renders_as_a_failure_not_a_number(self, tmp_path):
+        # The signature this probe exists to detect. It must not be possible
+        # to skim the section and read it as ordinary.
+        result = {**SAMPLE_RESIDUE, "provisional_entities": 7,
+                  "sweep_skipped": 3, "ok": False}
+        report_path = tmp_path / "benchmark.md"
+        append_residue_report(result, report_path)
+        text = report_path.read_text()
+        assert "**FAILED**" in text
+        assert "M > N" in text
+        assert "#251" in text
+
+    def test_second_call_appends_not_overwrites(self, tmp_path):
+        report_path = tmp_path / "benchmark.md"
+        append_residue_report(SAMPLE_RESIDUE, report_path)
+        append_residue_report(SAMPLE_RESIDUE, report_path)
+        assert report_path.read_text().count("## Provisional Residue") == 2
+
+    def test_a_populated_breakdown_is_rendered(self, tmp_path):
+        result = {**SAMPLE_RESIDUE, "provisional_entities": 3,
+                  "breakdown_by_entity_type": {"function": 2, "module": 1}}
+        report_path = tmp_path / "benchmark.md"
+        append_residue_report(result, report_path)
+        assert "| Provisional by entity type | function: 2, module: 1 |" in \
+            report_path.read_text()
+
+    def test_an_empty_breakdown_renders_none_not_not_measured(self, tmp_path):
+        # An empty dict is a MEASURED zero -- the healthy case. Only an
+        # absent key is unmeasured, and conflating the two would make every
+        # clean run look uninspected.
+        report_path = tmp_path / "benchmark.md"
+        append_residue_report(SAMPLE_RESIDUE, report_path)
+        assert "| Provisional by entity type | none |" in report_path.read_text()
+
+    @pytest.mark.parametrize(
+        "key,label",
+        [
+            ("provisional_entities", "Provisional entities (M)"),
+            ("sweep_skipped", "Sweep skipped (N)"),
+            ("commits_in_graph", "Commits in graph"),
+            ("breakdown_by_entity_type", "Provisional by entity type"),
+        ],
+    )
+    def test_an_absent_key_renders_not_measured_and_never_zero(self, tmp_path, key, label):
+        """report.py's standing convention (_poll_duty_row). It matters more
+        here than anywhere else in the file: the nightly workflow does not run
+        this probe, so most benchmark.md entries carry no residue section at
+        all, and a re-rendered older artifact must not be able to manufacture
+        a clean verdict out of missing keys.
+        """
+        result = {k: v for k, v in SAMPLE_RESIDUE.items() if k != key}
+        report_path = tmp_path / "benchmark.md"
+        append_residue_report(result, report_path)
+        row = next(
+            line for line in report_path.read_text().splitlines()
+            if line.startswith(f"| {label} |")
+        )
+        assert "not measured" in row
+        assert "| 0 |" not in row
+        assert "| none |" not in row
+
+    def test_an_absent_verdict_renders_not_measured(self, tmp_path):
+        result = {k: v for k, v in SAMPLE_RESIDUE.items() if k != "ok"}
+        report_path = tmp_path / "benchmark.md"
+        append_residue_report(result, report_path)
+        row = next(
+            line for line in report_path.read_text().splitlines()
+            if line.startswith("| Verdict (#256) |")
+        )
+        assert "not measured" in row
+        assert "OK" not in row
+
+    def test_the_three_artifact_paths_are_recorded(self, tmp_path):
+        report_path = tmp_path / "benchmark.md"
+        out_path = tmp_path / "results" / "256-provisional-residue.json"
+        append_residue_report(SAMPLE_RESIDUE, report_path, out_path)
+        text = report_path.read_text()
+        # Resolved on both sides: _relative_to_report resolves its input, and
+        # /tmp is a symlink on some platforms.
+        assert f"| Graph | `{Path('/tmp/bench/at-scale.graph').resolve()}` |" in text
+        assert "ingestion-20260816T194720Z.json" in text
+        assert "| Residue JSON | `results/256-provisional-residue.json` |" in text
+
+    def test_an_absent_residue_json_path_renders_not_recorded(self, tmp_path):
+        report_path = tmp_path / "benchmark.md"
+        append_residue_report(SAMPLE_RESIDUE, report_path)
+        assert "| Residue JSON | not recorded |" in report_path.read_text()
