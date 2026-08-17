@@ -14,6 +14,39 @@ def _utc_timestamp() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
+def _relative_to_report(path: Any, report_path: Path) -> str:
+    """Render an artifact path relative to the report's own directory.
+
+    benchmark.md lives at evals/at_scale/benchmark.md and the artifacts it
+    names live at evals/at_scale/results/, so the useful rendering is
+    `results/ingestion-<ts>.json`. Falls back to the absolute path when the
+    two share no common root -- an artifact copied off a run host, or a
+    tmp_path under test -- because a `../../../tmp/...` chain is worse than
+    an absolute path for a human reader.
+
+    Both sides are resolved first so a symlinked temp root (macOS's
+    /var -> /private/var) does not defeat the relative case.
+    """
+    resolved = Path(path).resolve()
+    base = Path(report_path).resolve().parent
+    try:
+        return str(resolved.relative_to(base))
+    except ValueError:
+        return str(resolved)
+
+
+def _metrics_json_bullet(json_path: Any, report_path: Path) -> str:
+    """The "- Metrics JSON:" provenance bullet (#276).
+
+    ALWAYS emitted, for the reason _poll_duty_row is: an omitted line is
+    invisible, so a reader could not tell a harness that did not record the
+    path from one that was never asked to.
+    """
+    if json_path is None:
+        return "- Metrics JSON: not recorded (this harness did not write one)"
+    return f"- Metrics JSON: `{_relative_to_report(json_path, report_path)}`"
+
+
 def write_json_result(metrics: dict[str, Any], results_dir: Path, prefix: str = "ingestion") -> Path:
     """Write metrics as machine-readable JSON to results_dir/<prefix>-<ts>.json."""
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -155,9 +188,20 @@ def _error_signals_row(metrics: dict[str, Any]) -> str:
     )
 
 
-def append_ingestion_report(metrics: dict[str, Any], report_path: Path) -> None:
+def append_ingestion_report(
+    metrics: dict[str, Any],
+    report_path: Path,
+    json_path: Path | None = None,
+) -> None:
     """Append a dated ingestion-run section to report_path, creating it with
-    the shared header first if it doesn't exist yet."""
+    the shared header first if it doesn't exist yet.
+
+    json_path is this run's results JSON, recorded so a reader can find the
+    machine-readable artifact -- and through it the paired residue verdict
+    (#276). It is a parameter rather than a metrics key because
+    write_json_result only learns the path by writing the file, so folding it
+    into the dict would need a second write.
+    """
     if not report_path.exists():
         report_path.write_text(_REPORT_HEADER)
 
@@ -166,6 +210,7 @@ def append_ingestion_report(metrics: dict[str, Any], report_path: Path) -> None:
         f"## Ingestion Run — {_utc_timestamp()}",
         "",
         f"- Repo: `{metrics['repo_path']}` @ `{metrics['branch']}`",
+        _metrics_json_bullet(json_path, report_path),
         "",
         "| Metric | Value |",
         "|---|---|",

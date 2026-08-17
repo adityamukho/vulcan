@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from evals.at_scale.report import append_ingestion_report, append_query_report, write_json_result
 
 SAMPLE_METRICS = {
@@ -177,6 +179,40 @@ class TestAppendIngestionReport:
         assert "| Commits dropped (#256) | not measured" in text
         assert "| Error signatures (#251/#256) | not measured" in text
         assert "NOT zero" in text
+
+
+class TestMetricsJsonBullet:
+    """#276: a reader of an Ingestion Run section had no way to find the
+    results JSON it was rendered from, and therefore no way to find the
+    residue JSON that pairs with it. The bullet sits beside `- Repo:` rather
+    than in the metrics table because it is provenance, not a measurement.
+    """
+
+    def test_records_the_metrics_json_relative_to_the_report(self, tmp_path):
+        report_path = tmp_path / "benchmark.md"
+        json_path = tmp_path / "results" / "ingestion-20260817T041942Z.json"
+        append_ingestion_report(SAMPLE_METRICS, report_path, json_path)
+        assert (
+            "- Metrics JSON: `results/ingestion-20260817T041942Z.json`"
+            in report_path.read_text()
+        )
+
+    def test_falls_back_to_the_absolute_path_when_not_under_the_report_dir(self, tmp_path):
+        # An artifact copied off a run host, or a tmp_path in a test. An
+        # absolute path is more useful to a human than a ../../.. chain.
+        report_path = tmp_path / "report" / "benchmark.md"
+        report_path.parent.mkdir()
+        json_path = tmp_path / "elsewhere" / "ingestion-x.json"
+        append_ingestion_report(SAMPLE_METRICS, report_path, json_path)
+        assert f"- Metrics JSON: `{json_path.resolve()}`" in report_path.read_text()
+
+    def test_absence_is_visible_rather_than_a_missing_line(self, tmp_path):
+        # Same reason _poll_duty_row always emits: an omitted line is
+        # invisible, and a reader cannot distinguish "not recorded" from
+        # "nobody looked".
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(SAMPLE_METRICS, report_path)
+        assert "- Metrics JSON: not recorded" in report_path.read_text()
 
 
 SAMPLE_QUERY_RESULTS = [
