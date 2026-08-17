@@ -482,6 +482,33 @@ def query_facts(
     return [[entity, attribute, value, valid_from, valid_to] for entity, attribute, value, valid_from, valid_to, _score in rows]
 
 
+def _file_identity(path: str) -> Optional[Tuple[int, int]]:
+    """(st_dev, st_ino) for the file at path, or None if nothing is there.
+
+    Identifies WHICH file a path currently names, so rebuild_index can tell
+    "the file I opened" from "whatever happens to sit at this path now" after
+    a racing recovery has swapped it. Any OSError (not just
+    FileNotFoundError) reads as "no identifiable file": an unreadable path is
+    equally not-the-file-we-opened for both callers below.
+    """
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _is_still_the_same_file(path: str, identity: Optional[Tuple[int, int]]) -> bool:
+    """True only when path POSITIVELY still names the file `identity` came
+    from. Unknown identity (None) and a vanished path both answer False:
+    callers use this to decide whether they may delete a file or must treat a
+    failure as fatal, and both of those need proof of sameness, not the
+    absence of proof of difference. An unlinked file and a file we could
+    never name are equally "not demonstrably ours".
+    """
+    return identity is not None and _file_identity(path) == identity
+
+
 def rebuild_index(
     path: str,
     facts: Sequence[Tuple[str, str, str, Optional[str], Optional[str]]],
@@ -513,7 +540,29 @@ def rebuild_index(
     attempts = 6
     base_delay = 0.02
     for attempt in range(attempts):
+        # Which file this attempt is about to work on (#274). Sampled BEFORE
+        # connect so a racer that swaps the path afterwards is detectable;
+        # when the path is empty, sqlite3.connect creates the file eagerly
+        # (before any statement runs), so re-sampling after it yields the
+        # identity of the file this connection actually holds. That second
+        # sample is the load-bearing one: the failure this guards against
+        # struck a process that found NO file at the path, had connect create
+        # one, and then lost it to a racer's unlink -- an interleaving that a
+        # before-connect sample alone cannot see, because there was no file
+        # to name at the time.
+        #
+        # Not airtight, and cannot be: a racer that swaps the path in the
+        # window between this stat and the connect leaves us holding an
+        # identity for a file we did not open. Closing that would need the
+        # inode of the connection's own descriptor, which sqlite3 does not
+        # expose. The window is orders of magnitude smaller than the one this
+        # replaces (a whole rebuild, vs. two adjacent syscalls), and both
+        # callers of the comparison fail safe -- they skip a delete, or take a
+        # bounded retry.
+        identity = _file_identity(path)
         con = sqlite3.connect(path, timeout=5.0, isolation_level=None)
+        if identity is None:
+            identity = _file_identity(path)
         try:
             con.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
             con.execute("PRAGMA journal_mode=WAL")
@@ -554,7 +603,30 @@ def rebuild_index(
             return
         except sqlite3.OperationalError as e:
             message = str(e).lower()
-            if "locked" not in message and "busy" not in message:
+            # Two kinds of transient. Lock/busy contention names itself in the
+            # message. The other kind (#274) does not: when a racing recovery
+            # unlinks or replaces the file mid-attempt, the statements still
+            # running against that now-orphaned inode fail with messages that
+            # describe the SYMPTOM, not the race -- observed as "disk I/O
+            # error", "attempt to write a readonly database" and "unable to
+            # open database file", and varying by which statement happened to
+            # touch the file first. Matching those strings would be wrong in
+            # both directions: they equally name genuinely fatal conditions
+            # (a full disk, a read-only mount), and the list is open-ended.
+            # So gate on evidence instead, and demand the evidence point at
+            # FATAL: re-raise only when the path positively still holds the
+            # same file we opened. Anything else -- a different file, or no
+            # file at all -- is the race. Note the asymmetry is deliberate:
+            # "no file at the path" cannot mean "we were never able to make
+            # one", because sqlite3.connect() runs OUTSIDE this try block, so
+            # an unwritable directory already raised there and never reaches
+            # this classifier. Reaching here with the path empty means the
+            # file existed and something unlinked it.
+            if (
+                "locked" not in message
+                and "busy" not in message
+                and _is_still_the_same_file(path, identity)
+            ):
                 raise
             if attempt == attempts - 1:
                 raise
@@ -574,16 +646,33 @@ def rebuild_index(
                 raise
             if attempt == attempts - 1:
                 raise
-            # TOCTOU: a concurrently-racing rebuild against the same
-            # corrupted file can already have removed it by the time this
-            # process gets here (unlike lock/busy contention, corruption is
-            # a static file property every racer detects at once, not a
-            # timing-dependent one) -- swallow the resulting FileNotFoundError
-            # rather than letting it propagate uncaught, since the file being
-            # gone is exactly the outcome this branch wants anyway.
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                pass
+            # Remove only the file we actually diagnosed (#274). This used to
+            # unlink by path unconditionally, which is a different and wider
+            # act: every racer detects this corruption at the same instant
+            # (it is a static property of the file, unlike timing-dependent
+            # lock contention), so by the time a straggler reaches here the
+            # winner has typically already removed the corrupt file and a NEW
+            # database sits in its place -- and the straggler would delete
+            # that replacement, a file it never inspected, purely for sharing
+            # the path. That is what broke the 8-racer test. Measured there,
+            # the deleted replacement was an EMPTY database that another
+            # racer's sqlite3.connect had just created (connect creates the
+            # file before any statement runs), and that racer's next
+            # statement then failed on the orphaned inode.
+            #
+            # A mismatch here means some other racer already did this branch's
+            # work, so skipping the removal IS the correct outcome, not a
+            # missed cleanup. The next attempt re-samples the identity and
+            # will remove the new file if that one is corrupt too.
+            #
+            # TOCTOU: the file can still vanish between this check and the
+            # unlink (another racer removing the very same file), so keep
+            # swallowing FileNotFoundError -- the file being gone is exactly
+            # what this branch wants anyway.
+            if _is_still_the_same_file(path, identity):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
         finally:
             con.close()
