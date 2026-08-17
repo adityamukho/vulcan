@@ -51,8 +51,9 @@ class TestExitCode:
             {"error_signals": [{"pattern": "page_out_of_bounds"}]},
             {"stderr_capture_complete": False},
             {"final_status": "error"},
+            {"tee_failure": "TeeStderrFailure('pump did not complete cleanly')"},
         ],
-        ids=["dropped-commit", "error-signature", "truncated-capture", "errored-run"],
+        ids=["dropped-commit", "error-signature", "truncated-capture", "errored-run", "tee-failure"],
     )
     def test_each_unclean_ingestion_clause_fails_the_run_on_its_own(self, override):
         """#275: the fail-open. Every query entry passes here; the graph those
