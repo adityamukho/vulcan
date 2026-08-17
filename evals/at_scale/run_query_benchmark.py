@@ -20,20 +20,51 @@ REPO_ROOT = Path(__file__).parent.parent.parent.resolve()
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from evals.at_scale.run_ingestion_benchmark import run_ingestion_benchmark  # noqa: E402
+from evals.at_scale.run_ingestion_benchmark import (  # noqa: E402
+    _exit_code as _ingestion_exit_code,
+    run_ingestion_benchmark,
+)
+
+# poll_offsets is the ONE key dropped from the ingestion metrics, on two
+# grounds that both have to hold: it is unbounded (one float per poll --
+# thousands on a full-history run, and this dict is printed to stdout), and it
+# is the only key run_ingestion_benchmark._exit_code does not read.
+#
+# Everything else is kept WHOLE and deliberately. Hand-picking the health keys
+# (skipped_commits / error_signals / stderr_capture_complete) would drift the
+# moment _exit_code grows a clause -- and _exit_code is precisely what this
+# module delegates to, so a stale subset would silently reinstate the fail-open
+# #275 exists to close.
+_DROPPED_INGESTION_KEYS = ("poll_offsets",)
+
+
+def _ingestion_health(metrics: dict[str, Any]) -> dict[str, Any]:
+    """The ingestion metrics this benchmark carries forward (#275)."""
+    return {k: v for k, v in metrics.items() if k not in _DROPPED_INGESTION_KEYS}
 
 
 async def run_query_benchmark(
     repo_path: str,
     graph_path: Path,
     ground_truth_path: Path,
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
+    """Run the query-correctness benchmark, returning both the per-entry
+    results and the health of the ingestion that built the graph they were
+    measured over (#275).
+
+    Returns {"entries": [...], "ingestion": {...}}. The ingestion half used to
+    be discarded; query latencies measured over a graph that silently lost
+    commits are not comparable to ones that were not, and nothing else in this
+    module can see that loss.
+    """
     import mcp_server
 
     ground_truth = json.loads(ground_truth_path.read_text())
     pinned_ref = ground_truth.get("pinned_commit") or "HEAD"
 
-    await run_ingestion_benchmark(repo_path, pinned_ref, graph_path, poll_interval=0.05)
+    metrics = await run_ingestion_benchmark(
+        repo_path, pinned_ref, graph_path, poll_interval=0.05
+    )
 
     results: list[dict[str, Any]] = []
     for entry in ground_truth["entries"]:
@@ -86,16 +117,35 @@ async def run_query_benchmark(
             "baseline_latency_seconds": baseline_latency,
         })
 
-    return results
+    return {"entries": results, "ingestion": _ingestion_health(metrics)}
 
 
-def _exit_code(results: list[dict[str, Any]]) -> int:
-    """Return 1 if any scored entry failed (passed is False), else 0.
+def _exit_code(report: dict[str, Any]) -> int:
+    """Return 1 if any scored entry failed, or if the ingestion phase that
+    built the graph was unclean; else 0.
+
+    The second clause is #275. This benchmark ingests its own graph and used to
+    drop the resulting metrics on the floor, so it could report success over a
+    graph that dropped commits, logged a #251 signature, or ran with a broken
+    stderr capture -- the same fail-open shape #256 spent its review cycle
+    removing from the ingestion benchmark, surviving in the entry point that
+    branch did not cover.
+
+    run_ingestion_benchmark._exit_code is IMPORTED, never reimplemented: its
+    clauses are the definition of "unclean", and a copy here would go stale the
+    first time one is added.
 
     Unscored entries (passed is None, e.g. manual-diff-only delta entries)
-    never affect the exit code -- only an explicit False does.
+    never affect the exit code -- only an explicit False does. An absent
+    "ingestion" key evaluates as clean, matching that function's own
+    .get()-everywhere posture toward inputs that predate an instrument.
     """
-    return 1 if any(r.get("passed") is False for r in results) else 0
+    if any(r.get("passed") is False for r in report["entries"]):
+        return 1
+    ingestion = report.get("ingestion")
+    if ingestion is not None and _ingestion_exit_code(ingestion):
+        return 1
+    return 0
 
 
 def main() -> int:
@@ -110,17 +160,17 @@ def main() -> int:
     import tempfile
     with tempfile.TemporaryDirectory(prefix="minigraf-at-scale-query-") as tmpdir:
         graph_path = Path(tmpdir) / "bench.graph"
-        results = asyncio.run(
+        report = asyncio.run(
             run_query_benchmark(args.repo_path, graph_path, Path(args.ground_truth))
         )
 
     from evals.at_scale.report import append_query_report
 
     report_path = REPO_ROOT / "evals" / "at_scale" / "benchmark.md"
-    append_query_report(results, report_path)
-    print(json.dumps(results, indent=2))
+    append_query_report(report, report_path)
+    print(json.dumps(report, indent=2))
     print(f"\nAppended to {report_path}")
-    return _exit_code(results)
+    return _exit_code(report)
 
 
 if __name__ == "__main__":
