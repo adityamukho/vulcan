@@ -23453,3 +23453,114 @@ class TestTraceWorkCounters:
         c = mcp_server._trace_work_counters(files)
         assert c["files_by_status"] == {"R": 1}
         assert c["idents_considered"] == 3
+
+
+class TestIngestTrace:
+    """#260: _IngestTrace appends one JSON object per commit to a JSONL file."""
+
+    @staticmethod
+    def _files(functions=1):
+        return [("M", "b.py", {}, {
+            "module_ident": ":module/b",
+            "function_entries": [(f":function/f{i}", f"f{i}", []) for i in range(functions)],
+            "class_entries": [], "global_entries": [], "field_entries": [],
+            "resolved_imports": [], "unchanged_idents": set(),
+        }, "")]
+
+    def _read(self, path):
+        import json
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+    def test_emits_one_json_object_per_commit(self, tmp_path):
+        import mcp_server
+        path = tmp_path / "trace.jsonl"
+        trace = mcp_server._IngestTrace(str(path))
+        trace.emit(0, "fwd", "aaa", 0.1, 0.2, self._files(), None)
+        trace.emit(766, "rev", "bbb", 0.3, 0.4, self._files(functions=3), None)
+        trace.close()
+        records = self._read(path)
+        assert len(records) == 2
+        assert trace.records == 2
+        assert [r["pos"] for r in records] == [0, 766]
+        assert [r["tag"] for r in records] == ["fwd", "rev"]
+        assert [r["hash"] for r in records] == ["aaa", "bbb"]
+
+    def test_record_carries_timings_and_work_counters(self, tmp_path):
+        import mcp_server
+        path = tmp_path / "trace.jsonl"
+        trace = mcp_server._IngestTrace(str(path))
+        trace.emit(5, "fwd", "abc", 0.25, 1.5, self._files(functions=4), None)
+        trace.close()
+        r = self._read(path)[0]
+        assert r["await_s"] == 0.25
+        assert r["apply_s"] == 1.5
+        # Task 1's counters are embedded, not recomputed here.
+        assert r["idents_considered"] == 5  # 1 module + 4 functions
+        assert r["n_functions"] == 4
+        assert r["files_by_status"] == {"M": 1}
+
+    def test_t_since_start_is_measured_from_construction(self, tmp_path):
+        """A fake clock, so this asserts the arithmetic rather than a duration."""
+        import mcp_server
+        ticks = iter([100.0, 103.5, 107.25])
+        trace = mcp_server._IngestTrace(str(tmp_path / "t.jsonl"), clock=lambda: next(ticks))
+        trace.emit(0, "fwd", "a", 0.0, 0.0, [], None)
+        trace.emit(1, "fwd", "b", 0.0, 0.0, [], None)
+        trace.close()
+        records = self._read(tmp_path / "t.jsonl")
+        assert records[0]["t_since_start"] == 3.5
+        assert records[1]["t_since_start"] == 7.25
+
+    def test_checkpoint_deltas_are_differences_not_totals(self, tmp_path):
+        """The policy's counters are CUMULATIVE. The trace must record the
+        per-commit delta -- recording the totals would make every downstream
+        per-checkpoint mean monotonically wrong, and the control gate reads
+        exactly these two fields."""
+        import mcp_server
+        path = tmp_path / "trace.jsonl"
+        policy = mcp_server._CheckpointPolicy(0.05)
+        trace = mcp_server._IngestTrace(str(path))
+
+        policy.checkpoints, policy.total_seconds = 1, 0.50
+        trace.emit(0, "fwd", "a", 0.0, 0.0, [], policy)
+        policy.checkpoints, policy.total_seconds = 1, 0.50   # no checkpoint here
+        trace.emit(1, "fwd", "b", 0.0, 0.0, [], policy)
+        policy.checkpoints, policy.total_seconds = 3, 2.75
+        trace.emit(2, "fwd", "c", 0.0, 0.0, [], policy)
+        trace.close()
+
+        records = self._read(path)
+        assert [r["ckpt_d_count"] for r in records] == [1, 0, 2]
+        assert [round(r["ckpt_d_seconds"], 6) for r in records] == [0.50, 0.0, 2.25]
+
+    def test_none_policy_records_zero_deltas_and_does_not_raise(self, tmp_path):
+        """_run_ingestion clears _ingest_checkpoint_policy at its terminal
+        paths, so emit must tolerate None rather than making the trace the
+        reason a run dies."""
+        import mcp_server
+        path = tmp_path / "trace.jsonl"
+        trace = mcp_server._IngestTrace(str(path))
+        trace.emit(0, "fwd", "a", 0.0, 0.0, [], None)
+        trace.close()
+        r = self._read(path)[0]
+        assert r["ckpt_d_count"] == 0
+        assert r["ckpt_d_seconds"] == 0.0
+
+    def test_close_is_idempotent(self, tmp_path):
+        """_run_ingestion has TWO terminal finally sites that both clear the
+        policy, so close() can genuinely be reached twice."""
+        import mcp_server
+        trace = mcp_server._IngestTrace(str(tmp_path / "t.jsonl"))
+        trace.emit(0, "fwd", "a", 0.0, 0.0, [], None)
+        trace.close()
+        trace.close()  # must not raise
+
+    def test_records_survive_without_close(self, tmp_path):
+        """A killed run must leave a readable partial trace -- that is the whole
+        point of JSONL over a single JSON document. Each emit flushes."""
+        import mcp_server
+        path = tmp_path / "trace.jsonl"
+        trace = mcp_server._IngestTrace(str(path))
+        trace.emit(0, "fwd", "a", 0.0, 0.0, [], None)
+        assert len(self._read(path)) == 1  # readable before close()
+        trace.close()

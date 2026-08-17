@@ -3749,6 +3749,79 @@ def _trace_work_counters(extracted_files: Sequence[tuple]) -> Dict[str, Any]:
     }
 
 
+class _IngestTrace:
+    """Per-commit cost trace for #260, armed by MINIGRAF_INGEST_TRACE_PATH.
+
+    One JSON object per line, appended as each commit's write half finishes.
+    JSONL rather than a single document so a killed run still leaves a
+    readable partial trace -- at-scale runs take ~30 minutes and the
+    interesting ones are sometimes the ones that die.
+
+    Checkpoint cost is recorded as a DELTA of _CheckpointPolicy's cumulative
+    `checkpoints`/`total_seconds` across each commit, so the policy gains no
+    state of its own. `policy` may be None (the two terminal finally sites in
+    _run_ingestion clear it), which records zero deltas rather than raising:
+    an instrument must never be the reason a run dies.
+
+    Writes only, no locks, no awaits, no DB access -- see this module's
+    _db_native_lock invariant comment for why the per-commit loop tolerates
+    nothing else.
+    """
+
+    def __init__(self, path: str, clock: "Callable[[], float]" = time.monotonic) -> None:
+        self._fh: Optional[Any] = open(path, "a", encoding="utf-8")
+        self._clock = clock
+        self._started_at = clock()
+        self._ckpt_count = 0
+        self._ckpt_seconds = 0.0
+        self.records = 0
+
+    def emit(
+        self,
+        pos: int,
+        tag: str,
+        commit_hash: str,
+        await_s: float,
+        apply_s: float,
+        extracted_files: Sequence[tuple],
+        policy: Optional["_CheckpointPolicy"],
+    ) -> None:
+        if self._fh is None:
+            return
+        if policy is None:
+            d_count, d_seconds = 0, 0.0
+        else:
+            d_count = policy.checkpoints - self._ckpt_count
+            d_seconds = policy.total_seconds - self._ckpt_seconds
+            self._ckpt_count = policy.checkpoints
+            self._ckpt_seconds = policy.total_seconds
+
+        record: Dict[str, Any] = {
+            "pos": pos,
+            "tag": tag,
+            "hash": commit_hash,
+            "t_since_start": self._clock() - self._started_at,
+            "await_s": await_s,
+            "apply_s": apply_s,
+            "ckpt_d_count": d_count,
+            "ckpt_d_seconds": d_seconds,
+        }
+        record.update(_trace_work_counters(extracted_files))
+        self._fh.write(json.dumps(record) + "\n")
+        self._fh.flush()
+        self.records += 1
+
+    def close(self) -> None:
+        """Idempotent -- _run_ingestion has two terminal paths that both
+        release the trace, and either may run first."""
+        if self._fh is None:
+            return
+        try:
+            self._fh.close()
+        finally:
+            self._fh = None
+
+
 def _checkpoint_duty_from_env() -> float:
     """Read MINIGRAF_INGEST_CHECKPOINT_DUTY, falling back to the default on
     anything unparseable or out of range. A typo must not crash ingestion or
