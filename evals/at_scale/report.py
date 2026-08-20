@@ -363,6 +363,89 @@ def append_residue_report(
         f.write("\n".join(lines))
 
 
+def _ratio_row(label: str, value: Any) -> str:
+    """A growth ratio row. None renders `not measured`, NEVER 0.00.
+
+    An undefined ratio means the fit could not be read. Rendering it as a
+    number -- especially a small one -- would make a failed measurement read
+    as a flat result, which is the exact defect #276 was filed about.
+
+    No trailing newline: every other row helper in this file returns a plain
+    line and relies on the caller's "\n".join(lines), and a baked-in \n here
+    would double it.
+    """
+    if value is None:
+        return f"- {label}: not measured"
+    return f"- {label}: {float(value):.2f}x"
+
+
+def _trace_fit_control_gate_row(control_gate: dict[str, Any]) -> str:
+    """The control gate's own pass/fail reading, spelled out the same way
+    _residue_verdict_row spells out M <= N: the raw growth number alone does
+    not carry whether it cleared CONTROL_MIN_GROWTH.
+    """
+    growth = control_gate.get("growth")
+    growth_str = "not measured" if growth is None else f"{float(growth):.2f}x"
+    if control_gate.get("passed"):
+        return f"- Control gate: passed (mean per-checkpoint duration grew {growth_str})"
+    return (
+        f"- Control gate: **FAILED** ({growth_str} growth) -- "
+        f"{control_gate.get('reason', 'reason not recorded')}"
+    )
+
+
+def append_trace_fit_report(
+    result: dict[str, Any],
+    report_path: Path,
+    json_out_path: Path | None = None,
+) -> None:
+    """Append a dated per-commit cost-fit section to report_path (#260).
+
+    Mirrors append_residue_report's shape and separation: probe_per_commit_cost.py
+    runs the traced ingestion and calls trace_fit.analyse in a SEPARATE PROCESS,
+    long after this module could have any opinion about the result, so this
+    appender consumes a plain dict exactly as append_residue_report does.
+
+    The three-state discipline (#275/#276) governs every field here: an absent
+    ratio renders "not measured" via _ratio_row, never 0.00, so a fit that could
+    not be read cannot be mistaken for a flat one; and a VOID verdict (the
+    control gate failed open, see trace_fit.control_gate) is rendered as VOID
+    and never re-derived as CONFOUNDED -- the verdict string is the analysis's
+    own final word, not recomputed here from a_ratio/b_ratio.
+
+    json_out_path is the probe's own artifact JSON, a parameter for the same
+    reason it is on append_residue_report: the result dict is written to disk
+    before this is called, so folding the path in would need a second write.
+    """
+    if not report_path.exists():
+        report_path.write_text(_REPORT_HEADER)
+
+    control_gate = result.get("control_gate", {})
+    group_sizes = result.get("group_sizes", {})
+
+    lines = [
+        "",
+        f"## Per-Commit Cost Fit — {_utc_timestamp()}",
+        "",
+        f"**Verdict: {result.get('verdict', 'not measured')}** -- "
+        f"{result.get('verdict_reason', 'not measured')}",
+        "",
+        _ratio_row("a_ratio (fixed-cost growth)", result.get("a_ratio")),
+        _ratio_row("b_ratio (per-unit-work-cost growth)", result.get("b_ratio")),
+        _trace_fit_control_gate_row(control_gate),
+        f"- Records: {result.get('records', 'not measured')}",
+        f"- Group sizes: first={group_sizes.get('first', 'not measured')}, "
+        f"middle={group_sizes.get('middle', 'not measured')}, "
+        f"last={group_sizes.get('last', 'not measured')}",
+        f"- Commits ingested: {result.get('commits_ingested', 'not measured')}",
+        _metrics_json_bullet(json_out_path, report_path),
+        "",
+    ]
+
+    with report_path.open("a") as f:
+        f.write("\n".join(lines))
+
+
 def _query_ingestion_block(report: dict[str, Any]) -> list[str]:
     """The ingestion-health block of a query-benchmark section (#275).
 
