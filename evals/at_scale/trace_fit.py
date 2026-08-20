@@ -51,9 +51,7 @@ REAL_AT = 2.0
 #: much, or the method has failed open and the run is VOID.
 CONTROL_MIN_GROWTH = 2.0
 
-#: Fewer checkpoints than this, combined across both groups, makes the
-#: control unevaluable. See control_gate's docstring for why it is combined
-#: rather than per-group.
+#: Fewer checkpoints than this in either group makes the control unevaluable.
 CONTROL_MIN_CHECKPOINTS = 5
 
 #: Fewer records than this in a group makes its fit untrustworthy.
@@ -131,18 +129,16 @@ def control_gate(first: list[dict], last: list[dict]) -> dict:
     grows, so the total is designed not to grow while each checkpoint still
     does; gating on the total would fail on healthy behaviour.
 
-    CONTROL_MIN_CHECKPOINTS is checked against the COMBINED count across both
-    groups, not each group individually: the mean is only meaningful once
-    there is enough data to trust it at all, and a lopsided but nonzero split
-    (e.g. 10 checkpoints early, 1 late, as ingestion's own checkpoint duty
-    naturally produces) is still evaluable once the combined count clears the
-    floor. Each side still needs a nonzero count -- dividing by zero is never
-    meaningful regardless of the other side.
+    CONTROL_MIN_CHECKPOINTS is checked against EACH group individually, not
+    their combined count: a "mean" drawn from a single checkpoint carries
+    none of the averaging the floor exists to provide, so a group short on
+    checkpoints must report unevaluable on its own rather than being
+    rescued by the other group's count.
     """
     def mean(group: list[dict]) -> tuple[Optional[float], int]:
         count = sum(int(r.get("ckpt_d_count", 0)) for r in group)
         seconds = sum(float(r.get("ckpt_d_seconds", 0.0)) for r in group)
-        if count == 0:
+        if count < CONTROL_MIN_CHECKPOINTS:
             return None, count
         return seconds / count, count
 
@@ -150,10 +146,10 @@ def control_gate(first: list[dict], last: list[dict]) -> dict:
     mean_last, n_last = mean(last)
     growth = growth_ratio(mean_first, mean_last)
 
-    if mean_first is None or mean_last is None or (n_first + n_last) < CONTROL_MIN_CHECKPOINTS:
+    if mean_first is None or mean_last is None:
         reason = (
-            f"unevaluable: need >= {CONTROL_MIN_CHECKPOINTS} checkpoints "
-            f"combined, saw {n_first} (first) and {n_last} (last)"
+            f"unevaluable: need >= {CONTROL_MIN_CHECKPOINTS} checkpoints per "
+            f"group, saw {n_first} (first) and {n_last} (last)"
         )
         passed = False
     elif growth is None:

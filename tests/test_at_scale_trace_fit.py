@@ -134,12 +134,25 @@ class TestControlGate:
     def test_gate_reads_per_checkpoint_mean_not_total(self):
         """Total checkpoint time is DESIGNED not to grow -- the duty policy holds
         it to a fixed fraction of wall clock. Gating on the total would fail on
-        healthy behaviour. Here totals are equal and the means differ 10x."""
-        first = [rec(10, 1.0, ckpt_count=10, ckpt_seconds=1.0)]
-        last = [rec(10, 1.0, ckpt_count=1, ckpt_seconds=1.0)]
+        healthy behaviour. Here totals are equal and the means differ 4x, and
+        both groups individually clear CONTROL_MIN_CHECKPOINTS so the mean
+        comparison is unconfounded by the checkpoint-count floor."""
+        first = [rec(10, 1.0, ckpt_count=4, ckpt_seconds=0.2) for _ in range(5)]  # count=20, total=1.0, mean=0.05
+        last = [rec(10, 1.0, ckpt_count=1, ckpt_seconds=0.2) for _ in range(5)]  # count=5, total=1.0, mean=0.20
         g = trace_fit.control_gate(first, last)
-        assert g["growth"] == pytest.approx(10.0)
+        assert g["growth"] == pytest.approx(4.0)
         assert g["passed"] is True
+
+    def test_one_short_group_fails_even_if_combined_count_clears_the_floor(self):
+        """THE PROOF THAT THE FLOOR IS PER-GROUP, NOT COMBINED. first has only 4
+        checkpoints (below CONTROL_MIN_CHECKPOINTS=5) while last has 20 -- their
+        combined count is 24, well over 5. A combined-count gate would wrongly
+        pass this; the per-group gate must not be rescued by the other side."""
+        first = [rec(10, 1.0, ckpt_count=4, ckpt_seconds=0.2)]
+        last = [rec(10, 1.0, ckpt_count=20, ckpt_seconds=4.0)]
+        g = trace_fit.control_gate(first, last)
+        assert g["passed"] is False
+        assert "checkpoint" in g["reason"].lower()
 
 
 class TestSplitThirds:
