@@ -235,6 +235,18 @@ class TestProbeIO:
         records = probe.read_trace(p)
         assert len(records) == 1
 
+    def test_read_trace_treats_an_interior_malformed_line_as_fatal(self, tmp_path):
+        """Corruption in the MIDDLE of the trace is not truncation. Silently
+        dropping an interior record would bias the fit invisibly, so this must
+        raise rather than being forgiven the way a truncated final line is."""
+        p = tmp_path / "t.jsonl"
+        p.write_text(
+            '{"pos": 0, "apply_s": 1.0}\nnot json\n{"pos": 2, "apply_s": 1.0}\n'
+        )
+        from evals.at_scale import probe_per_commit_cost as probe
+        with pytest.raises(SystemExit):
+            probe.read_trace(p)
+
     def test_read_trace_refuses_an_empty_trace(self, tmp_path):
         """Zero records must be a hard error, not a verdict. An empty trace and
         a flat trace are not the same finding."""
