@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 _REPORT_HEADER = "# At-Scale Code-Graph Benchmark\n\nSee issue #120 and `docs/superpowers/specs/2026-07-19-at-scale-benchmark-design.md`.\nObservational only -- no pass/fail thresholds.\n"
 
@@ -379,11 +379,23 @@ def _ratio_row(label: str, value: Any) -> str:
     return f"- {label}: {float(value):.2f}x"
 
 
-def _trace_fit_control_gate_row(control_gate: dict[str, Any]) -> str:
+def _trace_fit_control_gate_row(control_gate: Any) -> str:
     """The control gate's own pass/fail reading, spelled out the same way
     _residue_verdict_row spells out M <= N: the raw growth number alone does
     not carry whether it cleared CONTROL_MIN_GROWTH.
+
+    An absent or empty control_gate renders "not measured", never
+    **FAILED** -- {}.get("passed") is falsy the same way an actual failure
+    is, and treating the two alike would conflate "never measured" with
+    "measured and failed", the same absence-as-a-result hole _ratio_row
+    exists to close on the ratio axis. Not reachable through today's only
+    producer (trace_fit.analyse always populates control_gate), but a result
+    dict handed to this function by any other caller -- or an older/partial
+    one -- must not be able to manufacture a FAILED reading out of a missing
+    key.
     """
+    if not control_gate:
+        return "- Control gate: not measured (absent from the result)"
     growth = control_gate.get("growth")
     growth_str = "not measured" if growth is None else f"{float(growth):.2f}x"
     if control_gate.get("passed"):
@@ -392,6 +404,25 @@ def _trace_fit_control_gate_row(control_gate: dict[str, Any]) -> str:
         f"- Control gate: **FAILED** ({growth_str} growth) -- "
         f"{control_gate.get('reason', 'reason not recorded')}"
     )
+
+
+def _fit_quality_row(label: str, fit: Optional[dict[str, Any]]) -> str:
+    """One of the three per-group fit-quality rows.
+
+    docs/superpowers/specs/2026-08-17-per-commit-cost-attribution-design.md
+    (line 250) requires the INCONCLUSIVE verdict to "report both parameters
+    and the fit quality" -- a ratio alone cannot distinguish a clean fit from
+    one whose r^2 is near zero and cleared the growth thresholds by chance.
+
+    fit is None when trace_fit.fit_line found the group unidentifiable (too
+    few points, or zero variance in W -- see its docstring) -- rendered
+    "not identifiable", never a numeric r^2, for the same reason _ratio_row
+    never renders None as 0.00: a fit that could not be computed is not the
+    same finding as a fit that came out flat.
+    """
+    if fit is None:
+        return f"- {label} fit: not identifiable"
+    return f"- {label} fit: n={fit['n']}, r²={fit['r2']:.3f}"
 
 
 def append_trace_fit_report(
@@ -413,6 +444,11 @@ def append_trace_fit_report(
     and never re-derived as CONFOUNDED -- the verdict string is the analysis's
     own final word, not recomputed here from a_ratio/b_ratio.
 
+    Per-group fit quality (n, r^2) is rendered too, per the design spec's
+    "report both parameters and the fit quality" requirement for INCONCLUSIVE
+    -- a ratio alone cannot show whether it came from a clean fit or a
+    near-zero r^2 that happened to clear the growth thresholds.
+
     json_out_path is the probe's own artifact JSON, a parameter for the same
     reason it is on append_residue_report: the result dict is written to disk
     before this is called, so folding the path in would need a second write.
@@ -420,8 +456,10 @@ def append_trace_fit_report(
     if not report_path.exists():
         report_path.write_text(_REPORT_HEADER)
 
-    control_gate = result.get("control_gate", {})
+    control_gate = result.get("control_gate")
     group_sizes = result.get("group_sizes", {})
+    fits = result.get("fits") or {}
+    commits_ingested = result.get("commits_ingested")
 
     lines = [
         "",
@@ -432,12 +470,21 @@ def append_trace_fit_report(
         "",
         _ratio_row("a_ratio (fixed-cost growth)", result.get("a_ratio")),
         _ratio_row("b_ratio (per-unit-work-cost growth)", result.get("b_ratio")),
+        _fit_quality_row("First-group", fits.get("first")),
+        _fit_quality_row("Middle-group", fits.get("middle")),
+        _fit_quality_row("Last-group", fits.get("last")),
         _trace_fit_control_gate_row(control_gate),
         f"- Records: {result.get('records', 'not measured')}",
         f"- Group sizes: first={group_sizes.get('first', 'not measured')}, "
         f"middle={group_sizes.get('middle', 'not measured')}, "
         f"last={group_sizes.get('last', 'not measured')}",
-        f"- Commits ingested: {result.get('commits_ingested', 'not measured')}",
+        # .get(key) alone, not .get(key, default): build_result sets this key
+        # to an explicit None whenever metrics lacks it (the --metrics
+        # re-analyse path with an older/partial file), so a .get(..., default)
+        # would never fire and "None" -- outside the three-state vocabulary
+        # entirely -- would print on the page.
+        "- Commits ingested: "
+        + ("not measured" if commits_ingested is None else str(commits_ingested)),
         _metrics_json_bullet(json_out_path, report_path),
         "",
     ]

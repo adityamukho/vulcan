@@ -509,7 +509,12 @@ class TestAppendTraceFitReport:
             "control_gate": {"passed": True, "growth": 3.0, "reason": "passed"},
         }, report)
         text = report.read_text()
-        assert "not measured" in text
+        # The exact a_ratio row, not a bare substring: "not measured" is also
+        # the correct rendering for other absent fields in this fixture (e.g.
+        # commits_ingested, which is omitted here entirely), so a substring
+        # check alone would pass even if _ratio_row's None branch were broken,
+        # as long as some other field happened to say "not measured" too.
+        assert "a_ratio (fixed-cost growth): not measured" in text
         assert "0.00" not in text
 
     def test_appends_rather_than_truncating(self, tmp_path):
@@ -522,3 +527,72 @@ class TestAppendTraceFitReport:
             "control_gate": {"passed": True, "growth": 3.0, "reason": "passed"},
         }, report)
         assert "## Existing entry" in report.read_text()
+
+    def test_commits_ingested_present_but_none_renders_not_measured(self, tmp_path):
+        """build_result (Task 6) sets commits_ingested to an explicit None
+        whenever the metrics JSON lacks the field -- reachable through the
+        --metrics re-analyse path with an older or partial file. .get(key,
+        default) only substitutes the default when the KEY is absent, so a
+        present-but-None value must be checked explicitly or the page prints
+        the raw Python string "None", which is outside the three-state
+        vocabulary entirely.
+        """
+        report = tmp_path / "benchmark.md"
+        report.write_text("# At-Scale Code-Graph Benchmark\n")
+        append_trace_fit_report({
+            "verdict": "CONFOUNDED", "verdict_reason": "x",
+            "a_ratio": 1.0, "b_ratio": 1.0, "records": 100,
+            "group_sizes": {"first": 33, "middle": 34, "last": 33},
+            "control_gate": {"passed": True, "growth": 3.0, "reason": "passed"},
+            "commits_ingested": None,
+        }, report)
+        text = report.read_text()
+        assert "- Commits ingested: not measured" in text
+        assert "None" not in text
+
+    def test_absent_control_gate_renders_not_measured_not_failed(self, tmp_path):
+        """{}.get("passed") and a real failure's control_gate.get("passed")
+        are both falsy, so a control_gate that was never measured must be
+        distinguished BEFORE that lookup, not by it -- otherwise an absent
+        key manufactures a **FAILED** reading out of nothing, the same
+        absence-as-a-result hole _ratio_row exists to close for the ratios.
+        """
+        report = tmp_path / "benchmark.md"
+        report.write_text("# At-Scale Code-Graph Benchmark\n")
+        result = {
+            "verdict": "CONFOUNDED", "verdict_reason": "x",
+            "a_ratio": 1.0, "b_ratio": 1.0, "records": 100,
+            "group_sizes": {"first": 33, "middle": 34, "last": 33},
+        }
+        assert "control_gate" not in result
+        append_trace_fit_report(result, report)
+        text = report.read_text()
+        assert "- Control gate: not measured" in text
+        assert "FAILED" not in text
+
+    def test_populated_and_unidentifiable_fits_are_both_rendered(self, tmp_path):
+        """Design spec 2026-08-17-per-commit-cost-attribution-design.md line
+        250: the INCONCLUSIVE verdict must report both parameters and the fit
+        quality, since a ratio alone can't distinguish a clean fit from a
+        near-zero r^2 that happened to clear the growth thresholds. A None
+        fit (trace_fit.fit_line's unidentifiable case) must render "not
+        identifiable", never a numeric r^2 like 0.00.
+        """
+        report = tmp_path / "benchmark.md"
+        report.write_text("# At-Scale Code-Graph Benchmark\n")
+        append_trace_fit_report({
+            "verdict": "INCONCLUSIVE", "verdict_reason": "x",
+            "a_ratio": 1.6, "b_ratio": 1.3, "records": 300,
+            "group_sizes": {"first": 100, "middle": 100, "last": 100},
+            "control_gate": {"passed": True, "growth": 3.0, "reason": "passed"},
+            "fits": {
+                "first": {"a": 0.1, "b": 0.02, "r2": 0.91, "n": 100},
+                "middle": {"a": 0.12, "b": 0.021, "r2": 0.88, "n": 100},
+                "last": None,
+            },
+        }, report)
+        text = report.read_text()
+        assert "First-group fit: n=100, r²=0.910" in text
+        assert "Middle-group fit: n=100, r²=0.880" in text
+        assert "Last-group fit: not identifiable" in text
+        assert "r²=0.00" not in text
