@@ -214,3 +214,49 @@ class TestAnalyse:
         assert trace_fit.CONTROL_MIN_GROWTH == 2.0
         assert trace_fit.CONTROL_MIN_CHECKPOINTS == 5
         assert trace_fit.MIN_POINTS_PER_GROUP == 30
+
+
+class TestProbeIO:
+    """#260 probe: reading a trace and assembling the artifact. The fit itself
+    is tested in TestAnalyse -- this covers only I/O and provenance."""
+
+    def test_read_trace_skips_blank_lines(self, tmp_path):
+        p = tmp_path / "t.jsonl"
+        p.write_text('{"pos": 0}\n\n{"pos": 1}\n')
+        from evals.at_scale import probe_per_commit_cost as probe
+        assert [r["pos"] for r in probe.read_trace(p)] == [0, 1]
+
+    def test_read_trace_tolerates_a_truncated_final_line(self, tmp_path):
+        """A killed run leaves a half-written last record. That must cost one
+        record, not the whole 30-minute trace."""
+        p = tmp_path / "t.jsonl"
+        p.write_text('{"pos": 0, "apply_s": 1.0}\n{"pos": 1, "apply')
+        from evals.at_scale import probe_per_commit_cost as probe
+        records = probe.read_trace(p)
+        assert len(records) == 1
+
+    def test_read_trace_refuses_an_empty_trace(self, tmp_path):
+        """Zero records must be a hard error, not a verdict. An empty trace and
+        a flat trace are not the same finding."""
+        p = tmp_path / "t.jsonl"
+        p.write_text("")
+        from evals.at_scale import probe_per_commit_cost as probe
+        with pytest.raises(SystemExit):
+            probe.read_trace(p)
+
+    def test_result_carries_interpreter_and_minigraf_provenance(self, tmp_path):
+        from evals.at_scale import probe_per_commit_cost as probe
+        records = group(120, a=0.5, b=0.001, ckpt_seconds=0.1) \
+            + group(120, a=0.5, b=0.001, ckpt_seconds=0.3) \
+            + group(120, a=0.5, b=0.001, ckpt_seconds=0.5)
+        result = probe.build_result(records, {"commits_ingested": 360}, {})
+        assert "executable" in result["provenance"]
+        assert "minigraf_version" in result["provenance"]
+        assert result["provenance"]["stream_ratio"] == "1:1"
+        assert result["verdict"] == "CONFOUNDED"
+
+    def test_result_records_the_source_metrics_keys_it_used(self, tmp_path):
+        from evals.at_scale import probe_per_commit_cost as probe
+        records = group(120, a=0.5, b=0.001, ckpt_seconds=0.1) * 3
+        result = probe.build_result(records, {"commits_ingested": 42}, {})
+        assert result["commits_ingested"] == 42
