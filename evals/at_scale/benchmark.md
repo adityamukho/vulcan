@@ -1154,3 +1154,18 @@ nearly every code entity in every graph already written.
 | Stderr capture (#256) | complete |
 | Commits dropped (#256) | 0 |
 | Error signatures (#251/#256) | 0 |
+
+## Per-Commit Cost Fit — 20260820T172419Z
+
+**Verdict: REAL** -- a and b grew >= 2.0x (a=4.81x, b=2.13x)
+
+- a_ratio (fixed-cost growth): 4.81x
+- b_ratio (per-unit-work-cost growth): 2.13x
+- First-group fit: n=255, r²=0.882
+- Middle-group fit: n=257, r²=0.866
+- Last-group fit: n=255, r²=0.725
+- Control gate: passed (mean per-checkpoint duration grew 7.85x)
+- Records: 767
+- Group sizes: first=255, middle=257, last=255
+- Commits ingested: 767
+- Metrics JSON: `results/260-per-commit-cost-attribution.json`
