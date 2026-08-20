@@ -35,7 +35,7 @@ when a group has no variance in W.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Optional
 
 #: The frozen work metric. See _trace_work_counters for its arithmetic.
 W_KEY = "idents_considered"
@@ -51,7 +51,9 @@ REAL_AT = 2.0
 #: much, or the method has failed open and the run is VOID.
 CONTROL_MIN_GROWTH = 2.0
 
-#: Fewer checkpoints than this in either group makes the control unevaluable.
+#: Fewer checkpoints than this, combined across both groups, makes the
+#: control unevaluable. See control_gate's docstring for why it is combined
+#: rather than per-group.
 CONTROL_MIN_CHECKPOINTS = 5
 
 #: Fewer records than this in a group makes its fit untrustworthy.
