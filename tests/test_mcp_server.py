@@ -23564,3 +23564,131 @@ class TestIngestTrace:
         trace.emit(0, "fwd", "a", 0.0, 0.0, [], None)
         assert len(self._read(path)) == 1  # readable before close()
         trace.close()
+
+    def test_write_failure_disables_trace_and_warns(self, tmp_path, capsys):
+        """#260 carried finding from Task 2's review: emit() is called from
+        inside _run_ingestion's per-commit loop, OUTSIDE its own
+        try/except, so an unguarded OSError from the write (e.g. disk full
+        mid-run) would abort the whole ingestion over an instrument -- the
+        exact thing this class's docstring says must never happen.
+
+        Manufactured for real, not mocked: os.close() on the trace's own fd
+        invalidates the underlying OS file descriptor while the Python file
+        object still believes it is open, so the very next write() makes a
+        real write(2) syscall that the kernel rejects with EBADF. That is a
+        genuine OSError from genuine I/O failure, not a patched
+        json.dumps -- and it also exercises close()'s own OSError guard,
+        since closing an already-fd-dead file object raises a second EBADF
+        that emit()'s cleanup call to self.close() must swallow too."""
+        import os
+        import mcp_server
+        path = tmp_path / "trace.jsonl"
+        trace = mcp_server._IngestTrace(str(path))
+        os.close(trace._fh.fileno())
+
+        trace.emit(0, "fwd", "a", 0.0, 0.0, [], None)  # must not raise
+
+        assert trace.records == 0
+        err = capsys.readouterr().err
+        assert "per-commit trace write failed" in err
+        assert "tracing disabled" in err
+        # The guard must also have disabled the trace, not just swallowed
+        # one failure -- a second emit must be a silent no-op (mirrors the
+        # existing self._fh is None early-return in emit()).
+        trace.emit(1, "fwd", "b", 0.0, 0.0, [], None)  # must not raise
+        assert trace.records == 0
+        trace.close()  # must not raise
+
+
+class TestIngestTraceWiring:
+    """#260: MINIGRAF_INGEST_TRACE_PATH arms the per-commit trace, and its
+    absence leaves ingestion byte-for-byte unchanged."""
+
+    def test_no_env_var_means_no_trace_and_no_file(self, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.delenv("MINIGRAF_INGEST_TRACE_PATH", raising=False)
+        assert mcp_server._ingest_trace_from_env() is None
+
+    def test_env_var_returns_a_trace_writing_to_that_path(self, tmp_path, monkeypatch):
+        import mcp_server
+        path = tmp_path / "t.jsonl"
+        monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(path))
+        trace = mcp_server._ingest_trace_from_env()
+        assert trace is not None
+        try:
+            trace.emit(0, "fwd", "a", 0.0, 0.0, [], None)
+        finally:
+            trace.close()
+        assert path.exists()
+
+    def test_unopenable_path_degrades_to_none_and_warns(self, tmp_path, monkeypatch, capsys):
+        """A bad trace path must not be the reason a repository never ingests --
+        same principle as _parse_stream_ratio and _checkpoint_duty_from_env,
+        both of which degrade rather than raise."""
+        import mcp_server
+        monkeypatch.setenv(
+            "MINIGRAF_INGEST_TRACE_PATH", str(tmp_path / "no" / "such" / "dir" / "t.jsonl")
+        )
+        assert mcp_server._ingest_trace_from_env() is None
+        assert "MINIGRAF_INGEST_TRACE_PATH" in capsys.readouterr().err
+
+    @staticmethod
+    def _drive(git_repo, graph_path):
+        """_run_ingestion over a real file-backed graph, per
+        TestRunIngestionShutdown's pattern."""
+        import mcp_server
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(graph_path))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_real_ingestion_writes_one_record_per_applied_commit(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        """The load-bearing test: a real _run_ingestion over a real repo emits a
+        record per commit whose write half ran, with a tag from the claimer and
+        a positive apply_s.
+
+        git_repo has exactly 2 commits (auth.py's `def login`, models.py's
+        `class User`), so the record count and the pos set are both exact.
+        """
+        import json
+        import mcp_server
+        trace_path = tmp_path / "trace.jsonl"
+        monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(trace_path))
+
+        self._drive(git_repo, git_repo / "memory.graph")
+        try:
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        finally:
+            mcp_server._reset_db_state()
+
+        records = [json.loads(l) for l in trace_path.read_text().splitlines() if l.strip()]
+        assert len(records) == 2
+        assert {r["tag"] for r in records} <= {"fwd", "rev"}
+        assert sorted(r["pos"] for r in records) == [0, 1]
+        assert all(r["apply_s"] > 0.0 for r in records)
+        assert all(r["await_s"] >= 0.0 for r in records)
+        # Work counters must be real, not all-zero: git_repo introduces a
+        # function and a class. A trace of zeros would fit perfectly and mean
+        # nothing -- this is the positive control for the instrument itself.
+        assert sum(r["idents_considered"] for r in records) > 0
+
+    @pytest.mark.asyncio
+    async def test_trace_is_closed_and_global_cleared_after_a_run(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        """Mirrors _ingest_checkpoint_policy's contract: the global must not
+        outlive the run, or a later interactive transact writes into a finished
+        run's trace file."""
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(tmp_path / "t.jsonl"))
+        self._drive(git_repo, git_repo / "memory.graph")
+        try:
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        finally:
+            mcp_server._reset_db_state()
+        assert mcp_server._ingest_trace is None

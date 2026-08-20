@@ -3685,6 +3685,8 @@ def _db_checkpoint(db: Any) -> None:
 
 _ingest_checkpoint_policy: Optional["_CheckpointPolicy"] = None
 
+_ingest_trace: Optional["_IngestTrace"] = None
+
 _DEFAULT_CHECKPOINT_DUTY = 0.05
 
 
@@ -3763,6 +3765,12 @@ class _IngestTrace:
     _run_ingestion clear it), which records zero deltas rather than raising:
     an instrument must never be the reason a run dies.
 
+    That same principle covers the write itself: an OSError from the
+    underlying file (e.g. disk full mid-run) disables the trace and warns on
+    stderr rather than propagating -- emit() is called from inside
+    _run_ingestion's per-commit loop, outside its own try/except, so letting
+    an I/O failure raise there would abort the whole run over an instrument.
+
     Writes only, no locks, no awaits, no DB access -- see this module's
     _db_native_lock invariant comment for why the per-commit loop tolerates
     nothing else.
@@ -3807,8 +3815,17 @@ class _IngestTrace:
             "ckpt_d_seconds": d_seconds,
         }
         record.update(_trace_work_counters(extracted_files))
-        self._fh.write(json.dumps(record) + "\n")
-        self._fh.flush()
+        try:
+            self._fh.write(json.dumps(record) + "\n")
+            self._fh.flush()
+        except OSError as e:
+            print(
+                f"[_run_ingestion] per-commit trace write failed ({e}); "
+                f"tracing disabled for the rest of this run",
+                file=sys.stderr,
+            )
+            self.close()
+            return
         self.records += 1
 
     def close(self) -> None:
@@ -3818,8 +3835,32 @@ class _IngestTrace:
             return
         try:
             self._fh.close()
+        except OSError:
+            pass
         finally:
             self._fh = None
+
+
+def _ingest_trace_from_env() -> Optional["_IngestTrace"]:
+    """Read MINIGRAF_INGEST_TRACE_PATH and open a trace, or None.
+
+    Degrades to None on any open failure rather than raising, matching
+    _checkpoint_duty_from_env and _parse_stream_ratio: an unwritable trace path
+    is a typo in an instrument, and must not become the reason a repository
+    never ingests (#260).
+    """
+    raw = os.environ.get("MINIGRAF_INGEST_TRACE_PATH")
+    if not raw:
+        return None
+    try:
+        return _IngestTrace(raw)
+    except OSError as e:
+        print(
+            f"[_run_ingestion] cannot open MINIGRAF_INGEST_TRACE_PATH={raw!r} "
+            f"({e}); per-commit tracing disabled",
+            file=sys.stderr,
+        )
+        return None
 
 
 def _checkpoint_duty_from_env() -> float:
@@ -11007,7 +11048,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     Ordinary exceptions (bad git ref, unreadable blob, unsupported syntax)
     are unaffected and still fail only the one commit as before.
     """
-    global _ingest_progress, _ingest_checkpoint_policy
+    global _ingest_progress, _ingest_checkpoint_policy, _ingest_trace
     # Safe to clear unconditionally: handle_minigraf_ingest_git refuses to start a
     # new run while one is already active, so no in-flight shutdown signal is ever
     # stomped on here; main()'s finally block re-sets the flag on exit regardless,
@@ -11114,6 +11155,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # once per commit. See _CheckpointPolicy for why the per-commit
         # cadence was super-linear and why deferring is safe (#241).
         _ingest_checkpoint_policy = _CheckpointPolicy(_checkpoint_duty_from_env())
+        _ingest_trace = _ingest_trace_from_env()
 
         # Single fact-index write connection for the whole ingestion run,
         # opened on write_executor's one worker thread and never touched from
@@ -11220,6 +11262,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     # ingestion run — including the many existing tests that drive
                     # _run_ingestion through a real ProcessPoolExecutor worker — would
                     # otherwise fail with "too many values to unpack".
+                    _trace_t_await = time.perf_counter()
                     try:
                         extracted_files, gitlink_changes, gitmodules_map, renamed_pairs = await fut
                     except concurrent.futures.process.BrokenProcessPool:
@@ -11247,6 +11290,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         await asyncio.sleep(0)  # yield to event loop
                         continue
                     submit_next()
+                    _trace_await_s = time.perf_counter() - _trace_t_await
 
                     last_hash = commit_hash
                     _ingest_progress["current_commit"] = commit_hash
@@ -11257,6 +11301,11 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     # SECOND handle (#251/#253). There is no window now: the
                     # count is authoritative and the handle drops exactly when
                     # it reaches zero.
+                    # #260: apply_s deliberately spans the lease ACQUIRE as
+                    # well as the executor call -- the acquire is real serial
+                    # per-commit cost, and a reader must not take apply_s for
+                    # pure write time.
+                    _trace_t_apply = time.perf_counter()
                     async with db_lease_async() as db:
                         try:
                             if tag == "fwd":
@@ -11289,6 +11338,14 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 file=sys.stderr,
                             )
 
+                    if _ingest_trace is not None:
+                        _ingest_trace.emit(
+                            pos, tag, commit_hash,
+                            _trace_await_s,
+                            time.perf_counter() - _trace_t_apply,
+                            extracted_files,
+                            _ingest_checkpoint_policy,
+                        )
                     _ingest_progress["processed"] += 1
                     await asyncio.sleep(0)  # yield to event loop
 
@@ -11484,6 +11541,9 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             # Never let a finished run's budget gate a later interactive
             # transact (#241).
             _ingest_checkpoint_policy = None
+            if _ingest_trace is not None:
+                _ingest_trace.close()
+            _ingest_trace = None
 
     except Exception as e:
         # write_executor is shut down by the outermost finally below, which
@@ -11525,6 +11585,9 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         if _ingest_checkpoint_policy is not None:
             _ingest_progress["checkpoint_summary"] = _ingest_checkpoint_policy.summary()
         _ingest_checkpoint_policy = None
+        if _ingest_trace is not None:
+            _ingest_trace.close()
+        _ingest_trace = None
         # The single shutdown for this executor. It lives here, not in the
         # inner finally, because two awaited calls (_open_index_writer_safe,
         # _frontier_load) sit above the inner try and can raise in the gap --
