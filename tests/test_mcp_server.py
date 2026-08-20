@@ -23692,3 +23692,51 @@ class TestIngestTraceWiring:
         finally:
             mcp_server._reset_db_state()
         assert mcp_server._ingest_trace is None
+
+    @pytest.mark.asyncio
+    async def test_commit_whose_write_fails_emits_no_record_but_run_still_completes(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        """#260 review follow-up: emit() runs unconditionally after the
+        `async with db_lease_async()` block, whose own inner try/except
+        isolates an ordinary per-commit write failure (prints and falls
+        through, matching _run_ingestion's documented 'fail only the one
+        commit' contract) rather than re-raising. Left unguarded, that
+        commit would still get a trace record whose apply_s measures a
+        FAILED write -- the same contamination class the brief already
+        excluded extraction failures for, since the downstream regression
+        models the cost of a successful apply, not a failed one.
+
+        git_repo's first commit (pos 0) is claimed by the forward stream on
+        a fresh graph (verified empirically), so patching _forward_apply to
+        raise fails exactly that one commit's write while pos 1 (claimed by
+        the reverse stream, _reverse_apply) still succeeds. This is the
+        "plain double for an infrastructure concern" case, not a MiniGrafDb
+        fake (docs/testing-conventions.md) -- the thing under test is the
+        trace's response to a write failure, not the failure itself.
+        """
+        import json
+        import mcp_server
+        trace_path = tmp_path / "trace.jsonl"
+        monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(trace_path))
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("manufactured write failure")
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", _boom)
+
+        self._drive(git_repo, git_repo / "memory.graph")
+        try:
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        finally:
+            mcp_server._reset_db_state()
+
+        # The isolation contract is unchanged: one commit's write failing
+        # does not abort the run, and both commits still count as processed.
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2
+
+        records = [json.loads(l) for l in trace_path.read_text().splitlines() if l.strip()]
+        assert len(records) == 1, "the failed commit must not produce a trace record"
+        assert records[0]["pos"] == 1
+        assert records[0]["tag"] == "rev"

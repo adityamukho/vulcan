@@ -3830,7 +3830,15 @@ class _IngestTrace:
 
     def close(self) -> None:
         """Idempotent -- _run_ingestion has two terminal paths that both
-        release the trace, and either may run first."""
+        release the trace, and either may run first.
+
+        Also absorbs OSError from the close() call itself: emit()'s own
+        write-failure handler calls back into close() to disable the trace,
+        and on a broken fd (see emit()'s guard) the flush-on-close this
+        performs fails with a SECOND OSError from the same underlying
+        problem. Swallowing it here is what keeps that cleanup call from
+        defeating emit()'s guard by raising anyway.
+        """
         if self._fh is None:
             return
         try:
@@ -11306,6 +11314,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     # per-commit cost, and a reader must not take apply_s for
                     # pure write time.
                     _trace_t_apply = time.perf_counter()
+                    _trace_write_ok = True
                     async with db_lease_async() as db:
                         try:
                             if tag == "fwd":
@@ -11337,8 +11346,15 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 f"({subject!r}): write failed: {e}",
                                 file=sys.stderr,
                             )
+                            _trace_write_ok = False
 
-                    if _ingest_trace is not None:
+                    # #260: no record for a commit whose write failed -- same
+                    # contamination class the brief excluded extraction
+                    # failures for. apply_s on a failed attempt does not
+                    # measure the quantity the downstream regression models
+                    # (the cost of successfully applying a commit), so
+                    # recording it would inject a bad point into the fit.
+                    if _ingest_trace is not None and _trace_write_ok:
                         _ingest_trace.emit(
                             pos, tag, commit_hash,
                             _trace_await_s,
