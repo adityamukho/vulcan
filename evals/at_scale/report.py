@@ -35,16 +35,22 @@ def _relative_to_report(path: Any, report_path: Path) -> str:
         return str(resolved)
 
 
-def _metrics_json_bullet(json_path: Any, report_path: Path) -> str:
-    """The "- Metrics JSON:" provenance bullet (#276).
+def _artifact_bullet(label: str, json_path: Any, report_path: Path) -> str:
+    """The "- <label>:" provenance bullet (#276), parameterised on the label
+    so callers whose artifact is not a benchmark metrics JSON (#260's probe
+    artifact, e.g.) can say so rather than mislabel it.
 
     ALWAYS emitted, for the reason _poll_duty_row is: an omitted line is
     invisible, so a reader could not tell a harness that did not record the
     path from one that was never asked to.
     """
     if json_path is None:
-        return "- Metrics JSON: not recorded (this harness did not write one)"
-    return f"- Metrics JSON: `{_relative_to_report(json_path, report_path)}`"
+        return f"- {label}: not recorded (this harness did not write one)"
+    return f"- {label}: `{_relative_to_report(json_path, report_path)}`"
+
+
+def _metrics_json_bullet(json_path: Any, report_path: Path) -> str:
+    return _artifact_bullet("Metrics JSON", json_path, report_path)
 
 
 def write_json_result(metrics: dict[str, Any], results_dir: Path, prefix: str = "ingestion") -> Path:
@@ -452,6 +458,10 @@ def append_trace_fit_report(
     json_out_path is the probe's own artifact JSON, a parameter for the same
     reason it is on append_residue_report: the result dict is written to disk
     before this is called, so folding the path in would need a second write.
+    Labelled "Probe artifact" rather than "Metrics JSON" (#260 M4): unlike
+    append_ingestion_report's json_path, this file is not a benchmark metrics
+    JSON -- it is trace_fit's analysis plus provenance -- and reusing that
+    label would misdescribe it.
     """
     if not report_path.exists():
         report_path.write_text(_REPORT_HEADER)
@@ -485,7 +495,7 @@ def append_trace_fit_report(
         # entirely -- would print on the page.
         "- Commits ingested: "
         + ("not measured" if commits_ingested is None else str(commits_ingested)),
-        _metrics_json_bullet(json_out_path, report_path),
+        _artifact_bullet("Probe artifact", json_out_path, report_path),
         "",
     ]
 

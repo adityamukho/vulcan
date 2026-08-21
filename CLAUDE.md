@@ -48,7 +48,8 @@ Per-commit cost trace: `MINIGRAF_INGEST_TRACE_PATH` (unset by default).
 When set, ingestion appends one JSON object per applied commit — timings, work
 counters, and per-commit checkpoint deltas — for #260's cost attribution. Unset
 means no trace and no file. Commits skipped for extraction failure emit no
-record, so a trace is not a commit census; `stderr_capture.py` counts those.
+record, and neither do commits whose write fails, so a trace is not a commit
+census; `stderr_capture.py` counts those.
 Read with `evals/at_scale/probe_per_commit_cost.py`.
 
 The fact index is bi-temporal: it includes historical (retracted/superseded) facts

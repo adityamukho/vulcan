@@ -1155,7 +1155,7 @@ nearly every code entity in every graph already written.
 | Commits dropped (#256) | 0 |
 | Error signatures (#251/#256) | 0 |
 
-## Per-Commit Cost Fit — 20260820T172419Z
+## Per-Commit Cost Fit — 20260821T021434Z
 
 **Verdict: REAL** -- a and b grew >= 2.0x (a=4.81x, b=2.13x)
 
@@ -1168,4 +1168,4 @@ nearly every code entity in every graph already written.
 - Records: 767
 - Group sizes: first=255, middle=257, last=255
 - Commits ingested: 767
-- Metrics JSON: `results/260-per-commit-cost-attribution.json`
+- Probe artifact: `results/260-per-commit-cost-attribution.json`

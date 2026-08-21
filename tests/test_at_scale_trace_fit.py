@@ -1,6 +1,8 @@
 """#260: the per-commit cost fit. Pure functions over synthetic traces -- no DB,
 no ingestion, milliseconds."""
 
+import json
+
 import pytest
 
 from evals.at_scale import trace_fit
@@ -152,7 +154,13 @@ class TestControlGate:
         last = [rec(10, 1.0, ckpt_count=20, ckpt_seconds=4.0)]
         g = trace_fit.control_gate(first, last)
         assert g["passed"] is False
-        assert "checkpoint" in g["reason"].lower()
+        # M7: "checkpoint" alone is in BOTH unevaluable reasons (this one and
+        # the growth-not-positive one), so it cannot discriminate which branch
+        # fired; passed is False either way. Pin the exact reason instead --
+        # it is the "need >= N checkpoints per group" branch, not the other.
+        assert g["reason"] == (
+            "unevaluable: need >= 5 checkpoints per group, saw 4 (first) and 20 (last)"
+        )
 
 
 class TestSplitThirds:
@@ -169,6 +177,27 @@ class TestSplitThirds:
         assert (len(a), len(b), len(c)) == (100, 102, 100)
         # First and last must stay the same size -- they are what the verdict
         # compares, and an uneven pair would bias the ratio.
+
+    @pytest.mark.parametrize("n", [0, 1, 2])
+    def test_fewer_than_three_records_puts_everything_in_the_first_group(self, n):
+        """M8: pins CURRENT behaviour rather than changing it. `size = n // 3`
+        is 0 for n < 3, and the early return then reads `records, [], []` --
+        the first group gets every record, middle and last are empty.
+
+        Kept as-is rather than "fixed" to return three near-empty groups: real
+        traces are hundreds of records (MIN_POINTS_PER_GROUP=30 alone rules
+        out anything this small ever reaching fit_line with a usable group),
+        so this path only matters for a pathologically short or truncated
+        trace -- where every group is going to read "not identifiable" via
+        fit_line's own MIN_POINTS_PER_GROUP floor regardless of which group
+        the leftover records land in. Changing the split shape here would
+        touch trace_fit's core logic for a case that cannot affect a real
+        verdict; pinning it documents the choice instead."""
+        records = [rec(i, 1.0, pos=i) for i in range(n)]
+        a, b, c = trace_fit.split_thirds(records)
+        assert a == records
+        assert b == []
+        assert c == []
 
 
 class TestAnalyse:
@@ -261,14 +290,241 @@ class TestProbeIO:
         records = group(120, a=0.5, b=0.001, ckpt_seconds=0.1) \
             + group(120, a=0.5, b=0.001, ckpt_seconds=0.3) \
             + group(120, a=0.5, b=0.001, ckpt_seconds=0.5)
-        result = probe.build_result(records, {"commits_ingested": 360}, {})
+        result = probe.build_result(
+            records, {"commits_ingested": 360}, {}, trace_path="/tmp/t.jsonl",
+        )
         assert "executable" in result["provenance"]
         assert "minigraf_version" in result["provenance"]
         assert result["provenance"]["stream_ratio"] == "1:1"
         assert result["verdict"] == "CONFOUNDED"
 
     def test_result_records_the_source_metrics_keys_it_used(self, tmp_path):
+        """M6: `group(...) * 3` produced three identical copies of one group,
+        not three distinct groups the way its sibling
+        (test_result_carries_interpreter_and_minigraf_provenance) does --
+        harmless for this test's own assertion (it only reads
+        commits_ingested), but a landmine for anyone who later copies this
+        fixture to test something group-shape-sensitive."""
         from evals.at_scale import probe_per_commit_cost as probe
-        records = group(120, a=0.5, b=0.001, ckpt_seconds=0.1) * 3
-        result = probe.build_result(records, {"commits_ingested": 42}, {})
+        records = (
+            group(120, a=0.5, b=0.001, ckpt_seconds=0.1)
+            + group(120, a=0.5, b=0.001, ckpt_seconds=0.3)
+            + group(120, a=0.5, b=0.001, ckpt_seconds=0.5)
+        )
+        result = probe.build_result(
+            records, {"commits_ingested": 42}, {}, trace_path="/tmp/t.jsonl",
+        )
         assert result["commits_ingested"] == 42
+
+    def _fitted_records(self):
+        return (
+            group(120, a=0.5, b=0.001, ckpt_seconds=0.1)
+            + group(120, a=0.5, b=0.001, ckpt_seconds=0.3)
+            + group(120, a=0.5, b=0.001, ckpt_seconds=0.5)
+        )
+
+    # -- I2: carry the run's ingestion-health fields --------------------
+
+    def test_ingestion_health_keys_absent_from_metrics_stay_absent(self):
+        """Three-state discipline (#275/#276): a metrics dict that never had
+        these keys (an older/partial run) must not have them coerced into
+        existence -- e.g. as an empty list or False -- which would read as
+        "measured clean" rather than "not recorded"."""
+        from evals.at_scale import probe_per_commit_cost as probe
+        result = probe.build_result(
+            self._fitted_records(), {"commits_ingested": 42}, {},
+            trace_path="/tmp/t.jsonl",
+        )
+        for key in (
+            "skipped_commits", "error_signals", "stderr_capture_complete",
+            "poll_duty_fraction", "checkpoint_summary",
+        ):
+            assert key not in result
+
+    def test_ingestion_health_keys_present_in_metrics_are_carried_through(self):
+        """I2: these were the exact keys run_ingestion_benchmark.py:293-301
+        added and the probe used to discard -- most importantly
+        error_signals, where a #251 `Page N out of bounds` signature would
+        show up."""
+        from evals.at_scale import probe_per_commit_cost as probe
+        metrics = {
+            "commits_ingested": 42,
+            "skipped_commits": ["deadbeef"],
+            "error_signals": [{"pattern": "page_out_of_bounds", "line": "boom"}],
+            "stderr_capture_complete": False,
+            "poll_duty_fraction": 0.03,
+            "checkpoint_summary": {"checkpoints": 5, "total_seconds": 1.2},
+        }
+        result = probe.build_result(
+            self._fitted_records(), metrics, {}, trace_path="/tmp/t.jsonl",
+        )
+        assert result["skipped_commits"] == ["deadbeef"]
+        assert result["error_signals"] == [
+            {"pattern": "page_out_of_bounds", "line": "boom"}
+        ]
+        # False, not coerced away or dropped -- absence and False must render
+        # differently downstream.
+        assert result["stderr_capture_complete"] is False
+        assert result["poll_duty_fraction"] == pytest.approx(0.03)
+        assert result["checkpoint_summary"] == {"checkpoints": 5, "total_seconds": 1.2}
+
+    # -- I3: record the trace actually read ------------------------------
+
+    def test_trace_path_records_the_trace_actually_read(self):
+        from evals.at_scale import probe_per_commit_cost as probe
+        result = probe.build_result(
+            self._fitted_records(), {"commits_ingested": 42}, {},
+            trace_path="/tmp/actual/trace.jsonl",
+        )
+        assert result["trace_path"] == "/tmp/actual/trace.jsonl"
+
+    def test_trace_path_disagreement_warns_on_stderr_naming_both(self, capsys):
+        """The --metrics re-analyse path can point --trace at a different
+        file than the one the metrics JSON itself recorded (a stale metrics
+        JSON re-pointed at a fresh trace, or vice versa). The artifact must
+        record the trace ACTUALLY READ, and the disagreement must be visible,
+        not silently swallowed."""
+        from evals.at_scale import probe_per_commit_cost as probe
+        result = probe.build_result(
+            self._fitted_records(),
+            {"commits_ingested": 42, "trace_path": "/tmp/stale/trace.jsonl"},
+            {},
+            trace_path="/tmp/actual/trace.jsonl",
+        )
+        assert result["trace_path"] == "/tmp/actual/trace.jsonl"
+        err = capsys.readouterr().err
+        assert "/tmp/actual/trace.jsonl" in err
+        assert "/tmp/stale/trace.jsonl" in err
+
+    def test_trace_path_agreement_is_silent(self, capsys):
+        from evals.at_scale import probe_per_commit_cost as probe
+        probe.build_result(
+            self._fitted_records(),
+            {"commits_ingested": 42, "trace_path": "/tmp/actual/trace.jsonl"},
+            {},
+            trace_path="/tmp/actual/trace.jsonl",
+        )
+        assert capsys.readouterr().err == ""
+
+    # -- I4: --run refuses an existing --trace path -----------------------
+
+    def test_refuse_existing_trace_for_run_raises_and_names_the_path(self, tmp_path):
+        from evals.at_scale import probe_per_commit_cost as probe
+        trace_path = tmp_path / "trace.jsonl"
+        trace_path.write_text('{"pos": 0}\n')
+        with pytest.raises(SystemExit) as exc_info:
+            probe._refuse_existing_trace_for_run(trace_path)
+        assert str(trace_path) in str(exc_info.value)
+        assert "fresh" in str(exc_info.value)
+
+    def test_refuse_existing_trace_for_run_allows_a_fresh_path(self, tmp_path):
+        from evals.at_scale import probe_per_commit_cost as probe
+        probe._refuse_existing_trace_for_run(tmp_path / "does-not-exist.jsonl")
+
+    def test_main_with_run_refuses_before_touching_ingestion(self, tmp_path, monkeypatch):
+        """The guard must fire before main() imports run_ingestion_benchmark
+        or drives anything -- otherwise a reused --trace path would only be
+        caught after a 30-minute run, which is the whole defect."""
+        from evals.at_scale import probe_per_commit_cost as probe
+        trace_path = tmp_path / "trace.jsonl"
+        trace_path.write_text('{"pos": 0}\n')
+        with pytest.raises(SystemExit) as exc_info:
+            probe.main([
+                "--run",
+                "--graph-path", str(tmp_path / "g.graph"),
+                "--trace", str(trace_path),
+            ])
+        assert str(trace_path) in str(exc_info.value)
+
+    def test_main_without_run_allows_an_existing_trace(self, tmp_path):
+        """The --trace/--metrics re-analyse path must still be able to read
+        an existing trace -- that is its whole purpose. I4's guard is scoped
+        to --run only."""
+        from evals.at_scale import probe_per_commit_cost as probe
+        trace_path = tmp_path / "trace.jsonl"
+        lines = [json.dumps(r) for r in self._fitted_records()]
+        trace_path.write_text("\n".join(lines) + "\n")
+        metrics_path = tmp_path / "metrics.json"
+        metrics_path.write_text(json.dumps({"commits_ingested": 360}))
+        report_path = tmp_path / "benchmark.md"
+        out_path = tmp_path / "out.json"
+        rc = probe.main([
+            "--trace", str(trace_path),
+            "--metrics", str(metrics_path),
+            "--out", str(out_path),
+            "--report-path", str(report_path),
+        ])
+        assert rc == 0
+        assert out_path.exists()
+        assert "Per-Commit Cost Fit" in report_path.read_text()
+
+    # -- I5: the pre-registered await_s/W correlation sanity check --------
+
+    def test_pearson_perfect_positive_correlation(self):
+        from evals.at_scale import probe_per_commit_cost as probe
+        xs = [float(i) for i in range(30)]
+        ys = [2.0 * x + 1.0 for x in xs]
+        assert probe._pearson(xs, ys) == pytest.approx(1.0)
+
+    def test_pearson_zero_variance_is_none(self):
+        """Same convention as trace_fit.fit_line: zero variance cannot
+        support a correlation, and inventing 0.0 would read as "measured and
+        uncorrelated" rather than "could not be measured"."""
+        from evals.at_scale import probe_per_commit_cost as probe
+        assert probe._pearson([5.0] * 10, [1.0, 2.0] * 5) is None
+        assert probe._pearson([1.0, 2.0] * 5, [5.0] * 10) is None
+
+    def test_build_result_records_await_vs_w_correlation_and_totals(self):
+        """I5: nothing computed this before -- the design spec pre-registered
+        it as a sanity check on W's meaning, but the deliverable never wired
+        it in. await_s = 2*W here gives a clean positive correlation in
+        every third; the totals let a reader see why a weak real-world
+        correlation would be uninformative rather than falsifying (await_s
+        tiny relative to apply_s means the loop rarely stalls waiting on
+        extraction)."""
+        from evals.at_scale import probe_per_commit_cost as probe
+
+        def rec(w, tag="fwd"):
+            return {
+                "pos": 0, "tag": tag, "hash": "x", "t_since_start": 0.0,
+                "await_s": 2.0 * w, "apply_s": 1.0 + 0.001 * w,
+                "ckpt_d_count": 1, "ckpt_d_seconds": 0.1,
+                trace_fit.W_KEY: w,
+            }
+
+        records = [rec(float(w)) for w in range(90)]
+        result = probe.build_result(
+            records, {"commits_ingested": 90}, {}, trace_path="/tmp/t.jsonl",
+        )
+        exploratory = result["exploratory"]
+        assert exploratory["await_s_total_seconds"] == pytest.approx(
+            sum(2.0 * w for w in range(90))
+        )
+        assert exploratory["apply_s_total_seconds"] == pytest.approx(
+            sum(1.0 + 0.001 * w for w in range(90))
+        )
+        assert exploratory["await_s_to_apply_s_ratio"] == pytest.approx(
+            exploratory["await_s_total_seconds"] / exploratory["apply_s_total_seconds"]
+        )
+        pearson = exploratory["pearson_await_s_vs_W"]
+        assert pearson["overall"] == pytest.approx(1.0)
+        assert pearson["first_third"] == pytest.approx(1.0)
+        assert pearson["middle_third"] == pytest.approx(1.0)
+        assert pearson["last_third"] == pytest.approx(1.0)
+
+    def test_build_result_await_s_to_apply_s_ratio_is_none_when_apply_s_is_zero(self):
+        from evals.at_scale import probe_per_commit_cost as probe
+
+        def rec(w):
+            return {
+                "pos": 0, "tag": "fwd", "hash": "x", "t_since_start": 0.0,
+                "await_s": 0.0, "apply_s": 0.0,
+                "ckpt_d_count": 0, "ckpt_d_seconds": 0.0,
+                trace_fit.W_KEY: w,
+            }
+
+        records = [rec(float(w)) for w in range(30)]
+        result = probe.build_result(
+            records, {"commits_ingested": 30}, {}, trace_path="/tmp/t.jsonl",
+        )
+        assert result["exploratory"]["await_s_to_apply_s_ratio"] is None

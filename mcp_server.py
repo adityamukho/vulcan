@@ -11297,8 +11297,16 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         _ingest_progress["processed"] += 1
                         await asyncio.sleep(0)  # yield to event loop
                         continue
-                    submit_next()
+                    # #260 M1: read BEFORE submit_next(), not after -- await_s
+                    # is documented as extraction stall (wall clock stalled on
+                    # `await fut`), and submit_next() does real work (queues
+                    # the next commit's extraction). Reading the clock after it
+                    # would fold submission cost into a field the spec defines
+                    # as pure stall. Immaterial in magnitude on the shipped
+                    # trace (5.10s total over 767 commits), but the field
+                    # should mean what it says.
                     _trace_await_s = time.perf_counter() - _trace_t_await
+                    submit_next()
 
                     last_hash = commit_hash
                     _ingest_progress["current_commit"] = commit_hash
@@ -11312,7 +11320,12 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     # #260: apply_s deliberately spans the lease ACQUIRE as
                     # well as the executor call -- the acquire is real serial
                     # per-commit cost, and a reader must not take apply_s for
-                    # pure write time.
+                    # pure write time. #260 M2: it also spans the lease
+                    # RELEASE -- the timer below is read after `async with
+                    # db_lease_async()` has exited, and at refcount 0 that
+                    # release drops the handle. A follow-up attribution task
+                    # narrowing apply_s further needs to know handle open AND
+                    # drop are both inside the measured span, not just open.
                     _trace_t_apply = time.perf_counter()
                     _trace_write_ok = True
                     async with db_lease_async() as db:

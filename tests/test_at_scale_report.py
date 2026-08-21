@@ -479,7 +479,13 @@ class TestAppendTraceFitReport:
         }, report)
         text = report.read_text()
         assert "CONFOUNDED" in text
-        assert "1.10" in text and "1.05" in text
+        # Exact rows, not bare substrings: verdict_reason is rendered
+        # verbatim just above ("...a=1.10x, b=1.05x)"), so a substring check
+        # against "1.10"/"1.05" passes even if _ratio_row's value branch is
+        # broken -- the reason line alone already contains both. See the
+        # sibling test below, which was tightened for the same defect.
+        assert "- a_ratio (fixed-cost growth): 1.10x" in text
+        assert "- b_ratio (per-unit-work-cost growth): 1.05x" in text
         assert "4.2" in text or "4.20" in text
 
     def test_void_verdict_is_rendered_as_void_not_as_flat(self, tmp_path):
@@ -497,6 +503,33 @@ class TestAppendTraceFitReport:
         text = report.read_text()
         assert "VOID" in text
         assert "CONFOUNDED" not in text
+
+    def test_measured_and_failed_control_gate_renders_the_failed_row(self, tmp_path):
+        """M5: no prior test positively asserted the rendered control-gate row
+        for a MEASURED-and-FAILED gate -- test_void_verdict_is_rendered... above
+        exercises this same input shape but never reads the row itself, only
+        the verdict string. This pins _trace_fit_control_gate_row's FAILED
+        branch (report.py) directly, distinguishing it from both the passing
+        row and the "not measured (absent from the result)" row."""
+        report = tmp_path / "benchmark.md"
+        report.write_text("# At-Scale Code-Graph Benchmark\n")
+        append_trace_fit_report({
+            "verdict": "VOID",
+            "verdict_reason": "control gate did not pass: FAILED OPEN ...",
+            "a_ratio": 1.01, "b_ratio": 1.02, "records": 760,
+            "group_sizes": {"first": 253, "middle": 254, "last": 253},
+            "control_gate": {
+                "passed": False, "growth": 1.1,
+                "reason": "FAILED OPEN: mean per-checkpoint duration grew 1.10x",
+            },
+        }, report)
+        text = report.read_text()
+        assert (
+            "- Control gate: **FAILED** (1.10x growth) -- "
+            "FAILED OPEN: mean per-checkpoint duration grew 1.10x"
+        ) in text
+        assert "- Control gate: passed" not in text
+        assert "- Control gate: not measured" not in text
 
     def test_absent_ratio_renders_not_measured_never_zero(self, tmp_path):
         report = tmp_path / "benchmark.md"

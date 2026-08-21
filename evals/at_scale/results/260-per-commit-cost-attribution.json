@@ -62,6 +62,15 @@
     "tag_counts": {
       "fwd": 384,
       "rev": 383
+    },
+    "await_s_total_seconds": 5.103599421796389,
+    "apply_s_total_seconds": 732.5310774892569,
+    "await_s_to_apply_s_ratio": 0.0069670756349190345,
+    "pearson_await_s_vs_W": {
+      "overall": 0.1112526427560551,
+      "first_third": 0.24146648562816475,
+      "middle_third": -0.2178886470701579,
+      "last_third": -0.2203713379261711
     }
   }
 }
