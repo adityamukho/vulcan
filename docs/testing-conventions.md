@@ -184,3 +184,33 @@ your test calls `mcp_server._reset_db_state()` at teardown. Call it.
 
 In tests, use `mcp_server._reset_db_state()` rather than assigning any module
 global. A grep guard enforces this and will fail the suite.
+
+## Patch the class, never the module-level singleton
+
+To replace a *method* for one test, monkeypatch the class:
+
+```python
+monkeypatch.setattr(mcp_server._DbLeaseManager, "try_acquire",
+                    lambda self, path=None: ...)
+```
+
+Not the `mcp_server._lease_manager` singleton. `monkeypatch.setattr(instance,
+name, value)` reads the inherited value first and, on undo, **restores** it
+rather than deleting it — planting the class's bound method as a permanent
+entry in the instance's `__dict__`. Instance lookup then beats class lookup for
+the rest of the session, so every later class-level patch of that name is
+silently ignored on that object.
+
+The failure this produces is invisible and order-dependent: the victim test
+passes 20/20 alone and fails only when it runs after the planting test, with
+the patched function simply never called. It cost a full debugging cycle in
+PR #269 before it was named (#272).
+
+Instance *data* attributes set in `__init__` — `strict_leak_detection` is the
+one here — are not affected: they have no class-level counterpart, so undo
+restores them where they already lived. Patching those on the singleton is
+fine.
+
+The autouse `reset_mcp_server_db` fixture enforces this: at teardown it fails
+any test that left a class-shadowing name in `_lease_manager.__dict__`, and
+strips it so one offender cannot poison the rest of the run.

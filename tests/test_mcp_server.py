@@ -61,6 +61,43 @@ def reset_mcp_server_db():
     mcp_server._reset_db_state()
     mcp_server._grammar_cache.clear()
     mcp_server._reset_introduced_by_ambiguity_log_budget()
+    _assert_no_shadowing_residue_on_lease_manager()
+
+
+def _assert_no_shadowing_residue_on_lease_manager():
+    """Fail the test that plants a class-shadowing attribute on the singleton.
+
+    `monkeypatch.setattr(instance, name, value)` does NOT delete `name` on
+    undo when the instance did not own it -- it reads the inherited value
+    first and RESTORES that, planting the class's bound method as a permanent
+    entry in the instance's `__dict__`. Instance lookup then beats class
+    lookup for the rest of the session, so every later CLASS-level patch of
+    that name is silently ignored for `_lease_manager` (#272).
+
+    That is invisible and order-dependent: the victim passes alone and fails
+    only when it runs after the planting test. So catch it at the source --
+    here, in the teardown of the test that planted it.
+
+    Genuine per-instance state (`strict_leak_detection`, set in `__init__`)
+    is not shadowing: it has no class-level counterpart, so patching it is
+    safe and this check ignores it. Only names that ALSO exist on the class
+    are residue.
+    """
+    import mcp_server
+    mgr = mcp_server._lease_manager
+    residue = sorted(
+        name for name in list(vars(mgr))
+        if hasattr(type(mgr), name)
+    )
+    for name in residue:      # strip it, or one offender poisons the rest
+        delattr(mgr, name)
+    assert not residue, (
+        f"this test left {residue} in _lease_manager.__dict__, shadowing the "
+        f"class attribute(s) of the same name for the rest of the session "
+        f"(#272). Patch _DbLeaseManager (the class), not the _lease_manager "
+        f"singleton: monkeypatch's undo restores an instance attribute "
+        f"instead of deleting it."
+    )
 
 
 @pytest.fixture
@@ -285,14 +322,20 @@ class TestCallToolAcquiresOnlyForDbTools:
         mcp_server.open_db(graph)
 
         seen = []
-        real_try = mcp_server._lease_manager.try_acquire
+        # Patch the CLASS, not the _lease_manager singleton (#272).
+        # monkeypatch's undo RESTORES an attribute the instance did not own
+        # rather than deleting it, so patching the singleton would leave the
+        # bound method permanently in _lease_manager.__dict__ and silently
+        # shadow every later class-level patch of try_acquire in the session.
+        # The autouse fixture's teardown fails the test that does this.
+        real_try = mcp_server._DbLeaseManager.try_acquire
         monkeypatch.setattr(
-            mcp_server._lease_manager, "try_acquire",
-            # p=None, matching try_acquire's own signature (#255 review:
+            mcp_server._DbLeaseManager, "try_acquire",
+            # path=None matches try_acquire's own signature (#255 review:
             # db_lease/db_lease_async now call try_acquire() with no
             # argument, resolving the path inside the lock instead of
             # reading it outside).
-            lambda p=None: (seen.append(p), real_try(p))[1],
+            lambda self, path=None: (seen.append(path), real_try(self, path))[1],
         )
 
         mcp_server._ingest_progress["status"] = "running"
@@ -23256,15 +23299,14 @@ class TestConcurrentPollerDoesNotForceASecondOpen:
 
         main_has_opened = threading.Event()
         poller_has_tried = threading.Event()
-        mgr = mcp_server._lease_manager
 
-        def try_acquire_without_reuse(path=None):
+        def try_acquire_without_reuse(self, path=None):
             """`_DbLeaseManager.try_acquire` with the reuse branch (`count >
             0 -> return self._handle`) removed, so every acquisition attempts
             a fresh `MiniGrafDb.open()` -- including a second one while the
             first is still live. Otherwise faithful (locking, leak detection,
             session rule registration, and -- #255 review -- resolving
-            path=None from mgr._path the same way the real method does, since
+            path=None from self._path the same way the real method does, since
             db_lease() calls try_acquire() with no argument now). Does NOT
             catch the resulting "already open in this process" the way
             `_open_for_lease`'s self-heal path effectively re-raises it when
@@ -23272,37 +23314,29 @@ class TestConcurrentPollerDoesNotForceASecondOpen:
             caller uncaught, exactly as the pre-#255 idiom let it, not be
             absorbed by db_lease()'s outer retry loop.
 
-            Patched onto the `_lease_manager` INSTANCE, not the
-            `_DbLeaseManager` CLASS, and closes over `mgr` rather than taking
-            `self`/`path` the way the real method does. That is not a style
-            choice: `TestCallToolAcquiresOnlyForDbTools.
-            test_ingest_status_acquires_only_when_not_running` monkeypatches
-            `mcp_server._lease_manager.try_acquire` earlier in this same file
-            with a plain `lambda p: ...` (no `self`), and `monkeypatch`'s
-            undo does `setattr(instance, name, getattr(instance, name))`
-            captured *before* that patch -- which was the CLASS's bound
-            method, obtained via descriptor lookup through the instance. That
-            "restore" plants a real INSTANCE attribute, permanently shadowing
-            the class method on this singleton for the rest of the test
-            session. A class-level monkeypatch here is silently ineffective
-            once that shadow exists (confirmed: this test alone was 20/20
-            green, but failed inside the full suite -- `caught == []` -- with
-            debug prints showing the patched function was never even called).
-            Patching the instance directly sidesteps the shadow instead of
-            fighting it: whatever is currently shadowing gets overridden for
-            this test's duration and monkeypatch's teardown restores exactly
-            that prior (possibly already-shadowed) state, same as it already
-            was.
+            Patched onto the `_DbLeaseManager` CLASS, so it takes `self` and
+            `path` exactly as the real method does. It used to be patched onto
+            the `_lease_manager` INSTANCE instead, closing over `mgr`, because
+            a class-level patch here was silently ineffective: an earlier test
+            in this file patched `mcp_server._lease_manager.try_acquire` on
+            the instance, and `monkeypatch`'s undo RESTORES rather than deletes
+            an attribute the instance did not own -- planting the class's bound
+            method in the singleton's `__dict__` and shadowing the class method
+            for the rest of the session. This test alone was then 20/20 green
+            but failed inside the full suite with `caught == []`, the patched
+            function never called. That earlier test now patches the class too,
+            and the autouse fixture's teardown fails any test that plants such
+            a shadow, so the workaround is no longer needed (#272).
             """
             is_main = threading.current_thread() is threading.main_thread()
             if not is_main:
                 # Block until this round's handle is provably open before
                 # attempting a second one.
                 main_has_opened.wait(timeout=2.0)
-            with mgr._lock:
+            with self._lock:
                 if path is None:
-                    path = mgr._path or mcp_server._get_graph_path()
-                mgr._detect_leaked_handle(path)
+                    path = self._path or mcp_server._get_graph_path()
+                self._detect_leaked_handle(path)
                 try:
                     handle = mcp_server._open_for_lease(path)
                 finally:
@@ -23316,9 +23350,9 @@ class TestConcurrentPollerDoesNotForceASecondOpen:
                     mcp_server._db_execute(handle, rule)
                 for rule in mcp_server._user_rules:
                     mcp_server._db_execute(handle, rule)
-                mgr._handle = handle
-                mgr._path = path
-                mgr._count += 1
+                self._handle = handle
+                self._path = path
+                self._count += 1
             if is_main:
                 poller_has_tried.clear()
                 main_has_opened.set()
@@ -23328,7 +23362,9 @@ class TestConcurrentPollerDoesNotForceASecondOpen:
                 main_has_opened.clear()
             return handle
 
-        monkeypatch.setattr(mgr, "try_acquire", try_acquire_without_reuse)
+        monkeypatch.setattr(
+            mcp_server._DbLeaseManager, "try_acquire", try_acquire_without_reuse
+        )
 
         caught = []
         try:
