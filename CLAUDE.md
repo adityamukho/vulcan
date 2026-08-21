@@ -77,13 +77,35 @@ each other — the flaky `Page N out of bounds (total pages: M)` (#251, #253,
 project-minigraf/minigraf#304). minigraf enforces this as of 1.2.2 (hence the
 `minigraf>=1.2.3` floor): a second open now raises `Database is already open in
 this process` instead of silently succeeding. That makes the bug visible, not
-absent — `mcp_server.py` still does not enforce it: `_db =
-None` is its "release the lock" idiom, but it only releases when it drops the
-LAST reference, and a local `db` on a stack (e.g. `_run_ingestion`'s per-commit
-handle, held across awaits) keeps the handle alive while a concurrent
-`call_tool`'s `finally` clears the global. Before touching DB lifecycle, read the
-invariant comment above `_db_native_lock`. Enforcing it in Python by reusing the
-live handle was tried and rejected — it changes handle lifetime and segfaults.
+absent.
+
+`mcp_server.py` enforces it through `_DbLeaseManager` (#255), which replaced the
+old `_db = None` "release the lock" idiom — that global is **deleted**, so
+ignore any comment still describing it. The refcount is authoritative: the
+handle opens at 0 -> 1 and drops at 1 -> 0, and every acquisition in between
+reuses it. Before touching DB lifecycle, read the invariant comment above
+`_db_native_lock`. Enforcing the invariant by reusing a handle held only by a
+live weakref was tried and rejected — it resurrects dead graphs and segfaults
+(#253).
+
+**A lease is cheap in-process and exclusive out-of-process, and the difference
+decides design questions.** At count > 0 `try_acquire` joins and returns the
+same handle, so a concurrent `call_tool` never blocks. But `try_acquire` returns
+None while another PROCESS holds minigraf's `.graph.lock` sidecar, and BOTH
+auto-memory hooks (`hooks/claude-code.json`) are `command` hooks in separate
+processes — `finalize_hook.py` takes a lease to write each turn's facts. The
+retry budget is `_LOCK_RETRY_MAX` x `_LOCK_RETRY_BASE` doubling = **0.75 s
+total**, and both hooks swallow failures (`except Exception: pass`). So
+lengthening how long ingestion holds a lease does not block queries — it
+**silently discards auto-memory writes**. Do not "just hold one lease for the
+whole run".
+
+**Dropping the handle is not free: it runs a full O(graph size) checkpoint**
+inside minigraf's `Drop for Inner`, outside `_CheckpointPolicy`'s duty gate and
+invisible to the trace's `ckpt_d_seconds`. Ingestion currently drops it ~1.02
+times per commit, measured at 48% of write time and growing 3.47x within a
+220-commit run (#280). See `evals/at_scale/benchmark.md`, "Per-Commit Cost
+Attribution".
 
 ## Claude Code Plugin Publishing
 
