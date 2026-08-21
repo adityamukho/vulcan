@@ -126,12 +126,18 @@ async def run_ingestion_benchmark(
     poll_interval: float = 0.5,
     duty_factor: float = 10.0,
     compare_ignore: bool = False,
+    trace_path: Optional[Path] = None,
 ) -> dict[str, Any]:
     """Run a full git ingestion against repo_path into an isolated graph at
     graph_path, measuring wall-clock, throughput, peak RSS, final graph/index
     size, and MCP responsiveness (status/query latency) while ingestion runs.
 
     graph_path must not already exist -- each call is a fresh, isolated run.
+
+    trace_path, if given, arms mcp_server's per-commit cost trace (#260) via
+    MINIGRAF_INGEST_TRACE_PATH for the duration of this call only, and is
+    reported back as metrics["trace_path"]. Absent from metrics means the run
+    was NOT traced -- never "traced and empty".
     """
     import fact_index
     import mcp_server
@@ -169,6 +175,14 @@ async def run_ingestion_benchmark(
     captured = None
     tee_failure: Optional[TeeStderrFailure] = None
 
+    # Armed only around THIS drive of _run_ingestion, and disarmed again
+    # before returning to the caller -- never left set for the rest of the
+    # process, and (critically) restored before the compare_ignore branch
+    # below gets a chance to run its own, separate _run_ingestion (#260).
+    # See that branch's comment for why it must stay untraced.
+    _prior_trace_env = os.environ.get("MINIGRAF_INGEST_TRACE_PATH")
+    if trace_path is not None:
+        os.environ["MINIGRAF_INGEST_TRACE_PATH"] = str(Path(trace_path).resolve())
     start = time.perf_counter()
     try:
         # The tee spans the WHOLE run on purpose. Narrowing its scope to dodge
@@ -232,6 +246,11 @@ async def run_ingestion_benchmark(
             traceback.print_exception(exc)
     finally:
         wall_clock = time.perf_counter() - start
+        if trace_path is not None:
+            if _prior_trace_env is None:
+                os.environ.pop("MINIGRAF_INGEST_TRACE_PATH", None)
+            else:
+                os.environ["MINIGRAF_INGEST_TRACE_PATH"] = _prior_trace_env
 
     scanned = scan_ingestion_stderr(captured.text() if captured is not None else "")
 
@@ -258,6 +277,7 @@ async def run_ingestion_benchmark(
         # file is auditable from the metrics side too: the probe recording the
         # path it was HANDED says nothing about whether that was the right one.
         "graph_path": str(Path(graph_path).resolve()),
+        **({"trace_path": str(Path(trace_path).resolve())} if trace_path is not None else {}),
         "commits_ingested": commits_ingested,
         "wall_clock_seconds": wall_clock,
         "throughput_per_minute": throughput_per_minute(commits_ingested, wall_clock),
@@ -294,6 +314,12 @@ async def run_ingestion_benchmark(
         # ingestion exists only to size a graph built with the ignore patterns
         # disabled; its stderr is not part of the measured run, and folding it
         # into `scanned` would attribute its skips to the run reported above.
+        # Deliberately NOT traced either, for the same reason (#260): the
+        # env var was already restored in the finally above, so this run is
+        # untraced whether or not trace_path was given. Tracing it too would
+        # append a second ingestion's records into the same JSONL file with
+        # nothing marking where one run ended and the other began, corrupting
+        # the per-commit regression the trace exists to feed.
         no_ignore_graph_path = graph_path.parent / f"{graph_path.stem}-no-ignore{graph_path.suffix}"
         original_patterns = mcp_server._DEFAULT_IGNORE_PATTERNS
         mcp_server._DEFAULT_IGNORE_PATTERNS = ()
@@ -413,6 +439,11 @@ def main() -> int:
     )
     parser.add_argument("--compare-ignore", action="store_true")
     parser.add_argument(
+        "--trace-path", default=None,
+        help="Append a per-commit cost trace (JSONL) here (#260). Read it with "
+             "evals/at_scale/probe_per_commit_cost.py. Off by default.",
+    )
+    parser.add_argument(
         "--graph-path", default=None,
         help="Persist the graph at this path instead of using a temporary "
              "directory. Must not already exist. Required for the #256 "
@@ -429,6 +460,7 @@ def main() -> int:
                 poll_interval=args.poll_interval,
                 duty_factor=args.poll_duty_factor,
                 compare_ignore=args.compare_ignore,
+                trace_path=Path(args.trace_path) if args.trace_path else None,
             )
         )
 

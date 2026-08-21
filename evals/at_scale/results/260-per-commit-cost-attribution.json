@@ -1,0 +1,76 @@
+{
+  "records": 767,
+  "group_sizes": {
+    "first": 255,
+    "middle": 257,
+    "last": 255
+  },
+  "fits": {
+    "first": {
+      "a": 0.15758969578500195,
+      "b": 0.0008065604100813781,
+      "r2": 0.882260662135258,
+      "n": 255
+    },
+    "middle": {
+      "a": 0.5023387062340513,
+      "b": 0.0012573441484699907,
+      "r2": 0.8656148526779648,
+      "n": 257
+    },
+    "last": {
+      "a": 0.7573737139530867,
+      "b": 0.001719488004221704,
+      "r2": 0.7247170199087587,
+      "n": 255
+    }
+  },
+  "a_ratio": 4.805984999084991,
+  "b_ratio": 2.1318775168349955,
+  "control_gate": {
+    "passed": true,
+    "growth": 7.848398927369862,
+    "mean_first": 0.11490851876248295,
+    "mean_last": 0.9018478954011309,
+    "n_first": 30,
+    "n_last": 21,
+    "reason": "passed: mean per-checkpoint duration grew 7.85x"
+  },
+  "verdict": "REAL",
+  "verdict_reason": "a and b grew >= 2.0x (a=4.81x, b=2.13x)",
+  "pre_registered": {
+    "W_KEY": "idents_considered",
+    "CLOSE_BELOW": 1.5,
+    "REAL_AT": 2.0,
+    "CONTROL_MIN_GROWTH": 2.0,
+    "CONTROL_MIN_CHECKPOINTS": 5,
+    "MIN_POINTS_PER_GROUP": 30
+  },
+  "commits_ingested": 767,
+  "wall_clock_seconds": 1505.7844263210427,
+  "final_status": "complete",
+  "graph_path": "/tmp/260-run/g.graph",
+  "trace_path": "/tmp/260-run/trace.jsonl",
+  "provenance": {
+    "executable": "/home/aditya/Work/AMC/Minigraf/temporal_reasoning/.venv/bin/python",
+    "minigraf_version": "1.2.3",
+    "stream_ratio": "1:1",
+    "checkpoint_duty": "default"
+  },
+  "exploratory": {
+    "mean_await_s": 0.006653975778091772,
+    "tag_counts": {
+      "fwd": 384,
+      "rev": 383
+    },
+    "await_s_total_seconds": 5.103599421796389,
+    "apply_s_total_seconds": 732.5310774892569,
+    "await_s_to_apply_s_ratio": 0.0069670756349190345,
+    "pearson_await_s_vs_W": {
+      "overall": 0.1112526427560551,
+      "first_third": 0.24146648562816475,
+      "middle_third": -0.2178886470701579,
+      "last_third": -0.2203713379261711
+    }
+  }
+}

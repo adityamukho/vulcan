@@ -223,6 +223,63 @@ class TestRunIngestionBenchmark:
         assert metrics["commits_ingested"] == 2
 
 
+class TestBenchmarkTracePath:
+    """#260: --trace-path arms the per-commit trace and records where it went."""
+
+    @pytest.mark.asyncio
+    async def test_metrics_record_the_resolved_trace_path(self, git_repo, tmp_path):
+        """Provenance. #275's whole lesson was that a benchmark which does not
+        record what it measured produces an artifact nobody can interpret."""
+        graph_path = tmp_path / "g.graph"
+        trace = tmp_path / "trace.jsonl"
+        metrics = await run_ingestion_benchmark(
+            str(git_repo), "HEAD", graph_path, poll_interval=0.05, trace_path=trace,
+        )
+        assert metrics["trace_path"] == str(trace.resolve())
+        assert trace.exists()
+
+    @pytest.mark.asyncio
+    async def test_untraced_run_records_no_trace_path_key(self, git_repo, tmp_path):
+        """Absent must mean 'not traced', never 'traced and empty' -- the same
+        three-state discipline benchmark.md's residue rows use."""
+        metrics = await run_ingestion_benchmark(
+            str(git_repo), "HEAD", tmp_path / "g.graph", poll_interval=0.05,
+        )
+        assert "trace_path" not in metrics
+
+    @pytest.mark.asyncio
+    async def test_env_var_does_not_leak_past_the_run(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        import os
+        monkeypatch.delenv("MINIGRAF_INGEST_TRACE_PATH", raising=False)
+        await run_ingestion_benchmark(
+            str(git_repo), "HEAD", tmp_path / "g.graph", poll_interval=0.05,
+            trace_path=tmp_path / "t.jsonl",
+        )
+        assert "MINIGRAF_INGEST_TRACE_PATH" not in os.environ
+
+    @pytest.mark.asyncio
+    async def test_compare_ignore_run_is_not_traced(self, git_repo, tmp_path):
+        """The hazard this task exists to close: the trace must be armed ONLY
+        around the measured run. compare_ignore drives a SECOND, complete
+        ingestion into a different graph purely to size it -- if the env var
+        stayed armed across that second call, its records would land in the
+        same JSONL file (opened in append mode) and double the line count,
+        with nothing in the data marking where one run ended and the other
+        began. git_repo has exactly two commits, so a correctly-scoped trace
+        has exactly two records; a leaked one would have four."""
+        graph_path = tmp_path / "g.graph"
+        trace = tmp_path / "trace.jsonl"
+        metrics = await run_ingestion_benchmark(
+            str(git_repo), "HEAD", graph_path, poll_interval=0.05,
+            compare_ignore=True, trace_path=trace,
+        )
+        assert metrics["commits_ingested"] == 2
+        lines = trace.read_text().splitlines()
+        assert len(lines) == metrics["commits_ingested"] == 2
+
+
 class TestCompareIgnore:
     @pytest.mark.asyncio
     async def test_ignore_comparison_present_when_requested(self, git_repo, tmp_path):

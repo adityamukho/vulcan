@@ -3685,7 +3685,190 @@ def _db_checkpoint(db: Any) -> None:
 
 _ingest_checkpoint_policy: Optional["_CheckpointPolicy"] = None
 
+_ingest_trace: Optional["_IngestTrace"] = None
+
 _DEFAULT_CHECKPOINT_DUTY = 0.05
+
+
+def _trace_work_counters(extracted_files: Sequence[tuple]) -> Dict[str, Any]:
+    """Per-commit work size, for the #260 cost trace. Pure; len() only.
+
+    extracted_files is _extract_commit's file_results -- one
+    (status, file_path, extracted, precomputed, old_path) per changed file. A
+    "D" entry carries extracted=None and precomputed=None, so it counts as a
+    touched file and contributes nothing else: there is no module being
+    introduced and no entities to consider.
+
+    `idents_considered` is #260's frozen work metric W (see
+    docs/superpowers/specs/2026-08-17-per-commit-cost-attribution-design.md):
+    one module ident per file that has a precomputed, plus one per extracted
+    entity, plus one per RESOLVED import. It is the unit _build_code_triples
+    iterates. Unresolved imports are excluded because they take the
+    external-dependency fallback rather than an entity path;
+    n_imports_total - n_imports_resolved is kept as exploratory signal.
+
+    n_unchanged_idents (#221's body-diff narrowing) is likewise exploratory and
+    deliberately NOT subtracted from W: W counts idents CONSIDERED, and an
+    unchanged ident is considered before it is narrowed out.
+
+    W is FROZEN. Changing this arithmetic after a trace exists redefines the
+    experiment; fork it instead.
+    """
+    files_by_status: Dict[str, int] = {}
+    n_modules = n_functions = n_classes = n_globals = n_fields = 0
+    n_imports_total = n_imports_resolved = 0
+    n_unchanged_idents = 0
+
+    for status, _file_path, _extracted, precomputed, _old_path in extracted_files:
+        files_by_status[status] = files_by_status.get(status, 0) + 1
+        if not precomputed:
+            continue
+        n_modules += 1
+        n_functions += len(precomputed["function_entries"])
+        n_classes += len(precomputed["class_entries"])
+        n_globals += len(precomputed["global_entries"])
+        n_fields += len(precomputed["field_entries"])
+        for _import_name, _dep_ident, is_resolved in precomputed["resolved_imports"]:
+            n_imports_total += 1
+            if is_resolved:
+                n_imports_resolved += 1
+        n_unchanged_idents += len(precomputed.get("unchanged_idents", ()))
+
+    return {
+        "files_by_status": files_by_status,
+        "n_modules": n_modules,
+        "n_functions": n_functions,
+        "n_classes": n_classes,
+        "n_globals": n_globals,
+        "n_fields": n_fields,
+        "n_imports_total": n_imports_total,
+        "n_imports_resolved": n_imports_resolved,
+        "n_unchanged_idents": n_unchanged_idents,
+        "idents_considered": (
+            n_modules + n_functions + n_classes + n_globals + n_fields
+            + n_imports_resolved
+        ),
+    }
+
+
+class _IngestTrace:
+    """Per-commit cost trace for #260, armed by MINIGRAF_INGEST_TRACE_PATH.
+
+    One JSON object per line, appended as each commit's write half finishes.
+    JSONL rather than a single document so a killed run still leaves a
+    readable partial trace -- at-scale runs take ~30 minutes and the
+    interesting ones are sometimes the ones that die.
+
+    Checkpoint cost is recorded as a DELTA of _CheckpointPolicy's cumulative
+    `checkpoints`/`total_seconds` across each commit, so the policy gains no
+    state of its own. `policy` may be None (the two terminal finally sites in
+    _run_ingestion clear it), which records zero deltas rather than raising:
+    an instrument must never be the reason a run dies.
+
+    That same principle covers the write itself: an OSError from the
+    underlying file (e.g. disk full mid-run) disables the trace and warns on
+    stderr rather than propagating -- emit() is called from inside
+    _run_ingestion's per-commit loop, outside its own try/except, so letting
+    an I/O failure raise there would abort the whole run over an instrument.
+
+    Writes only, no locks, no awaits, no DB access -- see this module's
+    _db_native_lock invariant comment for why the per-commit loop tolerates
+    nothing else.
+    """
+
+    def __init__(self, path: str, clock: "Callable[[], float]" = time.monotonic) -> None:
+        self._fh: Optional[Any] = open(path, "a", encoding="utf-8")
+        self._clock = clock
+        self._started_at = clock()
+        self._ckpt_count = 0
+        self._ckpt_seconds = 0.0
+        self.records = 0
+
+    def emit(
+        self,
+        pos: int,
+        tag: str,
+        commit_hash: str,
+        await_s: float,
+        apply_s: float,
+        extracted_files: Sequence[tuple],
+        policy: Optional["_CheckpointPolicy"],
+    ) -> None:
+        if self._fh is None:
+            return
+        if policy is None:
+            d_count, d_seconds = 0, 0.0
+        else:
+            d_count = policy.checkpoints - self._ckpt_count
+            d_seconds = policy.total_seconds - self._ckpt_seconds
+            self._ckpt_count = policy.checkpoints
+            self._ckpt_seconds = policy.total_seconds
+
+        record: Dict[str, Any] = {
+            "pos": pos,
+            "tag": tag,
+            "hash": commit_hash,
+            "t_since_start": self._clock() - self._started_at,
+            "await_s": await_s,
+            "apply_s": apply_s,
+            "ckpt_d_count": d_count,
+            "ckpt_d_seconds": d_seconds,
+        }
+        record.update(_trace_work_counters(extracted_files))
+        try:
+            self._fh.write(json.dumps(record) + "\n")
+            self._fh.flush()
+        except OSError as e:
+            print(
+                f"[_run_ingestion] per-commit trace write failed ({e}); "
+                f"tracing disabled for the rest of this run",
+                file=sys.stderr,
+            )
+            self.close()
+            return
+        self.records += 1
+
+    def close(self) -> None:
+        """Idempotent -- _run_ingestion has two terminal paths that both
+        release the trace, and either may run first.
+
+        Also absorbs OSError from the close() call itself: emit()'s own
+        write-failure handler calls back into close() to disable the trace,
+        and on a broken fd (see emit()'s guard) the flush-on-close this
+        performs fails with a SECOND OSError from the same underlying
+        problem. Swallowing it here is what keeps that cleanup call from
+        defeating emit()'s guard by raising anyway.
+        """
+        if self._fh is None:
+            return
+        try:
+            self._fh.close()
+        except OSError:
+            pass
+        finally:
+            self._fh = None
+
+
+def _ingest_trace_from_env() -> Optional["_IngestTrace"]:
+    """Read MINIGRAF_INGEST_TRACE_PATH and open a trace, or None.
+
+    Degrades to None on any open failure rather than raising, matching
+    _checkpoint_duty_from_env and _parse_stream_ratio: an unwritable trace path
+    is a typo in an instrument, and must not become the reason a repository
+    never ingests (#260).
+    """
+    raw = os.environ.get("MINIGRAF_INGEST_TRACE_PATH")
+    if not raw:
+        return None
+    try:
+        return _IngestTrace(raw)
+    except OSError as e:
+        print(
+            f"[_run_ingestion] cannot open MINIGRAF_INGEST_TRACE_PATH={raw!r} "
+            f"({e}); per-commit tracing disabled",
+            file=sys.stderr,
+        )
+        return None
 
 
 def _checkpoint_duty_from_env() -> float:
@@ -10873,7 +11056,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     Ordinary exceptions (bad git ref, unreadable blob, unsupported syntax)
     are unaffected and still fail only the one commit as before.
     """
-    global _ingest_progress, _ingest_checkpoint_policy
+    global _ingest_progress, _ingest_checkpoint_policy, _ingest_trace
     # Safe to clear unconditionally: handle_minigraf_ingest_git refuses to start a
     # new run while one is already active, so no in-flight shutdown signal is ever
     # stomped on here; main()'s finally block re-sets the flag on exit regardless,
@@ -10980,6 +11163,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # once per commit. See _CheckpointPolicy for why the per-commit
         # cadence was super-linear and why deferring is safe (#241).
         _ingest_checkpoint_policy = _CheckpointPolicy(_checkpoint_duty_from_env())
+        _ingest_trace = _ingest_trace_from_env()
 
         # Single fact-index write connection for the whole ingestion run,
         # opened on write_executor's one worker thread and never touched from
@@ -11086,6 +11270,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     # ingestion run — including the many existing tests that drive
                     # _run_ingestion through a real ProcessPoolExecutor worker — would
                     # otherwise fail with "too many values to unpack".
+                    _trace_t_await = time.perf_counter()
                     try:
                         extracted_files, gitlink_changes, gitmodules_map, renamed_pairs = await fut
                     except concurrent.futures.process.BrokenProcessPool:
@@ -11112,6 +11297,15 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         _ingest_progress["processed"] += 1
                         await asyncio.sleep(0)  # yield to event loop
                         continue
+                    # #260 M1: read BEFORE submit_next(), not after -- await_s
+                    # is documented as extraction stall (wall clock stalled on
+                    # `await fut`), and submit_next() does real work (queues
+                    # the next commit's extraction). Reading the clock after it
+                    # would fold submission cost into a field the spec defines
+                    # as pure stall. Immaterial in magnitude on the shipped
+                    # trace (5.10s total over 767 commits), but the field
+                    # should mean what it says.
+                    _trace_await_s = time.perf_counter() - _trace_t_await
                     submit_next()
 
                     last_hash = commit_hash
@@ -11123,6 +11317,17 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     # SECOND handle (#251/#253). There is no window now: the
                     # count is authoritative and the handle drops exactly when
                     # it reaches zero.
+                    # #260: apply_s deliberately spans the lease ACQUIRE as
+                    # well as the executor call -- the acquire is real serial
+                    # per-commit cost, and a reader must not take apply_s for
+                    # pure write time. #260 M2: it also spans the lease
+                    # RELEASE -- the timer below is read after `async with
+                    # db_lease_async()` has exited, and at refcount 0 that
+                    # release drops the handle. A follow-up attribution task
+                    # narrowing apply_s further needs to know handle open AND
+                    # drop are both inside the measured span, not just open.
+                    _trace_t_apply = time.perf_counter()
+                    _trace_write_ok = True
                     async with db_lease_async() as db:
                         try:
                             if tag == "fwd":
@@ -11154,7 +11359,22 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 f"({subject!r}): write failed: {e}",
                                 file=sys.stderr,
                             )
+                            _trace_write_ok = False
 
+                    # #260: no record for a commit whose write failed -- same
+                    # contamination class the brief excluded extraction
+                    # failures for. apply_s on a failed attempt does not
+                    # measure the quantity the downstream regression models
+                    # (the cost of successfully applying a commit), so
+                    # recording it would inject a bad point into the fit.
+                    if _ingest_trace is not None and _trace_write_ok:
+                        _ingest_trace.emit(
+                            pos, tag, commit_hash,
+                            _trace_await_s,
+                            time.perf_counter() - _trace_t_apply,
+                            extracted_files,
+                            _ingest_checkpoint_policy,
+                        )
                     _ingest_progress["processed"] += 1
                     await asyncio.sleep(0)  # yield to event loop
 
@@ -11350,6 +11570,9 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             # Never let a finished run's budget gate a later interactive
             # transact (#241).
             _ingest_checkpoint_policy = None
+            if _ingest_trace is not None:
+                _ingest_trace.close()
+            _ingest_trace = None
 
     except Exception as e:
         # write_executor is shut down by the outermost finally below, which
@@ -11391,6 +11614,9 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         if _ingest_checkpoint_policy is not None:
             _ingest_progress["checkpoint_summary"] = _ingest_checkpoint_policy.summary()
         _ingest_checkpoint_policy = None
+        if _ingest_trace is not None:
+            _ingest_trace.close()
+        _ingest_trace = None
         # The single shutdown for this executor. It lives here, not in the
         # inner finally, because two awaited calls (_open_index_writer_safe,
         # _frontier_load) sit above the inner try and can raise in the gap --

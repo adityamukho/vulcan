@@ -23346,3 +23346,397 @@ class TestConcurrentPollerDoesNotForceASecondOpen:
         assert any("already open in this process" in str(e) for e in caught), (
             f"failure(s) came back but not the #255 one: {caught}"
         )
+
+
+class TestTraceWorkCounters:
+    """#260: _trace_work_counters turns _extract_commit's file_results into the
+    work-size counters the per-commit trace records."""
+
+    @staticmethod
+    def _precomputed(functions=0, classes=0, globals_=0, fields=0,
+                     imports=(), unchanged=()):
+        """A _precompute_file_triples-shaped dict with the given cardinalities.
+
+        Only lengths matter to the counters, so the entries are placeholders of
+        the right arity: (ident, name, candidate_triples) for entity lists and
+        (import_name, dep_ident, is_resolved) for resolved_imports.
+        """
+        return {
+            "module_ident": ":module/x",
+            "function_entries": [(f":function/f{i}", f"f{i}", []) for i in range(functions)],
+            "class_entries": [(f":class/c{i}", f"c{i}", []) for i in range(classes)],
+            "global_entries": [(f":variable/g{i}", f"g{i}", []) for i in range(globals_)],
+            "field_entries": [(f":field/d{i}", f"d{i}", []) for i in range(fields)],
+            "resolved_imports": list(imports),
+            "unchanged_idents": set(unchanged),
+        }
+
+    def test_counts_entities_and_module_across_files(self):
+        import mcp_server
+        files = [
+            ("A", "a.py", {}, self._precomputed(functions=3, classes=1), ""),
+            ("M", "b.py", {}, self._precomputed(functions=2, globals_=4, fields=5), ""),
+        ]
+        c = mcp_server._trace_work_counters(files)
+        assert c["n_modules"] == 2
+        assert c["n_functions"] == 5
+        assert c["n_classes"] == 1
+        assert c["n_globals"] == 4
+        assert c["n_fields"] == 5
+        assert c["files_by_status"] == {"A": 1, "M": 1}
+
+    def test_deleted_file_has_no_precomputed_and_contributes_no_module(self):
+        """A 'D' entry carries extracted=None and precomputed=None. It must count
+        as a touched file but must NOT contribute a module ident -- there is no
+        module being introduced, and counting one would inflate W on exactly the
+        commits that do the least entity work."""
+        import mcp_server
+        files = [
+            ("D", "gone.py", None, None, ""),
+            ("M", "b.py", {}, self._precomputed(functions=1), ""),
+        ]
+        c = mcp_server._trace_work_counters(files)
+        assert c["files_by_status"] == {"D": 1, "M": 1}
+        assert c["n_modules"] == 1
+        assert c["idents_considered"] == 2  # 1 module + 1 function
+
+    def test_imports_split_resolved_from_total(self):
+        import mcp_server
+        files = [("M", "b.py", {}, self._precomputed(imports=[
+            ("os", ":module/os", False),
+            ("pkg.mod", ":module/pkg-mod", True),
+            ("other", ":module/other", True),
+        ]), "")]
+        c = mcp_server._trace_work_counters(files)
+        assert c["n_imports_total"] == 3
+        assert c["n_imports_resolved"] == 2
+
+    def test_idents_considered_is_the_frozen_W_formula(self):
+        """W = sum over files (1 + functions + classes + globals + fields)
+        + resolved imports. Pinned as an explicit arithmetic identity, not as a
+        recomputation of the implementation -- this is the spec's frozen work
+        metric and a drift here silently redefines the whole experiment."""
+        import mcp_server
+        files = [
+            ("A", "a.py", {}, self._precomputed(functions=3, classes=2), ""),
+            ("M", "b.py", {}, self._precomputed(globals_=1, fields=4, imports=[
+                ("x", ":module/x", True), ("y", ":module/y", False),
+            ]), ""),
+        ]
+        c = mcp_server._trace_work_counters(files)
+        assert c["idents_considered"] == (1 + 3 + 2) + (1 + 1 + 4) + 1
+        assert c["idents_considered"] == (
+            c["n_modules"] + c["n_functions"] + c["n_classes"]
+            + c["n_globals"] + c["n_fields"] + c["n_imports_resolved"]
+        )
+
+    def test_unchanged_idents_counted_but_excluded_from_W(self):
+        """unchanged_idents is #221's body-diff narrowing. It is exploratory
+        signal in the trace, NOT part of W -- W counts idents CONSIDERED, and an
+        unchanged ident is still considered before being narrowed out."""
+        import mcp_server
+        files = [("M", "b.py", {}, self._precomputed(
+            functions=4, unchanged=[":function/a", ":function/b"]), "")]
+        c = mcp_server._trace_work_counters(files)
+        assert c["n_unchanged_idents"] == 2
+        assert c["idents_considered"] == 5  # 1 module + 4 functions, unchanged not subtracted
+
+    def test_empty_file_list_is_all_zeros(self):
+        import mcp_server
+        c = mcp_server._trace_work_counters([])
+        assert c["idents_considered"] == 0
+        assert c["files_by_status"] == {}
+
+    def test_renamed_file_counts_by_its_own_status(self):
+        import mcp_server
+        files = [("R", "new.py", {}, self._precomputed(functions=2), "old.py")]
+        c = mcp_server._trace_work_counters(files)
+        assert c["files_by_status"] == {"R": 1}
+        assert c["idents_considered"] == 3
+
+
+class TestIngestTrace:
+    """#260: _IngestTrace appends one JSON object per commit to a JSONL file."""
+
+    @staticmethod
+    def _files(functions=1):
+        return [("M", "b.py", {}, {
+            "module_ident": ":module/b",
+            "function_entries": [(f":function/f{i}", f"f{i}", []) for i in range(functions)],
+            "class_entries": [], "global_entries": [], "field_entries": [],
+            "resolved_imports": [], "unchanged_idents": set(),
+        }, "")]
+
+    def _read(self, path):
+        import json
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+    def test_emits_one_json_object_per_commit(self, tmp_path):
+        import mcp_server
+        path = tmp_path / "trace.jsonl"
+        trace = mcp_server._IngestTrace(str(path))
+        trace.emit(0, "fwd", "aaa", 0.1, 0.2, self._files(), None)
+        trace.emit(766, "rev", "bbb", 0.3, 0.4, self._files(functions=3), None)
+        trace.close()
+        records = self._read(path)
+        assert len(records) == 2
+        assert trace.records == 2
+        assert [r["pos"] for r in records] == [0, 766]
+        assert [r["tag"] for r in records] == ["fwd", "rev"]
+        assert [r["hash"] for r in records] == ["aaa", "bbb"]
+
+    def test_record_carries_timings_and_work_counters(self, tmp_path):
+        import mcp_server
+        path = tmp_path / "trace.jsonl"
+        trace = mcp_server._IngestTrace(str(path))
+        trace.emit(5, "fwd", "abc", 0.25, 1.5, self._files(functions=4), None)
+        trace.close()
+        r = self._read(path)[0]
+        assert r["await_s"] == 0.25
+        assert r["apply_s"] == 1.5
+        # Task 1's counters are embedded, not recomputed here.
+        assert r["idents_considered"] == 5  # 1 module + 4 functions
+        assert r["n_functions"] == 4
+        assert r["files_by_status"] == {"M": 1}
+
+    def test_t_since_start_is_measured_from_construction(self, tmp_path):
+        """A fake clock, so this asserts the arithmetic rather than a duration."""
+        import mcp_server
+        ticks = iter([100.0, 103.5, 107.25])
+        trace = mcp_server._IngestTrace(str(tmp_path / "t.jsonl"), clock=lambda: next(ticks))
+        trace.emit(0, "fwd", "a", 0.0, 0.0, [], None)
+        trace.emit(1, "fwd", "b", 0.0, 0.0, [], None)
+        trace.close()
+        records = self._read(tmp_path / "t.jsonl")
+        assert records[0]["t_since_start"] == 3.5
+        assert records[1]["t_since_start"] == 7.25
+
+    def test_checkpoint_deltas_are_differences_not_totals(self, tmp_path):
+        """The policy's counters are CUMULATIVE. The trace must record the
+        per-commit delta -- recording the totals would make every downstream
+        per-checkpoint mean monotonically wrong, and the control gate reads
+        exactly these two fields."""
+        import mcp_server
+        path = tmp_path / "trace.jsonl"
+        policy = mcp_server._CheckpointPolicy(0.05)
+        trace = mcp_server._IngestTrace(str(path))
+
+        policy.checkpoints, policy.total_seconds = 1, 0.50
+        trace.emit(0, "fwd", "a", 0.0, 0.0, [], policy)
+        policy.checkpoints, policy.total_seconds = 1, 0.50   # no checkpoint here
+        trace.emit(1, "fwd", "b", 0.0, 0.0, [], policy)
+        policy.checkpoints, policy.total_seconds = 3, 2.75
+        trace.emit(2, "fwd", "c", 0.0, 0.0, [], policy)
+        trace.close()
+
+        records = self._read(path)
+        assert [r["ckpt_d_count"] for r in records] == [1, 0, 2]
+        assert [round(r["ckpt_d_seconds"], 6) for r in records] == [0.50, 0.0, 2.25]
+
+    def test_none_policy_records_zero_deltas_and_does_not_raise(self, tmp_path):
+        """_run_ingestion clears _ingest_checkpoint_policy at its terminal
+        paths, so emit must tolerate None rather than making the trace the
+        reason a run dies."""
+        import mcp_server
+        path = tmp_path / "trace.jsonl"
+        trace = mcp_server._IngestTrace(str(path))
+        trace.emit(0, "fwd", "a", 0.0, 0.0, [], None)
+        trace.close()
+        r = self._read(path)[0]
+        assert r["ckpt_d_count"] == 0
+        assert r["ckpt_d_seconds"] == 0.0
+
+    def test_close_is_idempotent(self, tmp_path):
+        """_run_ingestion has TWO terminal finally sites that both clear the
+        policy, so close() can genuinely be reached twice."""
+        import mcp_server
+        trace = mcp_server._IngestTrace(str(tmp_path / "t.jsonl"))
+        trace.emit(0, "fwd", "a", 0.0, 0.0, [], None)
+        trace.close()
+        trace.close()  # must not raise
+
+    def test_records_survive_without_close(self, tmp_path):
+        """A killed run must leave a readable partial trace -- that is the whole
+        point of JSONL over a single JSON document. Each emit flushes."""
+        import mcp_server
+        path = tmp_path / "trace.jsonl"
+        trace = mcp_server._IngestTrace(str(path))
+        trace.emit(0, "fwd", "a", 0.0, 0.0, [], None)
+        assert len(self._read(path)) == 1  # readable before close()
+        trace.close()
+
+    def test_write_failure_disables_trace_and_warns(self, tmp_path, capsys):
+        """#260 carried finding from Task 2's review: emit() is called from
+        inside _run_ingestion's per-commit loop, OUTSIDE its own
+        try/except, so an unguarded OSError from the write (e.g. disk full
+        mid-run) would abort the whole ingestion over an instrument -- the
+        exact thing this class's docstring says must never happen.
+
+        Manufactured for real, not mocked: os.close() on the trace's own fd
+        invalidates the underlying OS file descriptor while the Python file
+        object still believes it is open, so the very next write() makes a
+        real write(2) syscall that the kernel rejects with EBADF. That is a
+        genuine OSError from genuine I/O failure, not a patched
+        json.dumps -- and it also exercises close()'s own OSError guard,
+        since closing an already-fd-dead file object raises a second EBADF
+        that emit()'s cleanup call to self.close() must swallow too."""
+        import os
+        import mcp_server
+        path = tmp_path / "trace.jsonl"
+        trace = mcp_server._IngestTrace(str(path))
+        os.close(trace._fh.fileno())
+
+        trace.emit(0, "fwd", "a", 0.0, 0.0, [], None)  # must not raise
+
+        assert trace.records == 0
+        err = capsys.readouterr().err
+        assert "per-commit trace write failed" in err
+        assert "tracing disabled" in err
+        # The guard must also have disabled the trace, not just swallowed
+        # one failure -- a second emit must be a silent no-op (mirrors the
+        # existing self._fh is None early-return in emit()).
+        trace.emit(1, "fwd", "b", 0.0, 0.0, [], None)  # must not raise
+        assert trace.records == 0
+        trace.close()  # must not raise
+
+
+class TestIngestTraceWiring:
+    """#260: MINIGRAF_INGEST_TRACE_PATH arms the per-commit trace, and its
+    absence leaves ingestion byte-for-byte unchanged."""
+
+    def test_no_env_var_means_no_trace_and_no_file(self, tmp_path, monkeypatch):
+        import mcp_server
+        monkeypatch.delenv("MINIGRAF_INGEST_TRACE_PATH", raising=False)
+        assert mcp_server._ingest_trace_from_env() is None
+
+    def test_env_var_returns_a_trace_writing_to_that_path(self, tmp_path, monkeypatch):
+        import mcp_server
+        path = tmp_path / "t.jsonl"
+        monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(path))
+        trace = mcp_server._ingest_trace_from_env()
+        assert trace is not None
+        try:
+            trace.emit(0, "fwd", "a", 0.0, 0.0, [], None)
+        finally:
+            trace.close()
+        assert path.exists()
+
+    def test_unopenable_path_degrades_to_none_and_warns(self, tmp_path, monkeypatch, capsys):
+        """A bad trace path must not be the reason a repository never ingests --
+        same principle as _parse_stream_ratio and _checkpoint_duty_from_env,
+        both of which degrade rather than raise."""
+        import mcp_server
+        monkeypatch.setenv(
+            "MINIGRAF_INGEST_TRACE_PATH", str(tmp_path / "no" / "such" / "dir" / "t.jsonl")
+        )
+        assert mcp_server._ingest_trace_from_env() is None
+        assert "MINIGRAF_INGEST_TRACE_PATH" in capsys.readouterr().err
+
+    @staticmethod
+    def _drive(git_repo, graph_path):
+        """_run_ingestion over a real file-backed graph, per
+        TestRunIngestionShutdown's pattern."""
+        import mcp_server
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(graph_path))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_real_ingestion_writes_one_record_per_applied_commit(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        """The load-bearing test: a real _run_ingestion over a real repo emits a
+        record per commit whose write half ran, with a tag from the claimer and
+        a positive apply_s.
+
+        git_repo has exactly 2 commits (auth.py's `def login`, models.py's
+        `class User`), so the record count and the pos set are both exact.
+        """
+        import json
+        import mcp_server
+        trace_path = tmp_path / "trace.jsonl"
+        monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(trace_path))
+
+        self._drive(git_repo, git_repo / "memory.graph")
+        try:
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        finally:
+            mcp_server._reset_db_state()
+
+        records = [json.loads(l) for l in trace_path.read_text().splitlines() if l.strip()]
+        assert len(records) == 2
+        assert {r["tag"] for r in records} <= {"fwd", "rev"}
+        assert sorted(r["pos"] for r in records) == [0, 1]
+        assert all(r["apply_s"] > 0.0 for r in records)
+        assert all(r["await_s"] >= 0.0 for r in records)
+        # Work counters must be real, not all-zero: git_repo introduces a
+        # function and a class. A trace of zeros would fit perfectly and mean
+        # nothing -- this is the positive control for the instrument itself.
+        assert sum(r["idents_considered"] for r in records) > 0
+
+    @pytest.mark.asyncio
+    async def test_trace_is_closed_and_global_cleared_after_a_run(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        """Mirrors _ingest_checkpoint_policy's contract: the global must not
+        outlive the run, or a later interactive transact writes into a finished
+        run's trace file."""
+        import mcp_server
+        monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(tmp_path / "t.jsonl"))
+        self._drive(git_repo, git_repo / "memory.graph")
+        try:
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        finally:
+            mcp_server._reset_db_state()
+        assert mcp_server._ingest_trace is None
+
+    @pytest.mark.asyncio
+    async def test_commit_whose_write_fails_emits_no_record_but_run_still_completes(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        """#260 review follow-up: emit() runs unconditionally after the
+        `async with db_lease_async()` block, whose own inner try/except
+        isolates an ordinary per-commit write failure (prints and falls
+        through, matching _run_ingestion's documented 'fail only the one
+        commit' contract) rather than re-raising. Left unguarded, that
+        commit would still get a trace record whose apply_s measures a
+        FAILED write -- the same contamination class the brief already
+        excluded extraction failures for, since the downstream regression
+        models the cost of a successful apply, not a failed one.
+
+        git_repo's first commit (pos 0) is claimed by the forward stream on
+        a fresh graph (verified empirically), so patching _forward_apply to
+        raise fails exactly that one commit's write while pos 1 (claimed by
+        the reverse stream, _reverse_apply) still succeeds. This is the
+        "plain double for an infrastructure concern" case, not a MiniGrafDb
+        fake (docs/testing-conventions.md) -- the thing under test is the
+        trace's response to a write failure, not the failure itself.
+        """
+        import json
+        import mcp_server
+        trace_path = tmp_path / "trace.jsonl"
+        monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(trace_path))
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("manufactured write failure")
+
+        monkeypatch.setattr(mcp_server, "_forward_apply", _boom)
+
+        self._drive(git_repo, git_repo / "memory.graph")
+        try:
+            await mcp_server._run_ingestion(str(git_repo), "HEAD")
+        finally:
+            mcp_server._reset_db_state()
+
+        # The isolation contract is unchanged: one commit's write failing
+        # does not abort the run, and both commits still count as processed.
+        assert mcp_server._ingest_progress["status"] == "complete"
+        assert mcp_server._ingest_progress["processed"] == 2
+
+        records = [json.loads(l) for l in trace_path.read_text().splitlines() if l.strip()]
+        assert len(records) == 1, "the failed commit must not produce a trace record"
+        assert records[0]["pos"] == 1
+        assert records[0]["tag"] == "rev"

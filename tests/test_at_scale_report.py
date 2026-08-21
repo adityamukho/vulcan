@@ -7,6 +7,7 @@ from evals.at_scale.report import (
     append_ingestion_report,
     append_query_report,
     append_residue_report,
+    append_trace_fit_report,
     write_json_result,
 )
 
@@ -455,3 +456,176 @@ class TestAppendResidueReport:
             if line.startswith(f"| {label} |")
         )
         assert "not recorded" in row
+
+
+class TestAppendTraceFitReport:
+    """#260: the per-commit cost fit's verdict, rendered the same defensive
+    way append_residue_report renders the M <= N verdict -- an absent ratio
+    must not be able to read as a flat result, and a VOID verdict (the
+    control gate failed open) must not be able to read as CONFOUNDED.
+    """
+
+    def test_renders_verdict_ratios_and_control_gate(self, tmp_path):
+        report = tmp_path / "benchmark.md"
+        report.write_text("# At-Scale Code-Graph Benchmark\n")
+        append_trace_fit_report({
+            "verdict": "CONFOUNDED",
+            "verdict_reason": "both parameters below 1.5x (a=1.10x, b=1.05x)",
+            "a_ratio": 1.10, "b_ratio": 1.05,
+            "records": 760,
+            "group_sizes": {"first": 253, "middle": 254, "last": 253},
+            "control_gate": {"passed": True, "growth": 4.2, "reason": "passed: ..."},
+            "commits_ingested": 767,
+        }, report)
+        text = report.read_text()
+        assert "CONFOUNDED" in text
+        # Exact rows, not bare substrings: verdict_reason is rendered
+        # verbatim just above ("...a=1.10x, b=1.05x)"), so a substring check
+        # against "1.10"/"1.05" passes even if _ratio_row's value branch is
+        # broken -- the reason line alone already contains both. See the
+        # sibling test below, which was tightened for the same defect.
+        assert "- a_ratio (fixed-cost growth): 1.10x" in text
+        assert "- b_ratio (per-unit-work-cost growth): 1.05x" in text
+        assert "4.2" in text or "4.20" in text
+
+    def test_void_verdict_is_rendered_as_void_not_as_flat(self, tmp_path):
+        """A void run must be unmistakable in the record. #276's whole lesson
+        was that a self-misdescribing record is the defect."""
+        report = tmp_path / "benchmark.md"
+        report.write_text("# At-Scale Code-Graph Benchmark\n")
+        append_trace_fit_report({
+            "verdict": "VOID",
+            "verdict_reason": "control gate did not pass: FAILED OPEN ...",
+            "a_ratio": 1.01, "b_ratio": 1.02, "records": 760,
+            "group_sizes": {"first": 253, "middle": 254, "last": 253},
+            "control_gate": {"passed": False, "growth": 1.1, "reason": "FAILED OPEN ..."},
+        }, report)
+        text = report.read_text()
+        assert "VOID" in text
+        assert "CONFOUNDED" not in text
+
+    def test_measured_and_failed_control_gate_renders_the_failed_row(self, tmp_path):
+        """M5: no prior test positively asserted the rendered control-gate row
+        for a MEASURED-and-FAILED gate -- test_void_verdict_is_rendered... above
+        exercises this same input shape but never reads the row itself, only
+        the verdict string. This pins _trace_fit_control_gate_row's FAILED
+        branch (report.py) directly, distinguishing it from both the passing
+        row and the "not measured (absent from the result)" row."""
+        report = tmp_path / "benchmark.md"
+        report.write_text("# At-Scale Code-Graph Benchmark\n")
+        append_trace_fit_report({
+            "verdict": "VOID",
+            "verdict_reason": "control gate did not pass: FAILED OPEN ...",
+            "a_ratio": 1.01, "b_ratio": 1.02, "records": 760,
+            "group_sizes": {"first": 253, "middle": 254, "last": 253},
+            "control_gate": {
+                "passed": False, "growth": 1.1,
+                "reason": "FAILED OPEN: mean per-checkpoint duration grew 1.10x",
+            },
+        }, report)
+        text = report.read_text()
+        assert (
+            "- Control gate: **FAILED** (1.10x growth) -- "
+            "FAILED OPEN: mean per-checkpoint duration grew 1.10x"
+        ) in text
+        assert "- Control gate: passed" not in text
+        assert "- Control gate: not measured" not in text
+
+    def test_absent_ratio_renders_not_measured_never_zero(self, tmp_path):
+        report = tmp_path / "benchmark.md"
+        report.write_text("# At-Scale Code-Graph Benchmark\n")
+        append_trace_fit_report({
+            "verdict": "INCONCLUSIVE",
+            "verdict_reason": "a_ratio is undefined",
+            "a_ratio": None, "b_ratio": 1.2, "records": 760,
+            "group_sizes": {"first": 253, "middle": 254, "last": 253},
+            "control_gate": {"passed": True, "growth": 3.0, "reason": "passed"},
+        }, report)
+        text = report.read_text()
+        # The exact a_ratio row, not a bare substring: "not measured" is also
+        # the correct rendering for other absent fields in this fixture (e.g.
+        # commits_ingested, which is omitted here entirely), so a substring
+        # check alone would pass even if _ratio_row's None branch were broken,
+        # as long as some other field happened to say "not measured" too.
+        assert "a_ratio (fixed-cost growth): not measured" in text
+        assert "0.00" not in text
+
+    def test_appends_rather_than_truncating(self, tmp_path):
+        report = tmp_path / "benchmark.md"
+        report.write_text("# At-Scale Code-Graph Benchmark\n\n## Existing entry\n")
+        append_trace_fit_report({
+            "verdict": "CONFOUNDED", "verdict_reason": "x",
+            "a_ratio": 1.0, "b_ratio": 1.0, "records": 100,
+            "group_sizes": {"first": 33, "middle": 34, "last": 33},
+            "control_gate": {"passed": True, "growth": 3.0, "reason": "passed"},
+        }, report)
+        assert "## Existing entry" in report.read_text()
+
+    def test_commits_ingested_present_but_none_renders_not_measured(self, tmp_path):
+        """build_result (Task 6) sets commits_ingested to an explicit None
+        whenever the metrics JSON lacks the field -- reachable through the
+        --metrics re-analyse path with an older or partial file. .get(key,
+        default) only substitutes the default when the KEY is absent, so a
+        present-but-None value must be checked explicitly or the page prints
+        the raw Python string "None", which is outside the three-state
+        vocabulary entirely.
+        """
+        report = tmp_path / "benchmark.md"
+        report.write_text("# At-Scale Code-Graph Benchmark\n")
+        append_trace_fit_report({
+            "verdict": "CONFOUNDED", "verdict_reason": "x",
+            "a_ratio": 1.0, "b_ratio": 1.0, "records": 100,
+            "group_sizes": {"first": 33, "middle": 34, "last": 33},
+            "control_gate": {"passed": True, "growth": 3.0, "reason": "passed"},
+            "commits_ingested": None,
+        }, report)
+        text = report.read_text()
+        assert "- Commits ingested: not measured" in text
+        assert "None" not in text
+
+    def test_absent_control_gate_renders_not_measured_not_failed(self, tmp_path):
+        """{}.get("passed") and a real failure's control_gate.get("passed")
+        are both falsy, so a control_gate that was never measured must be
+        distinguished BEFORE that lookup, not by it -- otherwise an absent
+        key manufactures a **FAILED** reading out of nothing, the same
+        absence-as-a-result hole _ratio_row exists to close for the ratios.
+        """
+        report = tmp_path / "benchmark.md"
+        report.write_text("# At-Scale Code-Graph Benchmark\n")
+        result = {
+            "verdict": "CONFOUNDED", "verdict_reason": "x",
+            "a_ratio": 1.0, "b_ratio": 1.0, "records": 100,
+            "group_sizes": {"first": 33, "middle": 34, "last": 33},
+        }
+        assert "control_gate" not in result
+        append_trace_fit_report(result, report)
+        text = report.read_text()
+        assert "- Control gate: not measured" in text
+        assert "FAILED" not in text
+
+    def test_populated_and_unidentifiable_fits_are_both_rendered(self, tmp_path):
+        """Design spec 2026-08-17-per-commit-cost-attribution-design.md line
+        250: the INCONCLUSIVE verdict must report both parameters and the fit
+        quality, since a ratio alone can't distinguish a clean fit from a
+        near-zero r^2 that happened to clear the growth thresholds. A None
+        fit (trace_fit.fit_line's unidentifiable case) must render "not
+        identifiable", never a numeric r^2 like 0.00.
+        """
+        report = tmp_path / "benchmark.md"
+        report.write_text("# At-Scale Code-Graph Benchmark\n")
+        append_trace_fit_report({
+            "verdict": "INCONCLUSIVE", "verdict_reason": "x",
+            "a_ratio": 1.6, "b_ratio": 1.3, "records": 300,
+            "group_sizes": {"first": 100, "middle": 100, "last": 100},
+            "control_gate": {"passed": True, "growth": 3.0, "reason": "passed"},
+            "fits": {
+                "first": {"a": 0.1, "b": 0.02, "r2": 0.91, "n": 100},
+                "middle": {"a": 0.12, "b": 0.021, "r2": 0.88, "n": 100},
+                "last": None,
+            },
+        }, report)
+        text = report.read_text()
+        assert "First-group fit: n=100, r²=0.910" in text
+        assert "Middle-group fit: n=100, r²=0.880" in text
+        assert "Last-group fit: not identifiable" in text
+        assert "r²=0.00" not in text

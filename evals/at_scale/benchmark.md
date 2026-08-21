@@ -74,6 +74,12 @@ that was wrong and has been corrected here.
 > dropped commits — `Final status | complete` and the commit count are both
 > blind to that by design. Query latencies measured over a graph that silently
 > lost commits are not comparable to ones that were not.
+>
+> **An absent `## Per-Commit Cost Fit` section means the #260 probe was not
+> run** — never that cost was flat. The nightly does not run
+> `probe_per_commit_cost.py`, so most entries below have no such section. A
+> `VOID` verdict means the run's positive control failed and its numbers say
+> nothing; it is not a flat result.
 
 ## Ingestion Run — 20260719T074053Z
 
@@ -1148,3 +1154,18 @@ nearly every code entity in every graph already written.
 | Stderr capture (#256) | complete |
 | Commits dropped (#256) | 0 |
 | Error signatures (#251/#256) | 0 |
+
+## Per-Commit Cost Fit — 20260821T021434Z
+
+**Verdict: REAL** -- a and b grew >= 2.0x (a=4.81x, b=2.13x)
+
+- a_ratio (fixed-cost growth): 4.81x
+- b_ratio (per-unit-work-cost growth): 2.13x
+- First-group fit: n=255, r²=0.882
+- Middle-group fit: n=257, r²=0.866
+- Last-group fit: n=255, r²=0.725
+- Control gate: passed (mean per-checkpoint duration grew 7.85x)
+- Records: 767
+- Group sizes: first=255, middle=257, last=255
+- Commits ingested: 767
+- Probe artifact: `results/260-per-commit-cost-attribution.json`

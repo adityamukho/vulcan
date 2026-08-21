@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 _REPORT_HEADER = "# At-Scale Code-Graph Benchmark\n\nSee issue #120 and `docs/superpowers/specs/2026-07-19-at-scale-benchmark-design.md`.\nObservational only -- no pass/fail thresholds.\n"
 
@@ -35,16 +35,22 @@ def _relative_to_report(path: Any, report_path: Path) -> str:
         return str(resolved)
 
 
-def _metrics_json_bullet(json_path: Any, report_path: Path) -> str:
-    """The "- Metrics JSON:" provenance bullet (#276).
+def _artifact_bullet(label: str, json_path: Any, report_path: Path) -> str:
+    """The "- <label>:" provenance bullet (#276), parameterised on the label
+    so callers whose artifact is not a benchmark metrics JSON (#260's probe
+    artifact, e.g.) can say so rather than mislabel it.
 
     ALWAYS emitted, for the reason _poll_duty_row is: an omitted line is
     invisible, so a reader could not tell a harness that did not record the
     path from one that was never asked to.
     """
     if json_path is None:
-        return "- Metrics JSON: not recorded (this harness did not write one)"
-    return f"- Metrics JSON: `{_relative_to_report(json_path, report_path)}`"
+        return f"- {label}: not recorded (this harness did not write one)"
+    return f"- {label}: `{_relative_to_report(json_path, report_path)}`"
+
+
+def _metrics_json_bullet(json_path: Any, report_path: Path) -> str:
+    return _artifact_bullet("Metrics JSON", json_path, report_path)
 
 
 def write_json_result(metrics: dict[str, Any], results_dir: Path, prefix: str = "ingestion") -> Path:
@@ -356,6 +362,140 @@ def append_residue_report(
         _residue_path_row("Graph", result.get("graph_path"), report_path),
         _residue_path_row("Metrics JSON", result.get("metrics_json"), report_path),
         _residue_path_row("Residue JSON", json_out_path, report_path),
+        "",
+    ]
+
+    with report_path.open("a") as f:
+        f.write("\n".join(lines))
+
+
+def _ratio_row(label: str, value: Any) -> str:
+    """A growth ratio row. None renders `not measured`, NEVER 0.00.
+
+    An undefined ratio means the fit could not be read. Rendering it as a
+    number -- especially a small one -- would make a failed measurement read
+    as a flat result, which is the exact defect #276 was filed about.
+
+    No trailing newline: every other row helper in this file returns a plain
+    line and relies on the caller's "\n".join(lines), and a baked-in \n here
+    would double it.
+    """
+    if value is None:
+        return f"- {label}: not measured"
+    return f"- {label}: {float(value):.2f}x"
+
+
+def _trace_fit_control_gate_row(control_gate: Any) -> str:
+    """The control gate's own pass/fail reading, spelled out the same way
+    _residue_verdict_row spells out M <= N: the raw growth number alone does
+    not carry whether it cleared CONTROL_MIN_GROWTH.
+
+    An absent or empty control_gate renders "not measured", never
+    **FAILED** -- {}.get("passed") is falsy the same way an actual failure
+    is, and treating the two alike would conflate "never measured" with
+    "measured and failed", the same absence-as-a-result hole _ratio_row
+    exists to close on the ratio axis. Not reachable through today's only
+    producer (trace_fit.analyse always populates control_gate), but a result
+    dict handed to this function by any other caller -- or an older/partial
+    one -- must not be able to manufacture a FAILED reading out of a missing
+    key.
+    """
+    if not control_gate:
+        return "- Control gate: not measured (absent from the result)"
+    growth = control_gate.get("growth")
+    growth_str = "not measured" if growth is None else f"{float(growth):.2f}x"
+    if control_gate.get("passed"):
+        return f"- Control gate: passed (mean per-checkpoint duration grew {growth_str})"
+    return (
+        f"- Control gate: **FAILED** ({growth_str} growth) -- "
+        f"{control_gate.get('reason', 'reason not recorded')}"
+    )
+
+
+def _fit_quality_row(label: str, fit: Optional[dict[str, Any]]) -> str:
+    """One of the three per-group fit-quality rows.
+
+    docs/superpowers/specs/2026-08-17-per-commit-cost-attribution-design.md
+    (line 250) requires the INCONCLUSIVE verdict to "report both parameters
+    and the fit quality" -- a ratio alone cannot distinguish a clean fit from
+    one whose r^2 is near zero and cleared the growth thresholds by chance.
+
+    fit is None when trace_fit.fit_line found the group unidentifiable (too
+    few points, or zero variance in W -- see its docstring) -- rendered
+    "not identifiable", never a numeric r^2, for the same reason _ratio_row
+    never renders None as 0.00: a fit that could not be computed is not the
+    same finding as a fit that came out flat.
+    """
+    if fit is None:
+        return f"- {label} fit: not identifiable"
+    return f"- {label} fit: n={fit['n']}, r²={fit['r2']:.3f}"
+
+
+def append_trace_fit_report(
+    result: dict[str, Any],
+    report_path: Path,
+    json_out_path: Path | None = None,
+) -> None:
+    """Append a dated per-commit cost-fit section to report_path (#260).
+
+    Mirrors append_residue_report's shape and separation: probe_per_commit_cost.py
+    runs the traced ingestion and calls trace_fit.analyse in a SEPARATE PROCESS,
+    long after this module could have any opinion about the result, so this
+    appender consumes a plain dict exactly as append_residue_report does.
+
+    The three-state discipline (#275/#276) governs every field here: an absent
+    ratio renders "not measured" via _ratio_row, never 0.00, so a fit that could
+    not be read cannot be mistaken for a flat one; and a VOID verdict (the
+    control gate failed open, see trace_fit.control_gate) is rendered as VOID
+    and never re-derived as CONFOUNDED -- the verdict string is the analysis's
+    own final word, not recomputed here from a_ratio/b_ratio.
+
+    Per-group fit quality (n, r^2) is rendered too, per the design spec's
+    "report both parameters and the fit quality" requirement for INCONCLUSIVE
+    -- a ratio alone cannot show whether it came from a clean fit or a
+    near-zero r^2 that happened to clear the growth thresholds.
+
+    json_out_path is the probe's own artifact JSON, a parameter for the same
+    reason it is on append_residue_report: the result dict is written to disk
+    before this is called, so folding the path in would need a second write.
+    Labelled "Probe artifact" rather than "Metrics JSON" (#260 M4): unlike
+    append_ingestion_report's json_path, this file is not a benchmark metrics
+    JSON -- it is trace_fit's analysis plus provenance -- and reusing that
+    label would misdescribe it.
+    """
+    if not report_path.exists():
+        report_path.write_text(_REPORT_HEADER)
+
+    control_gate = result.get("control_gate")
+    group_sizes = result.get("group_sizes", {})
+    fits = result.get("fits") or {}
+    commits_ingested = result.get("commits_ingested")
+
+    lines = [
+        "",
+        f"## Per-Commit Cost Fit — {_utc_timestamp()}",
+        "",
+        f"**Verdict: {result.get('verdict', 'not measured')}** -- "
+        f"{result.get('verdict_reason', 'not measured')}",
+        "",
+        _ratio_row("a_ratio (fixed-cost growth)", result.get("a_ratio")),
+        _ratio_row("b_ratio (per-unit-work-cost growth)", result.get("b_ratio")),
+        _fit_quality_row("First-group", fits.get("first")),
+        _fit_quality_row("Middle-group", fits.get("middle")),
+        _fit_quality_row("Last-group", fits.get("last")),
+        _trace_fit_control_gate_row(control_gate),
+        f"- Records: {result.get('records', 'not measured')}",
+        f"- Group sizes: first={group_sizes.get('first', 'not measured')}, "
+        f"middle={group_sizes.get('middle', 'not measured')}, "
+        f"last={group_sizes.get('last', 'not measured')}",
+        # .get(key) alone, not .get(key, default): build_result sets this key
+        # to an explicit None whenever metrics lacks it (the --metrics
+        # re-analyse path with an older/partial file), so a .get(..., default)
+        # would never fire and "None" -- outside the three-state vocabulary
+        # entirely -- would print on the page.
+        "- Commits ingested: "
+        + ("not measured" if commits_ingested is None else str(commits_ingested)),
+        _artifact_bullet("Probe artifact", json_out_path, report_path),
         "",
     ]
 
