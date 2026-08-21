@@ -1169,3 +1169,106 @@ nearly every code entity in every graph already written.
 - Group sizes: first=255, middle=257, last=255
 - Commits ingested: 767
 - Probe artifact: `results/260-per-commit-cost-attribution.json`
+
+## Per-Commit Cost Attribution — 260-handle-drop and 260-hot-ident-chain
+
+Follow-up to the Per-Commit Cost Fit above, which established that per-commit
+cost growth is REAL after controlling for work size and left ~0.54 s/commit of
+FIXED-cost growth unattributed. Two probes, one answer plus two by-catch
+findings.
+
+### Handle drop — the attributed cause
+
+- Script: `evals/at_scale/probe_lease_drop_cost.py`
+- Raw: `evals/at_scale/results/280-lease-drop-cost.json`
+- Question: how often is the `MiniGrafDb` handle dropped during ingestion, and
+  what does each drop cost?
+
+| Metric | Value |
+|---|---|
+| Repo / slice | `.` @ 220 commits, fresh graph, `.venv` + minigraf 1.2.3 |
+| Handle opens | 225 (**1.02 per commit**) |
+| Handle drops | 225 |
+| `apply_s` total | 40.4 s (51.0% of wall) |
+| `ckpt_d_seconds` total (explicit, `_CheckpointPolicy`) | 2.0 s (**4.9%** of `apply_s`) |
+| Drop time total | 19.4 s (24.5% of wall, **48.0%** of `apply_s`) |
+| Drop mean by third | 36.8 → 93.8 → 127.7 ms (**3.47x**) |
+| Isolated drop after ONE dirty fact, 100k facts | 337.5 ms |
+| Isolated drop after ONE dirty fact, 1M facts | 4241.0 ms |
+
+`_DbLeaseManager.release()` frees the handle at refcount 1 → 0 and minigraf's
+`Drop for Inner` (`src/db.rs:196`) runs a full `do_checkpoint`, which is
+O(graph size) (project-minigraf/minigraf#315). `db_lease_async()`'s `finally`
+calls `release()` before `apply_s`'s timer is read, so the cost lands in
+`apply_s`; `ckpt_d_seconds` is sourced from `_ingest_checkpoint_policy` and
+never sees it. Work-independent, graph-size-driven, growing, charged to the
+intercept — the residual's exact shape. Tracked as #280.
+
+**Reproducibility note.** The figures quoted in #260 and #280 come from a first
+run of this probe before it was cleaned up for the repo (47.3% of `apply_s`,
+3.20x). The artifact committed here is a second run of the committed script
+(48.0%, 3.47x). The difference is run-to-run noise; both are recorded rather
+than one being quietly restated.
+
+**This is a #255 regression.** `_CheckpointPolicy` landed 2026-08-07
+(`3196082`, #241); the lease conversion landed 2026-08-15 (`46ce19f`, #255).
+Before #255 `_db` was a process-lifetime global and `get_db()` returned the
+already-open handle, so ingestion never dropped it mid-run. #241's 51% → 2.3%
+was measured on that code. **#241's gate is not failing — it is being bypassed
+by a call site it does not know about**, which is why explicit checkpoint
+accounting kept reading healthy while real per-commit cost grew. General form: a
+duty-cycle gate governs only the sites routed through it, and a later refactor
+can add an ungoverned one without touching the gate or any of its tests.
+
+### Hot-ident version chains — real, O(N²), but ~2% at this history length
+
+- Script: `evals/at_scale/probe_hot_ident_chain_cost.py`
+- Raw: `evals/at_scale/results/260-hot-ident-chain-cost.json`
+- Question: `_watermark_update`, `_frontier_read_bounds` and
+  `_lineage_confirmed_through_update` each point-query one FIXED ident that
+  gains a version per commit. Does that read grow with chain depth?
+
+| Axis | Verdict | Result |
+|---|---|---|
+| A — chain depth (6000 cycles, filler fixed at 1M) | GROWS | 4.57x overall; **`query` component alone 22.80x** (3.7 → 84.0 ms/cycle, 64.5% of cycle time). `retract` 1.08x, `transact` 1.16x, index insert/delete 1.28x/1.55x |
+| B — graph size (400 cycles, filler 100k → 5M) | — | query total **1.12 / 1.12 / 1.09 s** — invariant across 50x |
+| C — WAL (checkpoint every cycle) | GROWS | 6.60x; depth growth survives an always-empty WAL, `query` share rising to 87.6% |
+| Control gate (axis B checkpoint duration across 50x filler) | PASSED | 58.07x against a 2.0x threshold |
+
+Thresholds (2.0x) and the control gate were fixed in the script before any data
+existed. Axes A and B separate cleanly: the cost tracks **chain depth and not
+graph size**. Mechanism is upstream —
+`src/query/datalog/executor.rs:416` → `src/graph/storage.rs:622` materializes
+the entity's whole EAVT span, resolving every historical version, before any
+valid-time filtering. Filed as project-minigraf/minigraf#323.
+
+**Confirmed but not the answer, and that distinction is the lesson.** At depth
+~767 this is about **14 ms/commit** against the fit's measured +599.8 ms/commit
+intercept rise — roughly 2%. The hypothesis was right about the mechanism and
+wrong about the magnitude by ~25x. Two-axis separation proved the mechanism;
+only dividing the measured effect by the residual showed it could not be the
+cause. **Confirming a mechanism is not the same as attributing a cost.** It
+remains a scaling landmine: 105 ms/commit at depth 6000, still rising linearly.
+
+### minigraf's auto-checkpoint — refuted here, live once #280 lands
+
+`wal_checkpoint_threshold: 1000` (minigraf `src/db.rs:81`) compacts every 1000
+WAL entries. In isolation, single-fact transacts on a 1M-fact graph spike at
+exactly index 999 and 1999, costing **3561.5 ms and 3551.3 ms**.
+
+It does not fire much during ingestion today. The preserved trace
+(`results/260-per-commit-trace.jsonl.gz`) shows no isolated multi-second
+outliers: among the 260 zero-work no-explicit-checkpoint commits the
+distribution is smooth (p50 0.338 s, p90 0.994 s, max 1.311 s). Consistent with
+the finding above — the per-commit handle drop keeps the WAL short enough that
+the threshold is rarely reached. **Recorded because fixing #280 removes that
+suppression**, so #280's win will not be the full 48% and must be re-measured
+rather than assumed.
+
+### Caveats
+
+- **220 commits, not the full history.** The share at 767 commits, before and
+  after any fix, needs the same instrument on a full run.
+- **The lease ACQUIRE is untimed.** It sits inside `apply_s` too; do not assume
+  the drop is the entire per-commit handle cost.
+- **Stage A only**, unchanged from the Per-Commit Cost Fit's own scoping.
