@@ -1,0 +1,135 @@
+{
+  "minigraf_version": "1.2.3",
+  "platform": "linux",
+  "python": "3.14.7",
+  "sections": {
+    "error_strings": {
+      "conditions": {
+        "cross_process_open": {
+          "_is_lock_error": true,
+          "_stale_lock_holder_pid": 221359,
+          "raised": true,
+          "text": "msg='Database is locked by another process (lock file: /tmp/tmp21y8ow83/probe.graph.lock, holder PID: 221359). If no other process is using this database, delete the lock file manually.'",
+          "type": "Other"
+        },
+        "invalid_date": {
+          "raised": true,
+          "text": "msg=\"invalid date '1000000000000': input contains invalid characters\"",
+          "type": "Other"
+        },
+        "retract_non_vector": {
+          "raised": true,
+          "text": "msg='Retract argument must be a vector'",
+          "type": "Other"
+        },
+        "same_process_second_open": {
+          "_is_lock_error": true,
+          "_stale_lock_holder_pid": 221356,
+          "raised": true,
+          "text": "msg='Database is already open in this process (lock file: /tmp/tmp21y8ow83/probe.graph.lock, holder PID: 221356 == our own). A second handle on one file would give each its own page table and corrupt both \u2014 reuse the existing handle instead. `Minigraf` is cheap to clone and all clones share the same database.'",
+          "type": "Storage"
+        },
+        "trailing_input": {
+          "raised": false,
+          "text": null,
+          "type": null
+        },
+        "unclosed_vector": {
+          "raised": true,
+          "text": "msg='Unexpected token: RightParen'",
+          "type": "Parse"
+        }
+      },
+      "control_cross_process_really_held": true,
+      "sidecar_present_while_held": true
+    },
+    "hook_path": {
+      "sweep": [
+        {
+          "auto_memory_write": "kept",
+          "elapsed_seconds": 0.35202069399747415,
+          "hold_seconds": 0.2,
+          "lease_acquired": true
+        },
+        {
+          "auto_memory_write": "kept",
+          "elapsed_seconds": 0.7519780919974437,
+          "hold_seconds": 0.5,
+          "lease_acquired": true
+        },
+        {
+          "auto_memory_write": "silently_lost",
+          "elapsed_seconds": 0.7516870360013854,
+          "hold_seconds": 0.8,
+          "lease_acquired": false
+        },
+        {
+          "auto_memory_write": "silently_lost",
+          "elapsed_seconds": 0.751577893999638,
+          "hold_seconds": 1.5,
+          "lease_acquired": false
+        },
+        {
+          "auto_memory_write": "silently_lost",
+          "elapsed_seconds": 0.7516359120018024,
+          "hold_seconds": 2.5,
+          "lease_acquired": false
+        },
+        {
+          "auto_memory_write": "silently_lost",
+          "elapsed_seconds": 0.7519366179985809,
+          "hold_seconds": 3.5,
+          "lease_acquired": false
+        }
+      ]
+    },
+    "lock_timing": {
+      "budget": {
+        "actual_wall_clock_seconds": 0.7513098330018693,
+        "designed_sleep_seconds": 0.75,
+        "lock_retry_base": 0.05,
+        "lock_retry_max": 5,
+        "overrun_factor": 1.0017464440024924,
+        "real_open_calls": 5
+      },
+      "control_all_samples_blocked": true,
+      "single_open_mean_seconds": 6.413280061678961e-05,
+      "single_open_samples": [
+        {
+          "blocked": true,
+          "seconds": 0.0001315829977102112
+        },
+        {
+          "blocked": true,
+          "seconds": 5.0539001676952466e-05
+        },
+        {
+          "blocked": true,
+          "seconds": 4.242000068188645e-05
+        },
+        {
+          "blocked": true,
+          "seconds": 3.93170012102928e-05
+        },
+        {
+          "blocked": true,
+          "seconds": 5.6805001804605126e-05
+        }
+      ]
+    },
+    "precheck": {
+      "control_open_refused_while_held": true,
+      "holder_subprocess_pid": 221369,
+      "live_lock_holder_pid": 221369,
+      "precheck_detects_holder": true,
+      "precheck_is_silent_noop": false
+    },
+    "stale_recovery": {
+      "clear_stale_lock_is_required": false,
+      "control_open_refused_while_held": true,
+      "reopen_after_sigkill_succeeds": true,
+      "reopen_error": null,
+      "sidecar_left_after_sigkill": true
+    }
+  }
+}
