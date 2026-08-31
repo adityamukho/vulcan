@@ -70,6 +70,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -150,7 +151,12 @@ def section_error_strings() -> dict[str, Any]:
             if predicates:
                 # Run the LIVE predicates against the real exception object.
                 entry["_is_lock_error"] = mcp_server._is_lock_error(exc)
-                entry["_stale_lock_holder_pid"] = mcp_server._stale_lock_holder_pid(exc)
+                # _stale_lock_holder_pid was DELETED by #284 item 5. The
+                # regex it ran is inlined here so this probe keeps reporting
+                # whether a holder PID is still scrapeable from the message
+                # -- the measurement that justified deleting it.
+                match = re.search(r"holder PID:\s*(\d+)", str(exc))
+                entry["holder_pid_scrapeable"] = int(match.group(1)) if match else None
         out["conditions"][name] = entry
 
     path = _fresh_graph()
@@ -299,11 +305,13 @@ def section_precheck() -> dict[str, Any]:
     from minigraf import MiniGrafDb
     import mcp_server
 
+    import json as _json
+
     path = _fresh_graph()
     child = _hold_graph(path, 20)
     try:
         # Positive control: prove the holder REALLY holds it, independently of
-        # the pre-check under test. Without this, `holder_pid is None` is
+        # anything under test. Without this, a None answer below is
         # indistinguishable from "nothing was holding the graph".
         try:
             MiniGrafDb.open(path)
@@ -311,7 +319,29 @@ def section_precheck() -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             control_held = True
 
-        holder_pid = mcp_server._live_lock_holder_pid(path)
+        # The OLD mechanism, inlined because #284 item 5 deleted it: read the
+        # `.graph.lock` sidecar. This is the measurement that condemned it --
+        # on 2.0.0 it cannot see a holder that demonstrably holds the graph.
+        sidecar_pid = None
+        try:
+            with open(path + ".lock") as f:
+                raw = f.read().strip()
+            sidecar_pid = int(raw) if raw.isdigit() else None
+        except (OSError, ValueError):
+            sidecar_pid = None
+
+        # The NEW mechanism: our own ownership hint. Version-independent by
+        # construction, which is the whole point -- it does not read
+        # minigraf's lock, so kernel locking cannot silence it.
+        hint_path = mcp_server._owner_hint_path(path)
+        with open(hint_path, "w") as f:
+            _json.dump(
+                {"pid": child.pid, "host": "some-other-host", "purpose": "ingestion"}, f
+            )
+        try:
+            hint = mcp_server._graph_owner_hint(path)
+        finally:
+            os.remove(hint_path)
         expected_pid = child.pid
     finally:
         child.kill()
@@ -320,11 +350,12 @@ def section_precheck() -> dict[str, Any]:
     return {
         "control_open_refused_while_held": control_held,
         "holder_subprocess_pid": expected_pid,
-        "live_lock_holder_pid": holder_pid,
-        "precheck_detects_holder": holder_pid is not None,
-        # The finding: a live holder that the pre-check cannot see means
-        # ingestion starts and races, which is what #108 exists to prevent.
-        "precheck_is_silent_noop": control_held and holder_pid is None,
+        # Old, deleted mechanism -- kept as the historical finding.
+        "sidecar_holder_pid": sidecar_pid,
+        "sidecar_precheck_is_silent_noop": control_held and sidecar_pid is None,
+        # New mechanism -- must work identically on both versions.
+        "owner_hint_detects_holder": hint is not None,
+        "owner_hint_pid": hint.get("pid") if hint else None,
     }
 
 

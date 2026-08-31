@@ -7,9 +7,9 @@
       "conditions": {
         "cross_process_open": {
           "_is_lock_error": true,
-          "_stale_lock_holder_pid": null,
+          "holder_pid_scrapeable": null,
           "raised": true,
-          "text": "msg='[STG-026] Database is locked by another process (/tmp/tmpka7hrsdy/probe.graph). The lock is held on the file itself and is released automatically when the holding process exits, so there is no lock file to clean up.'",
+          "text": "msg='[STG-026] Database is locked by another process (/tmp/tmpx5f5wsoq/probe.graph). The lock is held on the file itself and is released automatically when the holding process exits, so there is no lock file to clean up.'",
           "type": "Storage"
         },
         "invalid_date": {
@@ -24,9 +24,9 @@
         },
         "same_process_second_open": {
           "_is_lock_error": true,
-          "_stale_lock_holder_pid": null,
+          "holder_pid_scrapeable": null,
           "raised": true,
-          "text": "msg='[STG-025] Database is already open in this process (/tmp/tmpka7hrsdy/probe.graph). A second handle on one file would give each its own page table and corrupt both \u2014 reuse the existing handle instead. `Minigraf` is cheap to clone and all clones share the same database.'",
+          "text": "msg='[STG-025] Database is already open in this process (/tmp/tmpx5f5wsoq/probe.graph). A second handle on one file would give each its own page table and corrupt both \u2014 reuse the existing handle instead. `Minigraf` is cheap to clone and all clones share the same database.'",
           "type": "Storage"
         },
         "trailing_input": {
@@ -47,37 +47,37 @@
       "sweep": [
         {
           "auto_memory_write": "kept",
-          "elapsed_seconds": 0.22668315000191797,
+          "elapsed_seconds": 0.22625723799865227,
           "hold_seconds": 0.2,
           "lease_acquired": true
         },
         {
           "auto_memory_write": "kept",
-          "elapsed_seconds": 0.5030936699986341,
+          "elapsed_seconds": 0.5525777610018849,
           "hold_seconds": 0.5,
           "lease_acquired": true
         },
         {
           "auto_memory_write": "kept",
-          "elapsed_seconds": 0.8038319020015479,
+          "elapsed_seconds": 0.803118739000638,
           "hold_seconds": 0.8,
           "lease_acquired": true
         },
         {
           "auto_memory_write": "kept",
-          "elapsed_seconds": 1.5160571970009187,
+          "elapsed_seconds": 1.5149027730003581,
           "hold_seconds": 1.5,
           "lease_acquired": true
         },
         {
           "auto_memory_write": "kept",
-          "elapsed_seconds": 2.5337814849990536,
+          "elapsed_seconds": 2.5338286929982132,
           "hold_seconds": 2.5,
           "lease_acquired": true
         },
         {
           "auto_memory_write": "silently_lost",
-          "elapsed_seconds": 2.6329356959977304,
+          "elapsed_seconds": 2.633929649997299,
           "hold_seconds": 3.5,
           "lease_acquired": false
         }
@@ -85,44 +85,45 @@
     },
     "lock_timing": {
       "budget": {
-        "actual_wall_clock_seconds": 2.6325950469981763,
+        "actual_wall_clock_seconds": 2.6351603949988203,
         "designed_sleep_seconds": 0.75,
         "lock_retry_base": 0.05,
         "lock_retry_max": 5,
-        "overrun_factor": 3.5101267293309015,
+        "overrun_factor": 3.5135471933317604,
         "real_open_calls": 5
       },
       "control_all_samples_blocked": true,
-      "single_open_mean_seconds": 0.3764716594007041,
+      "single_open_mean_seconds": 0.37633989000023577,
       "single_open_samples": [
         {
           "blocked": true,
-          "seconds": 0.3767826180010161
+          "seconds": 0.37626774400268914
         },
         {
           "blocked": true,
-          "seconds": 0.37615509100214695
+          "seconds": 0.37612834999890765
         },
         {
           "blocked": true,
-          "seconds": 0.3766420100000687
+          "seconds": 0.37623157399866614
         },
         {
           "blocked": true,
-          "seconds": 0.3764726690023963
+          "seconds": 0.3761367410006642
         },
         {
           "blocked": true,
-          "seconds": 0.3763059089978924
+          "seconds": 0.37693504100025166
         }
       ]
     },
     "precheck": {
       "control_open_refused_while_held": true,
-      "holder_subprocess_pid": 221387,
-      "live_lock_holder_pid": null,
-      "precheck_detects_holder": false,
-      "precheck_is_silent_noop": true
+      "holder_subprocess_pid": 267869,
+      "owner_hint_detects_holder": true,
+      "owner_hint_pid": 267869,
+      "sidecar_holder_pid": null,
+      "sidecar_precheck_is_silent_noop": true
     },
     "stale_recovery": {
       "clear_stale_lock_is_required": false,

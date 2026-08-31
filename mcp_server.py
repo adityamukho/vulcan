@@ -17,6 +17,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import socket
 import re
 import signal
 import subprocess as _subprocess
@@ -129,6 +130,38 @@ _LOCK_RETRY_BASE = 0.05  # seconds; doubles each attempt
 _INGEST_LOCK_RETRY_BASE = 0.05     # seconds; matches _LOCK_RETRY_BASE for consistency
 _INGEST_LOCK_RETRY_CAP = 15.0      # seconds; per-attempt sleep never exceeds this
 _INGEST_LOCK_RETRY_BUDGET = 120.0  # seconds; total time before giving up
+
+# Portable graph-ownership hint (#284 item 5).
+#
+# minigraf 2.0.0 moved locking into the kernel and deleted the `.graph.lock`
+# PID sidecar, so nothing on disk names the holder any more. There is no
+# mechanism that is at once non-contending, PID-returning and portable across
+# Linux/macOS/Windows -- /proc/locks is Linux-only, and a non-blocking flock is
+# POSIX-only AND cannot tell our own handle from another process's, which is
+# fatal here because this server routinely holds a lease. So we publish our own
+# advisory hint instead of reading minigraf's lock.
+#
+# Correctness still rests entirely on minigraf's kernel lock. This is a
+# scheduling courtesy: acting on a wrong hint costs one race or one needless
+# decline, never a correctness failure.
+#
+# Staleness is decided by the hint file's mtime, NEVER by PID liveness. That is
+# what makes it portable, and it is why os.kill no longer appears in this file:
+# CPython maps non-CTRL signals to TerminateProcess on Windows, so the old
+# `os.kill(pid, 0)` "liveness check" would have terminated the process it asked
+# about. A fresh hint means something is actively refreshing it right now,
+# which is the liveness claim we actually want -- and it disposes of PID reuse
+# without special handling, since a reused PID under a stale hint is expired by
+# definition.
+_OWNER_HINT_HEARTBEAT = 5.0  # seconds between refreshes while held
+try:
+    # TTL must comfortably exceed the heartbeat so a merely-busy holder is
+    # never declared dead. The cost is that after a hard crash the graph looks
+    # owned for up to this long; declining is recoverable on the next attempt,
+    # whereas racing a long ingestion is what #108 was filed against.
+    _OWNER_HINT_TTL = float(os.environ.get("MINIGRAF_OWNER_HINT_TTL", "30.0"))
+except ValueError:
+    _OWNER_HINT_TTL = 30.0
 
 # Ingestion state
 _ingest_task: Optional[asyncio.Task] = None
@@ -3049,88 +3082,138 @@ def _is_lock_error(exc: Exception) -> bool:
     return "locked" in msg or "already open in this process" in msg
 
 
-def _stale_lock_holder_pid(exc: Exception) -> Optional[int]:
-    """Extract the holder PID from a minigraf lock-contention error message."""
-    match = re.search(r"holder PID:\s*(\d+)", str(exc))
-    return int(match.group(1)) if match else None
+def _owner_hint_path(graph_path: str) -> str:
+    """Path of our ownership hint for graph_path.
 
-
-def _pid_is_alive(pid: int) -> bool:
-    """Conservative liveness check: only a positive ProcessLookupError counts
-    as dead. Uncertain cases (PermissionError, other OSError) are treated as
-    alive rather than risking a false "safe to proceed" signal.
+    Deliberately NOT named `.lock`: a pre-2.0.0 `.graph.lock` may still be on
+    disk (2.0.0 ignores it and never deletes it), and nothing should confuse
+    ours with minigraf's.
     """
+    return graph_path + ".owner"
+
+
+def _graph_owner_hint_is_fresh(graph_path: str) -> bool:
+    """True if a hint exists and its mtime is within _OWNER_HINT_TTL."""
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
+        age = time.time() - os.stat(_owner_hint_path(graph_path)).st_mtime
+    except OSError:
         return False
-    except OSError:
-        pass  # PermissionError or other — can't confirm death, assume alive
-    return True
+    return age < _OWNER_HINT_TTL
 
 
-def _read_lock_holder_raw(path: str) -> Optional[str]:
-    """Read path's lock file and return its raw, unparsed contents, or None
-    if the lock file doesn't exist. Shared by _clear_stale_lock and
-    _live_lock_holder_pid, whose parsing/validation needs diverge past this
-    point (#106, #178)."""
-    try:
-        with open(path + ".lock") as f:
-            return f.read().strip()
-    except OSError:
-        return None  # no lock file
+def _graph_owner_hint(graph_path: str) -> Optional[Dict[str, Any]]:
+    """Return another live process's ownership hint, or None.
 
+    Replaces _live_lock_holder_pid, which read the deleted sidecar and so
+    returned None even while another process demonstrably held the graph.
 
-def _clear_stale_lock(path: str, holder_pid: int) -> bool:
-    """Remove path's lock file if its recorded holder process is no longer alive.
-
-    holder_pid is extracted from an earlier lock-contention error (at time
-    T0); by the time this runs (T1), the lock file may have already changed
-    hands to a different, live, legitimate holder. Re-reads the lock file's
-    *current* contents immediately before deleting and only proceeds if it
-    still names holder_pid, to avoid stripping a live holder of its lock
-    protection (#178). This narrows but does not eliminate the underlying
-    TOCTOU race -- a gap remains between this re-check and the os.remove.
-
-    Returns True if a stale lock was removed.
+    None means "no reason to decline": absent, stale, unreadable, or ours.
+    Self-detection compares pid AND host, because a PID from another machine
+    on a shared filesystem means nothing -- matching on pid alone would let an
+    unrelated remote holder look like our own handle.
     """
-    if _pid_is_alive(holder_pid):
-        return False  # holder still alive (or we lack permission to tell — leave it)
-    current_holder = _read_lock_holder_raw(path)
-    if current_holder is None:
-        return False  # no lock file (already cleared by someone else)
-    if current_holder != str(holder_pid):
-        return False  # reclaimed by a different holder since T0 — not ours to clear
+    if not _graph_owner_hint_is_fresh(graph_path):
+        return None
     try:
-        os.remove(path + ".lock")
+        with open(_owner_hint_path(graph_path)) as f:
+            hint = json.load(f)
+    except (OSError, ValueError):
+        return None  # unreadable or malformed -- advisory only, so ignore it
+    if not isinstance(hint, dict) or not isinstance(hint.get("pid"), int):
+        return None
+    if hint.get("pid") == os.getpid() and hint.get("host") == socket.gethostname():
+        return None  # our own hint, not another process
+    return hint
+
+
+def _write_owner_hint(graph_path: str, purpose: str) -> bool:
+    """Publish our ownership hint. Returns False if it could not be written.
+
+    Best-effort by contract: a hint we cannot write must never be able to stop
+    real work, so every failure here degrades to "no hint".
+    """
+    payload = {
+        "pid": os.getpid(),
+        "host": socket.gethostname(),
+        "purpose": purpose,
+        "started": _now_utc_ms(),
+        "graph": graph_path,
+    }
+    try:
+        with open(_owner_hint_path(graph_path), "w") as f:
+            json.dump(payload, f)
         return True
     except OSError:
         return False
 
 
-def _live_lock_holder_pid(path: str) -> Optional[int]:
-    """Return path's lock-file holder PID if that process is live and isn't
-    us, else None.
+def _touch_owner_hint(graph_path: str) -> None:
+    """Refresh the hint's mtime -- the heartbeat that proves we are alive."""
+    try:
+        os.utime(_owner_hint_path(graph_path), None)
+    except OSError:
+        pass
 
-    Reads the sidecar `.lock` file directly — never attempts to open the DB,
-    so this check can never itself contend for the lock. Used as a
-    proactive pre-check before starting ingestion, to avoid racing another
-    live session for the same lock instead of losing that race (#108).
 
-    Best-effort / racy by nature (the holder can appear or disappear
-    between this check and the real open attempt) — the lease manager's own
-    retry/self-heal (_open_for_lease, via db_lease/db_lease_async) still runs
-    as the fallback if the race is lost anyway.
+def _remove_owner_hint(graph_path: str) -> None:
+    try:
+        os.remove(_owner_hint_path(graph_path))
+    except OSError:
+        pass
+
+
+def _start_owner_hint_heartbeat(graph_path: str) -> Callable[[], None]:
+    """Refresh the hint's mtime on a timer. Returns a cancel callable.
+
+    Uses loop.call_later rather than a coroutine awaiting asyncio.sleep. A
+    sleeping coroutine would consume `mcp_server.asyncio.sleep`, which
+    ingestion tests patch to instrument the per-commit yield cadence -- the
+    heartbeat would then spin against the patched sleep and inject snapshots
+    into a measurement it has nothing to do with. A timer is also simply the
+    right primitive for a heartbeat: it schedules the next tick from the
+    completion of the last, and never competes for the event loop.
     """
-    holder = _read_lock_holder_raw(path)
-    if holder is None:
-        return None  # no lock file
-    if not holder.isdigit():
-        return None
-    pid = int(holder)
-    if pid == os.getpid():
-        return None  # our own leaked handle, not another process
-    return pid if _pid_is_alive(pid) else None
+    loop = asyncio.get_running_loop()
+    state: Dict[str, Any] = {"handle": None, "cancelled": False}
+
+    def tick() -> None:
+        if state["cancelled"]:
+            return
+        _touch_owner_hint(graph_path)
+        state["handle"] = loop.call_later(_OWNER_HINT_HEARTBEAT, tick)
+
+    state["handle"] = loop.call_later(_OWNER_HINT_HEARTBEAT, tick)
+
+    def cancel() -> None:
+        state["cancelled"] = True
+        if state["handle"] is not None:
+            state["handle"].cancel()
+
+    return cancel
+
+
+@contextlib.asynccontextmanager
+async def _graph_owner_hint_held(graph_path: str, purpose: str):
+    """Publish an ownership hint for the duration of a LONG-held claim.
+
+    Published only around long-held ownership (ingestion), not around every
+    lease. That is a deliberate narrowing of what the sidecar reader used to
+    see: declining to start ingestion because another process ran a 50ms query
+    would be wrong, and the lease's own retry already absorbs short overlaps.
+
+    The heartbeat is a dedicated timer rather than a refresh folded into the
+    per-commit progress update, so that one slow commit cannot let the hint
+    expire while ingestion is demonstrably alive.
+    """
+    written = _write_owner_hint(graph_path, purpose)
+    cancel_heartbeat = _start_owner_hint_heartbeat(graph_path) if written else None
+    try:
+        yield
+    finally:
+        if cancel_heartbeat is not None:
+            cancel_heartbeat()
+        if written:
+            _remove_owner_hint(graph_path)
 
 
 class _LeasedDb:
@@ -3205,9 +3288,15 @@ def _open_for_lease(path: str) -> MiniGrafDb:
     except Exception as e:
         if not _is_lock_error(e):
             raise
-        holder_pid = _stale_lock_holder_pid(e)
-        if holder_pid is not None and _clear_stale_lock(path, holder_pid):
-            return MiniGrafDb.open(path)
+        # The stale-lock self-heal that used to live here is gone (#284).
+        # It scraped a holder PID out of the error text and deleted the
+        # sidecar when that PID was dead. Measured, it recovered nothing on
+        # EITHER version: 2.0.0 has no sidecar at all and the kernel releases
+        # the lock on process exit however it exits, while 1.2.3 leaves the
+        # sidecar behind after a SIGKILL but reopens successfully anyway,
+        # checking the recorded PID's liveness itself. Do not reintroduce it
+        # from 1.2.3's "delete the lock file manually" error text -- that text
+        # invites exactly this mistake. See the probe's stale_recovery section.
         raise
 
 
@@ -11072,6 +11161,12 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     # (_open_index_writer_safe, _frontier_load) that sit above the inner try
     # (#250). Without this the finally would need an unbound-name guard.
     write_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+    # Advertise this long-held claim so another process's #108 pre-check can
+    # decline instead of racing us. Entered before the try so the outermost
+    # finally always releases it; best-effort, so a hint that cannot be
+    # written never blocks the run.
+    owner_hint = _graph_owner_hint_held(_graph_path_current(), "ingestion")
+    await owner_hint.__aenter__()
     try:
         # Enumerated BEFORE the preload (#238), which needs the positions to
         # bound its queries. Above the DB open too, not merely above the
@@ -11647,6 +11742,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # #250. One cleanup writer for one resource.
         if write_executor is not None:
             write_executor.shutdown(wait=True)
+        # Retract the ownership hint LAST, so it stays published for as long
+        # as this run holds anything another process would race us for.
+        # Suppressed rather than awaited bare: a failure retracting an
+        # advisory hint must not replace whatever exception is already in
+        # flight, and the TTL expires a leaked hint anyway.
+        with contextlib.suppress(Exception):
+            await owner_hint.__aexit__(None, None, None)
 
 
 async def handle_minigraf_ingest_git(
@@ -11658,10 +11760,12 @@ async def handle_minigraf_ingest_git(
     if _ingest_task and not _ingest_task.done():
         return {"ok": False, "error": "ingestion already in progress"}
     # Proactive check-before-attempt: if another live process already owns
-    # the graph lock, don't start ingestion here rather than racing for it
-    # and losing (#108).
-    holder_pid = _live_lock_holder_pid(_graph_path_current())
-    if holder_pid is not None:
+    # the graph, don't start ingestion here rather than racing for it and
+    # losing (#108). Reads our own ownership hint, not minigraf's lock --
+    # see _graph_owner_hint for why nothing portable can read the latter.
+    owner = _graph_owner_hint(_graph_path_current())
+    if owner is not None:
+        holder_pid = owner.get("pid")
         _ingest_progress["phase"] = None
         _ingest_progress["status"] = "skipped"
         _ingest_progress["owner_pid"] = holder_pid
@@ -11706,14 +11810,17 @@ def handle_minigraf_ingest_status() -> Dict[str, Any]:
     # that caused it (e.g. the orphaned holder it names has since died) —
     # re-check liveness on every poll instead of echoing a dead PID forever.
     # Purely informational: never auto-retries ingestion (#106).
-    if _ingest_progress["status"] == "error":
-        holder_pid = _stale_lock_holder_pid(_ingest_progress.get("error") or "")
-        if holder_pid is not None:
-            result["stale"] = not _pid_is_alive(holder_pid)
-    elif _ingest_progress["status"] == "skipped":
-        owner_pid = _ingest_progress.get("owner_pid")
-        if owner_pid is not None:
-            result["stale"] = not _pid_is_alive(owner_pid)
+    #
+    # The "error" branch used to name the holder by scraping a PID out of
+    # minigraf's lock-contention message. minigraf 2.0.0 removed "holder PID:
+    # N" from that text entirely, so there is nothing left to scrape and no
+    # staleness can be reported for that path (#284).
+    if _ingest_progress["status"] == "skipped":
+        if _ingest_progress.get("owner_pid") is not None:
+            # Staleness now follows the ownership hint's freshness rather than
+            # the recorded PID's liveness: a hint stops being refreshed when
+            # its holder stops running, however it stops.
+            result["stale"] = not _graph_owner_hint_is_fresh(_graph_path_current())
     if _ingest_progress["status"] != "running":
         try:
             with db_lease() as db:
@@ -12100,10 +12207,11 @@ async def main() -> None:
     }
     if not os.environ.get("MINIGRAF_NO_AUTO_INGEST"):
         # Proactive check-before-attempt: if another live process already
-        # owns the graph lock, don't start ingestion here at all rather
-        # than racing for it and losing (#108).
-        holder_pid = _live_lock_holder_pid(_get_graph_path())
-        if holder_pid is not None:
+        # owns the graph, don't start ingestion here at all rather than
+        # racing for it and losing (#108).
+        owner = _graph_owner_hint(_get_graph_path())
+        holder_pid = owner.get("pid") if owner is not None else None
+        if owner is not None:
             print(
                 f"[ingestion] skipped: already owned by live pid {holder_pid}",
                 file=sys.stderr,

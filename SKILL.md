@@ -285,7 +285,7 @@ minigraf_ingest_git(repo_path="/path/to/repo")
 # If already running:
 # → {"ok": false, "error": "ingestion already in progress"}
 
-# If another live process already owns the graph lock:
+# If another live process already owns the graph:
 # → {"ok": false, "error": "ingestion already owned by live process (pid 12345)", "owner_pid": 12345}
 ```
 
@@ -325,11 +325,14 @@ rejected with "already in progress" during this window, same as `running`.
 not a failure; the next `minigraf_ingest_git` call (or server auto-start)
 resumes from the watermark — and from `:ingestion/correction-sweep-through` for
 the confirmation pass — automatically. `skipped` means another live process
-already owns the graph lock (its PID is in `owner_pid`) — this server will not
+already owns the graph (its PID is in `owner_pid`) — this server will not
 attempt ingestion on its own; call `minigraf_ingest_git` again later to retry.
-For `error` and `skipped`, a `stale` field may be present: `stale: true` means the
-process that caused this state is no longer alive, so a `minigraf_ingest_git` retry
-is likely to succeed now — check it before assuming a cached error is still accurate.
+For `skipped`, a `stale` field may be present: `stale: true` means the owning
+process has stopped refreshing its ownership hint, so a `minigraf_ingest_git`
+retry is likely to succeed now — check it before assuming a cached state is
+still accurate. `error` no longer carries `stale`: it was derived by scraping a
+holder PID out of minigraf's lock-contention message, and minigraf 2.0.0
+removed that PID from the text.
 `error` also includes `error_at`, the timestamp the failure occurred. `processed` is the
 cumulative count of durably persisted commits (seeded from the true
 `:type/commit` entity count at run start, so it stays accurate even after a

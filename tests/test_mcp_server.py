@@ -25,6 +25,7 @@ import sqlite3
 import sys
 import os
 import subprocess as _subprocess
+import socket
 import time
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -382,7 +383,7 @@ def _hold_lock_subprocess(path, exit_immediately=False, hold_seconds=None):
       "open() raises citing a holder that's already dead" — that combination
       is not reachable through genuine process death on this platform, only
       through an unschedulable microsecond TOCTOU race. Tests that need to
-      exercise mcp_server._clear_stale_lock's own dead-PID-detection logic use
+      exercised the dead-PID-detection logic that #284 deleted; they use
       the PID yielded here (real, verifiably dead) to reconstruct that
       on-disk artifact by hand and call the real function directly — see
       test_self_heals_stale_lock_from_dead_pid and
@@ -484,22 +485,21 @@ class TestGetDbLockRetry:
             mcp_server.get_db()
         assert "locked" not in str(exc_info.value).lower()
 
-    def test_self_heals_stale_lock_from_dead_pid(self, tmp_path, monkeypatch):
-        """If the lock's recorded holder PID is no longer running, the stale
-        .lock file should be removed so the retry can succeed without
-        requiring the operator to delete it manually.
+    def test_a_dead_holders_leftover_lock_does_not_wedge_get_db(self, tmp_path, monkeypatch):
+        """A stale lock file lying around must not stop get_db() working.
 
-        NOTE: as documented on _hold_lock_subprocess, a real open() call
-        never actually raises "locked" for a lock file naming an
-        already-dead PID on this platform/minigraf build — it self-heals
-        silently inside MiniGrafDb.open() itself before mcp_server.py's own
-        _clear_stale_lock ever gets a chance to run. This test therefore (a)
-        exercises the real _clear_stale_lock function directly against a
-        real stale lock file naming a real, verifiably-dead PID (obtained
-        from a genuinely spawned-and-reaped subprocess, not a hardcoded
-        guess), and (b) separately confirms the practically-important
-        end-to-end guarantee: get_db() must not get stuck just because a
-        stale lock file is lying around.
+        This is what remains of test_self_heals_stale_lock_from_dead_pid after
+        #284 deleted mcp_server's own stale-lock self-heal. That helper
+        scraped a holder PID out of the error text and unlinked the sidecar
+        when the PID was dead. It recovered nothing on either minigraf
+        version: 2.0.0 has no sidecar and the kernel drops the lock on process
+        exit, while 1.2.3 leaves the file behind after a SIGKILL but reopens
+        successfully anyway, checking the recorded PID's liveness itself.
+
+        The END-TO-END guarantee it also covered is the part worth keeping,
+        and is asserted here directly rather than through the deleted helper.
+        A real subprocess supplies a genuinely dead PID rather than a
+        hardcoded guess.
         """
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
@@ -510,13 +510,14 @@ class TestGetDbLockRetry:
         with _hold_lock_subprocess(graph_path, exit_immediately=True) as dead_pid:
             pass  # holder opened, printed its PID, and is confirmed reaped/dead
 
+        mcp_server._reset_db_state()
         with open(lock_path, "w") as f:
             f.write(str(dead_pid))
-        assert mcp_server._clear_stale_lock(graph_path, dead_pid) is True
-        assert not os.path.exists(lock_path)
 
-        with open(lock_path, "w") as f:
-            f.write(str(dead_pid))
+        # Positive control: the leftover file really is there, so a passing
+        # assertion below cannot be a test that set nothing up.
+        assert os.path.exists(lock_path)
+
         result = mcp_server.get_db()
         assert result is not None
 
@@ -542,10 +543,9 @@ class TestGetDbLockRetry:
         _LOCK_RETRY_MAX - 1`. The clear must always be followed by one more
         open attempt, no matter which iteration triggered it.
 
-        NOTE: mcp_server._clear_stale_lock itself is not reachable end-to-end
-        here for the same reason documented on _hold_lock_subprocess — real
-        holder death and a real "locked" MiniGrafError never coincide on
-        this platform. What's still real and worth guarding: the retry loop
+        NOTE: mcp_server's stale-lock self-heal was deleted in #284, so
+        there is no longer any clearing step to reach from here. What's still
+        real and worth guarding: the retry loop
         must keep contending against a real, live-held lock all the way
         through its *last* attempt and succeed the moment that real
         contention clears, instead of giving up early. A real subprocess
@@ -583,66 +583,6 @@ class TestGetDbLockRetry:
             f"before succeeding on the last one, got {open_calls['n']} real "
             "open() calls"
         )
-
-
-class TestClearStaleLockReverifiesCurrentHolder:
-    """Regression tests for #178: _clear_stale_lock must re-read the lock
-    file's *current* contents immediately before deleting it, and only
-    delete if it still names the PID it was asked to clear. Without this,
-    a lock file that changed hands between the original failed open (T0,
-    when holder_pid was extracted from the error) and this call (T1) would
-    be deleted out from under a new, live, legitimate holder just because
-    the *original* holder_pid happened to be dead."""
-
-    def test_does_not_delete_lock_now_held_by_a_different_live_process(self, tmp_path):
-        import mcp_server
-        graph_path = str(tmp_path / "t.graph")
-        lock_path = graph_path + ".lock"
-
-        with _hold_lock_subprocess(graph_path, exit_immediately=True) as dead_pid:
-            pass  # holder opened, printed its PID, and is confirmed reaped/dead
-
-        # Simulate a new, live, legitimate holder having since acquired the
-        # lock at this same path (our own real PID stands in for "a
-        # different, live process").
-        new_holder_pid = os.getpid()
-        with open(lock_path, "w") as f:
-            f.write(str(new_holder_pid))
-
-        # Called with the stale holder_pid extracted from the earlier (T0)
-        # error, which is genuinely dead -- but the lock file no longer
-        # names that PID.
-        assert mcp_server._clear_stale_lock(graph_path, dead_pid) is False
-        assert os.path.exists(lock_path)
-        with open(lock_path) as f:
-            assert f.read().strip() == str(new_holder_pid)
-
-    def test_still_deletes_lock_that_still_names_the_dead_holder(self, tmp_path):
-        """Same-shape regression guard as the existing
-        test_self_heals_stale_lock_from_dead_pid, kept here alongside the
-        new re-verification test so the two behaviors (delete when still
-        stale, don't delete when reclaimed) are visible side by side."""
-        import mcp_server
-        graph_path = str(tmp_path / "t.graph")
-        lock_path = graph_path + ".lock"
-
-        with _hold_lock_subprocess(graph_path, exit_immediately=True) as dead_pid:
-            pass
-
-        with open(lock_path, "w") as f:
-            f.write(str(dead_pid))
-
-        assert mcp_server._clear_stale_lock(graph_path, dead_pid) is True
-        assert not os.path.exists(lock_path)
-
-    def test_missing_lock_file_returns_false(self, tmp_path):
-        """Another race shape: something else already removed the lock file
-        between the failed open and this call. No file to re-verify against
-        -- nothing to delete, must not raise."""
-        import mcp_server
-        graph_path = str(tmp_path / "t.graph")
-
-        assert mcp_server._clear_stale_lock(graph_path, 999999) is False
 
 
 class TestLeaseAcquireCannotBeRacedByReset:
@@ -1404,7 +1344,7 @@ class TestDbLeaseLeakDetector:
 
         A stray reference means the graph file lock is STILL HELD, so the next
         acquire fails no matter what: minigraf refuses a second same-process
-        open, and _clear_stale_lock correctly declines to steal a lock whose
+        open, and the retry loop correctly declines to steal a lock whose
         holder PID is our own live process. The detector buys a named holder
         in the log before that failure -- never a recovery from it.
 
@@ -1429,84 +1369,305 @@ class TestDbLeaseLeakDetector:
         mcp_server._reset_db_state()
 
 
-class TestLiveLockHolderPid:
-    """Unit tests for _live_lock_holder_pid — the proactive pre-check used
-    to avoid racing another live process for the ingestion lock (#108)."""
+class TestGraphOwnerHint:
+    """#284 item 5: the portable ownership hint that replaces the
+    `.graph.lock` sidecar reader.
 
-    def test_no_lock_file_returns_none(self, tmp_path):
+    minigraf 2.0.0 moved locking into the kernel and deleted the PID sidecar,
+    so _live_lock_holder_pid returned None while another process demonstrably
+    held the graph -- #108's "decline instead of racing" pre-check silently
+    stopped guarding. No portable replacement exists that reads minigraf's
+    lock (/proc/locks is Linux-only; a non-blocking flock is POSIX-only and
+    cannot tell our own handle from another process's), so we publish our own
+    advisory hint instead.
+
+    Freshness is decided by the hint file's mtime, never by PID liveness --
+    that is what makes it portable, and it is why os.kill is gone from the
+    tree (on Windows CPython maps it to TerminateProcess).
+    """
+
+    def _write_hint(self, graph_path, **overrides):
+        """Write a hint file directly, bypassing the writer under test.
+
+        Tests that assert "the reader sees this" must not depend on the
+        writer being correct, or a single bug would make both agree.
+        """
+        import mcp_server
+        payload = {
+            "pid": 424242,
+            "host": "some-other-host",
+            "purpose": "ingestion",
+            "started": "2026-08-31T00:00:00.000Z",
+            "graph": graph_path,
+        }
+        payload.update(overrides)
+        with open(mcp_server._owner_hint_path(graph_path), "w") as f:
+            json.dump(payload, f)
+        return payload
+
+    def test_no_hint_file_returns_none(self, tmp_path):
+        import mcp_server
+        assert mcp_server._graph_owner_hint(str(tmp_path / "t.graph")) is None
+
+    def test_fresh_hint_from_another_process_is_returned(self, tmp_path):
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
-        assert mcp_server._live_lock_holder_pid(graph_path) is None
+        self._write_hint(graph_path)
+        hint = mcp_server._graph_owner_hint(graph_path)
+        assert hint is not None
+        assert hint["pid"] == 424242
 
-    def test_unparsable_content_returns_none(self, tmp_path):
+    def test_stale_hint_returns_none(self, tmp_path, monkeypatch):
+        """A hint older than the TTL is ignored -- this is the crash path.
+
+        Carries its own positive control: the SAME hint at the SAME path,
+        freshly touched, must be returned. Without it, a reader that is
+        simply broken would pass this test by returning None always.
+        """
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_OWNER_HINT_TTL", 30.0)
+        graph_path = str(tmp_path / "t.graph")
+        self._write_hint(graph_path)
+        hint_path = mcp_server._owner_hint_path(graph_path)
+
+        # positive control: fresh => visible
+        assert mcp_server._graph_owner_hint(graph_path) is not None
+
+        old = time.time() - 3600
+        os.utime(hint_path, (old, old))
+        assert mcp_server._graph_owner_hint(graph_path) is None
+
+    def test_hint_naming_this_process_returns_none(self, tmp_path):
+        """Our own hint is not another process -- never a blocker."""
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
-        with open(graph_path + ".lock", "w") as f:
-            f.write("not-a-pid")
-        assert mcp_server._live_lock_holder_pid(graph_path) is None
+        self._write_hint(graph_path, pid=os.getpid(), host=socket.gethostname())
+        assert mcp_server._graph_owner_hint(graph_path) is None
 
-    def test_dead_holder_returns_none(self, tmp_path):
+    def test_hint_with_our_pid_on_another_host_is_returned(self, tmp_path):
+        """A PID from another machine on a shared filesystem means nothing.
+
+        Guards the self-check against comparing PID alone, which would make
+        an unrelated remote holder look like our own handle and let ingestion
+        start straight into a race.
+        """
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
-        dead_pid = 999999  # not running on any reasonable test machine
-        with open(graph_path + ".lock", "w") as f:
-            f.write(str(dead_pid))
-        assert mcp_server._live_lock_holder_pid(graph_path) is None
+        self._write_hint(graph_path, pid=os.getpid(), host="a-different-host")
+        hint = mcp_server._graph_owner_hint(graph_path)
+        assert hint is not None
+        assert hint["host"] == "a-different-host"
 
-    def test_live_holder_returns_pid(self, tmp_path, monkeypatch):
+    def test_unparseable_hint_returns_none(self, tmp_path):
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
-        other_pid = 424242
-        with open(graph_path + ".lock", "w") as f:
-            f.write(str(other_pid))
-        monkeypatch.setattr(mcp_server.os, "kill", lambda pid, sig: None)
-        assert mcp_server._live_lock_holder_pid(graph_path) == other_pid
+        with open(mcp_server._owner_hint_path(graph_path), "w") as f:
+            f.write("{not json")
+        assert mcp_server._graph_owner_hint(graph_path) is None
 
-    def test_own_pid_returns_none(self, tmp_path):
-        """The lock file recording our own PID means a leaked handle from
-        this same process, not another process — never a blocker."""
+    @pytest.mark.asyncio
+    async def test_holder_publishes_a_hint_and_removes_it_on_exit(self, tmp_path):
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
-        with open(graph_path + ".lock", "w") as f:
-            f.write(str(os.getpid()))
-        assert mcp_server._live_lock_holder_pid(graph_path) is None
+        hint_path = mcp_server._owner_hint_path(graph_path)
 
-    def test_permission_error_on_kill_treated_as_alive(self, tmp_path, monkeypatch):
-        """Can't confirm death -> conservatively assume alive (matches
-        _clear_stale_lock's existing bias)."""
+        async with mcp_server._graph_owner_hint_held(graph_path, "ingestion"):
+            assert os.path.exists(hint_path)
+            with open(hint_path) as f:
+                payload = json.load(f)
+            assert payload["pid"] == os.getpid()
+            assert payload["purpose"] == "ingestion"
+
+        assert not os.path.exists(hint_path)
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_keeps_a_long_hold_fresh_past_the_ttl(self, tmp_path, monkeypatch):
+        """Proves the heartbeat RUNS, not merely that it was started.
+
+        Without a refresh the hint's mtime would age past the TTL while
+        ingestion is demonstrably still alive, and another process would
+        start a competing run.
+        """
         import mcp_server
+        monkeypatch.setattr(mcp_server, "_OWNER_HINT_HEARTBEAT", 0.05)
+        monkeypatch.setattr(mcp_server, "_OWNER_HINT_TTL", 0.3)
         graph_path = str(tmp_path / "t.graph")
-        other_pid = 424242
-        with open(graph_path + ".lock", "w") as f:
-            f.write(str(other_pid))
 
-        def raise_permission_error(pid, sig):
-            raise PermissionError()
+        async with mcp_server._graph_owner_hint_held(graph_path, "ingestion"):
+            await asyncio.sleep(0.9)  # 3x the TTL
+            assert mcp_server._graph_owner_hint_is_fresh(graph_path) is True
 
-        monkeypatch.setattr(mcp_server.os, "kill", raise_permission_error)
-        assert mcp_server._live_lock_holder_pid(graph_path) == other_pid
-
-
-class TestPidIsAlive:
-    """Unit tests for _pid_is_alive — shared conservative liveness check
-    extracted from _clear_stale_lock and _live_lock_holder_pid (#106)."""
-
-    def test_dead_pid_returns_false(self):
+    @pytest.mark.asyncio
+    async def test_an_unwritable_hint_location_does_not_block_the_caller(self, tmp_path):
+        """Best-effort by contract: a hint we cannot write must never be able
+        to stop real work from running."""
         import mcp_server
-        assert mcp_server._pid_is_alive(999999) is False  # not running on any reasonable test machine
+        unwritable = tmp_path / "nope"
+        unwritable.mkdir()
+        os.chmod(unwritable, 0o500)
+        graph_path = str(unwritable / "t.graph")
+        try:
+            ran = False
+            async with mcp_server._graph_owner_hint_held(graph_path, "ingestion"):
+                ran = True
+            assert ran
+        finally:
+            os.chmod(unwritable, 0o700)
 
-    def test_live_pid_returns_true(self):
+    def test_a_hint_left_by_a_crashed_holder_expires(self, tmp_path, monkeypatch):
+        """The crash path the deleted _pid_is_alive used to cover.
+
+        A holder killed with SIGKILL runs no cleanup, so its hint stays on
+        disk. It must stop counting once the TTL passes -- without consulting
+        the recorded PID, which is exactly what portability forbids.
+        """
         import mcp_server
-        assert mcp_server._pid_is_alive(os.getpid()) is True
+        monkeypatch.setattr(mcp_server, "_OWNER_HINT_TTL", 0.3)
+        graph_path = str(tmp_path / "t.graph")
+        self._write_hint(graph_path)
 
-    def test_permission_error_treated_as_alive(self, monkeypatch):
+        assert mcp_server._graph_owner_hint(graph_path) is not None  # control
+        time.sleep(0.5)
+        assert mcp_server._graph_owner_hint(graph_path) is None
+
+
+class TestSidecarEraHelpersAreGone:
+    """#284 item 5: the deleted PID apparatus must not creep back.
+
+    os.kill is the one that matters beyond tidiness. CPython maps non-CTRL
+    signals to TerminateProcess on Windows -- which ROADMAP.md lists as a
+    supported platform -- so `os.kill(pid, 0)` as a "liveness check" would
+    terminate the process it asks about. Nothing here may reintroduce it.
+    """
+
+    def _source(self):
+        with open(os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "mcp_server.py")) as f:
+            return f.read()
+
+    def test_the_deleted_helpers_are_not_defined(self):
+        src = self._source()
+        for name in (
+            "_pid_is_alive",
+            "_clear_stale_lock",
+            "_read_lock_holder_raw",
+            "_live_lock_holder_pid",
+            "_stale_lock_holder_pid",
+        ):
+            assert f"def {name}(" not in src, f"{name} was reintroduced"
+
+    def test_the_search_can_actually_find_a_definition(self):
+        """Positive control for the test above.
+
+        A `not in` assertion over a source file passes trivially if the file
+        failed to load or the pattern shape is wrong -- it would report all
+        clear having matched nothing. This proves the same search DOES find a
+        function that is genuinely present.
+        """
+        src = self._source()
+        assert "def _graph_owner_hint(" in src
+
+    def test_os_kill_is_not_used_as_a_liveness_check(self):
+        src = self._source()
+        code = [
+            ln for ln in src.splitlines()
+            if "os.kill" in ln and not ln.lstrip().startswith("#")
+        ]
+        assert code == [], f"os.kill reintroduced outside a comment: {code}"
+
+
+class TestOwnerHintDrivesTheIngestionPreCheck:
+    """#284 item 5, end to end: the #108 pre-check must decline on a REAL
+    hint file, and ingestion must publish one while it runs.
+
+    These deliberately do not monkeypatch the reader. The regression being
+    fixed is that the pre-check's underlying signal silently disappeared, so a
+    test that stubs the signal out would still have passed against the broken
+    code.
+    """
+
+    @pytest.mark.asyncio
+    async def test_declines_to_start_when_another_process_holds_the_graph(
+        self, real_db, git_repo, monkeypatch, tmp_path
+    ):
         import mcp_server
+        graph_path = mcp_server._graph_path_current()
+        with open(mcp_server._owner_hint_path(graph_path), "w") as f:
+            json.dump(
+                {
+                    "pid": 424242,
+                    "host": "some-other-host",
+                    "purpose": "ingestion",
+                    "started": "2026-08-31T00:00:00.000Z",
+                    "graph": graph_path,
+                },
+                f,
+            )
+        try:
+            mcp_server._ingest_task = None
+            mcp_server._ingest_progress = {
+                "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+                "current_commit": "", "error": None, "owner_pid": None,
+            }
+            result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
+            assert result["ok"] is False
+            assert result["owner_pid"] == 424242
+            assert mcp_server._ingest_progress["status"] == "skipped"
+            assert mcp_server._ingest_task is None, "must not have started a run"
+        finally:
+            mcp_server._remove_owner_hint(graph_path)
 
-        def raise_permission_error(pid, sig):
-            raise PermissionError()
+    @pytest.mark.asyncio
+    async def test_starts_when_the_only_hint_is_a_stale_one(
+        self, real_db, git_repo, monkeypatch
+    ):
+        """Positive control for the test above: same setup, same path, only
+        the hint's age differs. Without this pairing, a pre-check that always
+        declined would pass the decline test."""
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_OWNER_HINT_TTL", 30.0)
+        graph_path = mcp_server._graph_path_current()
+        hint_path = mcp_server._owner_hint_path(graph_path)
+        with open(hint_path, "w") as f:
+            json.dump({"pid": 424242, "host": "some-other-host"}, f)
+        old = time.time() - 3600
+        os.utime(hint_path, (old, old))
+        try:
+            mcp_server._ingest_task = None
+            mcp_server._ingest_progress = {
+                "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+                "current_commit": "", "error": None, "owner_pid": None,
+            }
+            result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
+            assert result["ok"] is True
+            await mcp_server._ingest_task
+        finally:
+            mcp_server._remove_owner_hint(graph_path)
 
-        monkeypatch.setattr(mcp_server.os, "kill", raise_permission_error)
-        assert mcp_server._pid_is_alive(424242) is True
+    @pytest.mark.asyncio
+    async def test_a_running_ingestion_publishes_a_hint_for_other_processes(
+        self, real_db, git_repo, monkeypatch
+    ):
+        """The other half of the contract: the pre-check can only decline if
+        a running ingestion actually advertises itself."""
+        import mcp_server
+        graph_path = mcp_server._graph_path_current()
+        hint_path = mcp_server._owner_hint_path(graph_path)
+        assert not os.path.exists(hint_path)
+
+        seen = False
+        task = asyncio.create_task(
+            mcp_server._run_ingestion(str(git_repo), mcp_server._default_git_branch(str(git_repo)))
+        )
+        while not task.done():
+            if os.path.exists(hint_path):
+                seen = True
+                break
+            await asyncio.sleep(0.005)
+        await task
+
+        assert seen, "ingestion never published an ownership hint while running"
+        assert not os.path.exists(hint_path), "hint must be removed when the run ends"
 
 
 class TestMinigrafQuery:
@@ -6656,50 +6817,74 @@ class TestMinigrafIngestStatus:
         assert calls == []
 
     def test_reports_owner_pid_when_skipped(self, real_db, monkeypatch):
+        """Staleness now follows the ownership hint's freshness, not the
+        recorded PID's liveness (#284). A fresh hint means the holder is
+        actively refreshing it, which is the liveness claim we want and the
+        only one that is portable."""
         import mcp_server
         mcp_server._ingest_progress = {
             "status": "skipped", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": 424242,
         }
-        monkeypatch.setattr(mcp_server, "_pid_is_alive", lambda pid: True)
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint_is_fresh", lambda path: True)
         result = mcp_server.handle_minigraf_ingest_status()
         assert result["status"] == "skipped"
         assert result["owner_pid"] == 424242
         assert result["stale"] is False
 
-    def test_skipped_status_is_stale_when_owner_pid_dead(self, real_db, monkeypatch):
+    def test_skipped_status_is_stale_when_the_hint_has_expired(self, real_db, monkeypatch):
         import mcp_server
         mcp_server._ingest_progress = {
             "status": "skipped", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": 424242,
         }
-        monkeypatch.setattr(mcp_server, "_pid_is_alive", lambda pid: False)
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint_is_fresh", lambda path: False)
         result = mcp_server.handle_minigraf_ingest_status()
         assert result["stale"] is True
 
-    def test_error_status_reports_stale_when_holder_pid_dead(self, real_db, monkeypatch):
+    def test_skipped_staleness_tracks_a_real_hint_file_not_just_a_stub(
+        self, real_db, tmp_path, monkeypatch
+    ):
+        """The two tests above stub the freshness predicate, so neither would
+        notice if the wrong path were passed to it. This one drives the real
+        file, both ways, at the graph path the handler actually consults."""
+        import mcp_server
+        monkeypatch.setattr(mcp_server, "_OWNER_HINT_TTL", 30.0)
+        graph_path = mcp_server._graph_path_current()
+        hint_path = mcp_server._owner_hint_path(graph_path)
+        mcp_server._ingest_progress = {
+            "status": "skipped", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": 424242,
+        }
+        try:
+            with open(hint_path, "w") as f:
+                json.dump({"pid": 424242, "host": "some-other-host"}, f)
+            assert mcp_server.handle_minigraf_ingest_status()["stale"] is False
+
+            old_time = time.time() - 3600
+            os.utime(hint_path, (old_time, old_time))
+            assert mcp_server.handle_minigraf_ingest_status()["stale"] is True
+        finally:
+            mcp_server._remove_owner_hint(graph_path)
+
+    def test_error_status_no_longer_reports_staleness(self, real_db):
+        """The "error" branch used to scrape a holder PID out of minigraf's
+        lock-contention message and re-check its liveness. minigraf 2.0.0
+        removed "holder PID: N" from that text entirely (#284), so there is
+        nothing left to scrape and no staleness can be reported for this
+        path. Asserted rather than dropped, so the capability's removal is
+        deliberate and visible instead of silently regressing.
+        """
         import mcp_server
         mcp_server._ingest_progress = {
             "status": "error", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "",
-            "error": "Database is locked by another process (lock file: x.graph.lock, holder PID: 424242).",
+            "error": "[STG-026] Database is locked by another process (/tmp/x.graph).",
             "owner_pid": None,
         }
-        monkeypatch.setattr(mcp_server, "_pid_is_alive", lambda pid: False)
         result = mcp_server.handle_minigraf_ingest_status()
-        assert result["stale"] is True
-
-    def test_error_status_not_stale_when_holder_pid_alive(self, real_db, monkeypatch):
-        import mcp_server
-        mcp_server._ingest_progress = {
-            "status": "error", "processed": 0, "total": 0, "prior_ingested": 0,
-            "current_commit": "",
-            "error": "Database is locked by another process (lock file: x.graph.lock, holder PID: 424242).",
-            "owner_pid": None,
-        }
-        monkeypatch.setattr(mcp_server, "_pid_is_alive", lambda pid: True)
-        result = mcp_server.handle_minigraf_ingest_status()
-        assert result["stale"] is False
+        assert result["status"] == "error"
+        assert "stale" not in result
 
     def test_error_status_omits_stale_when_no_pid_in_message(self, real_db):
         import mcp_server
@@ -12368,7 +12553,7 @@ class TestRunIngestion:
     @pytest.mark.asyncio
     async def test_handle_minigraf_ingest_git_returns_immediately(self, real_db, git_repo, monkeypatch):
         import mcp_server
-        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
@@ -12385,7 +12570,7 @@ class TestRunIngestion:
     @pytest.mark.asyncio
     async def test_second_call_while_running_returns_error(self, real_db, git_repo, monkeypatch):
         import mcp_server
-        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
@@ -12403,7 +12588,7 @@ class TestRunIngestion:
         """Fails at the git-repo validity check, before any DB is ever
         touched — no DB fixture needed at all."""
         import mcp_server
-        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
@@ -12425,7 +12610,10 @@ class TestRunIngestion:
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
             "current_commit": "", "error": None, "owner_pid": None,
         }
-        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: 424242)
+        monkeypatch.setattr(
+            mcp_server, "_graph_owner_hint",
+            lambda path: {"pid": 424242, "host": "some-other-host", "purpose": "ingestion"},
+        )
 
         result = await mcp_server.handle_minigraf_ingest_git(repo_path=str(git_repo))
 
@@ -12441,7 +12629,7 @@ class TestRunIngestion:
         """When no live process owns the graph lock, handle_minigraf_ingest_git
         proceeds normally and starts the ingestion task."""
         import mcp_server
-        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
@@ -12465,7 +12653,7 @@ class TestRunIngestion:
         a subsequent minigraf_ingest_git call is rejected with "already in
         progress" because the task-existence check is accurate immediately."""
         import mcp_server
-        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
         mcp_server._ingest_task = None
         mcp_server._ingest_progress = {
             "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
@@ -12483,7 +12671,7 @@ class TestRunIngestion:
         """#130: omitting `branch` must resolve through _default_git_branch,
         not hardcode "HEAD"."""
         import mcp_server
-        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
         monkeypatch.setattr(mcp_server, "_default_git_branch", lambda repo_path: "resolved-branch")
         captured = {}
 
@@ -12508,7 +12696,7 @@ class TestRunIngestion:
         """An explicit `branch` argument must win over _default_git_branch,
         which shouldn't even be consulted in that case."""
         import mcp_server
-        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
 
         def unexpected_call(repo_path):
             raise AssertionError("_default_git_branch should not be called when branch is explicit")
@@ -12894,7 +13082,7 @@ class TestRunIngestionBatchedIndexWrites:
             return CountingConnection(original_open_writer(path))
 
         monkeypatch.setattr(fact_index, "open_writer", counting_open_writer)
-        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
 
         await mcp_server._run_ingestion(str(git_repo), "HEAD")
 
@@ -13512,7 +13700,10 @@ class TestMainAutoIngestLockCheck:
         import mcp_server
 
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
-        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: 424242)
+        monkeypatch.setattr(
+            mcp_server, "_graph_owner_hint",
+            lambda path: {"pid": 424242, "host": "some-other-host", "purpose": "ingestion"},
+        )
         mcp_server._shutdown_requested = asyncio.Event()
         mcp_server._ingest_task = None
 
@@ -13544,7 +13735,7 @@ class TestMainAutoIngestLockCheck:
         import mcp_server
 
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
-        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
 
         async def fake_run_ingestion(repo_path, branch):
             # Wait for either shutdown or an event that never gets set.
@@ -13598,7 +13789,7 @@ class TestMainAutoIngestLockCheck:
         import mcp_server
 
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
-        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
 
         async def fake_run_ingestion(repo_path, branch):
             # Never touches _ingest_progress — isolates what main() itself
@@ -13646,7 +13837,7 @@ class TestMainAutoIngestLockCheck:
         import mcp_server
 
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
-        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
         monkeypatch.setattr(mcp_server, "_default_git_branch", lambda repo_path: "resolved-default")
 
         captured = {}
@@ -13753,7 +13944,7 @@ class TestMainStartupBackfill:
         import mcp_server
 
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
-        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
 
         async def fake_run_ingestion(repo_path, branch):
             await asyncio.wait(
@@ -13805,7 +13996,7 @@ class TestMainStartupBackfill:
         import mcp_server
 
         monkeypatch.setenv("MINIGRAF_GRAPH_PATH", str(tmp_path / "t.graph"))
-        monkeypatch.setattr(mcp_server, "_live_lock_holder_pid", lambda path: None)
+        monkeypatch.setattr(mcp_server, "_graph_owner_hint", lambda path: None)
 
         async def fake_run_ingestion(repo_path, branch):
             await asyncio.wait(

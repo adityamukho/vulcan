@@ -1311,7 +1311,17 @@ is never released. Failure on this path is silent (`finalize_hook.py` is
 `except Exception: pass`), so the extra wall clock buys real robustness.
 
 **The #108 pre-check silently becomes a no-op**, which #284's scope did not
-name. `_live_lock_holder_pid` reads the sidecar upstream #317 deleted, so under
+name. **FIXED in #284 item 5** — the probe's `precheck` section now measures
+both mechanisms side by side, and the recorded runs show the replacement
+working on *both* versions where the old one fails on 2.0.0:
+
+| | 1.2.3 | 2.0.0 |
+|---|---|---|
+| old sidecar reader is a silent no-op | False | **True** |
+| new `<graph>.owner` hint detects the holder | True | **True** |
+
+The rest of this paragraph describes the defect as found, and is kept because
+it is the reason the replacement exists. `_live_lock_holder_pid` reads the sidecar upstream #317 deleted, so under
 2.0.0 it returns `None` while another process demonstrably holds the graph, and
 ingestion goes back to racing instead of declining. Restoring it portably is
 not a matter of swapping in another lock-reading API: no non-contending,

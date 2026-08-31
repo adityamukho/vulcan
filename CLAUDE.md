@@ -91,7 +91,7 @@ live weakref was tried and rejected — it resurrects dead graphs and segfaults
 **A lease is cheap in-process and exclusive out-of-process, and the difference
 decides design questions.** At count > 0 `try_acquire` joins and returns the
 same handle, so a concurrent `call_tool` never blocks. But `try_acquire` returns
-None while another PROCESS holds minigraf's `.graph.lock` sidecar, and BOTH
+None while another PROCESS holds minigraf's lock on the graph file, and BOTH
 auto-memory hooks (`hooks/claude-code.json`) are `command` hooks in separate
 processes — `finalize_hook.py` takes a lease to write each turn's facts. The
 retry budget is `_LOCK_RETRY_MAX` x `_LOCK_RETRY_BASE` doubling = **0.75 s
@@ -99,6 +99,23 @@ total**, and both hooks swallow failures (`except Exception: pass`). So
 lengthening how long ingestion holds a lease does not block queries — it
 **silently discards auto-memory writes**. Do not "just hold one lease for the
 whole run".
+
+**Locking is in the kernel; there is no PID sidecar to read.** As of minigraf
+2.0.0 the lock is `File::try_lock` on the `.graph` file itself (`flock` on Unix,
+`LockFileEx` on Windows), released by the kernel on process exit however it
+exits. The old `.graph.lock` PID sidecar is gone, so nothing on disk names the
+holder, and `mcp_server`'s stale-lock self-heal is gone with it — measured, it
+recovered nothing on either version (see `evals/at_scale/benchmark.md`).
+
+Ingestion's #108 "decline instead of racing" pre-check therefore reads **our
+own** advisory hint, `<graph_path>.owner`, written by `_graph_owner_hint_held`
+and read by `_graph_owner_hint` — never minigraf's lock. Freshness is a
+heartbeat-refreshed mtime (`_OWNER_HINT_TTL`, default 30s, override
+`MINIGRAF_OWNER_HINT_TTL`), never PID liveness: no portable mechanism can both
+name a holder and avoid contending, and `os.kill(pid, 0)` terminates the target
+on Windows. Correctness still rests entirely on minigraf's kernel lock — a
+wrong hint costs one race or one needless decline, never correctness. The hint
+is published only around LONG-held ownership (ingestion), not every lease.
 
 **Dropping the handle is not free: it runs a full O(graph size) checkpoint**
 inside minigraf's `Drop for Inner`, outside `_CheckpointPolicy`'s duty gate and
