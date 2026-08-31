@@ -111,10 +111,18 @@ def _seed_graph(graph_path: Path, seed_blocks: list[str]) -> None:
     sys.path.insert(0, str(REPO_ROOT))
     from minigraf import MiniGrafDb  # pylint: disable=import-outside-toplevel
 
-    now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+    # minigraf's grammar is `(transact {opts} facts)` -- the options map comes
+    # FIRST, as every other seeding call site in evals/ already has it (see the
+    # note in at_scale/run_query_benchmark.py). Reversed, the map was accepted
+    # and silently discarded, so seeds landed at wall clock instead of the
+    # requested valid time. Fixing only the order is not enough: :valid-from
+    # wants ISO 8601 UTC, so the epoch-millis value this used to build becomes a
+    # hard "invalid date" parse error the moment the map stops being dropped.
+    # Both had to change together (#284). Format mirrors mcp_server._now_utc_ms().
+    now_z = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
     db = MiniGrafDb.open(str(graph_path))
     for block in seed_blocks:
-        db.execute(f'(transact {block} {{:valid-from "{now_ms}"}})')
+        db.execute(f'(transact {{:valid-from "{now_z}"}} {block})')
     db.checkpoint()
 
 
