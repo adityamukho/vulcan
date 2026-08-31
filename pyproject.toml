@@ -33,7 +33,20 @@ dependencies = [
     # minigraf here means silent graph corruption under concurrent load.
     # The core fix shipped in 1.2.2; 1.2.3 is the release this is verified
     # against (1.2.2's Node binding was withdrawn for an unrelated gap).
-    "minigraf>=1.2.3",
+    # Capped below 2.0: minigraf 2.0.0 deleted the .graph.lock PID sidecar,
+    # moving the lock into the kernel via File::try_lock on the .graph file
+    # itself (project-minigraf/minigraf#317). With the bound open, CI resolved
+    # 2.0.0 and four tests that assert the sidecar's existence failed on master
+    # -- TestGetDbLockRetry (x2), TestDbLeaseManager and
+    # TestSingleHandlePerProcess. The single-handle invariant itself SURVIVES
+    # (flock/OFD locks attach to the open file description, so #304's
+    # same-process denial still holds); it is the sidecar the tests reach for
+    # that is gone. 2.0.0 also changes every error string (a "[CODE] " prefix)
+    # and adds a ~375ms internal retry before reporting a cross-process
+    # conflict, which absorbs attempts that used to reach _DbLeaseManager's
+    # own retry loop. Taking that upgrade is its own change -- raise the cap
+    # as part of it, not before it. See #284.
+    "minigraf>=1.2.3,<2.0.0",
     # Capped below 2.0: mcp 2.0.0 removed Server.list_tools, which
     # mcp_server.py registers its handlers through. With the bound open, CI
     # resolved 2.0.0 and every test that imports mcp_server errored at import
