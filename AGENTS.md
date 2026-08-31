@@ -34,9 +34,9 @@ Persistent bi-temporal graph memory for AI coding agents. Prevents context drift
 ```python
 from minigraf import query, transact
 
-transact("[[:decision/cache-strategy :decision/description \"use Redis\"]]",
+transact("[[:decision/cache-strategy :description \"use Redis\"]]",
          reason="Architecture decision for low-latency caching")
-result = query("[:find ?desc :where [?e :decision/description ?desc]]")
+result = query("[:find ?desc :where [?e :description ?desc]]")
 ```
 
 ### As CLI:

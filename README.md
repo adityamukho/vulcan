@@ -126,11 +126,11 @@ This syncs the skill into `.agents/skills/temporal-reasoning` — Codex CLI's do
 from minigraf import query, transact
 
 # Store a decision
-transact("[[:decision/cache-strategy :decision/description \"use Redis\"]]", 
+transact("[[:decision/cache-strategy :description \"use Redis\"]]", 
          reason="Architecture decision for low-latency caching")
 
-# Query decisions
-result = query("[:find ?d :where [?e :decision/description ?d]]")
+# Query stored descriptions
+result = query("[:find ?d :where [?e :description ?d]]")
 ```
 
 ## Storage Location
@@ -212,7 +212,7 @@ query("[:find ?x :where [?e :attr ?x]]")
 query("[:find ?x :as-of 5 :where [?e :attr ?x]]")
 
 # Aggregation
-query("[:find (count ?e) :where [?e :decision/description ?d]]")
+query("[:find (count ?e) :where [?e :description ?d]]")
 
 # Single-hop graph traversal — what does api-gateway call?
 query("[:find ?name :where [:project/api-gateway :calls ?svc] [?svc :name ?name]]")
