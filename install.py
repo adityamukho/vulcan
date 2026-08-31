@@ -144,7 +144,12 @@ def check_minigraf_package():
         print("✓ minigraf Python package found")
         return True
     print("✗ minigraf not found — installing via pip...")
-    if _venv_pip_install("minigraf>=1.2.1", timeout=120):
+    # Keep in sync with pyproject.toml's `dependencies`, which is canonical --
+    # this path installs into the venv directly and does not read it. The floor
+    # was stale here (1.2.1 vs pyproject's 1.2.3) and the cap was missing
+    # entirely, so a fresh install pulled minigraf 2.0.0 and got the .graph.lock
+    # sidecar removal. See #284.
+    if _venv_pip_install("minigraf>=1.2.3,<2.0.0", timeout=120):
         print("✓ minigraf installed")
         return True
     print("✗ pip install minigraf failed")
@@ -157,7 +162,10 @@ def check_mcp_package():
         print("✓ mcp Python package found")
         return True
     print("✗ mcp not found — installing via pip...")
-    if _venv_pip_install("mcp>=1.27.0", timeout=120):
+    # Same sync requirement as minigraf above: pyproject caps mcp below 2.0
+    # (2.0.0 removed Server.list_tools), but this call had no cap, so a fresh
+    # install could pull 2.x and fail at import.
+    if _venv_pip_install("mcp>=1.27.0,<2.0.0", timeout=120):
         print("✓ mcp installed")
         return True
     print("✗ pip install mcp failed")
