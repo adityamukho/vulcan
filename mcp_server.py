@@ -23,6 +23,7 @@ import subprocess as _subprocess
 import sys
 import threading
 import time
+import traceback
 import weakref
 from collections import deque
 from dataclasses import dataclass, field
@@ -11593,6 +11594,29 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         _ingest_progress["status"] = "error"
         _ingest_progress["error"] = str(e)
         _ingest_progress["error_at"] = _now_utc_ms()
+        # #270. Until this print, _ingest_progress was the ONLY record of
+        # what killed the run: this handler swallows the exception and
+        # returns normally, so a background run started through
+        # handle_minigraf_ingest_git left nothing in any log, and the
+        # at-scale harness's stderr tee could not scan for text that was
+        # never written to fd 2 -- error_signals read CLEAN for a run that
+        # produced nothing. The per-commit skip sites above already print
+        # their own failures; this is the run-level one that was missing.
+        #
+        # The traceback, not just str(e): this handler covers ~500 lines of
+        # _run_ingestion, and str() of a bare KeyError is the key alone.
+        # format_exc() returns a plain string -- it holds no frame past this
+        # statement, so it cannot keep a leased MiniGrafDb alive into the
+        # next acquire's _detect_leaked_handle check (the hazard the sweep's
+        # `e.__traceback__ = None` guards against, for a traceback that IS
+        # retained). Best-effort: fd 2 can be a closed tee pipe by the time
+        # a late failure lands here, and a BrokenPipeError from logging must
+        # not displace the error being reported.
+        with contextlib.suppress(BaseException):
+            print(
+                f"[_run_ingestion] ingestion failed: {e}\n{traceback.format_exc()}",
+                file=sys.stderr,
+            )
     finally:
         # The checkpoint policy is a separate story from write_executor
         # above: it is installed just after write_executor is created,
