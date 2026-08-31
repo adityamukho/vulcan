@@ -1327,6 +1327,26 @@ attempt 1 blocks 376 ms, so attempt 2 begins at ~426 ms and is still *inside*
 `open()` when the holder dies at 500 ms. Rewriting it to expect 2 would pin an
 artifact of one hold duration.
 
+### Crash recovery — `_clear_stale_lock` is redundant on BOTH versions
+
+The `stale_recovery` section exists because 1.2.3's error text invites exactly
+the wrong conclusion: *"If no other process is using this database, delete the
+lock file manually."* Read literally, that says our `_clear_stale_lock` is
+1.2.3's crash recovery and cannot be removed while the `<2.0.0` cap holds.
+
+Measured, with the positive control passing on both runs:
+
+| | 1.2.3 | 2.0.0 |
+|---|---|---|
+| sidecar left on disk after `SIGKILL` | True | False |
+| **reopen after `SIGKILL` succeeds** | **True** | **True** |
+| `_clear_stale_lock` genuinely required | **False** | False |
+
+1.2.3 leaves the file behind but checks the recorded PID's liveness on the next
+open and proceeds. `_clear_stale_lock` only ever deletes when that same PID is
+dead, so it duplicates work minigraf already does. Do not re-derive this from
+the error message.
+
 ### Not covered
 
 `stderr_capture.py`'s `page_out_of_bounds`, `serde_deserialization_error` and

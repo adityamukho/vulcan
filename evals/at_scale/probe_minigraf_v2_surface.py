@@ -328,11 +328,66 @@ def section_precheck() -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Section 5: crash recovery, and whether _clear_stale_lock is load-bearing
+# ---------------------------------------------------------------------------
+
+def section_stale_recovery() -> dict[str, Any]:
+    """Does a HARD-KILLED holder leave the graph unopenable?
+
+    Load-bearing for #284 item 5's staging decision. mcp_server carries a
+    stale-lock self-heal (_clear_stale_lock, driven from _open_for_lease); the
+    question is whether deleting it is safe on the version we actually run.
+
+    Reading 1.2.3's error text ("If no other process is using this database,
+    delete the lock file manually") suggests it is NOT safe. That reading is
+    WRONG, which is why this is measured: 1.2.3 leaves the sidecar on disk
+    after a SIGKILL but reopens successfully anyway, because it checks the
+    recorded PID's liveness itself. The self-heal is redundant on BOTH
+    versions. Do not re-derive this from the error message.
+    """
+    import signal
+
+    from minigraf import MiniGrafDb
+
+    path = _fresh_graph()
+    child = _hold_graph(path, 30)
+
+    # Positive control: while genuinely held, an open MUST fail. Without this,
+    # "reopen succeeded" could just mean the holder never held it.
+    try:
+        MiniGrafDb.open(path)
+        control_held = False
+    except Exception:  # noqa: BLE001
+        control_held = True
+
+    os.kill(child.pid, signal.SIGKILL)  # hard kill: no cleanup path runs
+    child.wait()
+    time.sleep(0.5)
+
+    sidecar_left = os.path.exists(path + ".lock")
+    try:
+        MiniGrafDb.open(path)
+        reopened, error = True, None
+    except Exception as exc:  # noqa: BLE001
+        reopened, error = False, str(exc)
+
+    return {
+        "control_open_refused_while_held": control_held,
+        "sidecar_left_after_sigkill": sidecar_left,
+        "reopen_after_sigkill_succeeds": reopened,
+        "reopen_error": error,
+        # True would mean the self-heal is genuinely required on this version.
+        "clear_stale_lock_is_required": control_held and not reopened,
+    }
+
+
 SECTIONS: dict[str, Callable[[], dict[str, Any]]] = {
     "error_strings": section_error_strings,
     "lock_timing": section_lock_timing,
     "hook_path": section_hook_path,
     "precheck": section_precheck,
+    "stale_recovery": section_stale_recovery,
 }
 
 
