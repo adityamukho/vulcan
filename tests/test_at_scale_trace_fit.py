@@ -337,7 +337,7 @@ class TestProbeIO:
         )
         for key in (
             "skipped_commits", "error_signals", "stderr_capture_complete",
-            "poll_duty_fraction", "checkpoint_summary",
+            "poll_duty_fraction", "checkpoint_summary", "ingest_error",
         ):
             assert key not in result
 
@@ -354,6 +354,11 @@ class TestProbeIO:
             "stderr_capture_complete": False,
             "poll_duty_fraction": 0.03,
             "checkpoint_summary": {"checkpoints": 5, "total_seconds": 1.2},
+            # #270. _run_ingestion swallows its exception into
+            # _ingest_progress["error"] and prints nothing, so for a run that
+            # died before Stage A this is the ONLY record of what happened --
+            # error_signals is empty precisely because nothing reached fd 2.
+            "ingest_error": "RuntimeError: injected pre-policy failure",
         }
         result = probe.build_result(
             self._fitted_records(), metrics, {}, trace_path="/tmp/t.jsonl",
@@ -367,6 +372,7 @@ class TestProbeIO:
         assert result["stderr_capture_complete"] is False
         assert result["poll_duty_fraction"] == pytest.approx(0.03)
         assert result["checkpoint_summary"] == {"checkpoints": 5, "total_seconds": 1.2}
+        assert result["ingest_error"] == "RuntimeError: injected pre-policy failure"
 
     # -- I3: record the trace actually read ------------------------------
 

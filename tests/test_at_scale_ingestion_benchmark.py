@@ -25,7 +25,7 @@ _EXPECTED_METRIC_KEYS = {
     "index_size_bytes", "status_latency", "query_latency", "final_status",
     "poll_count", "poll_duty_fraction", "poll_offsets", "checkpoint_summary",
     "skipped_commits", "error_signals", "correction_sweep_summaries",
-    "correction_sweep_skipped", "stderr_capture_complete",
+    "correction_sweep_skipped", "stderr_capture_complete", "ingest_error",
 }
 
 
@@ -172,17 +172,90 @@ class TestRunIngestionBenchmark:
         reports realised checkpoint duty, not just poll duty. mcp_server
         publishes this into _ingest_progress["checkpoint_summary"] just
         before _run_ingestion discards the policy that held the counters;
-        the harness must carry it through into its own returned metrics."""
+        the harness must carry it through into its own returned metrics.
+
+        #270: the status/error check comes FIRST, and it is not decoration.
+        _run_ingestion publishes the summary from two `finally` blocks, both
+        guarded on `_ingest_checkpoint_policy is not None`, so a run that
+        dies anywhere in _run_ingestion's first ~130 lines -- before the
+        policy is constructed (mcp_server.py, `_CheckpointPolicy(
+        _checkpoint_duty_from_env())`) -- publishes NOTHING and this test's
+        `summary is not None` was the assertion that fired. It reported
+        `assert None is not None` while _run_ingestion's swallowed exception
+        sat unread in _ingest_progress["error"], which is why #270 spent 48
+        sampled runs unable to name a cause. Asserting the status first puts
+        that error text in the failure message.
+
+        The two assertions this test used to make about total_seconds and
+        realised_duty were DELETED as tautologies, the same call
+        test_poll_duty_fraction_is_a_bounded_fraction got below.
+        total_seconds is a sum of time.monotonic deltas, so `>= 0.0` cannot
+        fail; and summary() computes realised_duty as `self.total_seconds /
+        elapsed` from the very same `elapsed` float it returns, so
+        `realised_duty == approx(total_seconds / elapsed_seconds)` compares
+        an expression against itself. #270 listed that one as a live
+        candidate for the flake; it can never fail. The non-vacuous version
+        of both -- a policy driven by a fake clock through known checkpoint
+        costs -- is tests/test_mcp_server.py
+        TestCheckpointPolicy::
+        test_summary_reports_checkpoints_suppressed_total_seconds_and_duty,
+        which drives a policy through known costs on a fake clock.
+        """
         graph_path = tmp_path / "bench.graph"
         metrics = await run_ingestion_benchmark(str(git_repo), "HEAD", graph_path, poll_interval=0.05)
+        assert metrics["final_status"] == "complete", (
+            f"ingestion did not complete: {metrics['ingest_error']!r}"
+        )
         summary = metrics["checkpoint_summary"]
         assert summary is not None
         assert summary["checkpoints"] >= 1
-        assert summary["total_seconds"] >= 0.0
-        if summary["elapsed_seconds"] > 0:
-            assert summary["realised_duty"] == pytest.approx(
-                summary["total_seconds"] / summary["elapsed_seconds"]
-            )
+
+    @pytest.mark.asyncio
+    async def test_reports_no_ingest_error_on_a_clean_run(self, git_repo, tmp_path):
+        """#270. The key must be present-and-None on a healthy run, not
+        absent: a reader that has to distinguish "no error" from "this
+        harness predates the key" cannot do it from an absent key, and the
+        `metrics['ingest_error']` reads in the tests above would KeyError."""
+        graph_path = tmp_path / "bench.graph"
+        metrics = await run_ingestion_benchmark(str(git_repo), "HEAD", graph_path, poll_interval=0.05)
+        assert metrics["ingest_error"] is None
+
+    @pytest.mark.asyncio
+    async def test_surfaces_a_failure_that_predates_the_checkpoint_policy(
+        self, git_repo, tmp_path, monkeypatch
+    ):
+        """#270's root finding, pinned. _load_ingestion_preload_state runs
+        BEFORE _run_ingestion constructs its _CheckpointPolicy (the
+        _frontier_load failure that TestCheckpointDutySummaryPublication::
+        test_summary_survives_a_pre_write_scope_failure covers runs AFTER
+        it, and does publish an all-zeros summary). A failure in this
+        earlier window is the one shape that leaves checkpoint_summary
+        absent entirely -- and _run_ingestion swallows the exception into
+        _ingest_progress["error"] without printing it, so before this key
+        existed the cause reached neither the metrics JSON, nor
+        scan_ingestion_stderr's error_signals, nor the test's failure
+        message.
+
+        Ablation-proven: with the `ingest_error` key removed from
+        run_ingestion_benchmark's result dict, this test fails on the
+        KeyError at `metrics["ingest_error"]`, not on the assertion.
+        """
+        import mcp_server
+
+        def boom(*a, **k):
+            raise RuntimeError("injected pre-policy failure")
+
+        monkeypatch.setattr(mcp_server, "_load_ingestion_preload_state", boom)
+        graph_path = tmp_path / "bench.graph"
+        metrics = await run_ingestion_benchmark(str(git_repo), "HEAD", graph_path, poll_interval=0.05)
+
+        # The precondition that makes this window distinct: nothing was
+        # published, so checkpoint_summary alone cannot name what went wrong.
+        assert metrics["checkpoint_summary"] is None
+        assert metrics["final_status"] == "error"
+        assert "injected pre-policy failure" in metrics["ingest_error"]
+        # And the gate still fails the run, as it did before.
+        assert _exit_code(metrics) == 1
 
     # test_poll_duty_fraction_is_a_bounded_fraction was DELETED here (final
     # whole-branch review). Both of its assertions were tautologies:

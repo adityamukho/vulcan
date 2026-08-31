@@ -264,6 +264,22 @@ async def run_ingestion_benchmark(
     # policy itself does not survive the run, so this dict is the only
     # surviving source for realised checkpoint duty.
     checkpoint_summary = mcp_server._ingest_progress.get("checkpoint_summary")
+    # #270. _run_ingestion catches its own exceptions, records them in
+    # _ingest_progress["error"] and returns normally WITHOUT printing them, so
+    # this dict is the only place the text of a failed run's exception exists:
+    # it reaches neither this harness's stderr tee (nothing was written to fd
+    # 2, so scan_ingestion_stderr finds no error_signals) nor the caller.
+    # final_status alone says "error" without saying of what.
+    #
+    # It matters most for the failures that predate _run_ingestion's
+    # _CheckpointPolicy -- the linearization, the preload, `git rev-list`.
+    # Both `finally` blocks that publish checkpoint_summary are guarded on the
+    # policy being non-None, so that whole window publishes no summary at all,
+    # and before this key a run that died there produced a metrics JSON whose
+    # only trace of the cause was final_status. Absent from a metrics file
+    # written by an older harness; None (not absent) on a clean run, so a
+    # reader can tell "measured, no error" from "not measured".
+    ingest_error = mcp_server._ingest_progress.get("error")
     peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
     index_path = fact_index.index_path_for(str(graph_path))
@@ -291,6 +307,7 @@ async def run_ingestion_benchmark(
         "poll_duty_fraction": poll_duty_fraction,
         "poll_offsets": poll_offsets,
         "checkpoint_summary": checkpoint_summary,
+        "ingest_error": ingest_error,
         # #256. Not derivable from commits_ingested or final_status: the
         # per-commit handler isolates failures and increments `processed`
         # anyway, so both are blind to a dropped commit.
