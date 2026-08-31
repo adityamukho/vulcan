@@ -91,6 +91,19 @@ def _checkpoint_duty_row(metrics: dict[str, Any]) -> str:
     """
     summary = metrics.get("checkpoint_summary")
     if summary is None:
+        # #270: two different runs land here, and conflating them writes a
+        # false claim into the durable record. _run_ingestion publishes the
+        # summary from two `finally` blocks, both guarded on its
+        # _CheckpointPolicy being non-None, so a run that died BEFORE that
+        # policy was constructed also has no summary -- and "assume
+        # once-per-commit cadence" would describe the pre-#241 code, not the
+        # code that actually produced this run. ingest_error separates them.
+        ingest_error = metrics.get("ingest_error")
+        if ingest_error:
+            return (
+                "| Checkpoint duty cycle (#241) | not measured -- the run "
+                f"failed before it checkpointed: {ingest_error} |"
+            )
         return (
             "| Checkpoint duty cycle (#241) | not measured "
             "(pre-2026-08-08 harness; assume once-per-commit cadence) |"

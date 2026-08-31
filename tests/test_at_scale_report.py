@@ -107,6 +107,28 @@ class TestAppendIngestionReport:
         assert "Checkpoint duty cycle (#241)" in text
         assert "not measured" in text
 
+    def test_checkpoint_duty_cycle_row_names_an_errored_run_instead_of_blaming_the_harness(
+        self, tmp_path,
+    ):
+        """#270. checkpoint_summary is absent for TWO different reasons: a
+        pre-#241 harness, and a run that died before _run_ingestion built
+        its _CheckpointPolicy. Both used to render the same
+        "pre-2026-08-08 harness; assume once-per-commit cadence" line,
+        which for the second case is a false claim about the code that
+        produced the run, written into benchmark.md -- the durable human
+        record. ingest_error is what tells them apart."""
+        errored = {
+            k: v for k, v in SAMPLE_METRICS.items() if k != "checkpoint_summary"
+        }
+        errored["final_status"] = "error"
+        errored["ingest_error"] = "RuntimeError: injected pre-policy failure"
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(errored, report_path)
+        text = report_path.read_text()
+        assert "Checkpoint duty cycle (#241)" in text
+        assert "injected pre-policy failure" in text
+        assert "once-per-commit cadence" not in text
+
     # --- #256 stderr-capture rows -------------------------------------
     #
     # benchmark.md is the DURABLE HUMAN RECORD, and it is the artifact the
