@@ -12040,6 +12040,44 @@ class TestRunIngestion:
         assert mcp_server._ingest_progress["error_at"].endswith("Z")
 
     @pytest.mark.asyncio
+    async def test_prints_the_swallowed_failure_to_stderr(
+        self, real_db, git_repo, monkeypatch, capsys,
+    ):
+        """#270. _run_ingestion catches its own exception and returns
+        normally, so without this print the text existed ONLY in
+        _ingest_progress["error"] -- a dict that lives in the server
+        process. A background run started through
+        handle_minigraf_ingest_git left nothing in any log, and the at-scale
+        harness could not scan for what was never written to fd 2. That is
+        what made #270 unattributable for 48 sampled runs.
+
+        The TRACEBACK, not just str(e): the message alone is frequently
+        useless for locating the failure (str() of a bare KeyError is the
+        key and nothing else), and this handler covers ~500 lines of
+        _run_ingestion.
+        """
+        import mcp_server
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        }
+
+        def raise_error(repo_path, watermark, branch):
+            raise RuntimeError("boom from _git_commits")
+
+        monkeypatch.setattr(mcp_server, "_git_commits", raise_error)
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        err = capsys.readouterr().err
+        assert "[_run_ingestion] ingestion failed: boom from _git_commits" in err
+        assert "Traceback (most recent call last)" in err
+        # The raising line itself -- proof the traceback is the real one and
+        # not a formatted stand-in built from str(e).
+        assert 'raise RuntimeError("boom from _git_commits")' in err
+        # Unchanged: printing must not stop the handler recording the run.
+        assert mcp_server._ingest_progress["status"] == "error"
+
+    @pytest.mark.asyncio
     async def test_watermark_updated_after_each_commit(self, real_db, git_repo, monkeypatch):
         import mcp_server
         # #222 phase 2d: :ingestion/watermark keeps its "contiguous from C0"

@@ -79,6 +79,14 @@ _ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(r"stream_all_entries: expected leaf page"),
     ),
     ("tee_stderr_pump_failed", re.compile(r"\[tee_stderr\] pump failed:")),
+    # #270. The four above are per-commit or apparatus signatures; none of
+    # them fires when the RUN ITSELF dies. _run_ingestion catches its own
+    # exception and returns normally, so a failure before Stage A skips no
+    # commit, corrupts no page and breaks no pump -- every other signal here
+    # reads clean for a run that ingested nothing. That is the fail-open this
+    # module exists to close, and it stayed open until _run_ingestion started
+    # printing this line.
+    ("ingestion_failed", re.compile(r"\[_run_ingestion\] ingestion failed:")),
 )
 
 

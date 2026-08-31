@@ -81,6 +81,17 @@ class TestErrorSignals:
         signals = scan_ingestion_stderr(text)["error_signals"]
         assert [s["pattern"] for s in signals] == ["tee_stderr_pump_failed"]
 
+    def test_detects_a_run_level_ingestion_failure(self):
+        """#270. The other four patterns are per-commit or apparatus
+        signatures; none of them fires when the RUN dies -- a failure before
+        Stage A skips no commit, corrupts no page, and breaks no pump, so
+        every existing signal reads clean while the run produced nothing.
+        This is the fifth entry, and it is the one that covers the whole
+        window before _run_ingestion builds its _CheckpointPolicy."""
+        text = "[_run_ingestion] ingestion failed: RuntimeError: boom\n"
+        signals = scan_ingestion_stderr(text)["error_signals"]
+        assert [s["pattern"] for s in signals] == ["ingestion_failed"]
+
     def test_clean_log_yields_no_signals(self):
         assert scan_ingestion_stderr(CLEAN)["error_signals"] == []
 

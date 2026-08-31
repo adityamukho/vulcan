@@ -222,7 +222,7 @@ class TestRunIngestionBenchmark:
 
     @pytest.mark.asyncio
     async def test_surfaces_a_failure_that_predates_the_checkpoint_policy(
-        self, git_repo, tmp_path, monkeypatch
+        self, git_repo, tmp_path, monkeypatch, capfd
     ):
         """#270's root finding, pinned. _load_ingestion_preload_state runs
         BEFORE _run_ingestion constructs its _CheckpointPolicy (the
@@ -247,7 +247,18 @@ class TestRunIngestionBenchmark:
 
         monkeypatch.setattr(mcp_server, "_load_ingestion_preload_state", boom)
         graph_path = tmp_path / "bench.graph"
-        metrics = await run_ingestion_benchmark(str(git_repo), "HEAD", graph_path, poll_interval=0.05)
+        # capfd.disabled(), or the error_signals half of this test is
+        # untestable: pytest's default fd capture leaves sys.stderr bound to
+        # its own temp file, so _run_ingestion's print() would never reach the
+        # fd 2 that tee_stderr dup2s -- the same layering
+        # TestTeeStderr::test_captures_parent_process_writes documents by
+        # using os.write(2, ...) instead of print(). Suspending capture for
+        # the run restores the real fd 2 and makes the tee see what a real
+        # at-scale run's tee sees.
+        with capfd.disabled():
+            metrics = await run_ingestion_benchmark(
+                str(git_repo), "HEAD", graph_path, poll_interval=0.05
+            )
 
         # The precondition that makes this window distinct: nothing was
         # published, so checkpoint_summary alone cannot name what went wrong.
@@ -256,6 +267,14 @@ class TestRunIngestionBenchmark:
         assert "injected pre-policy failure" in metrics["ingest_error"]
         # And the gate still fails the run, as it did before.
         assert _exit_code(metrics) == 1
+        # #270 follow-up: the same failure must also reach the tee, so it is
+        # machine-visible and not only readable in ingest_error. Before
+        # _run_ingestion printed it, nothing was written to fd 2 on this
+        # path and error_signals was EMPTY for a run that produced nothing --
+        # a clean-looking record of a dead run, the fail-open shape #256
+        # exists to close.
+        assert [sig["pattern"] for sig in metrics["error_signals"]] == ["ingestion_failed"]
+        assert "injected pre-policy failure" in metrics["error_signals"][0]["line"]
 
     # test_poll_duty_fraction_is_a_bounded_fraction was DELETED here (final
     # whole-branch review). Both of its assertions were tautologies:
