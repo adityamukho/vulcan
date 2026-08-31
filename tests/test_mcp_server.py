@@ -23776,3 +23776,94 @@ class TestIngestTraceWiring:
         assert len(records) == 1, "the failed commit must not produce a trace record"
         assert records[0]["pos"] == 1
         assert records[0]["tag"] == "rev"
+
+
+class TestShippedExamplesValidateAgainstSchema:
+    """#271: the `:decision/description` form in the shipped examples is
+    REJECTED by MINIGRAF_SCHEMA, which requires the bare `:description`.
+
+    The docs were the visible half. The half that matters is
+    `_TOOLS[*].inputSchema` -- that example string is not documentation a
+    reader may or may not open, it is shipped in the tool definition, so it
+    is in front of every agent at the moment it decides how to shape a
+    `minigraf_transact` call. An agent that copies it gets a schema
+    violation on its first write.
+
+    Guards the whole `_TOOLS` surface rather than the one string, so a
+    future example added to any tool description is covered too. Keyword-
+    valued triples (the `minigraf_retract` example,
+    `[[:component/auth :calls :component/jwt]]`) are not covered by
+    MINIGRAF_SCHEMA and pass through unvalidated by design -- they yield no
+    parsed facts and so contribute no violations.
+    """
+
+    @staticmethod
+    def _edn_blocks(tool):
+        """Every `[[...]]` EDN block embedded in a tool's own description or
+        in any of its inputSchema property descriptions, tagged with where
+        it came from so a failure names the string to fix."""
+        sources = [(f"{tool.name}.description", tool.description or "")]
+        for prop, spec in (tool.inputSchema.get("properties") or {}).items():
+            sources.append((f"{tool.name}.inputSchema.{prop}", spec.get("description", "")))
+        blocks = []
+        for where, text in sources:
+            blocks.extend((where, m.group(0)) for m in re.finditer(r"\[\[.*?\]\]", text, re.DOTALL))
+        return blocks
+
+    def test_every_edn_example_in_the_tool_schemas_passes_validation(self):
+        import mcp_server
+
+        checked = 0
+        for tool in mcp_server._TOOLS:
+            for where, block in self._edn_blocks(tool):
+                parsed = mcp_server._parse_transact_facts(block)
+                if not parsed:
+                    continue  # keyword-valued: unvalidated by design
+                checked += 1
+                violations = mcp_server._validate_facts(parsed)
+                assert not violations, (
+                    f"{where} ships an example that fails schema validation: "
+                    f"{block!r} -> {violations}"
+                )
+
+        assert checked, (
+            "no string-valued EDN example was found in _TOOLS -- the guard "
+            "matched nothing and would pass against any regression"
+        )
+
+    #: Docs that ship a copy-pasteable `transact(...)` example. `SKILL.md` is
+    #: deliberately absent -- its examples are multi-line `transact("""...""")`
+    #: blocks in a different shape, and it was already correct when #271 was
+    #: filed. Add it here only alongside an extractor that handles that shape.
+    _EXAMPLE_DOCS = ("CLAUDE.md", "AGENTS.md", "README.md")
+
+    def test_every_transact_example_in_the_docs_passes_validation(self):
+        import mcp_server
+
+        from pathlib import Path
+
+        repo_root = Path(__file__).resolve().parent.parent
+        checked = 0
+        for name in self._EXAMPLE_DOCS:
+            doc = repo_root / name
+            assert doc.exists(), f"{name} is missing -- this guard would pass vacuously"
+            text = doc.read_text()
+            for m in re.finditer(r"transact\(\s*\"(\[\[.*?\]\])\"", text, re.DOTALL):
+                # Markdown carries the Python source form, with the quotes
+                # around each value backslash-escaped. Undo that before the
+                # EDN parser sees it.
+                block = m.group(1).replace('\\"', '"')
+                parsed = mcp_server._parse_transact_facts(block)
+                if not parsed:
+                    continue  # keyword-valued: unvalidated by design
+                checked += 1
+                violations = mcp_server._validate_facts(parsed)
+                assert not violations, (
+                    f"{name} ships a transact example that fails schema "
+                    f"validation: {block!r} -> {violations}"
+                )
+
+        assert checked >= len(self._EXAMPLE_DOCS), (
+            f"expected at least one validated example per doc, found {checked} "
+            f"across {self._EXAMPLE_DOCS} -- the extractor stopped matching"
+        )

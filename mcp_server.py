@@ -11772,7 +11772,8 @@ _TOOLS: List[Tool] = [
                     "type": "string",
                     "description": (
                         'A Datalog transact block, e.g. [[:decision/cache-strategy '
-                        ':decision/description "use Redis"]]'
+                        ':description "use Redis"]] -- attributes are bare '
+                        '(:description, :rationale, :date, :alias), NOT namespaced'
                     ),
                 },
                 "reason": {

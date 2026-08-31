@@ -11,8 +11,8 @@ python install.py --harness claude-code
 # Use in code
 from minigraf import query, transact
 
-transact("[[:decision/cache :decision/description \"use Redis\"]]", reason="Caching strategy")
-result = query("[:find ?d :where [?e :decision/description ?d]]")
+transact("[[:decision/cache :description \"use Redis\"]]", reason="Caching strategy")
+result = query("[:find ?d :where [?e :description ?d]]")
 ```
 
 ## Key Files
@@ -141,5 +141,5 @@ query("[:find ?x :where [?e :attr ?x]]")
 query("[:find ?x :as-of 5 :where [?e :attr ?x]]")
 
 # Count
-query("[:find (count ?e) :where [?e :decision/description ?d]]")
+query("[:find (count ?e) :where [?e :description ?d]]")
 ```
