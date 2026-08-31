@@ -1,0 +1,370 @@
+# evals/at_scale/probe_minigraf_v2_surface.py
+"""#284 upgrade-surface probe: what minigraf 2.0.0 actually changes for us.
+
+Read-only. Run it TWICE -- once per interpreter -- and diff the two JSON
+outputs. It answers four questions the #284 issue body asked to be MEASURED
+rather than derived from the release notes, and it exists because three of
+the four answers were not what reading the notes predicted.
+
+    .venv/bin/python evals/at_scale/probe_minigraf_v2_surface.py \
+        --out evals/at_scale/results/284-v2-surface-1.2.3.json
+    /path/to/venv20/bin/python evals/at_scale/probe_minigraf_v2_surface.py \
+        --out evals/at_scale/results/284-v2-surface-2.0.0.json
+
+There is no committed 2.0.0 environment: pyproject caps minigraf <2.0.0 (#286)
+precisely so CI cannot drift onto it, so the 2.0.0 run needs a throwaway venv
+built by hand (`pip install -e ".[dev,git-ingestion]"` then a forced
+`pip install minigraf==2.0.0`, which will warn about the cap -- that warning is
+the cap working, not a problem).
+
+WHAT EACH SECTION MEASURES, AND WHAT IT PROVED (2026-08-31, 1.2.3 vs 2.0.0)
+
+`error_strings` -- provokes each condition the repo string-matches on and
+records the real message, then runs mcp_server's OWN predicates against the
+resulting exception rather than against a transcription of it.
+  * _is_lock_error SURVIVES. Both "locked" and "already open in this process"
+    are still present under the new [STG-026]/[STG-025] prefixes, and the
+    predicate lowercases and substring-matches, so the [CODE] prefix is inert.
+  * _stale_lock_holder_pid BREAKS: "holder PID: N" is gone from both messages
+    and it returns None. Call sites mcp_server.py:3208 and :11710.
+  NOT COVERED: stderr_capture.py's page_out_of_bounds,
+  serde_deserialization_error and stream_all_entries_expected_leaf_page.
+  Those are internal corruption states with no cheap trigger. They are safe
+  from the PREFIX by construction -- scan_ingestion_stderr uses an unanchored
+  pattern.search(line) -- but a WORDING change is not ruled out for them, and
+  wording changes are real: "Retract argument must be a vector" gained "of
+  facts". Treat those three as unverified, not as cleared.
+
+`lock_timing` -- the cost of one contended open, and what mcp_server's
+5-attempt/0.05s-doubling budget really spends against a lock held throughout.
+Confirms the issue's ~375ms prediction (376.1ms measured) and a 3.51x budget
+overrun (750ms designed -> 2631ms actual).
+
+`hook_path` -- the section that INVERTED the issue's conclusion, and the
+reason to keep this probe rather than delete it with the upgrade. Sweeps how
+long a foreign process holds the graph, then runs the real
+mcp_server.db_lease(). A failure here is a SILENTLY discarded auto-memory
+write, because hooks/finalize_hook.py is `except Exception: pass`. 2.0.0 is
+better on BOTH axes -- contention tolerance rises from ~0.5s to ~2.5s AND
+latency drops where it already worked (227ms vs 352ms at a 0.2s hold) --
+because the 375ms is an adaptive wait polling 5->50ms that returns the moment
+the lock frees, whereas our loop sleeps in coarse 50/100/200/400ms blocks and
+only rechecks at those boundaries. The 376ms figure appears in full ONLY when
+the lock is never released. This is why #284 must NOT shrink
+_LOCK_RETRY_MAX/_LOCK_RETRY_BASE to reclaim the 3.51x.
+
+`precheck` -- whether #108's "don't race for the lock, decline" pre-check
+still works. It does not. _live_lock_holder_pid reads the .graph.lock sidecar
+that upstream #317 deleted, so under 2.0.0 it returns None while another
+process demonstrably holds the graph, and ingestion silently goes back to
+racing. This was NOT in #284's scope and is the largest piece of the upgrade.
+
+EVERY SECTION CARRIES A POSITIVE CONTROL. A probe that reports "not held" or
+"no error" because its own setup silently failed would otherwise read as a
+clean result -- the failure mode this repo has been bitten by before. The
+controls are recorded in the JSON as `control_*` keys; a consumer MUST treat a
+false control as "this run measured nothing", never as a negative finding.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+from typing import Any, Callable
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, REPO_ROOT)
+
+HOLD_SWEEP_SECONDS = (0.2, 0.5, 0.8, 1.5, 2.5, 3.5)
+SINGLE_OPEN_SAMPLES = 5
+
+
+def _minigraf_version() -> str:
+    import importlib.metadata as md
+
+    return md.version("minigraf")
+
+
+def _hold_graph(graph: str, seconds: float) -> subprocess.Popen:
+    """Start a subprocess that opens `graph` and holds it for `seconds`.
+
+    Returns once the child has confirmed it holds the handle, so the caller
+    never measures against a child that has not opened yet.
+    """
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            textwrap.dedent(
+                f"""
+                import time
+                from minigraf import MiniGrafDb
+                db = MiniGrafDb.open({graph!r})
+                print("HELD", flush=True)
+                time.sleep({seconds})
+                """
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert child.stdout is not None
+    line = child.stdout.readline().strip()
+    if line != "HELD":
+        child.kill()
+        child.wait()
+        raise RuntimeError(f"holder subprocess never took the handle (said {line!r})")
+    return child
+
+
+def _fresh_graph() -> str:
+    from minigraf import MiniGrafDb
+
+    path = os.path.join(tempfile.mkdtemp(), "probe.graph")
+    MiniGrafDb.open(path).checkpoint()  # materialise, then drop
+    return path
+
+
+# ---------------------------------------------------------------------------
+# Section 1: error strings
+# ---------------------------------------------------------------------------
+
+def section_error_strings() -> dict[str, Any]:
+    from minigraf import MiniGrafDb
+    import mcp_server
+
+    out: dict[str, Any] = {"conditions": {}}
+
+    def record(name: str, fn: Callable[[], Any], predicates: bool = False) -> None:
+        entry: dict[str, Any]
+        try:
+            fn()
+            entry = {"raised": False, "type": None, "text": None}
+        except Exception as exc:  # noqa: BLE001 -- recording whatever comes out is the point
+            entry = {"raised": True, "type": type(exc).__name__, "text": str(exc)}
+            if predicates:
+                # Run the LIVE predicates against the real exception object.
+                entry["_is_lock_error"] = mcp_server._is_lock_error(exc)
+                entry["_stale_lock_holder_pid"] = mcp_server._stale_lock_holder_pid(exc)
+        out["conditions"][name] = entry
+
+    path = _fresh_graph()
+
+    def with_open_handle() -> None:
+        """Scope the handle to this call so it is released on return.
+
+        The cross-process section below needs the graph genuinely free; a
+        handle still live in THIS process would make the child's open fail
+        for the wrong reason and quietly invalidate that measurement.
+        """
+        db = MiniGrafDb.open(path)
+        record("same_process_second_open", lambda: MiniGrafDb.open(path), predicates=True)
+        record("unclosed_vector", lambda: db.execute("(query [:find ?x :where [?e :a ?x])"))
+        record("retract_non_vector", lambda: db.execute("(retract :not-a-vector)"))
+        record(
+            "invalid_date",
+            lambda: db.execute('(transact {:valid-from "1000000000000"} [[:a/b :c "d"]])'),
+        )
+        record(
+            "trailing_input",
+            lambda: db.execute("(query [:find ?x :where [?e :a ?x]]) trailing"),
+        )
+
+    with_open_handle()
+
+    child = _hold_graph(path, 20)
+    try:
+        record("cross_process_open", lambda: MiniGrafDb.open(path), predicates=True)
+        # Positive control: the cross-process condition is only meaningful if
+        # the holder really holds it, which the record() above just proved by
+        # raising. Surface it explicitly so a consumer need not infer it.
+        out["control_cross_process_really_held"] = out["conditions"][
+            "cross_process_open"
+        ]["raised"]
+    finally:
+        child.kill()
+        child.wait()
+
+    out["sidecar_present_while_held"] = os.path.exists(path + ".lock")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Section 2: contended open cost and the retry budget
+# ---------------------------------------------------------------------------
+
+def section_lock_timing() -> dict[str, Any]:
+    from minigraf import MiniGrafDb
+    import mcp_server
+
+    path = _fresh_graph()
+    child = _hold_graph(path, 60)
+    out: dict[str, Any] = {}
+    try:
+        samples = []
+        for _ in range(SINGLE_OPEN_SAMPLES):
+            t0 = time.perf_counter()
+            try:
+                MiniGrafDb.open(path)
+                samples.append({"blocked": False, "seconds": time.perf_counter() - t0})
+                break  # acquiring means the holder died; stop sampling
+            except Exception:  # noqa: BLE001
+                samples.append({"blocked": True, "seconds": time.perf_counter() - t0})
+        out["single_open_samples"] = samples
+        out["single_open_mean_seconds"] = sum(s["seconds"] for s in samples) / len(samples)
+        # Positive control: every sample must have been blocked, else the
+        # holder was not holding and the mean is meaningless.
+        out["control_all_samples_blocked"] = all(s["blocked"] for s in samples)
+
+        # Replay mcp_server's real budget shape against a lock held throughout.
+        t0 = time.perf_counter()
+        attempts = 0
+        slept = 0.0
+        delay = mcp_server._LOCK_RETRY_BASE
+        for attempt in range(mcp_server._LOCK_RETRY_MAX):
+            attempts += 1
+            try:
+                MiniGrafDb.open(path)
+                break
+            except Exception:  # noqa: BLE001
+                if attempt < mcp_server._LOCK_RETRY_MAX - 1:
+                    time.sleep(delay)
+                    slept += delay
+                    delay *= 2
+        total = time.perf_counter() - t0
+        out["budget"] = {
+            "lock_retry_max": mcp_server._LOCK_RETRY_MAX,
+            "lock_retry_base": mcp_server._LOCK_RETRY_BASE,
+            "real_open_calls": attempts,
+            "designed_sleep_seconds": slept,
+            "actual_wall_clock_seconds": total,
+            "overrun_factor": (total / slept) if slept else None,
+        }
+    finally:
+        child.kill()
+        child.wait()
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Section 3: the real auto-memory hook lease path
+# ---------------------------------------------------------------------------
+
+def section_hook_path() -> dict[str, Any]:
+    import mcp_server
+
+    rows = []
+    for hold in HOLD_SWEEP_SECONDS:
+        graph = os.path.join(tempfile.mkdtemp(), "hook.graph")
+        os.environ["MINIGRAF_GRAPH_PATH"] = graph
+        mcp_server._reset_db_state()
+        mcp_server.open_db(graph)      # materialise
+        mcp_server._reset_db_state()   # drop ours so the child can take it
+
+        child = _hold_graph(graph, hold)
+        t0 = time.perf_counter()
+        try:
+            with mcp_server.db_lease() as db:
+                mcp_server._db_execute(db, "(query [:find ?e :where [?e :ident ?v]])")
+            acquired = True
+        except Exception:  # noqa: BLE001 -- exactly what finalize_hook swallows
+            acquired = False
+        elapsed = time.perf_counter() - t0
+        child.wait()
+        mcp_server._reset_db_state()
+
+        rows.append(
+            {
+                "hold_seconds": hold,
+                "lease_acquired": acquired,
+                "elapsed_seconds": elapsed,
+                # A failure here is not an error report -- finalize_hook.py
+                # swallows it, so the turn's facts are silently discarded.
+                "auto_memory_write": "kept" if acquired else "silently_lost",
+            }
+        )
+    return {"sweep": rows}
+
+
+# ---------------------------------------------------------------------------
+# Section 4: the #108 pre-check
+# ---------------------------------------------------------------------------
+
+def section_precheck() -> dict[str, Any]:
+    from minigraf import MiniGrafDb
+    import mcp_server
+
+    path = _fresh_graph()
+    child = _hold_graph(path, 20)
+    try:
+        # Positive control: prove the holder REALLY holds it, independently of
+        # the pre-check under test. Without this, `holder_pid is None` is
+        # indistinguishable from "nothing was holding the graph".
+        try:
+            MiniGrafDb.open(path)
+            control_held = False
+        except Exception:  # noqa: BLE001
+            control_held = True
+
+        holder_pid = mcp_server._live_lock_holder_pid(path)
+        expected_pid = child.pid
+    finally:
+        child.kill()
+        child.wait()
+
+    return {
+        "control_open_refused_while_held": control_held,
+        "holder_subprocess_pid": expected_pid,
+        "live_lock_holder_pid": holder_pid,
+        "precheck_detects_holder": holder_pid is not None,
+        # The finding: a live holder that the pre-check cannot see means
+        # ingestion starts and races, which is what #108 exists to prevent.
+        "precheck_is_silent_noop": control_held and holder_pid is None,
+    }
+
+
+SECTIONS: dict[str, Callable[[], dict[str, Any]]] = {
+    "error_strings": section_error_strings,
+    "lock_timing": section_lock_timing,
+    "hook_path": section_hook_path,
+    "precheck": section_precheck,
+}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--out", help="write JSON here (default: stdout)")
+    ap.add_argument(
+        "--section",
+        action="append",
+        choices=sorted(SECTIONS),
+        help="run only these sections (repeatable; default: all)",
+    )
+    args = ap.parse_args()
+
+    names = args.section or sorted(SECTIONS)
+    result: dict[str, Any] = {
+        "minigraf_version": _minigraf_version(),
+        "python": sys.version.split()[0],
+        "platform": sys.platform,
+        "sections": {},
+    }
+    for name in names:
+        result["sections"][name] = SECTIONS[name]()
+
+    text = json.dumps(result, indent=2, sort_keys=True)
+    if args.out:
+        with open(args.out, "w") as f:
+            f.write(text + "\n")
+        print(f"wrote {args.out}", file=sys.stderr)
+    else:
+        print(text)
+
+
+if __name__ == "__main__":
+    main()

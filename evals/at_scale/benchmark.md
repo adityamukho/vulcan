@@ -1272,3 +1272,67 @@ rather than assumed.
 - **The lease ACQUIRE is untimed.** It sits inside `apply_s` too; do not assume
   the drop is the entire per-commit handle cost.
 - **Stage A only**, unchanged from the Per-Commit Cost Fit's own scoping.
+
+## minigraf v2.0.0 Upgrade Surface — 284-v2-surface
+
+`probe_minigraf_v2_surface.py`, run once per interpreter and diffed;
+`results/284-v2-surface-1.2.3.json` and `results/284-v2-surface-2.0.0.json`.
+Observational and read-only — not part of the recurring benchmark run.
+
+There is no committed 2.0.0 environment: `pyproject.toml` caps
+`minigraf<2.0.0` (#286) so CI cannot drift onto it again, so the 2.0.0 column
+comes from a hand-built throwaway venv. Every section carries a positive
+control; all controls passed on both runs, so no row below is a "clean result"
+produced by a probe that silently measured nothing.
+
+| | 1.2.3 | 2.0.0 |
+|---|---|---|
+| `_is_lock_error` (same-proc / cross-proc) | True / True | **True / True** |
+| `_stale_lock_holder_pid` (cross-proc) | `218663` | **`None`** |
+| trailing input after a complete form | accepted | raises `[PRS-077]` |
+| `.graph.lock` sidecar present while held | True | **False** |
+| single contended `open()`, mean of 5 | 0.1 ms | **376.5 ms** |
+| lease budget: designed → actual | 750 ms → 751 ms (1.00x) | 750 ms → **2634 ms (3.51x)** |
+| foreign holds the auto-memory hook survives | ≤ 0.5 s | **≤ 2.5 s** |
+| #108 pre-check is a silent no-op | False | **True** |
+
+Three things here are worth carrying forward, because two of them contradict
+what #284's issue body predicted from the release notes.
+
+**The lease budget overrun is real but must NOT be "fixed".** The 3.51x is
+confirmed. Shrinking `_LOCK_RETRY_MAX`/`_LOCK_RETRY_BASE` to reclaim it would
+be a mistake: 2.0.0 is better on *both* axes. Contention tolerance on the
+auto-memory hook path rises from ~0.5 s to ~2.5 s, **and** latency drops where
+it already worked (227 ms vs 352 ms at a 0.2 s hold). The 376 ms is not a
+fixed tax — it is an adaptive wait polling 5→50 ms that returns the moment the
+lock frees, whereas our loop sleeps in coarse 50/100/200/400 ms blocks and
+rechecks only at those boundaries. The full 376 ms appears only when the lock
+is never released. Failure on this path is silent (`finalize_hook.py` is
+`except Exception: pass`), so the extra wall clock buys real robustness.
+
+**The #108 pre-check silently becomes a no-op**, which #284's scope did not
+name. `_live_lock_holder_pid` reads the sidecar upstream #317 deleted, so under
+2.0.0 it returns `None` while another process demonstrably holds the graph, and
+ingestion goes back to racing instead of declining. Restoring it portably is
+not a matter of swapping in another lock-reading API: no non-contending,
+PID-returning mechanism exists across Linux, macOS and Windows
+(`/proc/locks` is Linux-only; `flock` is POSIX-only and cannot distinguish our
+own handle, which matters because `mcp_server` routinely holds a lease).
+
+**The four CI lock-test failures reproduce exactly**, and
+`test_retries_open_after_clearing_stale_lock_on_final_attempt`'s `2 == 5` is
+explained rather than arbitrary: the test holds the lock 0.5 s and assumes our
+backoff schedule (0/.05/.15/.35/.75 s) governs when attempts land. Under 2.0.0
+attempt 1 blocks 376 ms, so attempt 2 begins at ~426 ms and is still *inside*
+`open()` when the holder dies at 500 ms. Rewriting it to expect 2 would pin an
+artifact of one hold duration.
+
+### Not covered
+
+`stderr_capture.py`'s `page_out_of_bounds`, `serde_deserialization_error` and
+`stream_all_entries_expected_leaf_page` were not provoked — they are internal
+corruption states with no cheap trigger. They are safe from the `[CODE]`
+prefix *by construction*, since `scan_ingestion_stderr` uses an unanchored
+`pattern.search(line)`. A **wording** change is not ruled out, and wording
+changes are real in 2.0.0: `Retract argument must be a vector` gained `of
+facts`. Treat those three as unverified, not as cleared.

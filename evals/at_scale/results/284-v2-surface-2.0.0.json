@@ -1,0 +1,128 @@
+{
+  "minigraf_version": "2.0.0",
+  "platform": "linux",
+  "python": "3.14.7",
+  "sections": {
+    "error_strings": {
+      "conditions": {
+        "cross_process_open": {
+          "_is_lock_error": true,
+          "_stale_lock_holder_pid": null,
+          "raised": true,
+          "text": "msg='[STG-026] Database is locked by another process (/tmp/tmpey2i3s9r/probe.graph). The lock is held on the file itself and is released automatically when the holding process exits, so there is no lock file to clean up.'",
+          "type": "Storage"
+        },
+        "invalid_date": {
+          "raised": true,
+          "text": "msg=\"[INT-004] invalid timestamp: invalid date '1000000000000': input contains invalid characters\"",
+          "type": "Other"
+        },
+        "retract_non_vector": {
+          "raised": true,
+          "text": "msg='[PRS-044] Retract argument must be a vector of facts'",
+          "type": "Parse"
+        },
+        "same_process_second_open": {
+          "_is_lock_error": true,
+          "_stale_lock_holder_pid": null,
+          "raised": true,
+          "text": "msg='[STG-025] Database is already open in this process (/tmp/tmpey2i3s9r/probe.graph). A second handle on one file would give each its own page table and corrupt both \u2014 reuse the existing handle instead. `Minigraf` is cheap to clone and all clones share the same database.'",
+          "type": "Storage"
+        },
+        "trailing_input": {
+          "raised": true,
+          "text": "msg='[PRS-077] unexpected trailing input after a complete form: Symbol(\"trailing\")'",
+          "type": "Parse"
+        },
+        "unclosed_vector": {
+          "raised": true,
+          "text": "msg='[PRS-003] Unexpected token: RightParen'",
+          "type": "Parse"
+        }
+      },
+      "control_cross_process_really_held": true,
+      "sidecar_present_while_held": false
+    },
+    "hook_path": {
+      "sweep": [
+        {
+          "auto_memory_write": "kept",
+          "elapsed_seconds": 0.22683660899929237,
+          "hold_seconds": 0.2,
+          "lease_acquired": true
+        },
+        {
+          "auto_memory_write": "kept",
+          "elapsed_seconds": 0.5528647129976889,
+          "hold_seconds": 0.5,
+          "lease_acquired": true
+        },
+        {
+          "auto_memory_write": "kept",
+          "elapsed_seconds": 0.8033356970008754,
+          "hold_seconds": 0.8,
+          "lease_acquired": true
+        },
+        {
+          "auto_memory_write": "kept",
+          "elapsed_seconds": 1.5163333780001267,
+          "hold_seconds": 1.5,
+          "lease_acquired": true
+        },
+        {
+          "auto_memory_write": "kept",
+          "elapsed_seconds": 2.5339968520020193,
+          "hold_seconds": 2.5,
+          "lease_acquired": true
+        },
+        {
+          "auto_memory_write": "silently_lost",
+          "elapsed_seconds": 2.6335663390018453,
+          "hold_seconds": 3.5,
+          "lease_acquired": false
+        }
+      ]
+    },
+    "lock_timing": {
+      "budget": {
+        "actual_wall_clock_seconds": 2.633628030998807,
+        "designed_sleep_seconds": 0.75,
+        "lock_retry_base": 0.05,
+        "lock_retry_max": 5,
+        "overrun_factor": 3.5115040413317424,
+        "real_open_calls": 5
+      },
+      "control_all_samples_blocked": true,
+      "single_open_mean_seconds": 0.37654201640107204,
+      "single_open_samples": [
+        {
+          "blocked": true,
+          "seconds": 0.37644023000029847
+        },
+        {
+          "blocked": true,
+          "seconds": 0.37689944000157993
+        },
+        {
+          "blocked": true,
+          "seconds": 0.3764048240009288
+        },
+        {
+          "blocked": true,
+          "seconds": 0.3765401340024255
+        },
+        {
+          "blocked": true,
+          "seconds": 0.3764254540001275
+        }
+      ]
+    },
+    "precheck": {
+      "control_open_refused_while_held": true,
+      "holder_subprocess_pid": 218691,
+      "live_lock_holder_pid": null,
+      "precheck_detects_holder": false,
+      "precheck_is_silent_noop": true
+    }
+  }
+}

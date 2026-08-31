@@ -1,0 +1,128 @@
+{
+  "minigraf_version": "1.2.3",
+  "platform": "linux",
+  "python": "3.14.7",
+  "sections": {
+    "error_strings": {
+      "conditions": {
+        "cross_process_open": {
+          "_is_lock_error": true,
+          "_stale_lock_holder_pid": 218663,
+          "raised": true,
+          "text": "msg='Database is locked by another process (lock file: /tmp/tmpac_42ibs/probe.graph.lock, holder PID: 218663). If no other process is using this database, delete the lock file manually.'",
+          "type": "Other"
+        },
+        "invalid_date": {
+          "raised": true,
+          "text": "msg=\"invalid date '1000000000000': input contains invalid characters\"",
+          "type": "Other"
+        },
+        "retract_non_vector": {
+          "raised": true,
+          "text": "msg='Retract argument must be a vector'",
+          "type": "Other"
+        },
+        "same_process_second_open": {
+          "_is_lock_error": true,
+          "_stale_lock_holder_pid": 218660,
+          "raised": true,
+          "text": "msg='Database is already open in this process (lock file: /tmp/tmpac_42ibs/probe.graph.lock, holder PID: 218660 == our own). A second handle on one file would give each its own page table and corrupt both \u2014 reuse the existing handle instead. `Minigraf` is cheap to clone and all clones share the same database.'",
+          "type": "Storage"
+        },
+        "trailing_input": {
+          "raised": false,
+          "text": null,
+          "type": null
+        },
+        "unclosed_vector": {
+          "raised": true,
+          "text": "msg='Unexpected token: RightParen'",
+          "type": "Parse"
+        }
+      },
+      "control_cross_process_really_held": true,
+      "sidecar_present_while_held": true
+    },
+    "hook_path": {
+      "sweep": [
+        {
+          "auto_memory_write": "kept",
+          "elapsed_seconds": 0.35185777399965446,
+          "hold_seconds": 0.2,
+          "lease_acquired": true
+        },
+        {
+          "auto_memory_write": "kept",
+          "elapsed_seconds": 0.7522401269998227,
+          "hold_seconds": 0.5,
+          "lease_acquired": true
+        },
+        {
+          "auto_memory_write": "silently_lost",
+          "elapsed_seconds": 0.7518685710019781,
+          "hold_seconds": 0.8,
+          "lease_acquired": false
+        },
+        {
+          "auto_memory_write": "silently_lost",
+          "elapsed_seconds": 0.7514355369967234,
+          "hold_seconds": 1.5,
+          "lease_acquired": false
+        },
+        {
+          "auto_memory_write": "silently_lost",
+          "elapsed_seconds": 0.751734525001666,
+          "hold_seconds": 2.5,
+          "lease_acquired": false
+        },
+        {
+          "auto_memory_write": "silently_lost",
+          "elapsed_seconds": 0.7518293059983989,
+          "hold_seconds": 3.5,
+          "lease_acquired": false
+        }
+      ]
+    },
+    "lock_timing": {
+      "budget": {
+        "actual_wall_clock_seconds": 0.7514002419993631,
+        "designed_sleep_seconds": 0.75,
+        "lock_retry_base": 0.05,
+        "lock_retry_max": 5,
+        "overrun_factor": 1.001866989332484,
+        "real_open_calls": 5
+      },
+      "control_all_samples_blocked": true,
+      "single_open_mean_seconds": 5.411880119936541e-05,
+      "single_open_samples": [
+        {
+          "blocked": true,
+          "seconds": 0.0001202750027005095
+        },
+        {
+          "blocked": true,
+          "seconds": 4.415399962454103e-05
+        },
+        {
+          "blocked": true,
+          "seconds": 3.648900019470602e-05
+        },
+        {
+          "blocked": true,
+          "seconds": 3.462900349404663e-05
+        },
+        {
+          "blocked": true,
+          "seconds": 3.504699998302385e-05
+        }
+      ]
+    },
+    "precheck": {
+      "control_open_refused_while_held": true,
+      "holder_subprocess_pid": 218675,
+      "live_lock_holder_pid": 218675,
+      "precheck_detects_holder": true,
+      "precheck_is_silent_noop": false
+    }
+  }
+}
