@@ -5,7 +5,7 @@
       "id": 1,
       "category": "point-in-time",
       "question": "How many :type/function entities did fact_index.py contain right after its introduction commit (2a524096b9eb, 2026-07-17T04:30:55Z)?",
-      "datalog": "[:find (count ?fn) :valid-at \"2026-07-17T04:31:00Z\" :where [:module/fact-index-py :contains ?fn] [?fn :entity-type :type/function]]",
+      "datalog": "[:find (count ?fn) :valid-at \"2026-07-17T04:31:00Z\" :where [:module/fact_index-py :contains ?fn] [?fn :entity-type :type/function]]",
       "expected": [[8]],
       "baseline_cmd": "git show 2a524096b9eb:fact_index.py | grep -c '^def '"
     },
@@ -13,7 +13,7 @@
       "id": 2,
       "category": "delta",
       "question": "Which functions were added to fact_index.py between commit 2a524096b9eb (04:30:55Z) and commit 3f30610f49a4 (06:33:01Z)?",
-      "datalog": "[:find ?desc :valid-at \"2026-07-17T06:34:00Z\" :where [:module/fact-index-py :contains ?fn] [?fn :entity-type :type/function] [?fn :description ?desc]]",
+      "datalog": "[:find ?desc :valid-at \"2026-07-17T06:34:00Z\" :where [:module/fact_index-py :contains ?fn] [?fn :entity-type :type/function] [?fn :description ?desc]]",
       "expected_new_since_2026-07-17T04:31:00Z": ["_tokenize", "_fts5_match_query", "query_facts", "rebuild_index"],
       "note": "Run this query twice (:valid-at \"2026-07-17T04:31:00Z\" and :valid-at \"2026-07-17T06:34:00Z\") and diff the two 12-vs-8 result sets, per SKILL.md's documented cross-commit delta pattern -- the 4 names above are the rows present only in the second run.",
       "skip_scoring": true,
@@ -23,7 +23,7 @@
       "id": 3,
       "category": "regression-tracing",
       "question": "When did rebuild_index first appear in fact_index.py?",
-      "datalog": "[:find ?c ?date :where [:function/fact-index-py-rebuild-index :introduced-by ?c] [?c :date ?date]]",
+      "datalog": "[:find ?c ?date :where [:function/fact_index-py--rebuild_index :introduced-by ?c] [?c :date ?date]]",
       "expected": [[":commit/6f2e04df1145", "2026-07-17T06:22:35Z"]],
       "baseline_cmd": "git log -S'def rebuild_index' --oneline -- fact_index.py"
     },
@@ -31,8 +31,8 @@
       "id": 4,
       "category": "dependency-impact",
       "question": "Which module(s) depend on fact_index.py as of the pinned commit (3f30610f49a4)?",
-      "datalog": "[:find ?mi :where [?m :depends-on :module/fact-index-py] [?m :entity-type :type/module] [?m :ident ?mi]]",
-      "expected": [[":module/tests-test-fact-index-py"]],
+      "datalog": "[:find ?mi :where [?m :depends-on :module/fact_index-py] [?m :entity-type :type/module] [?m :ident ?mi]]",
+      "expected": [[":module/tests-test_fact_index-py"]],
       "baseline_cmd": "git grep -l '^import fact_index' 3f30610f49a4 -- '*.py'"
     },
     {
