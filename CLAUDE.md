@@ -90,9 +90,37 @@ facts stay readable, the index simply gains rows going forward. Existing graphs
 are not repaired — index rows are written at transact time — so a graph that
 needs `:static` searchable gets rebuilt, per the standing decision below.
 
-No other bare EDN literal has the same hole today: `nil` is emitted by no code
-path in `mcp_server.py`, and it was deliberately NOT added to the pattern
-rather than added speculatively.
+**`nil` is not a storable value, and #306 is the decision that settled it.**
+The one remaining bare EDN literal outside the pattern was `nil`, and #303 left
+it there deliberately rather than closing it speculatively. It was NOT then
+fixed the way `true`/`false` was. Indexing it would store a row whose value is
+the text `'nil'` — "no value" occupying a slot in a lexical retrieval index and
+answering a search for "nil" — and it would have to teach
+`fact_audit._index_text` a `None` case in the same commit, because minigraf
+returns `None` and `str(None)` is `'None'`, not `'nil'`. A pattern-only fix
+trades one divergence for another.
+
+So `handle_minigraf_transact` REFUSES a nil-valued triple, before the graph is
+touched (`_has_nil_valued_triple`, mcp_server.py). `_FACTS_TRIPLE_PATTERN` and
+`_index_text` are unchanged. The at-scale audit gate stays honest as a result: a
+nil fact found in a graph is now a genuine write-path defect, not the index
+being blamed for what it cannot hold. Rejection is all-or-nothing for the
+block — a partial write the caller cannot detect from `ok:True` is worse than
+a refusal.
+
+Two things the guard depends on. It blanks quoted strings before scanning, and
+that is load-bearing, not tidiness: a note written ABOUT this defect carries the
+offending triple as prose, so a raw scan would refuse a legitimate write.
+`_FACTS_TRIPLE_PATTERN` shares that blind spot but pays only a spurious index
+row for it; here the cost is a rejected write. And the trailing `\]` is what
+makes the unanchored `nil` safe, exactly as for `true`/`false` —
+`[:d/x :note nilpotent]` does not match. Both are ablation-proven, not merely
+asserted.
+
+The guard is on the public handler only; the internal `_transact` (ingestion)
+is unguarded, and deliberately so — ingestion emits no `nil`, and if it ever
+did, a red gate is then the correct signal rather than a misattribution.
+Existing graphs are not repaired either way.
 
 **Graph format version — there is no migration, by design.** `GRAPH_FORMAT_VERSION`
 (mcp_server.py) is stamped as `:ingestion/format-version` and ingestion refuses to

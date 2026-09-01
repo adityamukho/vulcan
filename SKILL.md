@@ -668,6 +668,13 @@ Boolean-valued facts such as `:static` are indexed in their EDN spelling, lowerc
 `true`/`false` — the datalog text they were transacted from, not Python's `True`. Search
 for `static` or `false`, never `False` (#303).
 
+`nil` is not a storable value. `minigraf_transact` refuses any triple whose value is a
+bare `nil` and writes nothing — the whole block, not just that triple — because a
+nil-valued fact reaches the graph but can never reach the fact index (#306). Use an
+explicit value, or omit the attribute entirely: an absent fact is how this graph spells
+"no value". `:nil` (with the colon) is an ordinary keyword and is unaffected, and so is
+the text `nil` inside a quoted string value.
+
 Retrieval is purely lexical (exact word/token match, not semantic similarity) — write
 fact descriptions and `:alias` values that name both the concept and the specific
 technology/term someone might search for later (e.g. a decision described only as "use
