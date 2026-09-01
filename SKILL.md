@@ -681,7 +681,7 @@ below 1.0 demote history, 1.0 is neutral).
 
 ## Dependencies
 
-- **Minigraf >= 0.19.0** — run `python install.py` to download the correct pre-built binary for your platform automatically. Falls back to `cargo install minigraf` only on unsupported platforms.
+- **minigraf >= 2.0.0, < 3.0.0** — run `python install.py`, which pip-installs this spec into the project venv. The upper bound is deliberate: with no cap, CI silently resolved 2.0.0 the day it shipped and ran red for days before anyone connected the two (#286). A major bump must be a decision, not a resolver outcome. `pyproject.toml` is canonical; `install.py` (`_MINIGRAF_SPEC`) mirrors it, and the two have drifted before.
 - **Python 3** — for the wrapper
 
 ## Examples
@@ -841,7 +841,7 @@ This is the key difference from a simple key-value store: changing your mind doe
 ## Error Responses
 
 All functions return `{"ok": bool, ...}`. Common errors:
-- `minigraf not found` — install via `cargo install minigraf`
+- `minigraf not found` — run `python install.py --harness claude-code`
 - `No graph file at <path>` — call `transact()` first
 - `as_of requires :as-of clause` — include `:as-of N` in query
 - `reason is required for all writes` — provide non-empty reason
