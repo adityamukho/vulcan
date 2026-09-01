@@ -1337,6 +1337,55 @@ attempt 1 blocks 376 ms, so attempt 2 begins at ~426 ms and is still *inside*
 `open()` when the holder dies at 500 ms. Rewriting it to expect 2 would pin an
 artifact of one hold duration.
 
+### The four red tests were the smaller half — nine more went silently vacuous
+
+#284's item 3 is framed as "rewrite the four lock tests". The four are the
+*loud* half. Thirteen assertions in the suite used
+`os.path.exists(graph + ".lock")` as a stand-in for "is the graph held?", and
+only four of them fail under 2.0.0. The other nine are of the form
+`assert not os.path.exists(...)`, which under kernel locking is **permanently
+true** — they keep passing while testing nothing.
+
+Measured, with `lease_count == 1` as the positive control proving a lease is
+genuinely held at the time:
+
+| | 1.2.3 | 2.0.0 |
+|---|---|---|
+| `not exists(.lock)` **while still leased** | False | **True** |
+| `not exists(.lock)` after release | True | True |
+| assertion discriminates? | yes | **no — tautology** |
+
+The counterfactual, with the #255/#253 handle-drop bug deliberately
+reintroduced under 2.0.0:
+
+| assertion | verdict |
+|---|---|
+| old `assert not os.path.exists(graph + ".lock")` | **True — passes, bug missed** |
+| new `assert _another_process_can_open(graph)` | **False — fails, bug caught** |
+
+So the replacement is not a cosmetic port. These assertions guard the
+corruption #251/#253 were filed for, and on 2.0.0 the old form cannot see it.
+The fix is to stop inferring exclusivity from an implementation detail and ask
+the OS directly — which is also what the original comment said the point was:
+*"`_db is None` was never evidence the graph file lock had been released."*
+
+`_another_process_can_open` carries its own positive control
+(`TestAnotherProcessCanOpenIsHonest`), because a helper that always answered
+"free" would rebuild the same tautology in a new place.
+
+**With this done the suite is green on BOTH versions — 1591 passed each.**
+The four failures that have blocked the upgrade since 2026-08-26 are resolved.
+
+### Constants: re-derived and deliberately UNCHANGED
+
+Item 3 also asks that `_LOCK_RETRY_MAX`/`_LOCK_RETRY_BASE` be re-derived from
+the measurements rather than reasoned about. They were, and the answer is to
+leave them alone — see the hook-path table above. The 3.51x budget overrun is
+real, but 2.0.0 raises contention tolerance on the auto-memory hook path from
+~0.5s to ~2.5s *and* lowers latency where it already worked. Shrinking the
+budget to reclaim wall clock would trade real robustness on the one path where
+failure is silent.
+
 ### Crash recovery — `_clear_stale_lock` is redundant on BOTH versions
 
 The `stale_recovery` section exists because 1.2.3's error text invites exactly
