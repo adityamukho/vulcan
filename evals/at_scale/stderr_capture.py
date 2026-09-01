@@ -73,14 +73,22 @@ _SWEEP_SUMMARY_RE = re.compile(
 # contains the substring. That is load-bearing, not incidental -- anchoring any
 # of these would silently break them on 2.0.0.
 #
-# COVERAGE CAVEAT, from one crude experiment during that audit and worth
-# treating as a lead rather than a result: this module can only see corruption
-# that PRINTS something. Garbling the interior of a live graph's eavt root page
-# on 2.0.0 produced no error at all -- the query simply returned less data
-# (15122 chars against 17122 for the same query on the intact graph). Every
-# pattern here read clean. So "no error signals" means "nothing was printed",
-# not "the graph is intact", and a silent-truncation class of corruption would
-# be invisible to this scanner on either version.
+# COVERAGE GAP -- THIS MODULE CANNOT SEE SILENT CORRUPTION. Measured on 2.0.0
+# with a before/after fact COUNT on one graph (see the issue for the sweep):
+#
+#     garble a FACT page (page 2 or 5)  -> 400 facts become 356 / 357,
+#                                          0 bytes on stderr, 0 error signals
+#     garble an INDEX ROOT page         -> no loss at all
+#
+# So roughly 11% of the graph vanished with every pattern here reading clean.
+# "No error signals" means "nothing was printed", NOT "the graph is intact".
+#
+# An earlier version of this comment cited the index-root case and compared
+# CHARACTER counts across two DIFFERENT graphs, which was an invalid
+# comparison: re-measured properly, garbling an index root loses nothing. The
+# conclusion survived; that evidence did not. Corrected rather than quietly
+# dropped, because the wrong experiment would have sent someone looking in the
+# wrong place.
 _ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     # VERIFIED 2.0.0 (source, not runtime): the format string
     # `"Page {page_id} out of bounds (total pages: {})"` is present verbatim at

@@ -1408,6 +1408,14 @@ the error message.
 
 ### Not covered
 
+**The scanner cannot see silent corruption at all.** Measured on 2.0.0 with a
+before/after fact count on a single graph: garbling a **fact page** drops 400
+facts to 356, with **zero bytes on stderr and zero error signals**; garbling an
+index root page loses nothing. So "no error signals" means "nothing was
+printed", not "the graph is intact". (An earlier note here cited the index-root
+case and compared character counts across two different graphs — an invalid
+comparison. Re-measured, the conclusion holds but that evidence did not.)
+
 `stderr_capture.py`'s `page_out_of_bounds`, `serde_deserialization_error` and
 `stream_all_entries_expected_leaf_page` were not provoked — they are internal
 corruption states with no cheap trigger. They are safe from the `[CODE]`
