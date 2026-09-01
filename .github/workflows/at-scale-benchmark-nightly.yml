@@ -31,6 +31,27 @@ name: At-Scale Benchmark (nightly)
 #      path can be exercised before it is ever needed. A notifier nobody has
 #      watched fire is the exact shape of the thing that just failed for three
 #      weeks.
+#
+# WHAT THIS STILL DOES NOT CATCH -- read this before treating silence as green.
+# The issue is filed by a STEP INSIDE THE RUN, so it can only report failures
+# that happen once the run is underway. It is blind to:
+#
+#   * A run that never starts. A YAML syntax error in this file, the workflow
+#     being disabled (GitHub auto-disables scheduled workflows in repos with no
+#     activity for 60 days), a deleted/renamed default branch, or the schedule
+#     silently not firing all produce NO run and therefore NO issue.
+#   * The job failing before its first step -- runner unavailable, the
+#     `runs-on` image being retired, a permissions change revoking issues:write.
+#   * The notifier itself failing. If `gh` errors, the run is red and nothing
+#     is filed. There is no second channel to report that; the recursion has to
+#     stop somewhere.
+#
+# In all of those cases this workflow is silent, and silence is exactly what it
+# looks like when everything is fine. The only thing that closes that gap is a
+# check EXTERNAL to this run -- something that notices the absence of a nightly
+# result rather than the presence of a failure. That does not exist here, and
+# is deliberately not pretended otherwise: #295's whole lesson was that an
+# assumed notification channel had never been verified.
 
 on:
   schedule:
