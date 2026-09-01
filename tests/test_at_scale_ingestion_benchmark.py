@@ -26,6 +26,9 @@ _EXPECTED_METRIC_KEYS = {
     "poll_count", "poll_duty_fraction", "poll_offsets", "checkpoint_summary",
     "skipped_commits", "error_signals", "correction_sweep_summaries",
     "correction_sweep_skipped", "stderr_capture_complete", "ingest_error",
+    # #284 item 4: attribution. A wall-clock number is not comparable across
+    # runs without the minigraf version that produced it.
+    "minigraf_version", "python_version",
 }
 
 

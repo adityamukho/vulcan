@@ -286,9 +286,16 @@ async def run_ingestion_benchmark(
     graph_size_bytes = os.path.getsize(graph_path) if graph_path.exists() else 0
     index_size_bytes = os.path.getsize(index_path) if os.path.exists(index_path) else 0
 
+    from evals.at_scale.report import runtime_versions
+
+    versions = runtime_versions()
     result = {
         "repo_path": repo_path,
         "branch": resolved_branch,
+        # #284 item 4: a wall-clock number is not comparable without the
+        # minigraf version that produced it.
+        "minigraf_version": versions["minigraf"],
+        "python_version": versions["python"],
         # #256. Recorded so the pairing of a persisted graph to this metrics
         # file is auditable from the metrics side too: the probe recording the
         # path it was HANDED says nothing about whether that was the right one.

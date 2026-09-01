@@ -164,8 +164,11 @@ def main() -> int:
             run_query_benchmark(args.repo_path, graph_path, Path(args.ground_truth))
         )
 
-    from evals.at_scale.report import append_query_report
+    from evals.at_scale.report import append_query_report, runtime_versions
 
+    versions = runtime_versions()
+    report["minigraf_version"] = versions["minigraf"]
+    report["python_version"] = versions["python"]
     report_path = REPO_ROOT / "evals" / "at_scale" / "benchmark.md"
     append_query_report(report, report_path)
     print(json.dumps(report, indent=2))

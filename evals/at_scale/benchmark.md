@@ -1415,3 +1415,169 @@ prefix *by construction*, since `scan_ingestion_stderr` uses an unanchored
 `pattern.search(line)`. A **wording** change is not ruled out, and wording
 changes are real in 2.0.0: `Retract argument must be a vector` gained `of
 facts`. Treat those three as unverified, not as cleared.
+
+## Ingestion Run — 20260901T025946Z
+
+- Repo: `.` @ `master`
+- minigraf: `1.2.3`
+- Metrics JSON: `results/ingestion-20260901T025946Z.json`
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 808 |
+| Final status | complete |
+| Wall-clock | 1451.24s |
+| Throughput | 33.4 commits/min |
+| Peak RSS | 852144 KB |
+| Graph size | 221491200 bytes |
+| Fact-index size | 96776192 bytes |
+| Status-query latency (min/p50/p99/max) | 0.1ms / 0.3ms / 9.7ms / 33.4ms |
+| Graph-query latency (min/p50/p99/max) | 0.9ms / 21.1ms / 959.4ms / 1160.6ms |
+| Poll duty cycle (#242) | 6.46% over 1164 polls |
+| Checkpoint duty cycle (#241) | 4.56% over 101 checkpoints (66.11s total, 1112 suppressed) |
+| Stderr tee (#256) | active (wall-clock and latencies measured with an fd-level tee in place) |
+| Stderr capture (#256) | complete |
+| Commits dropped (#256) | 0 |
+| Error signatures (#251/#256) | 0 |
+
+## Query Correctness Run — 20260901T030822Z
+
+- minigraf: `1.2.3`
+
+| ID | Category | Result | minigraf latency | baseline latency |
+|---|---|---|---|---|
+| 1 | point-in-time | FAIL (expected `[[8]]`, got `[[0]]`) | 37.8ms | 3.3ms |
+| 2 | delta | SKIPPED (manual diff) | 0.0ms | 0.0ms |
+| 3 | regression-tracing | FAIL (expected `[[':commit/6f2e04df1145', '2026-07-17T06:22:35Z']]`, got `[]`) | 27.7ms | 4.9ms |
+| 4 | dependency-impact | FAIL (expected `[[':module/tests-test-fact-index-py']]`, got `[]`) | 46.6ms | 7.2ms |
+| 5 | cross-layer | PASS | 305.3ms | 4.9ms |
+| 6 | cross-layer | PASS | 306.7ms | 3.2ms |
+
+Ingestion phase (#275) -- the graph these latencies were measured over:
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 443 |
+| Final status | complete |
+| Stderr capture (#256) | complete |
+| Commits dropped (#256) | 0 |
+| Error signatures (#251/#256) | 0 |
+
+## Ingestion Run — 20260901T033318Z
+
+- Repo: `.` @ `master`
+- minigraf: `2.0.0`
+- Metrics JSON: `results/ingestion-20260901T033318Z.json`
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 808 |
+| Final status | complete |
+| Wall-clock | 1473.70s |
+| Throughput | 32.9 commits/min |
+| Peak RSS | 759876 KB |
+| Graph size | 221523968 bytes |
+| Fact-index size | 96452608 bytes |
+| Status-query latency (min/p50/p99/max) | 0.1ms / 0.3ms / 5.3ms / 46.2ms |
+| Graph-query latency (min/p50/p99/max) | 0.7ms / 21.2ms / 1049.3ms / 1782.2ms |
+| Poll duty cycle (#242) | 6.46% over 1155 polls |
+| Checkpoint duty cycle (#241) | 4.60% over 101 checkpoints (67.70s total, 1112 suppressed) |
+| Stderr tee (#256) | active (wall-clock and latencies measured with an fd-level tee in place) |
+| Stderr capture (#256) | complete |
+| Commits dropped (#256) | 0 |
+| Error signatures (#251/#256) | 0 |
+
+## Query Correctness Run — 20260901T034249Z
+
+- minigraf: `2.0.0`
+
+| ID | Category | Result | minigraf latency | baseline latency |
+|---|---|---|---|---|
+| 1 | point-in-time | FAIL (expected `[[8]]`, got `[[0]]`) | 37.7ms | 3.2ms |
+| 2 | delta | SKIPPED (manual diff) | 0.0ms | 0.0ms |
+| 3 | regression-tracing | FAIL (expected `[[':commit/6f2e04df1145', '2026-07-17T06:22:35Z']]`, got `[]`) | 28.2ms | 4.9ms |
+| 4 | dependency-impact | FAIL (expected `[[':module/tests-test-fact-index-py']]`, got `[]`) | 47.4ms | 7.7ms |
+| 5 | cross-layer | PASS | 308.2ms | 4.8ms |
+| 6 | cross-layer | PASS | 311.2ms | 3.3ms |
+
+Ingestion phase (#275) -- the graph these latencies were measured over:
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 443 |
+| Final status | complete |
+| Stderr capture (#256) | complete |
+| Commits dropped (#256) | 0 |
+| Error signatures (#251/#256) | 0 |
+
+## minigraf 1.2.3 vs 2.0.0 — At-Scale Comparison (#284 item 4)
+
+The four sections above are the paired runs: ingestion `20260901T025946Z` +
+query `20260901T030822Z` on **1.2.3**, ingestion `20260901T033318Z` + query
+`20260901T034249Z` on **2.0.0**. Same machine, same 808-commit history, same
+Python 3.14.7, run back to back and **sequentially** — two concurrent
+ingestions would contend for CPU and corrupt the wall-clock numbers this
+comparison exists to produce.
+
+### Ingestion
+
+| metric | 1.2.3 | 2.0.0 | Δ |
+|---|---|---|---|
+| Commits ingested | 808 | 808 | — |
+| Wall-clock | 1451.2s | 1473.7s | +1.5% |
+| Throughput | 33.41/min | 32.90/min | −1.5% |
+| **Peak RSS** | **852,144 KB** | **759,876 KB** | **−10.8%** |
+| Graph size | 221,491,200 B | 221,523,968 B | +0.01% |
+| Index size | 96,776,192 B | 96,452,608 B | −0.3% |
+| Checkpoints | 101 (1112 suppressed) | 101 (1112 suppressed) | identical |
+| Checkpoint duty | 4.559% | 4.596% | +0.04pp |
+| Query latency p50 / p99 | 21.1ms / 959ms | 21.2ms / 1049ms | ~flat / +9% |
+| Commits dropped | 0 | 0 | — |
+| Error signatures | 0 | 0 | — |
+
+### Query correctness
+
+**Identical on both versions** — same six verdicts, same expected-vs-actual
+values, latencies within 2%. 2.0.0 changes nothing measurable here.
+
+### What this does and does not support
+
+**It does not show a cost regression, and it is not strong enough to show a
+cost improvement either.** The +1.5% wall clock sits far inside this tier's
+own run-to-run spread: 1455s and 1888s on consecutive days for the *same* 629
+commits, a ~30% swing. One run per version cannot separate a version effect
+from that. What makes even this much comparable is the identical checkpoint
+accounting (101/1112 on both) — the two runs demonstrably did the same work.
+
+The one delta larger than plausible noise is **peak RSS, −10.8%**. Recorded as
+a sighting, not a result; a second sample per version would be needed before
+treating it as real.
+
+2.0.0's advertised `not`/`or` pushdown gains do not appear, and should not be
+expected to: none of the six ground-truth queries uses negation or
+disjunction, so the optimisation has nothing to bite on. p99 here is 9%
+*worse*, which at n=1 is noise.
+
+### The three query failures are NOT a 2.0.0 effect
+
+Entries 1, 3 and 4 fail identically on both versions. They are long-standing:
+the last all-green query run was **2026-07-19**, and the nightly workflow has
+failed **21 consecutive nights** (last success 2026-08-10, red every night
+2026-08-11 through 2026-08-31). The local 1.2.3 run reproduces CI's pattern
+exactly, so this is neither new nor version-related.
+
+The workflow was reporting it correctly the whole time —
+`run_query_benchmark._exit_code` returns 1 on any failed entry and the nightly
+runs it — so this is an unattended signal, not a missing one.
+
+Exactly one commit lands between the last green nightly (03:00 UTC 08-10) and
+the first red one (03:00 UTC 08-11):
+
+    463a922  2026-08-10 07:52 UTC
+    Adopt minigraf 1.2.3 and fix the handle leaks behind the flaky
+    page-bounds error (#254)
+
+**That is a window coincidence, not an attribution.** It has not been tested
+against `463a922^`, and #254 changed handle/lease behaviour as well as the
+dependency floor. Confirming it is two query-benchmark runs (~18 min). Not run
+here because it would have contended with the paired runs above.
