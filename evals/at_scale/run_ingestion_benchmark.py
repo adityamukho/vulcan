@@ -404,7 +404,7 @@ def _exit_code(metrics: dict[str, Any]) -> int:
     run into a green one: with an incomplete capture, `skipped_commits ==
     []` means "nothing was seen", not "nothing happened".
 
-    Clause 5 (#302) is the only one that reads the graph's CONTENT. The four
+    Clauses 5 and 6 are the only ones that read the graph's CONTENT. The four
     above it are all derived from what the run PRINTED, and a graph that
     silently drops facts prints nothing -- measured, ~11% of a graph gone with
     every stderr pattern reading clean. It gates on `divergence` with NO
@@ -426,6 +426,20 @@ def _exit_code(metrics: dict[str, Any]) -> int:
         return 1
     audit = metrics.get("fact_audit")
     if audit and (audit.get("divergence") or audit.get("audit_error")):
+        return 1
+    # Clause 6 (#287) reads the same graph as clause 5 and asks a different
+    # question, which is why it is a separate clause rather than another term
+    # in `divergence`: a two-value :introduced-by reaches the fact index
+    # faithfully too, so the two witnesses agree perfectly and clause 5 passes
+    # on a graph that must be thrown away. Gated with NO tolerance on the
+    # strength of a measurement, not by symmetry: the 831-commit at-scale
+    # graph carries 3150 :introduced-by facts across 3150 entities, every one
+    # holding exactly one. `.get("entities")` so a metrics file from a harness
+    # that had the fact audit but not this check -- outer key present, inner
+    # key absent -- still evaluates clean, exactly as an absent fact_audit
+    # does. `None` (the audit could not scan) is already failed by
+    # audit_error above, which is the only way this key becomes None.
+    if audit and (audit.get("introduced_by_duplicates") or {}).get("entities"):
         return 1
     # The audit's own blind spot, closed with the one reference it does not
     # have: a fact absent from BOTH witnesses is invisible to a comparison of

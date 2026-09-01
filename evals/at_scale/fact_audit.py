@@ -70,6 +70,8 @@ import uuid
 from collections import Counter
 from typing import Any, Optional
 
+from evals.at_scale.introduced_by_audit import introduced_by_duplicates
+
 # Every fact the graph can currently produce. Wildcard on all three positions:
 # a per-attribute scan would be blind to loss in any attribute nobody thought
 # to list.
@@ -166,6 +168,10 @@ def audit_graph_against_index(
             "index_total_rows": 0, "index_current_rows": 0,
             "missing_from_graph": 0, "missing_from_index": 0, "divergence": 0,
             "missing_from_graph_sample": [], "missing_from_index_sample": [],
+            # None, never a zero dict: nothing was scanned, so "no affected
+            # entities" would be a claim about a graph never read. Same
+            # reasoning as audit_error itself.
+            "introduced_by_duplicates": None,
             "audit_seconds": time.perf_counter() - t0,
             "audit_error": (
                 f"bound to {bound!r}, expected {expected_graph_path!r} -- "
@@ -175,6 +181,15 @@ def audit_graph_against_index(
 
     graph_facts, distinct_entities, scan_error = _graph_facts(query_fn)
     graph_total = sum(graph_facts.values())
+
+    # #287, riding this scan rather than paying for its own. Kept OUT of
+    # `divergence` deliberately: a two-value :introduced-by is faithfully in
+    # the index too, so the two witnesses agree perfectly about a graph that
+    # is wrong -- see introduced_by_audit.py. None on a failed scan, because
+    # an empty fact set trivially has no duplicates.
+    duplicates = (
+        None if scan_error else introduced_by_duplicates(graph_facts, sample_cap)
+    )
 
     remaining = Counter(graph_facts)
     index_current = 0
@@ -230,6 +245,9 @@ def audit_graph_against_index(
         "divergence": missing_from_graph + missing_from_index,
         "missing_from_graph_sample": missing_samples,
         "missing_from_index_sample": extra_samples,
+        # #287. An affected graph must be REBUILT into a fresh graph path --
+        # never repaired, never re-ingested in place.
+        "introduced_by_duplicates": duplicates,
         "audit_seconds": time.perf_counter() - t0,
         "audit_error": "; ".join(errors) if errors else None,
     }

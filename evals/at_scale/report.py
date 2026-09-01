@@ -245,6 +245,46 @@ def _fact_audit_row(metrics: dict[str, Any]) -> str:
     )
 
 
+def _introduced_by_duplicates_row(metrics: dict[str, Any]) -> str:
+    """The "Duplicate :introduced-by" row (#287).
+
+    Adjacent to the fact-index row, and NOT part of it, because #287's shape
+    is the one the row above cannot see: both values are faithfully in the
+    index too, so the two witnesses agree perfectly about a graph that is
+    wrong. A run can read `divergence | 0` and be condemned.
+
+    "not measured" covers two different pasts and says the same true thing
+    about both -- a metrics file with no `fact_audit` at all, and one from a
+    harness that had the fact audit but not this check. Neither graph was
+    ever asked, and absence is not zero.
+    """
+    audit = metrics.get("fact_audit")
+    if audit is None or "introduced_by_duplicates" not in audit:
+        return (
+            "| Duplicate :introduced-by (#287) | not measured "
+            "(pre-2026-09-01 harness; this graph was never asked) |"
+        )
+    duplicates = audit["introduced_by_duplicates"]
+    if duplicates is None:
+        return (
+            f"| Duplicate :introduced-by (#287) | **UNVERIFIED** -- the audit "
+            f"could not scan the graph: `{audit.get('audit_error', 'unknown')}` |"
+        )
+    entities = duplicates.get("entities", 0)
+    if not entities:
+        return "| Duplicate :introduced-by (#287) | 0 |"
+    sample = ", ".join(
+        f"`{name}` ({', '.join(values)})" for name, values in duplicates.get("sample", [])
+    )
+    return (
+        f"| Duplicate :introduced-by (#287) | **{entities}** entities carry more "
+        f"than one -- this graph must be **rebuilt into a fresh graph path**, "
+        f"not repaired or re-ingested in place"
+        + (f". e.g. {sample}" if sample else "")
+        + " |"
+    )
+
+
 def _residue_verdict_row(result: dict[str, Any]) -> str:
     """The "Verdict" row (#256/#276): the M <= N reading, in words.
 
@@ -389,6 +429,7 @@ def append_ingestion_report(
         _skipped_commits_row(metrics),
         _error_signals_row(metrics),
         _fact_audit_row(metrics),
+        _introduced_by_duplicates_row(metrics),
     ]
     if "ignore_comparison" in metrics:
         comp = metrics["ignore_comparison"]
@@ -589,7 +630,7 @@ def _query_ingestion_block(report: dict[str, Any]) -> list[str]:
     latencies measured over a graph that had silently dropped commits.
 
     _stderr_capture_row / _skipped_commits_row / _error_signals_row /
-    _fact_audit_row are reused verbatim rather than re-rendered from the same
+    _fact_audit_row / _introduced_by_duplicates_row are reused verbatim rather than re-rendered from the same
     keys. That is the point: an Ingestion Run section and a Query Correctness
     Run section must not be able to disagree about how a dirty run reads.
     """
@@ -613,6 +654,7 @@ def _query_ingestion_block(report: dict[str, Any]) -> list[str]:
         _skipped_commits_row(metrics),
         _error_signals_row(metrics),
         _fact_audit_row(metrics),
+        _introduced_by_duplicates_row(metrics),
     ]
 
 

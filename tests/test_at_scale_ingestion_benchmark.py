@@ -141,6 +141,53 @@ class TestExitCodeGate:
             "fact_audit": {"divergence": 0, "audit_error": None},
         }) == 0
 
+    def test_a_duplicate_introduced_by_fails_the_run(self):
+        """#287, gated with no tolerance on the strength of a measurement:
+        the 831-commit at-scale graph carries 3150 :introduced-by facts across
+        3150 entities, every one of them holding exactly one. A clean graph
+        has zero, so any nonzero is a real defect rather than a threshold to
+        be tuned.
+
+        Note every other key here, INCLUDING divergence, reads clean. That is
+        not a contrived case -- it is the only case: both values reach the
+        index too, so the two witnesses agree perfectly about a graph that
+        must be thrown away."""
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+            "fact_audit": {
+                "divergence": 0, "audit_error": None,
+                "introduced_by_duplicates": {"entities": 12, "sample": []},
+            },
+        }) == 1
+
+    def test_a_zero_duplicate_count_is_clean(self):
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+            "fact_audit": {
+                "divergence": 0, "audit_error": None,
+                "introduced_by_duplicates": {"entities": 0, "sample": []},
+            },
+        }) == 0
+
+    def test_a_pre_287_audit_stays_clean_for_old_metrics(self):
+        """A metrics file from a harness that HAD the fact audit but not this
+        check carries the outer key and not the inner one. It cannot be
+        retro-audited, so it must not be retro-failed -- the same precedent as
+        an absent fact_audit."""
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+            "fact_audit": {"divergence": 0, "audit_error": None},
+        }) == 0
+
     def test_an_absent_audit_stays_clean_for_old_metrics(self):
         """Same precedent as stderr_capture_complete: a metrics file written
         before this harness cannot be retro-audited."""

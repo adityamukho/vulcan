@@ -256,6 +256,89 @@ class TestAppendIngestionReport:
         assert "| Fact-index divergence (#302) | **UNVERIFIED**" in text
         assert "no such table" in text
 
+    def test_a_clean_run_reports_zero_duplicate_introduced_by(self, tmp_path):
+        metrics = {
+            **self._clean_256_metrics(),
+            "fact_audit": {
+                "divergence": 0, "graph_facts": 1894, "audit_error": None,
+                "introduced_by_duplicates": {"entities": 0, "sample": []},
+            },
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "| Duplicate :introduced-by (#287) | 0 |" in text
+
+    def test_an_affected_graph_is_told_to_rebuild_not_repair(self, tmp_path):
+        """The whole point of the detection: the answer is never "repair". A
+        row that printed a count without saying what to do would leave the
+        reader to discover the standing decision somewhere else."""
+        metrics = {
+            **self._clean_256_metrics(),
+            "fact_audit": {
+                "divergence": 0, "graph_facts": 29465, "audit_error": None,
+                "introduced_by_duplicates": {
+                    "entities": 12,
+                    "sample": [[":function/f", [":commit/aaa", ":commit/bbb"]]],
+                },
+            },
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "| Duplicate :introduced-by (#287) | **12**" in text
+        assert "rebuilt into a fresh graph path" in text
+        assert ":function/f" in text
+
+    def test_an_affected_graph_reads_wrong_beside_a_zero_divergence(self, tmp_path):
+        """#287's exact shape, and why it is not folded into `divergence`:
+        the index holds both values faithfully, so the two witnesses agree
+        perfectly about a graph that is wrong. Only this row contradicts the
+        clean sweep above it."""
+        metrics = {
+            **self._clean_256_metrics(),
+            "fact_audit": {
+                "divergence": 0, "graph_facts": 29465, "audit_error": None,
+                "introduced_by_duplicates": {"entities": 12, "sample": []},
+            },
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "| Fact-index divergence (#302) | 0 (29465 facts cross-checked) |" in text
+        assert "| Duplicate :introduced-by (#287) | **12**" in text
+
+    def test_an_audit_that_could_not_run_renders_unverified_not_zero_here_too(
+        self, tmp_path
+    ):
+        """A failed scan yields an empty fact set, and an empty fact set has
+        no duplicates. Rendering 0 would say "clean" about a graph nobody
+        managed to read."""
+        metrics = {
+            **self._clean_256_metrics(),
+            "fact_audit": {
+                "divergence": 0, "audit_error": "OperationalError: no such table",
+                "introduced_by_duplicates": None,
+            },
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "| Duplicate :introduced-by (#287) | **UNVERIFIED**" in text
+
+    def test_a_pre_287_fact_audit_renders_not_measured(self, tmp_path):
+        """A metrics file from a harness that HAD the fact audit but not this
+        check carries the outer key and not the inner one. Absent is not zero:
+        that graph was never asked."""
+        metrics = {
+            **self._clean_256_metrics(),
+            "fact_audit": {"divergence": 0, "graph_facts": 1894, "audit_error": None},
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "| Duplicate :introduced-by (#287) | not measured" in text
+
     def test_the_256_rows_still_render_for_a_pre_fix_result(self, tmp_path):
         """Same defensive precedent as the poll and checkpoint rows: a result
         JSON written before 2026-08-16 carries none of these keys. Absence
@@ -269,6 +352,7 @@ class TestAppendIngestionReport:
         assert "| Commits dropped (#256) | not measured" in text
         assert "| Error signatures (#251/#256) | not measured" in text
         assert "| Fact-index divergence (#302) | not measured" in text
+        assert "| Duplicate :introduced-by (#287) | not measured" in text
         assert "NOT zero" in text
 
 
@@ -384,6 +468,29 @@ class TestAppendQueryReport:
         text = report_path.read_text()
         assert "INCOMPLETE" in text
         assert "LOWER BOUNDS" in text
+
+    def test_a_condemned_graph_is_flagged_in_the_query_section_too(self, tmp_path):
+        """#287, and the reason _query_ingestion_rows reuses the row rather
+        than re-rendering it: query latencies measured over a graph that must
+        be thrown away are not comparable to ones measured over a healthy
+        graph, and the fact-index row above cannot say so -- an affected graph
+        diverges by zero. Wiring the row into the ingestion section alone
+        broke no test until this one existed."""
+        report = {
+            **SAMPLE_QUERY_REPORT,
+            "ingestion": {
+                **SAMPLE_QUERY_REPORT["ingestion"],
+                "fact_audit": {
+                    "divergence": 0, "graph_facts": 29465, "audit_error": None,
+                    "introduced_by_duplicates": {"entities": 12, "sample": []},
+                },
+            },
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_query_report(report, report_path)
+        text = report_path.read_text()
+        assert "| Duplicate :introduced-by (#287) | **12**" in text
+        assert "rebuilt into a fresh graph path" in text
 
     def test_an_absent_ingestion_key_renders_not_measured(self, tmp_path):
         report_path = tmp_path / "benchmark.md"

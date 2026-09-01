@@ -6503,6 +6503,22 @@ def _entity_introduced_by_query(db: Any, entity_ident: str) -> Optional[str]:
     _correction_sweep_apply, which has the linearization positions this
     function does not.
 
+    THE REPAIR IS WITHIN-RUN ONLY, and this used to say otherwise (#287).
+    The sweep heals what it reaches while a run is still climbing, and that
+    is all. A finished run parks :ingestion/correction-sweep-through at
+    frontier-high's own :hi-hash, so the next run's
+    _correction_sweep_select_position computes pos = through + 1 > ceiling_pos
+    and returns None on its FIRST call -- _correction_sweep_apply, which owns
+    the repair, then runs zero times. Measured during #235: watermark at
+    linearization position 13 of 13, one select call, zero apply calls. Later
+    commits raise the ceiling but never lower the resume point, so a position
+    already passed is not revisited either.
+
+    So an entity left corrupt by a COMPLETED run stays corrupt, and no amount
+    of re-ingestion changes that: the graph must be REBUILT into a fresh graph
+    path (CLAUDE.md's standing decision). evals/at_scale/introduced_by_audit.py
+    is how a graph is asked whether it is in that state.
+
     The warning is rate-capped per run (_INTRODUCED_BY_AMBIGUITY_LOG_CAP);
     the RETURN VALUE never is. A corrupt at-scale graph can hold thousands
     of ambiguous entities and _reverse_apply calls this up to 3x per ident
@@ -6517,7 +6533,9 @@ def _entity_introduced_by_query(db: Any, entity_ident: str) -> Optional[str]:
             print(
                 f"[_entity_introduced_by] {entity_ident} has {len(values)} live "
                 f":introduced-by values {sorted(values)} -- returning an arbitrary "
-                "one (#235); the correction sweep repairs this",
+                "one (#235); the correction sweep repairs this only while "
+                "this run is still climbing -- a graph left this way by a "
+                "completed run must be rebuilt, not re-ingested (#287)",
                 file=sys.stderr,
             )
             if _introduced_by_ambiguity_logged == _INTRODUCED_BY_AMBIGUITY_LOG_CAP:
