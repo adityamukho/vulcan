@@ -172,3 +172,70 @@ class TestRunQueryBenchmark:
 
         from evals.at_scale.run_query_benchmark import _DROPPED_INGESTION_KEYS
         assert _DROPPED_INGESTION_KEYS == ("poll_offsets",)
+
+
+class TestGroundTruthIdentsTrackTheLiveIdentRule:
+    """#295: the ground truth's code idents must be ones the CURRENT
+    `_code_ident` rule would actually mint.
+
+    query_ground_truth.json hard-codes idents inside its Datalog (e.g.
+    `[:module/fact_index-py :contains ?fn]`) and inside its expected values.
+    Those are minted by mcp_server._code_ident at ingestion time, so any change
+    to the ident rule silently invalidates them: the query stops matching and
+    returns `[]` or `0`, which reads as a wrong answer rather than a stale
+    fixture.
+
+    That is exactly what happened. #263's R3 rule moved `_` INSIDE the allowed
+    charset and stopped collapsing consecutive hyphens, so
+    `:module/fact-index-py` became `:module/fact_index-py` and
+    `:function/fact-index-py-rebuild-index` became
+    `:function/fact_index-py--rebuild_index`. Entries 1, 3 and 4 had been
+    failing every night since, and nothing connected the two -- the nightly
+    just went red.
+
+    This binds the fixture to the rule so the next change to `_canonical_ident`
+    fails HERE, in milliseconds, naming the file to update.
+    """
+
+    # (entity_type, file_path, name) -> the literal the fixture relies on.
+    # Every code-derived ident appearing anywhere in query_ground_truth.json.
+    EXPECTED_IDENTS = (
+        ("module", "fact_index.py", None),
+        ("module", "tests/test_fact_index.py", None),
+        ("function", "fact_index.py", "rebuild_index"),
+    )
+
+    def _ground_truth_text(self):
+        from evals.at_scale.run_query_benchmark import REPO_ROOT
+
+        path = REPO_ROOT / "evals" / "at_scale" / "query_ground_truth.json"
+        return path.read_text()
+
+    @pytest.mark.parametrize("entity_type,file_path,name", EXPECTED_IDENTS)
+    def test_the_fixture_uses_the_ident_the_live_rule_mints(
+        self, entity_type, file_path, name
+    ):
+        import mcp_server
+
+        ident = mcp_server._code_ident(entity_type, file_path, name)
+        assert ident in self._ground_truth_text(), (
+            f"query_ground_truth.json does not mention {ident!r}, which is what "
+            f"_code_ident({entity_type!r}, {file_path!r}, {name!r}) mints today. "
+            "The ident rule changed and the fixture was not updated -- the "
+            "queries will return empty and the nightly will go red."
+        )
+
+    def test_no_pre_263_ident_survives_in_the_fixture(self):
+        """The other direction: catch a stale literal that was never updated.
+
+        Without this, adding a NEW correct ident alongside an old one would
+        pass the check above while the stale query kept failing.
+        """
+        stale = (
+            ":module/fact-index-py",
+            ":module/tests-test-fact-index-py",
+            ":function/fact-index-py-rebuild-index",
+        )
+        text = self._ground_truth_text()
+        found = [s for s in stale if s in text]
+        assert found == [], f"pre-#263 idents still in the fixture: {found}"

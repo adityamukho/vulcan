@@ -1581,3 +1581,26 @@ the first red one (03:00 UTC 08-11):
 against `463a922^`, and #254 changed handle/lease behaviour as well as the
 dependency floor. Confirming it is two query-benchmark runs (~18 min). Not run
 here because it would have contended with the paired runs above.
+
+## Query Correctness Run — 20260901T044627Z
+
+- minigraf: `1.2.3`
+
+| ID | Category | Result | minigraf latency | baseline latency |
+|---|---|---|---|---|
+| 1 | point-in-time | PASS | 39.1ms | 3.0ms |
+| 2 | delta | SKIPPED (manual diff) | 0.0ms | 0.0ms |
+| 3 | regression-tracing | PASS | 28.7ms | 4.8ms |
+| 4 | dependency-impact | PASS | 49.4ms | 6.8ms |
+| 5 | cross-layer | PASS | 309.0ms | 4.7ms |
+| 6 | cross-layer | PASS | 313.0ms | 3.1ms |
+
+Ingestion phase (#275) -- the graph these latencies were measured over:
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 443 |
+| Final status | complete |
+| Stderr capture (#256) | complete |
+| Commits dropped (#256) | 0 |
+| Error signatures (#251/#256) | 0 |
