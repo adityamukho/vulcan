@@ -30,23 +30,36 @@ dependencies = [
     # was created silently. Two handles each cache their own page_count and
     # corrupt each other -- the flaky "Page N out of bounds" of #251/#253.
     # mcp_server reaches that state through normal operation, so an older
-    # minigraf here means silent graph corruption under concurrent load.
-    # The core fix shipped in 1.2.2; 1.2.3 is the release this is verified
-    # against (1.2.2's Node binding was withdrawn for an unrelated gap).
-    # Capped below 2.0: minigraf 2.0.0 deleted the .graph.lock PID sidecar,
-    # moving the lock into the kernel via File::try_lock on the .graph file
-    # itself (project-minigraf/minigraf#317). With the bound open, CI resolved
-    # 2.0.0 and four tests that assert the sidecar's existence failed on master
-    # -- TestGetDbLockRetry (x2), TestDbLeaseManager and
-    # TestSingleHandlePerProcess. The single-handle invariant itself SURVIVES
-    # (flock/OFD locks attach to the open file description, so #304's
-    # same-process denial still holds); it is the sidecar the tests reach for
-    # that is gone. 2.0.0 also changes every error string (a "[CODE] " prefix)
-    # and adds a ~375ms internal retry before reporting a cross-process
-    # conflict, which absorbs attempts that used to reach _DbLeaseManager's
-    # own retry loop. Taking that upgrade is its own change -- raise the cap
-    # as part of it, not before it. See #284.
-    "minigraf>=1.2.3,<2.0.0",
+    # minigraf here means silent graph corruption under concurrent load. That
+    # fix shipped in 1.2.2 and is present in every release since.
+    #
+    # Raised to 2.0.0 in #284 item 6, after the whole tier was re-verified
+    # against a real 2.0.0 build rather than reasoned about:
+    #   * Suite green on BOTH versions (1599 passed each). The four sidecar
+    #     tests that blocked this were rewritten in #293 to assert exclusivity
+    #     against the OS instead of a `.graph.lock` file that 2.0.0 does not
+    #     write -- and nine more assertions had silently become TAUTOLOGIES
+    #     under kernel locking, which the file-based form could not have caught.
+    #   * The #108 ingestion pre-check, which 2.0.0 silently turned into a
+    #     no-op, was rebuilt on a portable ownership hint (#292).
+    #   * Every minigraf error string we match was audited against v2.0.0
+    #     source (#296).
+    #   * At-scale benchmark on both: wall clock within 1.5%, checkpoint
+    #     accounting identical, query correctness identical (#294).
+    #
+    # The last stated blocker, project-minigraf/minigraf#287 (batching facts
+    # that share entity+attribute loses all but one), is still OPEN -- and is
+    # NOT a reason to hold the cap, because it is VERSION-INVARIANT. Measured:
+    # it reproduces identically on 1.2.3 and 2.0.0, and this repo's per-fact
+    # transact workaround neutralises it identically on both. #83's other two
+    # gates (minigraf#297, #298) are CLOSED upstream.
+    #
+    # Capped below 3.0 deliberately. Upstream's 3.0.0 milestone is format v8 +
+    # window completeness + FFI expansion; a major bump must be a decision, not
+    # a resolver outcome. That is the whole lesson of this cap's own history:
+    # with no upper bound, CI silently resolved 2.0.0 the day it shipped and
+    # ran red for days before anyone connected the two (#286).
+    "minigraf>=2.0.0,<3.0.0",
     # Capped below 2.0: mcp 2.0.0 removed Server.list_tools, which
     # mcp_server.py registers its handlers through. With the bound open, CI
     # resolved 2.0.0 and every test that imports mcp_server errored at import

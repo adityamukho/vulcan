@@ -13367,6 +13367,65 @@ class TestRunIngestionParentEdgeFactIndex:
         assert parent_rows, "no :parent-attribute rows found in the fact index after ingestion"
 
 
+class TestMergeCommitKeepsBothParentEdges:
+    """#284 item 6 / minigraf#287: the one-transact-per-parent split was
+    UNGUARDED, like the re-dating split beside it.
+
+    A merge commit has two :parent edges sharing (entity, attribute,
+    valid_from), which is exactly the EAVT collision minigraf#287 describes --
+    still OPEN upstream and reproducing identically on 1.2.3 and 2.0.0, so this
+    workaround is permanent, not transitional.
+
+    The pre-existing TestRunIngestionParentEdgeFactIndex cannot catch a
+    regression here: its own docstring notes git_repo has "two linear commits,
+    so the second commit produces exactly one :parent edge". With one parent
+    there is nothing to collide with, and it passes with the split removed --
+    ablation confirmed the whole suite did. Losing a merge's second parent is
+    not cosmetic: the bootstrap `ancestor` rule is defined purely over :parent,
+    so a half-written merge silently truncates ancestry for everything below it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_both_parents_of_a_merge_survive_ingestion(
+        self, real_db, git_repo_diamond_clock_skewed
+    ):
+        import mcp_server
+
+        repo = git_repo_diamond_clock_skewed
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0,
+            "current_commit": "", "error": None,
+        }
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        # Ask git which commit is the merge, rather than assuming the fixture's
+        # shape -- if the fixture ever stops containing one, this test must
+        # fail loudly instead of quietly asserting nothing.
+        merges = _subprocess.run(
+            ["git", "log", "--merges", "--format=%H"],
+            cwd=repo, capture_output=True, text=True, check=True,
+        ).stdout.split()
+        assert merges, "fixture no longer contains a merge commit"
+        merge_ident = f":commit/{merges[0][:12]}"
+
+        expected = _subprocess.run(
+            ["git", "log", "-1", "--format=%P", merges[0]],
+            cwd=repo, capture_output=True, text=True, check=True,
+        ).stdout.split()
+        assert len(expected) == 2, f"expected a 2-parent merge, got {expected}"
+
+        raw = mcp_server._db_execute(
+            real_db,
+            f"(query [:find ?p :any-valid-time :where [{merge_ident} :parent ?p]])",
+        )
+        got = sorted(r[0] for r in json.loads(raw)["results"])
+        want = sorted(f":commit/{h[:12]}" for h in expected)
+        assert got == want, (
+            "the merge's :parent edges were batched into one transact and "
+            f"collapsed (minigraf#287). want {want}, got {got}"
+        )
+
+
 class TestRunIngestionConcurrency:
     @pytest.mark.asyncio
     async def test_concurrent_run_matches_sequential_facts(
@@ -19862,6 +19921,61 @@ class TestParseStreamRatio:
         this runs inside a background coroutine with no user in the loop."""
         import mcp_server
         assert mcp_server._parse_stream_ratio("\x00\xff") == (1, 1)
+
+
+class TestReDateStructuralFactsKeepsEverySiblingEdge:
+    """#284 item 6 / minigraf#287: the per-triple split in
+    _re_date_structural_facts is load-bearing and was UNGUARDED.
+
+    minigraf#287 is still OPEN and reproduces identically on 1.2.3 and 2.0.0:
+    facts sharing (entity, attribute, valid_from) in ONE transact collapse to
+    the last, because the EAVT pending index omits value bytes. This repo's
+    only protection is transacting such facts one per call, and we now depend
+    on that indefinitely -- upstream has no fix in either version.
+
+    The pre-existing test_contains_edge_survives_re_dating asserts a SINGLE
+    surviving edge, so it cannot see the collision: with one edge there is
+    nothing to collide with, and it passes with the split removed. Ablation
+    confirmed the whole suite passed with :contains batched back in here,
+    which left this site one plausible "merge these two loops" edit away from
+    silently losing containment edges -- the exact #222 phase 2b1 bug that
+    cost five of six edges on an ordinary multi-entity file, permanently.
+
+    Two siblings is the minimum that can collide, so this uses three.
+    """
+
+    def test_every_sibling_contains_edge_survives_re_dating(self, real_db):
+        import mcp_server
+
+        old_ts, new_ts = "2026-06-01T00:00:00Z", "2026-01-01T00:00:00Z"
+        children = [":code/fn-a", ":code/fn-b", ":code/fn-c"]
+        structural = [f"[:module/auth :contains {c}]" for c in children]
+
+        # Seed one per call, so the SEEDING cannot itself be the thing that
+        # loses edges -- otherwise a failure below would be ambiguous.
+        for triple in structural:
+            mcp_server._transact(real_db, f"[{triple}]", old_ts)
+
+        # Positive control: all three are really present before re-dating.
+        raw = mcp_server._db_execute(
+            real_db,
+            f'(query [:find ?c :valid-at "{old_ts}" '
+            ':where [:module/auth :contains ?c]])',
+        )
+        assert sorted(r[0] for r in json.loads(raw)["results"]) == sorted(children)
+
+        mcp_server._re_date_structural_facts(real_db, structural, new_ts)
+
+        raw = mcp_server._db_execute(
+            real_db,
+            f'(query [:find ?c :valid-at "{new_ts}" '
+            ':where [:module/auth :contains ?c]])',
+        )
+        survived = sorted(r[0] for r in json.loads(raw)["results"])
+        assert survived == sorted(children), (
+            "re-dating lost sibling :contains edges -- they were batched into "
+            f"one transact and collapsed (minigraf#287). Survived: {survived}"
+        )
 
 
 class TestForwardReconcileProvisional:

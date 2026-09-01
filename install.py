@@ -22,6 +22,7 @@ import os
 import re
 import tempfile
 import importlib.util
+from typing import Optional
 from datetime import datetime, timezone
 
 UPDATE_INTERVAL = 7 * 24 * 60 * 60  # 7 days in seconds
@@ -129,6 +130,43 @@ def _venv_has(module: str) -> bool:
     return result.returncode == 0
 
 
+def _venv_version(package: str) -> Optional[str]:
+    """Return *package*'s version inside the venv, or None if not installed."""
+    result = subprocess.run(
+        [VENV_PYTHON, "-c",
+         f"import importlib.metadata as m; print(m.version({package!r}))"],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _version_tuple(v: str) -> tuple:
+    """Best-effort comparison key for a floor check.
+
+    Not a full PEP 440 implementation -- it only has to answer "is this at
+    least X", and pulling in `packaging` for that would add a dependency to the
+    installer that bootstraps dependencies.
+
+    A trailing release marker keeps a PRERELEASE below its own release:
+    "2.0.0rc1" -> (2, 0, 0, 0) sorts below "2.0.0" -> (2, 0, 0, 1). Without it
+    the numeric heads are equal and an rc would satisfy a floor it does not
+    actually meet.
+    """
+    parts = []
+    prerelease = False
+    for seg in v.split("."):
+        head = ""
+        for ch in seg:
+            if ch.isdigit():
+                head += ch
+            else:
+                prerelease = True
+                break
+        parts.append(int(head) if head else -1)
+    parts.append(0 if prerelease else 1)
+    return tuple(parts)
+
+
 def _venv_pip_install(*specs: str, timeout: int = 300) -> bool:
     """Install one or more pip specs into the venv. Returns True on success."""
     result = subprocess.run(
@@ -138,18 +176,34 @@ def _venv_pip_install(*specs: str, timeout: int = 300) -> bool:
     return result.returncode == 0
 
 
+# Keep in sync with pyproject.toml's `dependencies`, which is CANONICAL --
+# this path installs into the venv directly and never reads it. These have
+# drifted before: the floor was stale here (1.2.1 vs pyproject's 1.2.3) and the
+# cap was missing entirely, so a fresh install pulled minigraf 2.0.0 the day it
+# shipped. See #284.
+_MINIGRAF_SPEC = "minigraf>=2.0.0,<3.0.0"
+_MINIGRAF_FLOOR = "2.0.0"
+
+
 def check_minigraf_package():
-    """Verify minigraf Python package is installed in the venv."""
-    if _venv_has("minigraf"):
-        print("✓ minigraf Python package found")
+    """Verify a SATISFYING minigraf is installed in the venv.
+
+    Version-aware on purpose (#284). This used to return early whenever
+    `import minigraf` merely succeeded, so a venv left on an older release was
+    reported as "found" and never corrected -- the floor in pyproject.toml is a
+    correctness requirement, and an install path that cannot enforce it is not
+    checking anything. A machine that installed before a floor bump would sit
+    on the old version indefinitely with no signal.
+    """
+    installed = _venv_version("minigraf")
+    if installed and _version_tuple(installed) >= _version_tuple(_MINIGRAF_FLOOR):
+        print(f"✓ minigraf Python package found ({installed})")
         return True
-    print("✗ minigraf not found — installing via pip...")
-    # Keep in sync with pyproject.toml's `dependencies`, which is canonical --
-    # this path installs into the venv directly and does not read it. The floor
-    # was stale here (1.2.1 vs pyproject's 1.2.3) and the cap was missing
-    # entirely, so a fresh install pulled minigraf 2.0.0 and got the .graph.lock
-    # sidecar removal. See #284.
-    if _venv_pip_install("minigraf>=1.2.3,<2.0.0", timeout=120):
+    if installed:
+        print(f"✗ minigraf {installed} is below the {_MINIGRAF_FLOOR} floor — upgrading...")
+    else:
+        print("✗ minigraf not found — installing via pip...")
+    if _venv_pip_install(_MINIGRAF_SPEC, timeout=120):
         print("✓ minigraf installed")
         return True
     print("✗ pip install minigraf failed")
