@@ -58,9 +58,11 @@ def main() -> None:
             # No explicit open: handle_memory_finalize_turn takes its own
             # lease (db_lease_async(), conditional on
             # MINIGRAF_EXTRACTION_STRATEGY), which carries the same
-            # retry/backoff and stale-lock self-heal, and releases when it
-            # returns so the next turn's hook process can acquire the file
-            # lock (#255).
+            # retry/backoff, and releases when it returns so the next
+            # turn's hook process can acquire the file lock (#255). The
+            # stale-lock self-heal this used to mention was deleted in #284:
+            # minigraf's lock is now held by the kernel and released on
+            # process exit, so there is nothing stale left to heal.
             asyncio.run(mcp_server.handle_memory_finalize_turn(conversation_delta))
         except Exception:
             pass  # Never block on memory errors
