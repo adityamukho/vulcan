@@ -217,6 +217,27 @@ red for days before anyone connected the two (#286). A major bump must be a
 decision, not a resolver outcome. `install.py` mirrors this spec and is
 version-aware — pyproject.toml is canonical, and the two have drifted before.
 
+**What ships in the wheel is a hand-maintained list, and it has been wrong.**
+`[tool.setuptools] py-modules` (pyproject.toml) names the top-level modules
+setuptools packages; the repo is a flat layout with no package directory, so
+nothing is discovered automatically. `frontier_registry.py` landed 2026-07-24
+and was imported from `mcp_server.py` without being added — the whole suite
+stayed green (the repo root is on `sys.path` in every checkout and every CI
+run) and a built wheel died at `import mcp_server` with `ModuleNotFoundError`.
+It surfaced only when #82 ran `uvx temporal-reasoning` for real.
+`tests/test_packaging.py` now walks the shipped modules' imports transitively
+and fails if the list does not cover them.
+
+**PyPI metadata is stamped at RELEASE time, so a dependency cap that is not
+released does not exist.** 0.6.0 (2026-07-22) is on PyPI with uncapped
+`mcp>=1.27.0` and `minigraf>=1.2.1`; the `mcp<2.0.0` cap landed 2026-08-03 in
+`4f630c9`. So every `uvx temporal-reasoning` between those dates resolved mcp
+2.x and crashed at `@server.list_tools()` — the exact failure the cap exists to
+prevent — while `pyproject.toml` on master read as correct. `install.py` writes
+a `.mcp.json` pointing at the PyPI package, so this broke the full install as
+much as the MCP-only one. After changing a dependency bound, cut a release or
+the bound protects only developers.
+
 **project-minigraf/minigraf#287 is still OPEN and is worked around here, not
 fixed.** Batching facts that share `(entity, attribute, valid_from)` into one
 transact silently keeps only the last, because the EAVT pending index omits

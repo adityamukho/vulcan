@@ -90,7 +90,14 @@ dev = [
 ]
 
 [tool.setuptools]
-py-modules = ["mcp_server", "report_issue", "fact_index"]
+# Hand-maintained, and it has to be: the repo is a flat module layout with no
+# package directory, so setuptools discovers nothing on its own. A module
+# missing here imports fine in every checkout and every CI run (repo root is
+# on sys.path) and raises ModuleNotFoundError in the built wheel --
+# frontier_registry did exactly that from 2026-07-24 until #82.
+# tests/test_packaging.py walks the shipped modules' imports and fails if this
+# list does not cover them.
+py-modules = ["mcp_server", "report_issue", "fact_index", "frontier_registry"]
 
 [tool.ruff]
 line-length = 100
