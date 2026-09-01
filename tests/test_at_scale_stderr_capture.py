@@ -426,3 +426,50 @@ class TestFailingRestoreIsRecorded:
         assert any(
             "simulated restore failure" in repr(err) for err in cap.errors
         ), f"not recorded on the capture either: {cap.errors}"
+
+
+class TestMinigrafPatternsSurviveTheCodePrefix:
+    """#284 item 2: minigraf 2.0.0 prefixes every error's Display with
+    `[CODE] ` (e.g. `[INT-049] `). Our minigraf-originated patterns survive
+    that ONLY because scan_ingestion_stderr uses re.search, never match or
+    fullmatch -- an anchored pattern would silently stop firing on 2.0.0 and
+    read as "no corruption detected".
+
+    These are the repo's only detector for the #251/#253 corruption, so a
+    silent failure here is the worst shape available: a clean report over a
+    corrupt graph.
+    """
+
+    # Rendered forms taken from real minigraf v2.0.0 source, not invented:
+    #   file.rs:390 + Int049's "storage: internal invariant violation: {}"
+    #   btree_v6.rs:598
+    CASES = (
+        (
+            "page_out_of_bounds",
+            "[INT-049] storage: internal invariant violation: "
+            "Page 44 out of bounds (total pages: 2)",
+        ),
+        (
+            "stream_all_entries_expected_leaf_page",
+            "[INT-049] storage: internal invariant violation: "
+            "stream_all_entries: expected leaf page at page_id=19",
+        ),
+    )
+
+    @pytest.mark.parametrize("name,line", CASES)
+    def test_pattern_still_fires_on_a_2_0_0_rendered_line(self, name, line):
+        from evals.at_scale.stderr_capture import scan_ingestion_stderr
+
+        signals = scan_ingestion_stderr(line)["error_signals"]
+        assert [s["pattern"] for s in signals] == [name]
+
+    @pytest.mark.parametrize("name,line", CASES)
+    def test_pattern_also_fires_without_the_prefix(self, name, line):
+        """Control: the same line as minigraf 1.2.3 would render it, with no
+        [CODE] prefix. Both must fire, or the pattern has merely traded one
+        version for the other rather than covering both."""
+        from evals.at_scale.stderr_capture import scan_ingestion_stderr
+
+        unprefixed = line.split("] ", 1)[1]
+        signals = scan_ingestion_stderr(unprefixed)["error_signals"]
+        assert [s["pattern"] for s in signals] == [name]
