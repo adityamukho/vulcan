@@ -52,6 +52,12 @@ name: At-Scale Benchmark (nightly)
 # result rather than the presence of a failure. That does not exist here, and
 # is deliberately not pretended otherwise: #295's whole lesson was that an
 # assumed notification channel had never been verified.
+#
+# NOT ALL THREE STEPS MEAN THE SAME THING WHEN RED. Ingestion and the query
+# benchmark failing means the HARNESS broke. The ident-collision census failing
+# means the harness worked and found something: two entities on real history
+# sharing one ident, which reopens #263's rule choice (#267). The issue body
+# below names which step it was for exactly that reason.
 
 on:
   schedule:
@@ -130,6 +136,31 @@ jobs:
         if: always()
         run: python -m evals.at_scale.run_query_benchmark --repo-path .
 
+      # #267. R3's zero ident-collision residual is MEASURED over history, not
+      # proven by construction (see _canonical_ident), so it can be falsified by
+      # a commit landing tomorrow. The in-suite guard is a fixed 9-pair corpus
+      # and catches only a REGRESSION in the rule; this is the census that can
+      # discover something new.
+      #
+      # --fail-on-collision is passed HERE and nowhere else. The probe's default
+      # is exit 0, because finding a collision is a measurement rather than an
+      # invalid run -- but a finding that only lands in a green run's log is the
+      # exact shape of the undelivered detection #295 was about. The flag is
+      # what routes it into the issue-filing path below.
+      #
+      # `if: always()` so a red ingestion or query step does not hide it: the
+      # three steps fail for unrelated reasons. Cost is ~97s over 835 commits
+      # (2026-09-01) against this job's 360-minute ceiling, which is why it runs
+      # over FULL history with no --since bound -- and a bound would be wrong
+      # anyway, since the collision it is hunting is a new entity against an old
+      # one.
+      - name: Census ident collisions under the shipped rule
+        id: census
+        if: always()
+        run: |
+          python evals/at_scale/probe_ident_collision_new_history.py \
+            --repo-path . --fail-on-collision
+
       # --- #295 alerting -------------------------------------------------
       # `failure() || cancelled()` rather than just `failure()`: a cancelled
       # run is a real signal here, not noise. This job was CANCELLED nightly
@@ -143,6 +174,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           INGESTION_OUTCOME: ${{ steps.ingestion.outcome }}
           QUERY_OUTCOME: ${{ steps.query.outcome }}
+          CENSUS_OUTCOME: ${{ steps.census.outcome }}
           EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
@@ -159,9 +191,14 @@ jobs:
             "| Trigger | \`$EVENT\` |" \
             "| Ingestion step | \`${INGESTION_OUTCOME:-did not run}\` |" \
             "| Query step | \`${QUERY_OUTCOME:-did not run}\` |" \
+            "| Ident-collision census | \`${CENSUS_OUTCOME:-did not run}\` |" \
             "" \
-            "The two steps fail for unrelated reasons and want opposite fixes" \
+            "The three steps fail for unrelated reasons and want opposite fixes" \
             "(#295) -- read the outcomes above before assuming which one broke." \
+            "" \
+            "A red census step is NOT a harness failure: it means real history" \
+            "produced two entities sharing one \`_code_ident\`, which reopens" \
+            "#263's rule choice. The run's log names the colliding pairs." \
             "" \
             "This issue is filed and closed automatically by" \
             "\`.github/workflows/at-scale-benchmark-nightly.yml\`. While it stays" \

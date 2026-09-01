@@ -1,0 +1,56 @@
+{
+  "repo_path": ".",
+  "branch": "master",
+  "head_commit": "07d3a4a7176ff1de044103498c1cd88c61fbb245",
+  "ignore_patterns": [
+    "3rdParty/",
+    "third_party/",
+    "vendor/",
+    "node_modules/",
+    "dist/",
+    "build/",
+    "*.min.js",
+    "*.map"
+  ],
+  "commits": 835,
+  "extraction_failures": 0,
+  "failed_commits": [],
+  "triples_total": 3692,
+  "idents_total": 3692,
+  "offenders": {
+    "module": {
+      "idents_total": 159,
+      "count": 0,
+      "idents": {}
+    },
+    "function": {
+      "idents_total": 2741,
+      "count": 0,
+      "idents": {}
+    },
+    "class": {
+      "idents_total": 386,
+      "count": 0,
+      "idents": {}
+    },
+    "variable": {
+      "idents_total": 306,
+      "count": 0,
+      "idents": {}
+    },
+    "field": {
+      "idents_total": 100,
+      "count": 0,
+      "idents": {}
+    }
+  },
+  "offenders_total": 0,
+  "offenders_by_shape": {
+    "leading-underscore": 0,
+    "case-only": 0,
+    "separator-vs-path": 0,
+    "cross-producer": 0,
+    "other": 0
+  },
+  "timestamp": "2026-09-01T15:40:25Z"
+}

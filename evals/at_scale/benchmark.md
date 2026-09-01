@@ -1103,6 +1103,87 @@ change** — the cheapest rule that eliminates all 9 collisions (R1) still renam
 97.5% of existing idents, so a forward-only change would orphan the history of
 nearly every code entity in every graph already written.
 
+## Ident Collision Census, Shipped Rule — 267-ident-collision-new-history
+
+- Repo: `.` @ `master` (`07d3a4a`, full history, 835 commits)
+- Script: `evals/at_scale/probe_ident_collision_new_history.py`
+- Raw: `evals/at_scale/results/267-ident-collision-new-history.json`
+- Run: `.venv/bin/python evals/at_scale/probe_ident_collision_new_history.py
+  --repo-path . --json-out evals/at_scale/results/267-ident-collision-new-history.json`
+- Question: does history under the **shipped** R3 rule collide? The section
+  above is the frozen audit that *chose* R3 and reproduces the pre-#263
+  measurement forever; this is the third row of #267's coverage table — whether
+  NEW commits introduce collisions under the rule that actually ships.
+
+**Why a separate file rather than a flag on the frozen probe.** That artifact's
+`PREDICTIONS` block was registered before any data existed, and P3/P4 are claims
+about R5 and R2 *as measured against the old baseline*. Re-pointing it at
+production would re-evaluate pre-registered predictions against a different
+experiment while still printing them as "held". The separation is pinned from
+both sides: the frozen file asserts its rule is **not** production's
+(`test_the_frozen_rule_is_no_longer_productions_rule`), and this one asserts its
+baseline **is** (`TestBaselineIsProduction`, parametrized over an adversarial
+corpus). Neither can silently drift onto the other's rule.
+
+| Metric | Value |
+|---|---|
+| Exit code | 0 (valid measurement, nothing found) |
+| Commits walked | 835 |
+| Extraction failures | 0 |
+| Distinct inputs collected | 3692 |
+| Distinct idents | 3692 |
+| **Offenders under R3** | **0** |
+| Wall clock | 97s |
+
+Per entity type, all zero: module 0/159, function 0/2741, class 0/386, variable
+0/306, field 0/100. Every shape count is 0.
+
+**The finding: R3's zero residual still holds, now over 835 commits and 3692
+inputs.** The frozen audit measured 674 commits and 2789 inputs; this is 161
+more commits and 903 more inputs, and `idents_total` equals `triples_total`
+exactly — every distinct input reached its own ident. The 9 pairs #263 found are
+among those inputs and are separated, which is the same claim
+`TestIdentCollisionRegression263` makes, here re-derived from real history
+rather than from a fixed corpus.
+
+**Read the 0 as measured, not proven.** `_canonical_ident`'s docstring is
+explicit that R3's zero was the accepted cost of rejecting R4's hash suffix, and
+that a contrived path/name combination can still collide: `a/b.py` and `a-b.py`
+both reach `:module/a-b-py`. That exact pair is this probe's positive control —
+the test suite constructs it, drives the real extractor over a real repo
+containing both files, and requires the census to report it. Without that
+control a census that could not see any collision would report the same 0 as
+this one.
+
+**There is no `--since` bound, deliberately.** A collision is a property of a
+*pair*, and the pair to worry about is a new entity against an **old** one that
+has sat in the tree for years. A `--since`-bounded collection sees only
+new-vs-new and would report clean while missing precisely the case it was built
+for. #267 raised the bound because a full walk was assumed too expensive for CI
+— an assumption inherited from `TestIdentCollisionRegression263`'s docstring and
+false at this size: 97s against the nightly's 360-minute ceiling. If the walk
+ever stops fitting, the fix is a cached input manifest keyed on `head_commit`
+that new commits are unioned into, which preserves new-vs-old detection.
+
+**Where it runs, and what a red run means.** The at-scale nightly runs it with
+`--fail-on-collision` (`if: always()`, so a red ingestion or query step cannot
+hide it). The probe's own default is exit 0 on a collision — finding one is a
+measurement, not an invalid run, the same reasoning as the frozen probe's exit
+gate — and the flag exists only so a find reaches a human through #295's
+issue-filing path instead of sitting in a green log. The two axes stay separate:
+`measurement_invalid` (zero commits, zero inputs, >1% extraction failures) exits
+1 whether or not the flag was passed. **A red census step is not a harness
+failure**; it means real history produced two entities sharing one ident and
+#263's rule choice is reopened. The nightly's issue body names which of the
+three steps was red for exactly that reason.
+
+**The zero-inputs gate is not hypothetical.** The first driver written against
+this collection stage omitted `multiprocessing`'s spawn guard, every worker
+died, and the run printed a confident *0 collisions* over 835 commits with 0
+inputs collected and 835 extraction failures. A census whose collection failed
+outright reports the same headline number as a clean history; only the
+diagnostics separate them.
+
 ## Ingestion Run — 20260816T022619Z
 
 - Repo: `.` @ `master`
