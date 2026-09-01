@@ -2273,6 +2273,47 @@ class TestParseFactsBlock:
             (":decision/x", ":score", "1.5"),
         ]
 
+    def test_boolean_valued_triples(self):
+        """#303: a bare true/false is a value like any other. The extractors
+        emit `:static` this way (mcp_server.py's `'true' if is_static else
+        'false'`), so dropping it here made every :static fact invisible to
+        memory retrieval -- 83 of them on the 822-commit at-scale graph."""
+        import mcp_server
+        block = (
+            "[[:function/f :static true] "
+            "[:function/g :static false]]"
+        )
+        result = mcp_server._parse_facts_block(block)
+        assert result == [
+            (":function/f", ":static", "true"),
+            (":function/g", ":static", "false"),
+        ]
+
+    def test_boolean_value_is_indexed_in_its_edn_spelling(self):
+        """Lowercase, not Python's `True`. The index stores the datalog text
+        it was transacted from for every other type (`:version 1` -> '1'), and
+        that is what a reader -- fact_audit, or a person searching -- compares
+        against."""
+        import mcp_server
+        result = mcp_server._parse_facts_block("[:function/f :static true]")
+        assert result[0][2] == "true"
+
+    def test_bare_symbol_is_not_mistaken_for_a_boolean(self):
+        r"""The negative control for the new alternative. `true` is only a
+        value when it is the WHOLE value: the pattern's trailing `\]` means a
+        symbol that merely starts with it must not match, or the parser would
+        index `truthy` as `true` and silently corrupt the second witness."""
+        import mcp_server
+        assert mcp_server._parse_facts_block("[:function/f :static truthy]") == []
+        assert mcp_server._parse_facts_block("[:function/f :static falsehood]") == []
+
+    def test_keyword_true_is_still_a_keyword(self):
+        """`:true` is a keyword, not a boolean, and the keyword alternative
+        must keep claiming it -- colon and all."""
+        import mcp_server
+        result = mcp_server._parse_facts_block("[:function/f :static :true]")
+        assert result == [(":function/f", ":static", ":true")]
+
     def test_uuid_tagged_entity_triple(self):
         import mcp_server
         result = mcp_server._parse_facts_block(
@@ -2409,6 +2450,95 @@ class TestTransactRetractChokePoint:
         raw = mcp_server._db_execute(real_db, '(query [:find ?v :where [:decision/x :description ?v]])')
         import json
         assert json.loads(raw)["results"] == [["hello"]]  # the graph write still succeeded
+
+
+class TestBooleanFactsReachTheIndex:
+    """#303: `[:function/f :static true]` used to reach the graph and never
+    the fact index, because `_FACTS_TRIPLE_PATTERN`'s value alternation had no
+    bare-boolean case. Nothing raised -- `_index_write` simply received no row.
+
+    These go through `_transact`/`_retract` rather than asserting on the
+    pattern, because the pattern is only half of it: the same triples must
+    round-trip out of the index on retract, or a fixed insert path just leaks
+    stale rows into the graph's only independent witness (#302).
+    """
+
+    def _index_rows(self, attribute):
+        import os
+        import sqlite3
+        import fact_index
+        import mcp_server
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
+        # A never-written index leaves no file at all. Report that as "no
+        # rows" rather than letting sqlite3 raise: the absence IS the #303
+        # defect, and it should surface as the assertion that names it.
+        if not os.path.exists(index_path):
+            return []
+        con = sqlite3.connect(index_path)
+        try:
+            return con.execute(
+                "SELECT entity, value FROM facts_dedup WHERE attribute = ? "
+                "ORDER BY entity",
+                (attribute,),
+            ).fetchall()
+        finally:
+            con.close()
+
+    def test_transact_indexes_a_true_valued_fact(self, real_db):
+        import mcp_server
+        mcp_server._transact(
+            real_db, "[[:function/f :static true]]", "2026-01-01T00:00:00.000Z",
+        )
+        assert self._index_rows(":static") == [(":function/f", "true")]
+
+    def test_transact_indexes_a_false_valued_fact(self, real_db):
+        """false is not a falsy no-op: `:static false` is as real a fact as
+        `:static true`, and the extractors emit far more of them."""
+        import mcp_server
+        mcp_server._transact(
+            real_db, "[[:function/g :static false]]", "2026-01-01T00:00:00.000Z",
+        )
+        assert self._index_rows(":static") == [(":function/g", "false")]
+
+    def test_the_graph_still_holds_the_boolean_it_indexed(self, real_db):
+        """The two witnesses must agree in TYPE-normalized form: minigraf
+        returns a Python bool, the index the EDN text it was transacted from."""
+        import json
+        import mcp_server
+        mcp_server._transact(
+            real_db, "[[:function/f :static true]]", "2026-01-01T00:00:00.000Z",
+        )
+        raw = mcp_server._db_execute(
+            real_db, "(query [:find ?v :where [:function/f :static ?v]])"
+        )
+        graph_value = json.loads(raw)["results"][0][0]
+        assert graph_value is True
+        assert str(graph_value).lower() == self._index_rows(":static")[0][1]
+
+    def test_retract_removes_the_boolean_row(self, real_db):
+        """Without this the insert fix alone would make the index accumulate
+        rows the graph has retracted -- divergence in the other direction."""
+        import mcp_server
+        mcp_server._transact(
+            real_db, "[[:function/f :static true]]", "2026-01-01T00:00:00.000Z",
+        )
+        assert self._index_rows(":static")
+        mcp_server._retract(real_db, "[[:function/f :static true]]")
+        assert self._index_rows(":static") == []
+
+    def test_boolean_fact_is_retrievable_by_search(self, real_db):
+        """The user-visible point of #303: "which of these are static" was
+        unanswerable through memory retrieval while the graph knew."""
+        import fact_index
+        import mcp_server
+        mcp_server._transact(
+            real_db, "[[:function/f :static true]]", "2026-01-01T00:00:00.000Z",
+        )
+        index_path = fact_index.index_path_for(mcp_server._graph_path_current())
+        results = fact_index.query_facts(
+            index_path, "static", top_n=10, boost=2.0, historical_discount=1.0
+        )
+        assert [r[:3] for r in results] == [[":function/f", ":static", "true"]]
 
 
 class TestBookkeepingWritesFactIndex:

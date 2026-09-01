@@ -1464,15 +1464,25 @@ a wrong answer rather than by reasoning:
 | values compared as strings (`:version 1` vs `'1'`) | 2 |
 | boolean-valued facts counted apart | 83 |
 
-The last one is not a normalization but a **defect the audit found**:
-`_FACTS_TRIPLE_PATTERN` (mcp_server.py) accepts a quoted string, a keyword, a
-number or a `#uuid`/`#inst` literal as a triple's value, and nothing else — so
-`[:function/f :static true]` is transacted into the graph and **never reaches
-the fact index at all**. 83 facts on this graph, every one of them `:static`.
-They are excluded from `divergence` by Python type, not by rendered text, and
-reported separately. Boolean-valued facts being invisible to memory retrieval
-is a bug in its own right; it is not graph loss and the gate must not say it
-is.
+The last one is not a normalization but a **defect the audit found**, filed as
+#303 and **since fixed**: `_FACTS_TRIPLE_PATTERN` (mcp_server.py) accepted a
+quoted string, a keyword, a number or a `#uuid`/`#inst` literal as a triple's
+value and nothing else — so `[:function/f :static true]` was transacted into
+the graph and **never reached the fact index at all**. 83 facts on this graph,
+every one of them `:static`, invisible to memory retrieval as much as to this
+audit. At the time of the run above they were excluded from `divergence` by
+Python type, not by rendered text, and reported separately as
+`unindexed_boolean_facts`.
+
+The numbers in the table above are the measurement as taken, and stand.
+What changed after it: the pattern gained a `true|false` alternative, the index
+stores the EDN spelling (lowercase `true`/`false`), `fact_audit._index_text`
+renders minigraf's Python `True` back into that text, and the
+`unindexed_boolean_facts` key was **deleted rather than left reporting zero**.
+A re-run on a freshly built graph therefore cross-checks those 83 facts instead
+of setting them aside. Note what the exclusion cost while it stood: a `:static`
+fact the graph had genuinely lost and one the index could never hold produced
+the same number.
 
 **Corrupted: 3 of 18 targets detected, stderr 0 of 18.** Each target is one
 4 KiB page overwritten with `0xff` on a copy of the graph, measured in a fresh

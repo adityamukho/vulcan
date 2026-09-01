@@ -225,9 +225,12 @@ class TestAppendIngestionReport:
         assert "| Fact-index divergence (#302) | **44**" in text
         assert "44 in the index but not the graph" in text
 
-    def test_excluded_boolean_facts_are_named_beside_a_zero(self, tmp_path):
-        """A zero that set 83 facts aside is not the same zero as one that
-        set none aside, and the table must not render them identically."""
+    def test_a_zero_sets_nothing_aside(self, tmp_path):
+        """#303 taught the index to hold boolean-valued facts, so the row no
+        longer carries an "excluded" caveat -- the zero now means every fact
+        the graph produced was cross-checked. A stale key left over in a
+        metrics dict must not resurrect the note: a reader who sees facts set
+        aside would read the gate as narrower than it is."""
         metrics = {
             **self._clean_256_metrics(),
             "fact_audit": {
@@ -238,8 +241,9 @@ class TestAppendIngestionReport:
         report_path = tmp_path / "benchmark.md"
         append_ingestion_report(metrics, report_path)
         text = report_path.read_text()
-        assert "83 boolean-valued facts excluded" in text
-        assert "not graph loss" in text
+        assert "| Fact-index divergence (#302) | 0 (29465 facts cross-checked) |" in text
+        assert "excluded" not in text
+        assert "boolean" not in text
 
     def test_an_audit_that_could_not_run_renders_unverified_not_zero(self, tmp_path):
         metrics = {

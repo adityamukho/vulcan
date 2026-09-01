@@ -228,28 +228,20 @@ def _fact_audit_row(metrics: dict[str, Any]) -> str:
             f"| Fact-index divergence (#302) | **UNVERIFIED** -- the audit "
             f"could not run: `{audit['audit_error']}` |"
         )
-    # Rendered even when it is zero and even when divergence is nonzero: it
-    # is the one number that says how much of the comparison was set aside,
-    # and a reader who cannot see it cannot tell a clean audit from a narrow
-    # one.
-    excluded = audit.get("unindexed_boolean_facts")
-    excluded_note = (
-        f", {excluded} boolean-valued facts excluded (never indexed -- "
-        f"a fact index defect, not graph loss)"
-        if excluded else ""
-    )
+    # No "excluded" note any more: #303 taught the index to hold
+    # boolean-valued facts, so nothing is set aside and every fact the graph
+    # produces is cross-checked. A count that is always zero would read like a
+    # covered case while covering nothing -- see fact_audit.py's docstring.
     divergence = audit.get("divergence", 0)
     if not divergence:
         return (
             f"| Fact-index divergence (#302) | 0 "
-            f"({audit.get('graph_facts', '?')} facts cross-checked"
-            f"{excluded_note}) |"
+            f"({audit.get('graph_facts', '?')} facts cross-checked) |"
         )
     return (
         f"| Fact-index divergence (#302) | **{divergence}**: "
         f"{audit.get('missing_from_graph', '?')} in the index but not the graph, "
-        f"{audit.get('missing_from_index', '?')} in the graph but not the index"
-        f"{excluded_note} |"
+        f"{audit.get('missing_from_index', '?')} in the graph but not the index |"
     )
 
 

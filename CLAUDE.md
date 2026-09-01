@@ -66,15 +66,33 @@ audit diverges by exactly zero — verified on the 822-commit at-scale graph, at
 a cost of 0.8s. Two normalizations buy that exactness and both are
 load-bearing: index entities are mapped forward into UUID space the way
 minigraf derives them (`uuid5(NAMESPACE_OID, ":the/ident")`), and graph values
-are compared as strings (minigraf returns `1`, the index stored `'1'`).
+are rendered back into the datalog text the index stored (`_index_text`:
+minigraf returns `1`, the index holds `'1'`).
 
-**The audit also found that boolean-valued facts are NEVER indexed.**
-`_FACTS_TRIPLE_PATTERN` accepts a quoted string, keyword, number or
-`#uuid`/`#inst` literal as a value — not a bare `true`/`false` — so
-`[:function/f :static true]` reaches the graph and never the index (83 facts on
-the at-scale graph, all `:static`). They are excluded from `divergence` by
-Python type and counted separately. This is a fact-index bug, not graph loss:
-those facts are invisible to memory retrieval too.
+**The audit also found that boolean-valued facts were never indexed, and #303
+fixed it.** `_FACTS_TRIPLE_PATTERN` accepted a quoted string, keyword, number
+or `#uuid`/`#inst` literal as a value but not a bare `true`/`false`, so
+`[:function/f :static true]` reached the graph and never the index — 83 facts
+on the at-scale graph, all `:static`, invisible to memory retrieval as well as
+to the audit. The pattern now has a `true|false` alternative, and the audit's
+`unindexed_boolean_facts` key is **deleted, not zeroed**: a key that always
+reports 0 reads like a covered case while covering nothing, and while the
+exclusion stood a `:static` fact the graph had genuinely LOST was
+indistinguishable from one the index could never hold.
+
+Two things the fix depends on. The index stores the **EDN spelling**, lowercase
+`true`/`false` — the datalog text it was transacted from, the same rule every
+other value type follows — and `fact_audit._index_text` renders minigraf's
+Python `True` back into it. That test is on the Python **type**, never the
+text, so a fact whose value is genuinely the string `"True"` keeps its
+capitalization on both sides and stays auditable. No graph format bump: stored
+facts stay readable, the index simply gains rows going forward. Existing graphs
+are not repaired — index rows are written at transact time — so a graph that
+needs `:static` searchable gets rebuilt, per the standing decision below.
+
+No other bare EDN literal has the same hole today: `nil` is emitted by no code
+path in `mcp_server.py`, and it was deliberately NOT added to the pattern
+rather than added speculatively.
 
 **Graph format version — there is no migration, by design.** `GRAPH_FORMAT_VERSION`
 (mcp_server.py) is stamped as `:ingestion/format-version` and ingestion refuses to
