@@ -83,6 +83,14 @@ _SWEEP_SUMMARY_RE = re.compile(
 # So roughly 11% of the graph vanished with every pattern here reading clean.
 # "No error signals" means "nothing was printed", NOT "the graph is intact".
 #
+# THE GAP IS NOW COVERED ELSEWHERE, NOT HERE. `evals/at_scale/fact_audit.py`
+# cross-checks the graph against its fact index -- a second witness on a
+# different storage engine -- and `_exit_code` gates on that divergence being
+# zero. Nothing below changed: a detector for the absence of output cannot be
+# built out of output, so this module stays exactly as blind as it was. Read a
+# clean scan here as "nothing was printed" and the audit's `divergence: 0` as
+# "the graph still produces what it wrote"; neither substitutes for the other.
+#
 # An earlier version of this comment cited the index-root case and compared
 # CHARACTER counts across two DIFFERENT graphs, which was an invalid
 # comparison: re-measured properly, garbling an index root loses nothing. The

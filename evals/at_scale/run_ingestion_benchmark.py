@@ -28,6 +28,7 @@ REPO_ROOT = Path(__file__).parent.parent.parent.resolve()
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from evals.at_scale.fact_audit import audit_graph_against_index  # noqa: E402
 from evals.at_scale.metrics import latency_stats, throughput_per_minute  # noqa: E402
 from evals.at_scale.stderr_capture import (  # noqa: E402
     TeeStderrFailure,
@@ -286,6 +287,21 @@ async def run_ingestion_benchmark(
     graph_size_bytes = os.path.getsize(graph_path) if graph_path.exists() else 0
     index_size_bytes = os.path.getsize(index_path) if os.path.exists(index_path) else 0
 
+    # #302. Everything above this line is stderr-derived, and a graph that
+    # silently loses facts prints nothing: #302 measured ~11% of a graph
+    # vanishing with zero bytes on stderr and zero error_signals. This is the
+    # only check here that reads the graph's CONTENT rather than its logs.
+    #
+    # Runs here, before the compare_ignore branch below rebinds the module to
+    # a second graph, and after _run_ingestion's finally has committed and
+    # closed the batched index writer -- an audit against a half-written index
+    # would report the harness's own timing as divergence. Also deliberately
+    # AFTER peak_rss_kb is sampled: the scan materialises the fact set, and
+    # that is the instrument's memory, not the ingestion's.
+    fact_audit = audit_graph_against_index(
+        index_path, expected_graph_path=str(graph_path)
+    )
+
     from evals.at_scale.report import runtime_versions
 
     versions = runtime_versions()
@@ -315,6 +331,9 @@ async def run_ingestion_benchmark(
         "poll_offsets": poll_offsets,
         "checkpoint_summary": checkpoint_summary,
         "ingest_error": ingest_error,
+        # #302. divergence == 0 is the pass; see fact_audit.py for why it is
+        # exactly zero on a clean run rather than "small".
+        "fact_audit": fact_audit,
         # #256. Not derivable from commits_ingested or final_status: the
         # per-commit handler isolates failures and increments `processed`
         # anyway, so both are blind to a dropped commit.
@@ -372,7 +391,8 @@ async def run_ingestion_benchmark(
 
 def _exit_code(metrics: dict[str, Any]) -> int:
     """Return 1 if ingestion ended in an error state, dropped any commit,
-    logged a #251 signature, or could not be verified at all; else 0.
+    logged a #251 signature, diverged from its own fact index, or could not be
+    verified at all; else 0.
 
     Clauses 2 and 3 matter because `final_status` cannot see either --
     _run_ingestion isolates per-commit failures by design rather than
@@ -384,16 +404,37 @@ def _exit_code(metrics: dict[str, Any]) -> int:
     run into a green one: with an incomplete capture, `skipped_commits ==
     []` means "nothing was seen", not "nothing happened".
 
+    Clause 5 (#302) is the only one that reads the graph's CONTENT. The four
+    above it are all derived from what the run PRINTED, and a graph that
+    silently drops facts prints nothing -- measured, ~11% of a graph gone with
+    every stderr pattern reading clean. It gates on `divergence` with NO
+    tolerance because a clean audit diverges by exactly zero (fact_audit.py);
+    it also fails on `audit_error`, because an audit that could not run is
+    unverified, not verified-clean -- the same reasoning as clause 4.
+
     Every key is read with .get() so pre-#256 metrics files, which carry none
     of them, still evaluate. `is False` rather than `not ...` for
     stderr_capture_complete, so an ABSENT key (old file) stays clean while an
-    explicit False fails.
+    explicit False fails. An absent `fact_audit` is treated the same way, and
+    for the same reason: an old metrics file cannot be retro-audited.
     """
     if metrics.get("final_status") == "error":
         return 1
     if metrics.get("skipped_commits") or metrics.get("error_signals"):
         return 1
     if metrics.get("tee_failure") or metrics.get("stderr_capture_complete") is False:
+        return 1
+    audit = metrics.get("fact_audit")
+    if audit and (audit.get("divergence") or audit.get("audit_error")):
+        return 1
+    # The audit's own blind spot, closed with the one reference it does not
+    # have: a fact absent from BOTH witnesses is invisible to a comparison of
+    # the two, and two empty witnesses agree perfectly. `commits_ingested` is
+    # an independent count, so a run that processed commits and produced a
+    # graph reading back completely empty is a failure however cleanly the
+    # two sides matched. Guarded on commits_ingested being truthy, so a
+    # zero-commit run is not failed for having no facts.
+    if metrics.get("commits_ingested") and audit and audit.get("graph_facts") == 0:
         return 1
     return 0
 

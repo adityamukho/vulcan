@@ -196,6 +196,46 @@ class TestAppendIngestionReport:
         assert "LOWER BOUNDS" in text
         assert "pump did not complete cleanly" in text
 
+    def test_a_clean_run_reports_zero_fact_index_divergence(self, tmp_path):
+        metrics = {
+            **self._clean_256_metrics(),
+            "fact_audit": {"divergence": 0, "graph_facts": 1894, "audit_error": None},
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "| Fact-index divergence (#302) | 0 (1894 facts cross-checked) |" in text
+
+    def test_a_silent_loss_is_visible_beside_an_error_signature_count_of_zero(
+        self, tmp_path
+    ):
+        """#302's exact shape: nothing was printed, so "Error signatures | 0"
+        renders clean, and the only row that can contradict it is this one."""
+        metrics = {
+            **self._clean_256_metrics(),
+            "fact_audit": {
+                "divergence": 44, "missing_from_graph": 44, "missing_from_index": 0,
+                "graph_facts": 356, "audit_error": None,
+            },
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "| Error signatures (#251/#256) | 0 |" in text
+        assert "| Fact-index divergence (#302) | **44**" in text
+        assert "44 in the index but not the graph" in text
+
+    def test_an_audit_that_could_not_run_renders_unverified_not_zero(self, tmp_path):
+        metrics = {
+            **self._clean_256_metrics(),
+            "fact_audit": {"divergence": 0, "audit_error": "OperationalError: no such table"},
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "| Fact-index divergence (#302) | **UNVERIFIED**" in text
+        assert "no such table" in text
+
     def test_the_256_rows_still_render_for_a_pre_fix_result(self, tmp_path):
         """Same defensive precedent as the poll and checkpoint rows: a result
         JSON written before 2026-08-16 carries none of these keys. Absence
@@ -208,6 +248,7 @@ class TestAppendIngestionReport:
         assert "| Stderr capture (#256) | not measured" in text
         assert "| Commits dropped (#256) | not measured" in text
         assert "| Error signatures (#251/#256) | not measured" in text
+        assert "| Fact-index divergence (#302) | not measured" in text
         assert "NOT zero" in text
 
 

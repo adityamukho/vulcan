@@ -208,6 +208,39 @@ def _error_signals_row(metrics: dict[str, Any]) -> str:
     )
 
 
+def _fact_audit_row(metrics: dict[str, Any]) -> str:
+    """The "Fact-index divergence" row (#302).
+
+    Deliberately adjacent to the "Error signatures" row, because the two are
+    easy to confuse and only one of them can see a silent loss. A `0` there
+    means nothing was PRINTED; a `0` here means the graph still produces every
+    fact its own index witnessed. #302 measured ~11% of a graph vanishing with
+    the first reading 0 throughout.
+    """
+    audit = metrics.get("fact_audit")
+    if audit is None:
+        return (
+            "| Fact-index divergence (#302) | not measured "
+            "(pre-2026-09-01 harness; a silent loss would not have been seen) |"
+        )
+    if audit.get("audit_error"):
+        return (
+            f"| Fact-index divergence (#302) | **UNVERIFIED** -- the audit "
+            f"could not run: `{audit['audit_error']}` |"
+        )
+    divergence = audit.get("divergence", 0)
+    if not divergence:
+        return (
+            f"| Fact-index divergence (#302) | 0 "
+            f"({audit.get('graph_facts', '?')} facts cross-checked) |"
+        )
+    return (
+        f"| Fact-index divergence (#302) | **{divergence}**: "
+        f"{audit.get('missing_from_graph', '?')} in the index but not the graph, "
+        f"{audit.get('missing_from_index', '?')} in the graph but not the index |"
+    )
+
+
 def _residue_verdict_row(result: dict[str, Any]) -> str:
     """The "Verdict" row (#256/#276): the M <= N reading, in words.
 
@@ -351,6 +384,7 @@ def append_ingestion_report(
         _stderr_capture_row(metrics),
         _skipped_commits_row(metrics),
         _error_signals_row(metrics),
+        _fact_audit_row(metrics),
     ]
     if "ignore_comparison" in metrics:
         comp = metrics["ignore_comparison"]
@@ -550,10 +584,10 @@ def _query_ingestion_block(report: dict[str, Any]) -> list[str]:
     resulting metrics -- so its section could show a clean sweep of query
     latencies measured over a graph that had silently dropped commits.
 
-    _stderr_capture_row / _skipped_commits_row / _error_signals_row are reused
-    verbatim rather than re-rendered from the same keys. That is the point: an
-    Ingestion Run section and a Query Correctness Run section must not be able
-    to disagree about how a dirty run reads.
+    _stderr_capture_row / _skipped_commits_row / _error_signals_row /
+    _fact_audit_row are reused verbatim rather than re-rendered from the same
+    keys. That is the point: an Ingestion Run section and a Query Correctness
+    Run section must not be able to disagree about how a dirty run reads.
     """
     metrics = report.get("ingestion")
     if metrics is None:
@@ -574,6 +608,7 @@ def _query_ingestion_block(report: dict[str, Any]) -> list[str]:
         _stderr_capture_row(metrics),
         _skipped_commits_row(metrics),
         _error_signals_row(metrics),
+        _fact_audit_row(metrics),
     ]
 
 

@@ -55,6 +55,18 @@ Read with `evals/at_scale/probe_per_commit_cost.py`.
 The fact index is bi-temporal: it includes historical (retracted/superseded) facts
 alongside current ones, labeled with their validity window.
 
+**The index is also the graph's only independent witness (#302).** It is written
+from the same triples in the same transaction boundary but by a different
+storage engine, so `evals/at_scale/fact_audit.py` can ask what the graph has
+stopped producing. That gap is real: garbling one fact page cost ~11% of a
+measured graph with **zero bytes on stderr and zero `error_signals`**, so
+`stderr_capture.py` — the tier's other detector — reported it clean. The
+at-scale gate now fails on any divergence, with NO tolerance, because a clean
+audit diverges by exactly zero. Two normalizations buy that exactness and both
+are load-bearing: index entities are mapped forward into UUID space the way
+minigraf derives them (`uuid5(NAMESPACE_OID, ":the/ident")`), and graph values
+are compared as strings (minigraf returns `1`, the index stored `'1'`).
+
 **Graph format version — there is no migration, by design.** `GRAPH_FORMAT_VERSION`
 (mcp_server.py) is stamped as `:ingestion/format-version` and ingestion refuses to
 run against any other version, including an absent stamp (which means the graph

@@ -75,6 +75,16 @@ that was wrong and has been corrected here.
 > blind to that by design. Query latencies measured over a graph that silently
 > lost commits are not comparable to ones that were not.
 >
+> **2026-09-01 — `Error signatures | 0` never meant "the graph is intact"
+> (#302).** Every row above it in an Ingestion Run table is derived from what
+> the run PRINTED, and a graph that silently drops facts prints nothing:
+> garbling one fact page cost ~11% of a measured graph with zero bytes on
+> stderr. Sections from this date onward carry a **`Fact-index divergence
+> (#302)`** row, which cross-checks the graph against its own fact index — a
+> second witness on a different storage engine — and is gated at exactly zero.
+> Earlier sections have no such row; read that absence as "a silent loss would
+> not have been seen", never as zero.
+>
 > **An absent `## Per-Commit Cost Fit` section means the #260 probe was not
 > run** — never that cost was flat. The nightly does not run
 > `probe_per_commit_cost.py`, so most entries below have no such section. A
@@ -1415,6 +1425,13 @@ index root page loses nothing. So "no error signals" means "nothing was
 printed", not "the graph is intact". (An earlier note here cited the index-root
 case and compared character counts across two different graphs — an invalid
 comparison. Re-measured, the conclusion holds but that evidence did not.)
+
+**Covered as of 2026-09-01 (#302), by a different instrument.** The finding
+above stands unchanged — the scanner is exactly as blind as it was, and no
+patch to it could help, since the failure mode is the absence of output. What
+changed is that the harness no longer relies on it alone: `fact_audit.py`
+cross-checks the graph against its fact index and `_exit_code` gates on that
+divergence being zero. See `## Graph vs Fact Index — 302-graph-index-divergence`.
 
 `stderr_capture.py`'s `page_out_of_bounds`, `serde_deserialization_error` and
 `stream_all_entries_expected_leaf_page` were not provoked — they are internal
