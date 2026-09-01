@@ -6,16 +6,66 @@ name: At-Scale Benchmark (nightly)
 # this repo's real history grows) -- not benchmark-number regressions. The tier is
 # deliberately observational (see evals/at_scale/benchmark.md), so this workflow
 # does not gate on or compare any metric; it only fails if either script exits
-# non-zero. A failed scheduled run notifies via GitHub's own default workflow
-# failure notifications -- no extra alerting is wired up here.
+# non-zero.
+#
+# ALERTING (#295). This used to rely on "GitHub's own default workflow failure
+# notifications", with no extra alerting wired up. That assumption failed
+# silently and expensively: the job was red for 21 CONSECUTIVE NIGHTS
+# (2026-08-11 .. 2026-08-31) and nobody noticed. Both underlying bugs were
+# reported correctly by CI every single night -- detection worked, delivery did
+# not. The cost was not cosmetic: this nightly is the only signal that would
+# catch a regression from the minigraf 2.0.0 upgrade (#284), and it was
+# unusable for exactly the period that mattered.
+#
+# So a failure now FILES AN ISSUE. Three properties make that useful rather
+# than just louder:
+#
+#   1. It DEDUPES. Filing one issue per red night would have produced 21 issues
+#      for that streak, which is worse than silence -- that volume is precisely
+#      what gets muted. An existing open `nightly-failure` issue gets a comment
+#      instead.
+#   2. It CLOSES ITSELF on green, so the issue's state answers "is the nightly
+#      broken right now?". Without this the issue outlives the fix and dedupe
+#      just makes staleness quieter.
+#   3. It is TESTABLE on demand via the simulate_failure input below, so the
+#      path can be exercised before it is ever needed. A notifier nobody has
+#      watched fire is the exact shape of the thing that just failed for three
+#      weeks.
+#
+# WHAT THIS STILL DOES NOT CATCH -- read this before treating silence as green.
+# The issue is filed by a STEP INSIDE THE RUN, so it can only report failures
+# that happen once the run is underway. It is blind to:
+#
+#   * A run that never starts. A YAML syntax error in this file, the workflow
+#     being disabled (GitHub auto-disables scheduled workflows in repos with no
+#     activity for 60 days), a deleted/renamed default branch, or the schedule
+#     silently not firing all produce NO run and therefore NO issue.
+#   * The job failing before its first step -- runner unavailable, the
+#     `runs-on` image being retired, a permissions change revoking issues:write.
+#   * The notifier itself failing. If `gh` errors, the run is red and nothing
+#     is filed. There is no second channel to report that; the recursion has to
+#     stop somewhere.
+#
+# In all of those cases this workflow is silent, and silence is exactly what it
+# looks like when everything is fine. The only thing that closes that gap is a
+# check EXTERNAL to this run -- something that notices the absence of a nightly
+# result rather than the presence of a failure. That does not exist here, and
+# is deliberately not pretended otherwise: #295's whole lesson was that an
+# assumed notification channel had never been verified.
 
 on:
   schedule:
     - cron: "0 3 * * *"  # 03:00 UTC daily
-  workflow_dispatch: {}  # allows manual runs to verify the workflow itself
+  workflow_dispatch:     # allows manual runs to verify the workflow itself
+    inputs:
+      simulate_failure:
+        description: "Force the benchmark step to fail, to exercise the issue-filing path end to end"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  issues: write  # #295: the failure path files/comments/closes an issue
 
 jobs:
   at-scale-benchmark:
@@ -62,9 +112,91 @@ jobs:
       - name: Add project to PYTHONPATH
         run: echo "PYTHONPATH=${{ github.workspace }}" >> $GITHUB_ENV
 
+      - name: Simulate a failure (manual dispatch only)
+        # Exercises the issue-filing path below without waiting for a real
+        # breakage, and without touching the benchmark scripts. Cannot fire on
+        # a scheduled run: `inputs` is empty there, so the expression is false.
+        if: inputs.simulate_failure
+        run: |
+          echo "simulate_failure=true -- failing deliberately to exercise the notifier"
+          exit 1
+
       - name: Run ingestion benchmark
+        id: ingestion
         run: python -m evals.at_scale.run_ingestion_benchmark --repo-path . --branch HEAD
 
       - name: Run query-correctness benchmark
+        id: query
         if: always()
         run: python -m evals.at_scale.run_query_benchmark --repo-path .
+
+      # --- #295 alerting -------------------------------------------------
+      # `failure() || cancelled()` rather than just `failure()`: a cancelled
+      # run is a real signal here, not noise. This job was CANCELLED nightly
+      # from 2026-08-03 to 2026-08-07 for blowing its old 30-minute budget,
+      # which is exactly the kind of "never reached a verdict" outcome that
+      # should reach a human.
+      - name: File or update the failure issue
+        if: (failure() || cancelled()) && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          INGESTION_OUTCOME: ${{ steps.ingestion.outcome }}
+          QUERY_OUTCOME: ${{ steps.query.outcome }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # Naming WHICH half broke matters: this session established that the
+          # ingestion and query steps fail for unrelated reasons with opposite
+          # fixes, and conflating them sent an investigation at the wrong
+          # commit. An outcome of "" means the step never ran.
+          body=$(printf '%s\n' \
+            "The at-scale nightly failed." \
+            "" \
+            "| | |" \
+            "|---|---|" \
+            "| Run | $RUN_URL |" \
+            "| Trigger | \`$EVENT\` |" \
+            "| Ingestion step | \`${INGESTION_OUTCOME:-did not run}\` |" \
+            "| Query step | \`${QUERY_OUTCOME:-did not run}\` |" \
+            "" \
+            "The two steps fail for unrelated reasons and want opposite fixes" \
+            "(#295) -- read the outcomes above before assuming which one broke." \
+            "" \
+            "This issue is filed and closed automatically by" \
+            "\`.github/workflows/at-scale-benchmark-nightly.yml\`. While it stays" \
+            "open, later failures are added as comments rather than new issues;" \
+            "it closes itself on the first green run.")
+
+          existing=$(gh issue list --label nightly-failure --state open \
+                       --limit 1 --json number --jq '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            echo "Existing open issue #$existing -- commenting instead of filing a duplicate."
+            printf '%s\n' "$body" | gh issue comment "$existing" --body-file -
+          else
+            printf '%s\n' "$body" | gh issue create \
+              --title "At-scale nightly failed" \
+              --label nightly-failure \
+              --body-file -
+          fi
+
+      - name: Close the failure issue on a green run
+        if: success() && github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Without this the issue outlives the fix and its state stops
+          # answering "is the nightly broken right now?" -- which is the only
+          # question this whole mechanism exists to answer.
+          existing=$(gh issue list --label nightly-failure --state open \
+                       --limit 1 --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" \
+              --comment "The at-scale nightly is green again: $RUN_URL"
+            echo "Closed #$existing."
+          else
+            echo "No open nightly-failure issue; nothing to close."
+          fi
