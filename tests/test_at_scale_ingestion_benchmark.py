@@ -26,6 +26,8 @@ _EXPECTED_METRIC_KEYS = {
     "poll_count", "poll_duty_fraction", "poll_offsets", "checkpoint_summary",
     "skipped_commits", "error_signals", "correction_sweep_summaries",
     "correction_sweep_skipped", "stderr_capture_complete", "ingest_error",
+    # #302: the one key derived from the graph's CONTENT rather than its logs.
+    "fact_audit",
     # #284 item 4: attribution. A wall-clock number is not comparable across
     # runs without the minigraf version that produced it.
     "minigraf_version", "python_version",
@@ -107,6 +109,70 @@ class TestExitCodeGate:
             "stderr_capture_complete": False,
         }) == 1
 
+    def test_a_fact_index_divergence_fails_the_run(self):
+        """#302. Every other key here reads clean -- nothing was printed, no
+        commit was dropped, the capture completed -- which is exactly the
+        state a silently corrupted graph produces."""
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+            "fact_audit": {"divergence": 44, "audit_error": None},
+        }) == 1
+
+    def test_an_audit_that_could_not_run_fails_the_run(self):
+        """Unverified is not verified-clean: the same reasoning as an
+        incomplete stderr capture."""
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+            "fact_audit": {"divergence": 0, "audit_error": "RuntimeError: boom"},
+        }) == 1
+
+    def test_a_zero_divergence_audit_is_clean(self):
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+            "fact_audit": {"divergence": 0, "audit_error": None},
+        }) == 0
+
+    def test_an_absent_audit_stays_clean_for_old_metrics(self):
+        """Same precedent as stderr_capture_complete: a metrics file written
+        before this harness cannot be retro-audited."""
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+        }) == 0
+
+    def test_a_graph_that_reads_back_empty_fails_even_with_a_matching_index(self):
+        """The audit's blind spot: two empty witnesses agree perfectly.
+        commits_ingested is the independent count that catches it."""
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+            "commits_ingested": 808,
+            "fact_audit": {"divergence": 0, "audit_error": None, "graph_facts": 0},
+        }) == 1
+
+    def test_a_zero_commit_run_is_not_failed_for_having_no_facts(self):
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+            "commits_ingested": 0,
+            "fact_audit": {"divergence": 0, "audit_error": None, "graph_facts": 0},
+        }) == 0
+
     def test_a_complete_capture_with_no_signals_is_still_clean(self):
         """Counterpart to the above: the flag must fail only when explicitly
         False, or it would fail every clean run too."""
@@ -168,6 +234,39 @@ class TestRunIngestionBenchmark:
         assert metrics["correction_sweep_skipped"] == 0
         assert "tee_failure" not in metrics
         assert _exit_code(metrics) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_clean_run_diverges_from_its_fact_index_by_exactly_zero(
+        self, git_repo, tmp_path
+    ):
+        """#302. The gate has no tolerance, so this is the load-bearing claim:
+        a real ingestion, through the real harness, must produce a graph and
+        an index that agree fact for fact. Anything above zero here would be
+        permanent false red on the nightly, not a caught corruption.
+
+        `graph_facts > 0` is not decoration -- an audit of an empty graph
+        against an empty index also diverges by zero. Neither is the
+        independent re-count below: asserting only on the numbers the audit
+        reported about itself passes just as happily when the harness stops
+        auditing and hands back a constant (verified by ablation).
+        """
+        import mcp_server
+
+        graph_path = tmp_path / "bench.graph"
+        metrics = await run_ingestion_benchmark(
+            str(git_repo), "HEAD", graph_path, poll_interval=0.05
+        )
+        audit = metrics["fact_audit"]
+        assert audit["audit_error"] is None
+        assert audit["graph_facts"] > 0
+        assert audit["divergence"] == 0, audit["missing_from_graph_sample"]
+        assert _exit_code(metrics) == 0
+
+        recount = mcp_server.handle_minigraf_query(
+            "[:find (count ?e) :where [?e ?a ?v]]"
+        )["results"][0][0]
+        assert audit["graph_facts"] == recount
+        assert audit["index_current_rows"] == recount
 
     @pytest.mark.asyncio
     async def test_checkpoint_summary_is_present_and_self_consistent(self, git_repo, tmp_path):
