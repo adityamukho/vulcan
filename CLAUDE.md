@@ -200,8 +200,35 @@ value bytes. It is VERSION-INVARIANT — measured identically on 1.2.3 and 2.0.0
 `:parent` are therefore transacted ONE PER CALL at four sites; never "simplify"
 those loops into a single batch. All four are now regression-guarded.
 
-`mcp_server.py` enforces it through `_DbLeaseManager` (#255), which replaced the
-old `_db = None` "release the lock" idiom — that global is **deleted**, so
+**Which triples go down that one-per-call path is decided by SUBSTRING match on
+the whole rendered triple, and its safety rests on an unwritten invariant:
+code-entity string-valued attributes never contain `:`.** Eight sites classify
+with `":contains" in t` / `":introduced-by" not in t` and friends
+(`_forward_apply`, `_reverse_apply`, `_re_date_structural_facts`,
+`_ingest_close`, the correction sweep), matching anywhere in the string —
+including inside a quoted VALUE. #232 filed that as silent corruption and was
+closed 2026-09-01 as an **accepted residual**, on a measurement rather than an
+argument: on the 831-commit at-scale graph, **0 of 7,235** code-entity
+`:description`/`:file`/`:path` values contain even one colon, because those
+attributes hold identifiers and paths and every classification literal starts
+with `:`.
+
+The 24 values that DO carry the literals are commit `:description`/`:subject`
+(this repo's own subjects, e.g. "Retract `:introduced-by` at every entity close
+site"), and they reach only the two `:contains` splits — where a misroute sends
+the triple into the one-per-call loop instead of the batch, i.e. toward the
+SAFE path. Nothing is dropped.
+
+**So before adding any free-text attribute to a code entity — a docstring, a
+comment, a commit-message-derived summary — reopen #232 and switch those sites
+to an anchored attribute-slot match (`^\[\S+\s+:contains\s`) FIRST.** The
+corrupting direction becomes reachable the moment such an attribute exists: a
+structural triple wrongly filtered out of the re-dated set leaves an entity with
+lineage but no type, name or file, silently. The same applies to ingesting a
+repository with `:` in a tracked file path.
+
+`mcp_server.py` enforces the single-handle invariant through `_DbLeaseManager`
+(#255), which replaced the old `_db = None` "release the lock" idiom — that global is **deleted**, so
 ignore any comment still describing it. The refcount is authoritative: the
 handle opens at 0 -> 1 and drops at 1 -> 0, and every acquisition in between
 reuses it. Before touching DB lifecycle, read the invariant comment above
