@@ -4165,6 +4165,41 @@ _FACTS_TRIPLE_PATTERN = re.compile(
 )
 _TAGGED_LITERAL_PATTERN = re.compile(r'#(?:uuid|inst)\s+"([^"\\]*)"')
 
+# `nil` is NOT in the value group above, and #306 is the decision not to put it
+# there. Indexing it would mean a row whose value is the text 'nil' -- "no
+# value" occupying a slot in a lexical retrieval index and answering a search
+# for "nil" -- and it would need fact_audit._index_text to grow a `None` case
+# in the same commit, since minigraf returns None and str(None) is 'None'. A
+# pattern-only fix trades one divergence for another. So a nil-valued triple is
+# refused at the transact boundary instead: it is not a storable value, and the
+# at-scale audit gate (#302, zero tolerance) stays honest -- a nil fact found in
+# a graph is a genuine write-path defect, not the index being blamed for what
+# it cannot hold.
+_EDN_STRING_PATTERN = re.compile(r'"(?:[^"\\]|\\.)*"')
+_NIL_VALUE_PATTERN = re.compile(
+    r'\[(?:\:[^\s\]]+|' + _TAGGED_LITERAL + r')\s+\:[^\s\]]+\s+nil\]'
+)
+
+
+def _has_nil_valued_triple(facts_str: str) -> bool:
+    r"""True if facts_str contains a triple whose VALUE is a bare `nil`.
+
+    Quoted strings are blanked before the scan, and that is load-bearing
+    rather than tidy: a note written ABOUT this defect carries the offending
+    triple as prose, so a raw text scan would refuse a legitimate write.
+    `_FACTS_TRIPLE_PATTERN` shares the blind spot but pays only a spurious
+    index row for it -- here the cost is a rejected write, so this scan cannot
+    inherit the shortcut. Blanking leaves `#uuid ""`, which `_TAGGED_LITERAL`
+    still matches, so a #uuid-tagged entity stays detectable.
+
+    Entity and attribute token shapes are `_FACTS_TRIPLE_PATTERN`'s own so the
+    two cannot drift on what counts as a triple, and the trailing `\]` is what
+    makes the unanchored `nil` safe: `[:d/x :note nilpotent]` is left holding
+    `potent]` and does not match, exactly as `truthy` does not match `true`
+    (#303).
+    """
+    return _NIL_VALUE_PATTERN.search(_EDN_STRING_PATTERN.sub('""', facts_str)) is not None
+
 
 def _unwrap_facts_block_token(raw: str) -> str:
     """Strip quoting/tagging from a captured entity or value token: a quoted
@@ -4444,6 +4479,16 @@ def handle_minigraf_transact(facts: str, reason: str) -> Dict[str, Any]:
     """
     if not reason or not reason.strip():
         return {"ok": False, "error": "reason is required for all writes"}
+    # #306: refuse the whole block, before the graph is touched. minigraf
+    # accepts a nil-valued triple, so nothing downstream would stop it, and
+    # the fact index cannot hold one -- see _has_nil_valued_triple.
+    if _has_nil_valued_triple(facts):
+        return {
+            "ok": False,
+            "error": "nil is not a storable value: a nil-valued triple reaches "
+                     "the graph but never the fact index (#306). Omit the "
+                     "attribute, or give it an explicit value.",
+        }
     # Schema validation — closed-world enforcement on parseable string-valued triples.
     # Only string-valued triples are schema-validated. Keyword-valued triples
     # (e.g. relationship edges like [:service/auth :calls :component/jwt]) are
