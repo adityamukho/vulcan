@@ -74,10 +74,23 @@ nothing. See `docs/superpowers/specs/2026-08-14-ident-rule-r3-and-format-version
 **Single-handle invariant.** At most one live `MiniGrafDb` handle may exist per
 process. Two handles on one file each cache their own `page_count` and corrupt
 each other — the flaky `Page N out of bounds (total pages: M)` (#251, #253,
-project-minigraf/minigraf#304). minigraf enforces this as of 1.2.2 (hence the
-`minigraf>=1.2.3` floor): a second open now raises `Database is already open in
-this process` instead of silently succeeding. That makes the bug visible, not
-absent.
+project-minigraf/minigraf#304). minigraf has enforced this since 1.2.2: a second
+open raises `Database is already open in this process` instead of silently
+succeeding. That makes the bug visible, not absent.
+
+**The floor is `minigraf>=2.0.0,<3.0.0`** as of #284 item 6. The upper bound is
+deliberate: with no cap, CI silently resolved 2.0.0 the day it shipped and ran
+red for days before anyone connected the two (#286). A major bump must be a
+decision, not a resolver outcome. `install.py` mirrors this spec and is
+version-aware — pyproject.toml is canonical, and the two have drifted before.
+
+**project-minigraf/minigraf#287 is still OPEN and is worked around here, not
+fixed.** Batching facts that share `(entity, attribute, valid_from)` into one
+transact silently keeps only the last, because the EAVT pending index omits
+value bytes. It is VERSION-INVARIANT — measured identically on 1.2.3 and 2.0.0
+— so the upgrade neither helped nor hurt. `:contains`, `:depends-on` and
+`:parent` are therefore transacted ONE PER CALL at four sites; never "simplify"
+those loops into a single batch. All four are now regression-guarded.
 
 `mcp_server.py` enforces it through `_DbLeaseManager` (#255), which replaced the
 old `_db = None` "release the lock" idiom — that global is **deleted**, so
