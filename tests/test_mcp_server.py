@@ -235,7 +235,7 @@ class TestHandlersLeaseRatherThanHold:
         call(mcp_server)
 
         assert mcp_server._lease_manager.lease_count == 0
-        assert not os.path.exists(graph + ".lock"), (
+        assert _another_process_can_open(graph), (
             "the handler returned still holding the graph file lock, so the "
             "prepare_hook subprocess cannot open the DB between turns"
         )
@@ -252,7 +252,7 @@ class TestHandlersLeaseRatherThanHold:
         assert mcp_server.open_db(graph) is None
         assert mcp_server._lease_manager.lease_count == 0
         assert mcp_server._lease_manager.path == graph
-        assert not os.path.exists(graph + ".lock")
+        assert _another_process_can_open(graph)
 
     def test_get_db_returns_a_leased_handle(self, tmp_path, monkeypatch):
         """get_db survives as a shim, but what it returns must be LEASED.
@@ -280,7 +280,7 @@ class TestHandlersLeaseRatherThanHold:
 
         mcp_server._reset_db_state()
         assert mcp_server._lease_manager.lease_count == 0
-        assert not os.path.exists(graph + ".lock")
+        assert _another_process_can_open(graph)
 
 
 class TestCallToolAcquiresOnlyForDbTools:
@@ -358,7 +358,7 @@ class TestCallToolAcquiresOnlyForDbTools:
         with pytest.raises(ValueError, match="Unknown tool"):
             asyncio.run(mcp_server.call_tool("no_such_tool", {}))
         assert mcp_server._lease_manager.lease_count == 0
-        assert not os.path.exists(graph + ".lock")
+        assert _another_process_can_open(graph)
 
 
 @contextlib.contextmanager
@@ -382,12 +382,12 @@ def _hold_lock_subprocess(path, exit_immediately=False, hold_seconds=None):
       alive and contending" and "holder has cleanly finished", but not
       "open() raises citing a holder that's already dead" — that combination
       is not reachable through genuine process death on this platform, only
-      through an unschedulable microsecond TOCTOU race. Tests that need to
-      exercised the dead-PID-detection logic that #284 deleted; they use
-      the PID yielded here (real, verifiably dead) to reconstruct that
-      on-disk artifact by hand and call the real function directly — see
-      test_self_heals_stale_lock_from_dead_pid and
-      test_self_heals_dead_holder_mid_loop for the full rationale.
+      through an unschedulable microsecond TOCTOU race.
+      The dead-PID-detection logic this mode was built to feed was deleted in
+      #284, along with the two tests this docstring used to name. The mode
+      survives because a real, verifiably-dead PID is still the honest way to
+      build a stale on-disk artifact by hand — see
+      test_a_dead_holders_leftover_lock_does_not_wedge_get_db.
 
     - hold_seconds=<float>: the subprocess holds the lock for that many real
       wall-clock seconds (a genuine `time.sleep` inside the subprocess, not a
@@ -434,6 +434,70 @@ def _hold_lock_subprocess(path, exit_immediately=False, hold_seconds=None):
             proc.terminate()
             proc.wait(timeout=5)
         proc.stdout.close()
+
+
+def _another_process_can_open(path):
+    """True if a SEPARATE process can open the graph at `path` right now.
+
+    Replaces `os.path.exists(path + ".lock")` as the way these tests ask "is
+    the graph free?" (#284 item 3). That file was minigraf's PID sidecar, which
+    2.0.0 deleted when it moved locking into the kernel. The substitution is
+    not cosmetic: `assert not os.path.exists(path + ".lock")` is a TAUTOLOGY
+    under 2.0.0 -- measured True even while a lease is demonstrably held
+    (lease_count == 1) -- so every such assertion silently stopped testing
+    anything while continuing to pass.
+
+    This asks the real question instead of inferring it from an implementation
+    detail, which is what the tests meant all along: the whole point of the
+    lease protocol is that a released lease frees the graph for the hook
+    subprocesses, and `_db is None` was never evidence of that. Works
+    identically on both minigraf versions, and on platforms that never had a
+    sidecar at all.
+
+    Costs a process spawn per call. That is why it is used at the sites whose
+    claim is genuinely cross-process, not sprinkled everywhere.
+    """
+    script = (
+        "import sys\n"
+        "from minigraf import MiniGrafDb\n"
+        "try:\n"
+        f"    MiniGrafDb.open({path!r})\n"
+        "except Exception:\n"
+        "    sys.exit(1)\n"
+        "sys.exit(0)\n"
+    )
+    proc = _subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, timeout=60
+    )
+    return proc.returncode == 0
+
+
+class TestAnotherProcessCanOpenIsHonest:
+    """Positive control for _another_process_can_open itself.
+
+    Every rewritten lock assertion rests on this helper. A helper that always
+    returned True would make "the graph is free after release" pass
+    everywhere -- re-creating, in a new place, exactly the tautology it was
+    introduced to remove. So it must be shown to DISCRIMINATE: False while a
+    lease is genuinely held, True once it is released.
+    """
+
+    def test_discriminates_between_held_and_released(self, tmp_path, monkeypatch):
+        import mcp_server
+
+        graph = str(tmp_path / "t.graph")
+        monkeypatch.setenv("MINIGRAF_GRAPH_PATH", graph)
+        mcp_server._reset_db_state()
+
+        with mcp_server.db_lease() as db:
+            mcp_server._db_execute(db, "(query [:find ?e :where [?e :ident ?v]])")
+            # Control on the control: prove a lease really is held, so a
+            # False below cannot be some unrelated open failure.
+            assert mcp_server._lease_manager.lease_count == 1
+            assert _another_process_can_open(graph) is False
+
+        assert mcp_server._lease_manager.lease_count == 0
+        assert _another_process_can_open(graph) is True
 
 
 class TestGetDbLockRetry:
@@ -521,69 +585,95 @@ class TestGetDbLockRetry:
         result = mcp_server.get_db()
         assert result is not None
 
-    def test_leaves_lock_alone_when_holder_pid_alive(self, tmp_path, monkeypatch):
+    def test_does_not_steal_the_graph_from_a_live_holder(self, tmp_path, monkeypatch):
+        """Renamed from test_leaves_lock_alone_when_holder_pid_alive (#284).
+
+        It asserted that a live holder's `.lock` file was still on disk after
+        our failed attempt -- i.e. that the stale-lock self-heal had not
+        stolen it. That self-heal is deleted and minigraf 2.0.0 writes no
+        sidecar, so the old assertion could only ever fail. The property is
+        unchanged and is now asked of the OS: after we contend and lose, the
+        holder must still hold it.
+        """
         monkeypatch.setattr("mcp_server.time.sleep", lambda s: None)
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
         mcp_server._reset_db_state()
         mcp_server.open_db(graph_path)
-        lock_path = graph_path + ".lock"
 
         # See test_gives_up_after_max_attempts: db_lease() wraps the
         # exhausted-retry failure in its own RuntimeError (#255).
         with _hold_lock_subprocess(graph_path):
             with pytest.raises(RuntimeError, match="could not acquire a lease"):
                 mcp_server.get_db()
-            assert os.path.exists(lock_path)  # untouched — real holder still alive
+            # The holder is still holding it: we contended and lost, we did
+            # not steal it. Asked of the OS rather than of a sidecar file,
+            # which 2.0.0 does not create (#284).
+            assert not _another_process_can_open(graph_path)
 
-    def test_retries_open_after_clearing_stale_lock_on_final_attempt(self, tmp_path, monkeypatch):
-        """Regression test for #91: previously, clearing a stale lock on the
-        final retry attempt still fell through to raising the just-resolved
-        lock error, because the follow-up open was gated on `attempt <
-        _LOCK_RETRY_MAX - 1`. The clear must always be followed by one more
-        open attempt, no matter which iteration triggered it.
+    def test_keeps_contending_until_real_contention_clears(self, tmp_path, monkeypatch):
+        """Renamed from test_retries_open_after_clearing_stale_lock_on_final_attempt.
 
-        NOTE: mcp_server's stale-lock self-heal was deleted in #284, so
-        there is no longer any clearing step to reach from here. What's still
-        real and worth guarding: the retry loop
-        must keep contending against a real, live-held lock all the way
-        through its *last* attempt and succeed the moment that real
-        contention clears, instead of giving up early. A real subprocess
-        holds the lock through the first several backoff attempts and exits
-        only shortly before the final one; a real (uninstrumented-behavior)
-        open() call counter — not a canned exception — proves the loop
-        actually reached its last attempt rather than succeeding trivially
-        on the first.
+        Original intent (#91): a clear on the FINAL retry attempt must still
+        be followed by one more open, rather than falling through and raising
+        the lock error it had just resolved. Nothing clears anything now --
+        #284 deleted the self-heal -- but the surviving property is the one
+        that mattered: the loop must keep contending against a real, live-held
+        lock and succeed the moment that contention clears, instead of giving
+        up early.
+
+        The old assertion was `open_calls == _LOCK_RETRY_MAX`, and it pinned
+        1.2.3's backoff schedule rather than the property. Under minigraf
+        2.0.0 it observes 2 instead of 5, because a contended open() now
+        blocks ~376ms internally: attempt 1 blocks until ~376ms, attempt 2
+        begins at ~426ms and is still INSIDE open() when the holder dies at
+        500ms, so it succeeds there. That is the internal retry absorbing
+        attempts that used to reach this loop -- a finding, not a number to
+        relax the assertion to. Asserting 2 would pin one hold duration on one
+        minigraf version just as arbitrarily as asserting 5 did.
+
+        So this asserts what is actually wanted, and is true on both versions:
+        it succeeded, it genuinely waited out the holder, and it did not
+        succeed on the first try.
         """
         import mcp_server
         graph_path = str(tmp_path / "t.graph")
         mcp_server._reset_db_state()
         mcp_server.open_db(graph_path)
 
-        open_calls = {"n": 0}
+        hold_seconds = 0.5
+        attempts = {"total": 0, "refused": 0}
         real_open = mcp_server.MiniGrafDb.open
 
         def counting_open(path):
-            open_calls["n"] += 1
-            return real_open(path)
+            attempts["total"] += 1
+            try:
+                return real_open(path)
+            except Exception:
+                attempts["refused"] += 1
+                raise
 
         monkeypatch.setattr(mcp_server.MiniGrafDb, "open", staticmethod(counting_open))
 
-        # get_db()'s cumulative real backoff before each of its 5 attempts is
-        # 0, .05, .15, .35, .75s — hold the lock past the 4th attempt (~.35s)
-        # but let it die before the 5th (~.75s), forcing success on the last
-        # possible attempt.
-        with _hold_lock_subprocess(graph_path, hold_seconds=0.5):
+        started = time.monotonic()
+        with _hold_lock_subprocess(graph_path, hold_seconds=hold_seconds):
             result = mcp_server.get_db()
+        elapsed = time.monotonic() - started
 
-        assert result is not None
-        assert open_calls["n"] == mcp_server._LOCK_RETRY_MAX, (
-            f"expected the retry loop to genuinely exhaust all "
-            f"{mcp_server._LOCK_RETRY_MAX} attempts against real contention "
-            f"before succeeding on the last one, got {open_calls['n']} real "
-            "open() calls"
+        assert result is not None, "the loop gave up while contention was transient"
+        assert attempts["refused"] >= 1, (
+            "the very first open() succeeded, so this exercised no contention "
+            "at all and would pass even if the retry loop were deleted "
+            f"(total opens: {attempts['total']})"
         )
-
+        # Real waiting, not a canned exception: the holder is a real
+        # subprocess sleeping for hold_seconds, so succeeding at all means
+        # the loop stayed in contention for at least that long. The 0.8
+        # factor absorbs scheduling jitter only.
+        assert elapsed >= hold_seconds * 0.8, (
+            f"returned after {elapsed:.3f}s against a holder that held for "
+            f"{hold_seconds}s -- it cannot have waited out real contention"
+        )
 
 class TestLeaseAcquireCannotBeRacedByReset:
     """Replaces TestGetDbConcurrentResetRace, which pinned #122 against
@@ -852,7 +942,7 @@ class TestDbLeaseManager:
         for i in range(3):
             with mcp_server.db_lease() as db:
                 mcp_server._db_execute(db, "(query [:find ?e :where [?e :ident ?v]])")
-            assert not os.path.exists(graph + ".lock"), (
+            assert _another_process_can_open(graph), (
                 f"iteration {i}: the caller's surviving `db` binding kept the "
                 f"handle alive past the end of its lease"
             )
@@ -882,9 +972,9 @@ class TestDbLeaseManager:
 
         with mcp_server.db_lease() as db:
             mcp_server._db_execute(db, "(query [:find ?e :where [?e :ident ?v]])")
-            assert os.path.exists(graph + ".lock"), "lock must be held while leased"
+            assert not _another_process_can_open(graph), "lock must be held while leased"
 
-        assert not os.path.exists(graph + ".lock"), (
+        assert _another_process_can_open(graph), (
             "the lock file survived the last lease -- the handle was not dropped, "
             "which is exactly the #255 failure the lease protocol exists to remove"
         )
@@ -1172,7 +1262,7 @@ class TestStaleHandlesAreStructurallyImpossible:
             with mcp_server.db_lease() as db:
                 mcp_server._db_execute(db, "(query [:find ?e :where [?e :ident ?v]])")
             assert mcp_server._lease_manager.lease_count == 0
-            assert not os.path.exists(graph + ".lock")
+            assert _another_process_can_open(graph)
 
     def test_a_lease_sees_writes_made_between_leases(self, tmp_path, monkeypatch):
         """What _refresh_if_stale was FOR: a change landing while we held no
@@ -1308,7 +1398,7 @@ class TestDbLeaseLeakDetector:
 
         with mcp_server.db_lease():           # must NOT raise
             pass
-        assert not os.path.exists(graph + ".lock")
+        assert _another_process_can_open(graph)
         del still_bound
 
     def test_strict_can_be_switched_off_for_a_deliberate_ablation(
@@ -23187,9 +23277,9 @@ class TestSingleHandlePerProcess:
         with mcp_server.db_lease() as db:
             raw = mcp_server._db_execute(db, "(query [:find ?e :where [?e :ident ?v]])")
             assert "out of bounds" not in raw
-            assert os.path.exists(graph + ".lock")
+            assert not _another_process_can_open(graph)
 
-        assert not os.path.exists(graph + ".lock"), (
+        assert _another_process_can_open(graph), (
             "a released lease left the lock file behind, so the handle is still "
             "alive and the next open is a second handle -- the #253 interleaving"
         )
