@@ -1441,6 +1441,76 @@ prefix *by construction*, since `scan_ingestion_stderr` uses an unanchored
 changes are real in 2.0.0: `Retract argument must be a vector` gained `of
 facts`. Treat those three as unverified, not as cleared.
 
+## Graph vs Fact Index — 302-graph-index-divergence
+
+- Probe: `evals/at_scale/probe_graph_index_divergence.py`
+- Result JSON: `results/302-graph-index-divergence.json`
+- Graph: `.` @ `HEAD`, 822 commits, 217 MB, 53,139 pages, 29,465 current facts
+- minigraf: 2.0.0
+
+**The question.** `stderr_capture.py` can only see corruption that prints, and
+#302 measured ~11% of a graph vanishing with nothing on stderr. Is the fact
+index a usable second witness, and — since the gate is meant to be hard — does
+a CLEAN graph cross-check at exactly zero?
+
+**Clean: zero, in both directions.** 29,465 graph facts against 29,382 current
+index rows, `missing_from_graph = 0` and `missing_from_index = 0`. That is not
+the raw comparison; three things had to be right first, and each was found by
+a wrong answer rather than by reasoning:
+
+| normalization | without it, a CLEAN graph reports |
+|---|---|
+| index entities mapped forward into UUID space (`uuid5(NAMESPACE_OID, ":the/ident")`) | 136 phantom divergences on each side (100-commit graph) |
+| values compared as strings (`:version 1` vs `'1'`) | 2 |
+| boolean-valued facts counted apart | 83 |
+
+The last one is not a normalization but a **defect the audit found**:
+`_FACTS_TRIPLE_PATTERN` (mcp_server.py) accepts a quoted string, a keyword, a
+number or a `#uuid`/`#inst` literal as a triple's value, and nothing else — so
+`[:function/f :static true]` is transacted into the graph and **never reaches
+the fact index at all**. 83 facts on this graph, every one of them `:static`.
+They are excluded from `divergence` by Python type, not by rendered text, and
+reported separately. Boolean-valued facts being invisible to memory retrieval
+is a bug in its own right; it is not graph loss and the gate must not say it
+is.
+
+**Corrupted: 3 of 18 targets detected, stderr 0 of 18.** Each target is one
+4 KiB page overwritten with `0xff` on a copy of the graph, measured in a fresh
+subprocess whose stderr is captured whole.
+
+| target | graph facts | missing from graph | missing from index | stderr bytes | error_signals |
+|---|---|---|---|---|---|
+| clean | 29,465 | 0 | 0 | 0 | 0 |
+| page 7,970 | 29,517 | 0 | **52** | 0 | 0 |
+| page 10,627 | 29,518 | 0 | **53** | 0 | 0 |
+| page 13,284 | 29,467 | **1** | **3** | 0 | 0 |
+| page 37,197 | 29,465 | 0 | 0 | 0 | 0 |
+| 13 other targets | 29,465 | 0 | 0 | 0 | 0 |
+
+**Read the two failure shapes, not just the counts.** Pages 7,970 and 10,627
+did not lose anything — they **fabricated** 52 and 53 facts (`:introduced-by`
+and `:modified-in` edges to real commits). Page 13,284 moved one entity's
+identity: a `:file` fact left one UUID and three facts appeared under another,
+so the fact COUNT went UP by two while a fact was lost. #302's option 1, a
+fact-count invariant, sees the first two as a suspicious rise and the third as
+nothing at all; only a comparison against a second witness names any of them.
+
+**13 of 18 targets lost nothing, and that is a fact about the FILE, not the
+detector.** The graph is 53,139 pages holding 29,465 facts, so most of it is
+free space. A sweep is not a hit rate — #302 already records the sharper
+version of this trap (garbling an index ROOT loses nothing, so a sweep that
+only hits roots wrongly clears the scanner).
+
+**Cost: 0.8 s** for the full `[?e ?a ?v]` scan plus the index pass, against a
+~25-minute ingestion. Not a reason to sample or to skip it.
+
+**Methodological note.** An earlier sweep recorded a divergence of 83 at page
+37,197. It was an artifact: ablation runs were overwriting `fact_audit.py`
+while that sweep's measurement subprocesses were importing it. Five repeats of
+the same target on the same source graph came back clean, and the table above
+is from a re-run with nothing else touching the tree. Editing a file a
+background run reads is not a safe thing to do.
+
 ## Ingestion Run — 20260901T025946Z
 
 - Repo: `.` @ `master`

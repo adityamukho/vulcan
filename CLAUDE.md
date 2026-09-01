@@ -62,10 +62,19 @@ stopped producing. That gap is real: garbling one fact page cost ~11% of a
 measured graph with **zero bytes on stderr and zero `error_signals`**, so
 `stderr_capture.py` — the tier's other detector — reported it clean. The
 at-scale gate now fails on any divergence, with NO tolerance, because a clean
-audit diverges by exactly zero. Two normalizations buy that exactness and both
-are load-bearing: index entities are mapped forward into UUID space the way
+audit diverges by exactly zero — verified on the 822-commit at-scale graph, at
+a cost of 0.8s. Two normalizations buy that exactness and both are
+load-bearing: index entities are mapped forward into UUID space the way
 minigraf derives them (`uuid5(NAMESPACE_OID, ":the/ident")`), and graph values
 are compared as strings (minigraf returns `1`, the index stored `'1'`).
+
+**The audit also found that boolean-valued facts are NEVER indexed.**
+`_FACTS_TRIPLE_PATTERN` accepts a quoted string, keyword, number or
+`#uuid`/`#inst` literal as a value — not a bare `true`/`false` — so
+`[:function/f :static true]` reaches the graph and never the index (83 facts on
+the at-scale graph, all `:static`). They are excluded from `divergence` by
+Python type and counted separately. This is a fact-index bug, not graph loss:
+those facts are invisible to memory retrieval too.
 
 **Graph format version — there is no migration, by design.** `GRAPH_FORMAT_VERSION`
 (mcp_server.py) is stamped as `:ingestion/format-version` and ingestion refuses to

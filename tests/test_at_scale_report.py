@@ -225,6 +225,22 @@ class TestAppendIngestionReport:
         assert "| Fact-index divergence (#302) | **44**" in text
         assert "44 in the index but not the graph" in text
 
+    def test_excluded_boolean_facts_are_named_beside_a_zero(self, tmp_path):
+        """A zero that set 83 facts aside is not the same zero as one that
+        set none aside, and the table must not render them identically."""
+        metrics = {
+            **self._clean_256_metrics(),
+            "fact_audit": {
+                "divergence": 0, "graph_facts": 29465, "audit_error": None,
+                "unindexed_boolean_facts": 83,
+            },
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "83 boolean-valued facts excluded" in text
+        assert "not graph loss" in text
+
     def test_an_audit_that_could_not_run_renders_unverified_not_zero(self, tmp_path):
         metrics = {
             **self._clean_256_metrics(),

@@ -34,6 +34,30 @@ divergence.json):
     alone that is a divergence of exactly the number of non-string-valued
     facts.
 
+ONE CLASS OF FACT IS NEVER INDEXED AT ALL, and it is excluded by TYPE rather
+than by tolerance. `_FACTS_TRIPLE_PATTERN` (mcp_server.py) accepts a quoted
+string, a keyword, a number or a #uuid/#inst literal as a triple's value --
+but not a bare `true`/`false`. So `[:function/f :static true]` is transacted
+into the graph and never reaches the index. Measured on the 822-commit
+at-scale graph: 83 facts, every one of them `:static`, and nothing else. They
+are counted as `unindexed_boolean_facts` and kept OUT of `divergence`, because
+the alternative is a permanently red gate that says nothing.
+
+The exclusion is exact, not a heuristic: the graph side knows these facts by
+their Python type (`isinstance(v, bool)`) BEFORE anything is stringified, so
+a genuinely fabricated fact whose value happened to render as "True" is not
+swept up with them unless the graph also reports it as a real boolean. This
+is a defect in the fact index -- boolean-valued facts are invisible to memory
+retrieval, not just to this audit -- and belongs in its own issue; the audit
+only refuses to blame the graph for it.
+
+The exclusion rests on minigraf returning these values as Python bools. If a
+future version returns them as strings instead, they stop being recognized and
+the gate goes red with a count equal to the graph's boolean facts. That is why
+`test_the_boolean_fact_really_is_missing_from_the_index` asserts the index
+side as a PRECONDITION: when the index starts holding them, delete the
+exclusion rather than widening it.
+
 WHAT IT DOES NOT COVER. A fact absent from BOTH witnesses is invisible here --
 if a write never reached either, or if both were damaged the same way. This
 detects divergence between two witnesses, which is strictly more than the
@@ -71,8 +95,15 @@ def entity_uuid(entity: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_OID, entity))
 
 
-def _graph_facts(query_fn: Any) -> tuple[Counter, int, Optional[str]]:
-    """(counter of (entity, attribute, str(value)), distinct entities, error).
+def _graph_facts(query_fn: Any) -> tuple[Counter, set, int, Optional[str]]:
+    """(counter of (entity, attribute, str(value)), boolean-valued keys,
+    distinct entities, error).
+
+    The boolean set is collected HERE and nowhere else: this is the only point
+    at which the value's Python type still exists. One step later everything
+    is a string and "True" is indistinguishable from a fact whose value really
+    is the text "True" -- which is precisely the ambiguity that would turn the
+    unindexed-boolean exclusion into a guess.
 
     A scan that raises is RECORDED, not propagated: a graph too damaged to
     query is the loudest possible result of this audit, and an exception here
@@ -81,15 +112,20 @@ def _graph_facts(query_fn: Any) -> tuple[Counter, int, Optional[str]]:
     try:
         res = query_fn(SCAN_QUERY)
     except Exception as e:  # noqa: BLE001 -- recorded, see docstring
-        return Counter(), 0, f"{type(e).__name__}: {e}"
+        return Counter(), set(), 0, f"{type(e).__name__}: {e}"
     if not res.get("ok"):
-        return Counter(), 0, f"query not ok: {res!r}"
+        return Counter(), set(), 0, f"query not ok: {res!r}"
     rows = res.get("results") or []
-    return (
-        Counter((e, a, str(v)) for e, a, v in rows),
-        len({e for e, _, _ in rows}),
-        None,
-    )
+    facts = Counter()
+    boolean_keys = set()
+    entities = set()
+    for e, a, v in rows:
+        key = (e, a, str(v))
+        facts[key] += 1
+        entities.add(e)
+        if isinstance(v, bool):
+            boolean_keys.add(key)
+    return facts, boolean_keys, len(entities), None
 
 
 def audit_graph_against_index(
@@ -129,6 +165,7 @@ def audit_graph_against_index(
             "index_total_rows": 0, "index_current_rows": 0,
             "missing_from_graph": 0, "missing_from_index": 0, "divergence": 0,
             "missing_from_graph_sample": [], "missing_from_index_sample": [],
+            "unindexed_boolean_facts": 0,
             "audit_seconds": time.perf_counter() - t0,
             "audit_error": (
                 f"bound to {bound!r}, expected {expected_graph_path!r} -- "
@@ -136,7 +173,7 @@ def audit_graph_against_index(
             ),
         }
 
-    graph_facts, distinct_entities, scan_error = _graph_facts(query_fn)
+    graph_facts, boolean_keys, distinct_entities, scan_error = _graph_facts(query_fn)
     graph_total = sum(graph_facts.values())
 
     remaining = Counter(graph_facts)
@@ -169,8 +206,18 @@ def audit_graph_against_index(
     except Exception as e:  # noqa: BLE001 -- recorded like the scan error
         index_error = f"{type(e).__name__}: {e}"
 
-    missing_from_index = sum(n for n in remaining.values() if n > 0)
-    extra_samples = [list(k) for k, n in remaining.items() if n > 0][:sample_cap]
+    missing_from_index = 0
+    unindexed_boolean = 0
+    extra_samples: list[list[str]] = []
+    for key, n in remaining.items():
+        if n <= 0:
+            continue
+        if key in boolean_keys:
+            unindexed_boolean += n
+            continue
+        missing_from_index += n
+        if len(extra_samples) < sample_cap:
+            extra_samples.append(list(key))
 
     errors = [e for e in (scan_error, index_error) if e]
     return {
@@ -185,6 +232,10 @@ def audit_graph_against_index(
         # index write.
         "missing_from_index": missing_from_index,
         "divergence": missing_from_graph + missing_from_index,
+        # Excluded from divergence by TYPE, not by tolerance -- see the module
+        # docstring. A nonzero count here is a fact index defect, not graph
+        # corruption, and it is reported so it cannot be mistaken for zero.
+        "unindexed_boolean_facts": unindexed_boolean,
         "missing_from_graph_sample": missing_samples,
         "missing_from_index_sample": extra_samples,
         "audit_seconds": time.perf_counter() - t0,

@@ -150,6 +150,83 @@ class TestNormalizationsAreLoadBearing:
         mcp_server._reset_db_state()
 
 
+class TestUnindexedBooleans:
+    """A fact the index CANNOT hold is not a graph that lost it.
+
+    `_FACTS_TRIPLE_PATTERN` has no `true`/`false` alternative, so a
+    boolean-valued triple is transacted and never indexed -- 83 of them on the
+    822-commit at-scale graph, all `:static`. Counted separately or the gate
+    would be red every night while saying nothing."""
+
+    @pytest.fixture
+    def boolean_graph(self, tmp_path, monkeypatch):
+        graph_path, index_path = _write_graph(
+            tmp_path, monkeypatch,
+            ['[[:decision/d0 :description "has a boolean sibling"]]'],
+        )
+        # Transacted through _transact directly rather than the public
+        # handler: the point is a fact the index deriver drops, and going
+        # through the same path production ingestion uses is what makes that
+        # real rather than staged.
+        import mcp_server
+
+        _bind(graph_path)
+        with mcp_server.db_lease() as db:
+            mcp_server._transact(
+                db, "[[:function/f :static true]]",
+                valid_from=mcp_server._now_utc_ms(),
+            )
+            db.checkpoint()
+        yield graph_path, index_path
+        mcp_server._reset_db_state()
+
+    def test_the_boolean_fact_really_is_missing_from_the_index(self, boolean_graph):
+        """The precondition. If the index ever starts holding these, the
+        exclusion below stops being load-bearing and should be deleted."""
+        _, index_path = boolean_graph
+        con = sqlite3.connect(index_path)
+        try:
+            rows = con.execute(
+                "SELECT count(*) FROM facts_dedup WHERE attribute = ':static'"
+            ).fetchone()[0]
+        finally:
+            con.close()
+        assert rows == 0
+
+    def test_it_is_counted_apart_from_divergence(self, boolean_graph):
+        graph_path, index_path = boolean_graph
+        _bind(graph_path)
+        result = audit_graph_against_index(str(index_path))
+        assert result["unindexed_boolean_facts"] == 1
+        assert result["missing_from_index"] == 0
+        assert result["divergence"] == 0
+
+    def test_a_string_valued_fact_is_never_excluded_as_a_boolean(
+        self, tmp_path, monkeypatch
+    ):
+        """The exclusion is by Python type, not by the rendered text. A fact
+        whose value is the STRING "True" is indexable, and losing it must
+        still count."""
+        import mcp_server
+
+        graph_path, index_path = _write_graph(
+            tmp_path, monkeypatch, ['[[:decision/d0 :description "True"]]']
+        )
+        con = sqlite3.connect(index_path)
+        try:
+            con.execute("DELETE FROM facts_dedup WHERE value = 'True'")
+            con.commit()
+        finally:
+            con.close()
+
+        _bind(graph_path)
+        result = audit_graph_against_index(str(index_path))
+        assert result["unindexed_boolean_facts"] == 0
+        assert result["missing_from_index"] == 1
+        assert result["divergence"] == 1
+        mcp_server._reset_db_state()
+
+
 class TestGarbledPage:
     """#302's actual failure: a graph that quietly stops producing facts."""
 

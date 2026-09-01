@@ -195,6 +195,9 @@ def main() -> int:
                    help="Reuse an already-ingested graph instead of ingesting "
                         "(the corruption sweep is the cheap half; re-ingesting "
                         "to re-sweep is not).")
+    p.add_argument("--reused-commits", type=int, default=None,
+                   help="With --graph: how many commits the reused graph "
+                        "holds, for the record. Not verified.")
     p.add_argument("--out", default=None, help="Write the result JSON here.")
     args = p.parse_args()
 
@@ -211,7 +214,21 @@ def main() -> int:
         index_path = f"{graph_path}.fts.sqlite3"
         os.environ["MINIGRAF_GRAPH_PATH"] = graph_path
         os.environ["MINIGRAF_INDEX_PATH"] = index_path
-        ingestion = {"reused_graph": graph_path}
+        # --repo/--ref are recorded but NOT acted on here: they describe where
+        # the reused graph came from, which is provenance this run cannot
+        # otherwise state. A results file whose only note is "reused" cannot
+        # be tied back to a history.
+        ingestion = {
+            "reused_graph": graph_path,
+            "provenance": (
+                f"pre-existing graph, built by an earlier run of this probe "
+                f"from {args.repo} @ {args.ref}"
+                if args.repo and args.ref else
+                "pre-existing graph, provenance not recorded"
+            ),
+            **({"commits_ingested": args.reused_commits}
+               if args.reused_commits else {}),
+        }
     else:
         tmpdir = tempfile.mkdtemp(prefix="probe302-")
         graph_path = os.path.join(tmpdir, "bench.graph")
@@ -225,9 +242,16 @@ def main() -> int:
     corrupted = []
     for fraction in _CORRUPT_FRACTIONS:
         page = int(pages * fraction)
-        cg, ci = _corrupt_copy(graph_path, index_path,
-                               os.path.join(tmpdir, f"corrupt-{page}"), page)
-        entry = _measure_in_subprocess(cg, ci)
+        dest = os.path.join(tmpdir, f"corrupt-{page}")
+        cg, ci = _corrupt_copy(graph_path, index_path, dest, page)
+        try:
+            entry = _measure_in_subprocess(cg, ci)
+        finally:
+            # Deleted immediately, not at the end. Each copy is the graph plus
+            # its index -- ~310 MB at at-scale size -- so keeping the whole
+            # sweep on disk needs several GB of /tmp for no reason. Only the
+            # measurements are wanted.
+            shutil.rmtree(dest, ignore_errors=True)
         entry["page"] = page
         entry["page_fraction"] = fraction
         corrupted.append(entry)
