@@ -4740,10 +4740,19 @@ def _canonical_ident(entity_type: str, value: str) -> str:
     the old rule). That zero is MEASURED, NOT PROVEN BY CONSTRUCTION — a
     contrived path/name combination can still collide. R4 (a hash suffix) would
     have been collision-free by construction and was rejected because idents are
-    the human- and agent-legible handle in query results. The guards are
-    TestIdentCollisionRegression263 (the 9 measured pairs, in the suite) and
-    evals/at_scale/probe_ident_collision_census.py (full-history re-measurement,
-    deliberately not in CI).
+    the human- and agent-legible handle in query results. Three guards, and they
+    answer different questions — do not treat any one as covering the others:
+
+      * TestIdentCollisionRegression263 (in the suite) — the 9 measured pairs
+        still separate. A fixed corpus: catches a REGRESSION in this rule,
+        discovers nothing new.
+      * evals/at_scale/probe_ident_collision_new_history.py (#267) — censuses
+        FULL history against this function, live, and is the only thing that can
+        discover a NEW collision. Runs in the at-scale nightly with
+        --fail-on-collision; ~97s over 835 commits.
+      * evals/at_scale/probe_ident_collision_census.py — FROZEN at the pre-#263
+        rule. It reproduces the audit that chose R3 and deliberately does NOT
+        track this function; it is not a guard on the shipped rule.
 
     Changing this rule changes every ident the graph will ever mint, and
     ingestion recomputes idents from scratch on every run rather than reading

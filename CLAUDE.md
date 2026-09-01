@@ -163,6 +163,31 @@ every reader holding a finished graph — the one state in which anyone consults
 it — and #287 corrected both. An affected graph gets **rebuilt into a fresh
 graph path**, like every other condemned graph here.
 
+**R3's zero ident collisions is MEASURED, never proven — and #267 is what keeps
+measuring it.** `_canonical_ident`'s rule (keep `_`, drop the hyphen-run
+collapse) was chosen over R4's hash suffix in full knowledge that a contrived
+path/name pair can still collide: `a/b.py` and `a-b.py` both reach
+`:module/a-b-py`. Three guards, answering DIFFERENT questions — never treat one
+as covering the others:
+
+  * `TestIdentCollisionRegression263` (in the suite) — the 9 measured pairs still
+    separate. A FIXED corpus: catches a regression in the rule, discovers nothing.
+  * `evals/at_scale/probe_ident_collision_new_history.py` (#267) — censuses FULL
+    history against the LIVE `_code_ident`. The only one that can discover a new
+    collision. Runs in the at-scale nightly with `--fail-on-collision`; ~97s over
+    835 commits, measured clean (3692 inputs, 3692 idents, 0 offenders).
+  * `evals/at_scale/probe_ident_collision_census.py` — **FROZEN at the pre-#263
+    rule** and NOT a guard on the shipped rule. It reproduces the audit that chose
+    R3, whose predictions were pre-registered against the old baseline. Never
+    re-point it at production, and never merge the two: each file's tests assert
+    its own baseline in both directions precisely so they cannot drift together.
+
+There is deliberately **no `--since` bound** on the new-history census. A collision
+is a property of a PAIR, and the pair to fear is a new entity against an OLD one, so
+a bounded collection sees only new-vs-new and reports clean while missing the case it
+exists for. A red census step in the nightly is **not** a harness failure — it means
+history produced two entities sharing one ident, and #263's rule choice is reopened.
+
 **Graph format version — there is no migration, by design.** `GRAPH_FORMAT_VERSION`
 (mcp_server.py) is stamped as `:ingestion/format-version` and ingestion refuses to
 run against any other version, including an absent stamp (which means the graph

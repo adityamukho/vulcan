@@ -7392,9 +7392,18 @@ class TestIdentCollisionRegression263:
 
     Asserts a COUNT of distinct idents rather than any timing, per #261. The
     corpus is a fixed 9 pairs, so it catches a regression in the rule but cannot
-    discover NEW collisions in new history — that stays the job of
-    evals/at_scale/probe_ident_collision_census.py, which is deliberately not
-    wired into CI (a 674-commit run is far too expensive for the suite)."""
+    discover NEW collisions in new history. That is
+    evals/at_scale/probe_ident_collision_new_history.py's job (#267), which
+    censuses full history against production's live rule and runs in the
+    at-scale nightly with --fail-on-collision.
+
+    This docstring used to say a full-history run was "far too expensive for the
+    suite" and to point at probe_ident_collision_census.py for the new-history
+    question. Both were wrong. That probe is FROZEN at the pre-#263 rule so its
+    pre-registered predictions keep meaning what they meant, and cannot answer a
+    question about the shipped rule at all; and the walk costs 97s over 835
+    commits (2026-09-01), which is expensive for THIS suite but trivial for the
+    nightly. Neither belongs in CI's per-PR path — that part still holds."""
 
     def test_all_census_offenders_now_get_distinct_idents(self):
         import mcp_server
