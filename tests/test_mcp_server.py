@@ -2541,6 +2541,126 @@ class TestBooleanFactsReachTheIndex:
         assert [r[:3] for r in results] == [[":function/f", ":static", "true"]]
 
 
+class TestNilValuedFactsAreRejected:
+    """#306: a bare `nil` value matched none of `_FACTS_TRIPLE_PATTERN`'s
+    alternatives, so `[:decision/n :note nil]` was transacted into the graph
+    and never handed to the fact index -- the same shape of hole #303 closed
+    for `true`/`false`, and the one it deliberately left open.
+
+    #303's fix does not transfer. Indexing `nil` would mean storing a row
+    whose value is the text 'nil' -- a value meaning "no value" occupying a
+    slot in a lexical retrieval index and matching a search for "nil" -- and
+    it would need `fact_audit._index_text` to learn a `None` case in the same
+    breath, since minigraf returns `None` and `str(None)` is 'None', not
+    'nil'. A pattern-only fix would replace one divergence with another.
+
+    So nil is rejected at the transact boundary instead: it is not a storable
+    value. The audit gate (#302, zero tolerance) then stays HONEST -- a nil
+    fact appearing in a graph is a genuine write-path defect, not an index
+    limitation being mis-blamed on the graph.
+    """
+
+    def test_nil_valued_fact_is_rejected(self, real_db):
+        import mcp_server
+        result = mcp_server.handle_minigraf_transact(
+            "[[:decision/n :note nil]]", reason="probe"
+        )
+        assert result["ok"] is False
+        assert "nil" in result["error"]
+
+    def test_the_rejected_nil_fact_never_reached_the_graph(self, real_db):
+        """The rejection has to happen BEFORE the write, not after. Returning
+        ok:False having already transacted would leave exactly the divergence
+        this closes -- and minigraf accepts the write, so nothing downstream
+        would stop it."""
+        import json
+        import mcp_server
+        mcp_server.handle_minigraf_transact(
+            "[[:decision/n :note nil]]", reason="probe"
+        )
+        raw = mcp_server._db_execute(
+            real_db, "(query [:find ?v :where [:decision/n :note ?v]])"
+        )
+        assert json.loads(raw)["results"] == []
+
+    def test_a_valid_triple_alongside_a_nil_one_is_rejected_too(self, real_db):
+        """All-or-nothing. A transact block is one unit: silently keeping the
+        storable half would write a partial fact set the caller never asked
+        for, and the caller cannot tell from ok:True which half landed."""
+        import json
+        import mcp_server
+        result = mcp_server.handle_minigraf_transact(
+            '[[:decision/n :description "real"] [:decision/n :note nil]]',
+            reason="probe",
+        )
+        assert result["ok"] is False
+        raw = mcp_server._db_execute(
+            real_db, "(query [:find ?v :where [:decision/n :description ?v]])"
+        )
+        assert json.loads(raw)["results"] == []
+
+    def test_keyword_nil_is_still_a_value(self, real_db):
+        """`:nil` is a keyword like any other -- colon and all -- and the
+        guard must not claim it. The negative control that the `\\s+` before
+        `nil` cannot cross a colon."""
+        import mcp_server
+        result = mcp_server.handle_minigraf_transact(
+            "[[:decision/n :note :nil]]", reason="probe"
+        )
+        assert result["ok"] is True
+
+    def test_a_string_value_containing_a_nil_triple_is_not_rejected(self, real_db):
+        """The false-positive control, and NOT a hypothetical one: a note
+        written ABOUT #306 contains the offending triple as prose. A raw
+        text scan would find the `nil` inside the quoted string and refuse a
+        perfectly legitimate write, so the guard blanks quoted strings first.
+
+        `_FACTS_TRIPLE_PATTERN` shares the blind spot but pays only a
+        spurious index row for it; here the cost is a REJECTED WRITE, which
+        is why this guard cannot inherit the same shortcut."""
+        import mcp_server
+        result = mcp_server.handle_minigraf_transact(
+            '[[:decision/n :description '
+            '"#306: [[:decision/n :note nil]] reaches the graph, not the index"]]',
+            reason="probe",
+        )
+        assert result["ok"] is True
+
+    def test_nil_inside_a_string_is_not_detected(self):
+        r"""The same control at the pattern level, where the reason is
+        visible: `_has_nil_valued_triple` strips quoted strings before
+        scanning, so a triple that exists only as prose inside a value is
+        not a triple."""
+        import mcp_server
+        assert mcp_server._has_nil_valued_triple(
+            '[:decision/x :description "see [:decision/n :note nil]"]'
+        ) is False
+
+    def test_a_bare_symbol_starting_with_nil_is_not_detected(self):
+        r"""`nil` is only a nil value when it is the WHOLE value: the
+        trailing `\]` is what makes the unanchored alternative safe, exactly
+        as it is for `true`/`false` (#303)."""
+        import mcp_server
+        assert mcp_server._has_nil_valued_triple(
+            "[:decision/x :note nilpotent]"
+        ) is False
+
+    def test_a_nil_valued_triple_is_detected(self):
+        import mcp_server
+        assert mcp_server._has_nil_valued_triple(
+            "[[:decision/n :note nil]]"
+        ) is True
+
+    def test_a_uuid_tagged_entity_with_a_nil_value_is_detected(self):
+        """Entities reach transact in both spellings; the guard uses the same
+        entity token shapes as `_FACTS_TRIPLE_PATTERN` so the two cannot
+        drift apart on what counts as a triple."""
+        import mcp_server
+        assert mcp_server._has_nil_valued_triple(
+            '[#uuid "b14d54ed-41b3-5675-a334-26f9fbcba5fe" :note nil]'
+        ) is True
+
+
 class TestBookkeepingWritesFactIndex:
     def test_watermark_update_indexes_new_hash(self, real_db):
         import mcp_server
