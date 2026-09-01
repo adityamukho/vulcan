@@ -65,16 +65,49 @@ _SWEEP_SUMMARY_RE = re.compile(
 # pattern -- that requires an adversarial commit subject, while a pump dying
 # mid-run is the ordinary EMFILE timing -- but it is a trade-off, not a
 # free win.
+# All three minigraf-originated patterns below were re-audited against real
+# minigraf 2.0.0 source for #284 item 2, at tag v2.0.0 (the local checkout is
+# v2.0.0-1-gccdc85e, whose single extra commit is docs-only and touches no .rs).
+# Every one of them is a `re.search` below, never a match/fullmatch, which is
+# what makes 2.0.0's new `[CODE] ` prefix inert here: `[INT-049] ...` still
+# contains the substring. That is load-bearing, not incidental -- anchoring any
+# of these would silently break them on 2.0.0.
+#
+# COVERAGE CAVEAT, from one crude experiment during that audit and worth
+# treating as a lead rather than a result: this module can only see corruption
+# that PRINTS something. Garbling the interior of a live graph's eavt root page
+# on 2.0.0 produced no error at all -- the query simply returned less data
+# (15122 chars against 17122 for the same query on the intact graph). Every
+# pattern here read clean. So "no error signals" means "nothing was printed",
+# not "the graph is intact", and a silent-truncation class of corruption would
+# be invisible to this scanner on either version.
 _ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    # VERIFIED 2.0.0 (source, not runtime): the format string
+    # `"Page {page_id} out of bounds (total pages: {})"` is present verbatim at
+    # src/storage/backend/file.rs:390, raised via bail_coded!(ErrorCode::Int049),
+    # whose template is "storage: internal invariant violation: {}". So the
+    # rendered text is
+    #   [INT-049] storage: internal invariant violation: Page N out of bounds (total pages: M)
+    # and this unanchored search still matches it.
+    #
+    # NOT runtime-observed, and it resisted a deliberate attempt: forging the
+    # on-disk header's page_count is caught first by STG-008, which validates
+    # the four root pages on open, and the roots sit at the TOP of the file, so
+    # no page_count is both above every root and below a referenced page.
+    # Reaching it needs btree-node pointer surgery. Source verification is the
+    # honest limit here -- do not upgrade this comment to "observed" without
+    # actually seeing it.
     ("page_out_of_bounds", re.compile(r"Page \d+ out of bounds")),
-    # Provenance: tests/test_mcp_server.py:22876, which records this string as
-    # OBSERVED against minigraf 1.2.1. Unlike the other two it is NOT confirmed
-    # against current minigraf source (file.rs:265, btree_v6.rs:514 back those);
-    # a grep of the whole tree for serde in an error/Display context finds
-    # nothing. Kept anyway -- an extra pattern that never fires cannot cause a
-    # false clean, and a 1.2.1-era string may still surface from an older graph.
+    # DEAD PATTERN, kept deliberately. Provenance: tests/test_mcp_server.py,
+    # which records this string as OBSERVED against minigraf 1.2.1. #284 item 2
+    # upgraded the old "NOT confirmed against current source" note to a
+    # definite answer: a grep of minigraf v2.0.0 for "Serde" finds ZERO hits in
+    # src/, so this can never fire on 2.0.0. Still kept, for the reason it
+    # always was -- a pattern that never fires cannot cause a false clean --
+    # but do not read a zero count for it as evidence of anything.
     ("serde_deserialization_error", re.compile(r"Serde Deserialization Error")),
     (
+        # VERIFIED 2.0.0 (source): exact string at src/storage/btree_v6.rs:598.
         "stream_all_entries_expected_leaf_page",
         re.compile(r"stream_all_entries: expected leaf page"),
     ),
