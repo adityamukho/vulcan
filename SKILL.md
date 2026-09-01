@@ -664,6 +664,10 @@ ones — historical entries are labeled with their validity window, e.g. `[was v
 2024-06-01 → 2025-01-15]`. Follow up with a precise `:as-of`/`:valid-at` query against
 the graph directly for the full picture at that point in time.
 
+Boolean-valued facts such as `:static` are indexed in their EDN spelling, lowercase
+`true`/`false` — the datalog text they were transacted from, not Python's `True`. Search
+for `static` or `false`, never `False` (#303).
+
 Retrieval is purely lexical (exact word/token match, not semantic similarity) — write
 fact descriptions and `:alias` values that name both the concept and the specific
 technology/term someone might search for later (e.g. a decision described only as "use

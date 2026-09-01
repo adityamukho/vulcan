@@ -4153,9 +4153,15 @@ def handle_minigraf_query(datalog: str) -> Dict[str, Any]:
 
 
 _TAGGED_LITERAL = r'#(?:uuid|inst)\s+"[^"\\]*"'
+# The bare-boolean alternative is #303. It comes LAST in the value group so
+# the keyword alternative still claims `:true`, and it is safe unanchored only
+# because the group is followed by `\]`: `[:f :static truthy]` tries `true`,
+# is left holding `thy]`, and fails every alternative rather than indexing a
+# truncated value into the graph's only independent witness (#302).
 _FACTS_TRIPLE_PATTERN = re.compile(
     r'\[(\:[^\s\]]+|' + _TAGGED_LITERAL + r')\s+(\:[^\s\]]+)\s+'
-    r'("(?:[^"\\]|\\.)*"|\:[^\s\]]+|-?\d+(?:\.\d+)?|' + _TAGGED_LITERAL + r')\]'
+    r'("(?:[^"\\]|\\.)*"|\:[^\s\]]+|-?\d+(?:\.\d+)?|' + _TAGGED_LITERAL
+    + r'|true|false)\]'
 )
 _TAGGED_LITERAL_PATTERN = re.compile(r'#(?:uuid|inst)\s+"([^"\\]*)"')
 
@@ -4178,12 +4184,15 @@ def _parse_facts_block(facts_str: str) -> List[Tuple[str, str, str]]:
     block or a single triple string -- scans for all matches rather than
     requiring a strict split, so it works on both shapes uniformly (mirrors
     _parse_transact_facts' existing regex-scan approach, extended to also
-    capture keyword-valued and bare-numeric-valued triples, which schema
-    validation intentionally skips but the index must not). Value is
-    unquoted for string-valued triples, kept as-is (a keyword, number, or
-    entity reference) otherwise. #uuid/#inst-tagged entity references and
-    values are also captured, with the tag stripped and the raw UUID/
-    timestamp text kept as the indexed entity/value (#177) -- this is not
+    capture keyword-valued, bare-numeric-valued and bare-boolean-valued
+    triples, which schema validation intentionally skips but the index must
+    not). Value is unquoted for string-valued triples, kept as-is (a keyword,
+    number, `true`/`false`, or entity reference) otherwise -- so a boolean is
+    indexed in its EDN spelling, lowercase, the same datalog text it was
+    transacted from, even though minigraf reads it back as a Python bool
+    (#303). #uuid/#inst-tagged entity references and values are also
+    captured, with the tag stripped and the raw UUID/timestamp text kept as
+    the indexed entity/value (#177) -- this is not
     a keyword ident, so a caller wanting identity-resolved output should use
     _resolved_facts_triples() instead, which wraps this function and
     resolves #uuid-tagged entities to their stored :ident when one exists

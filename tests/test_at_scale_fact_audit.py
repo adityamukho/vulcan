@@ -150,13 +150,21 @@ class TestNormalizationsAreLoadBearing:
         mcp_server._reset_db_state()
 
 
-class TestUnindexedBooleans:
-    """A fact the index CANNOT hold is not a graph that lost it.
+class TestBooleanFactsAreAudited:
+    """#303 closed the hole this class used to document.
 
-    `_FACTS_TRIPLE_PATTERN` has no `true`/`false` alternative, so a
-    boolean-valued triple is transacted and never indexed -- 83 of them on the
-    822-commit at-scale graph, all `:static`. Counted separately or the gate
-    would be red every night while saying nothing."""
+    `_FACTS_TRIPLE_PATTERN` had no `true`/`false` alternative, so a
+    boolean-valued triple reached the graph and never the index -- 83 of them
+    on the 822-commit at-scale graph, all `:static`. The audit counted them as
+    `unindexed_boolean_facts` and kept them OUT of `divergence`, because the
+    alternative was a permanently red gate.
+
+    That exclusion is now DELETED rather than zeroed, and these tests hold the
+    line at deleted: a key that always reports 0 reads like a covered case
+    while covering nothing, and the exclusion was a blind spot -- a genuinely
+    lost `:static` fact was indistinguishable from one the index could never
+    hold. The last test here is the one that could not exist before.
+    """
 
     @pytest.fixture
     def boolean_graph(self, tmp_path, monkeypatch):
@@ -165,9 +173,9 @@ class TestUnindexedBooleans:
             ['[[:decision/d0 :description "has a boolean sibling"]]'],
         )
         # Transacted through _transact directly rather than the public
-        # handler: the point is a fact the index deriver drops, and going
-        # through the same path production ingestion uses is what makes that
-        # real rather than staged.
+        # handler: the point is what the index deriver does with a bare
+        # boolean, and going through the same path production ingestion uses
+        # is what makes that real rather than staged.
         import mcp_server
 
         _bind(graph_path)
@@ -180,33 +188,88 @@ class TestUnindexedBooleans:
         yield graph_path, index_path
         mcp_server._reset_db_state()
 
-    def test_the_boolean_fact_really_is_missing_from_the_index(self, boolean_graph):
-        """The precondition. If the index ever starts holding these, the
-        exclusion below stops being load-bearing and should be deleted."""
+    def test_the_boolean_fact_reaches_the_index(self, boolean_graph):
+        """The precondition, inverted. This assertion is what used to say
+        `== 0`."""
         _, index_path = boolean_graph
         con = sqlite3.connect(index_path)
         try:
             rows = con.execute(
-                "SELECT count(*) FROM facts_dedup WHERE attribute = ':static'"
-            ).fetchone()[0]
+                "SELECT value FROM facts_dedup WHERE attribute = ':static'"
+            ).fetchall()
         finally:
             con.close()
-        assert rows == 0
+        assert rows == [("true",)]
 
-    def test_it_is_counted_apart_from_divergence(self, boolean_graph):
+    def test_the_two_witnesses_agree_without_an_exclusion(self, boolean_graph):
+        """minigraf returns Python `True`, the index holds the EDN text
+        `'true'`. The audit normalizes the graph side to the index's spelling,
+        so the fact simply matches -- no exclusion, no divergence."""
         graph_path, index_path = boolean_graph
         _bind(graph_path)
         result = audit_graph_against_index(str(index_path))
-        assert result["unindexed_boolean_facts"] == 1
         assert result["missing_from_index"] == 0
+        assert result["missing_from_graph"] == 0
         assert result["divergence"] == 0
 
-    def test_a_string_valued_fact_is_never_excluded_as_a_boolean(
+    def test_the_exclusion_key_is_gone_not_merely_zero(self, boolean_graph):
+        """A key reporting 0 forever would read as a covered case. #303 says
+        delete it, not widen it."""
+        graph_path, index_path = boolean_graph
+        _bind(graph_path)
+        result = audit_graph_against_index(str(index_path))
+        assert "unindexed_boolean_facts" not in result
+
+    def test_a_lost_boolean_fact_is_now_reported_as_divergence(
+        self, boolean_graph
+    ):
+        """The payoff, and the test that could not be written before: while
+        the exclusion stood, a `:static` fact the graph lost and a `:static`
+        fact the index could never hold produced the same number."""
+        graph_path, index_path = boolean_graph
+        con = sqlite3.connect(index_path)
+        try:
+            con.execute("DELETE FROM facts_dedup WHERE attribute = ':static'")
+            con.commit()
+        finally:
+            con.close()
+
+        _bind(graph_path)
+        result = audit_graph_against_index(str(index_path))
+        assert result["missing_from_index"] == 1
+        assert result["divergence"] == 1
+
+    def test_a_string_valued_true_keeps_its_capitalization(
         self, tmp_path, monkeypatch
     ):
-        """The exclusion is by Python type, not by the rendered text. A fact
-        whose value is the STRING "True" is indexable, and losing it must
-        still count."""
+        """The normalization lowercases by Python TYPE, not by text. A fact
+        whose value is the string "True" is stored and returned as "True" on
+        both sides; a blanket `.lower()` would make the graph say 'true' while
+        the index says 'True' and report a divergence that is not there."""
+        import mcp_server
+
+        graph_path, index_path = _write_graph(
+            tmp_path, monkeypatch, ['[[:decision/d0 :description "True"]]']
+        )
+        con = sqlite3.connect(index_path)
+        try:
+            stored = con.execute(
+                "SELECT value FROM facts_dedup WHERE attribute = ':description'"
+            ).fetchall()
+        finally:
+            con.close()
+        assert stored == [("True",)]
+
+        _bind(graph_path)
+        result = audit_graph_against_index(str(index_path))
+        assert result["divergence"] == 0
+        mcp_server._reset_db_state()
+
+    def test_losing_a_string_valued_true_still_counts(
+        self, tmp_path, monkeypatch
+    ):
+        """The other half of the same guard: "True" the string must stay
+        auditable, not get swept up by anything that recognizes booleans."""
         import mcp_server
 
         graph_path, index_path = _write_graph(
@@ -221,7 +284,6 @@ class TestUnindexedBooleans:
 
         _bind(graph_path)
         result = audit_graph_against_index(str(index_path))
-        assert result["unindexed_boolean_facts"] == 0
         assert result["missing_from_index"] == 1
         assert result["divergence"] == 1
         mcp_server._reset_db_state()
