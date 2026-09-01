@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import datetime
 import json
 from pathlib import Path
@@ -275,6 +276,28 @@ def _residue_path_row(label: str, value: Any, report_path: Path) -> str:
     return f"| {label} | `{_relative_to_report(value, report_path)}` |"
 
 
+def runtime_versions() -> dict[str, str]:
+    """The versions that produced a run: minigraf, and the interpreter.
+
+    Recorded because a benchmark number is meaningless without the minigraf
+    version behind it (#284 item 4). minigraf's version materially changes
+    ingestion cost -- the #260 per-commit handle drop, 2.0.0's ~376ms
+    contended-open retry, SyncMode -- so two runs appended to benchmark.md
+    without it are not comparable, and every section written before this
+    existed is an unattributed number.
+    """
+    import importlib.metadata as md
+
+    try:
+        minigraf_version = md.version("minigraf")
+    except Exception:  # noqa: BLE001 -- attribution must never fail a run
+        minigraf_version = "unrecorded"
+    return {
+        "minigraf": minigraf_version,
+        "python": ".".join(str(n) for n in sys.version_info[:3]),
+    }
+
+
 def append_ingestion_report(
     metrics: dict[str, Any],
     report_path: Path,
@@ -297,6 +320,10 @@ def append_ingestion_report(
         f"## Ingestion Run — {_utc_timestamp()}",
         "",
         f"- Repo: `{metrics['repo_path']}` @ `{metrics['branch']}`",
+        # "unrecorded" rather than omitted: a section with no version line
+        # would be indistinguishable from one written before this existed,
+        # and silently reads as "the current version" to a later reader.
+        f"- minigraf: `{metrics.get('minigraf_version', 'unrecorded')}`",
         _metrics_json_bullet(json_path, report_path),
         "",
         "| Metric | Value |",
@@ -567,6 +594,8 @@ def append_query_report(report: dict[str, Any], report_path: Path) -> None:
     lines = [
         "",
         f"## Query Correctness Run — {_utc_timestamp()}",
+        "",
+        f"- minigraf: `{report.get('minigraf_version', 'unrecorded')}`",
         "",
         "| ID | Category | Result | minigraf latency | baseline latency |",
         "|---|---|---|---|---|",

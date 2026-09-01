@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -651,3 +652,55 @@ class TestAppendTraceFitReport:
         assert "Middle-group fit: n=100, r²=0.880" in text
         assert "Last-group fit: not identifiable" in text
         assert "r²=0.00" not in text
+
+
+class TestRuntimeVersionAttribution:
+    """#284 item 4: every recorded run must name the minigraf version that
+    produced it.
+
+    Comparing 1.2.3 against 2.0.0 is the entire point of the item, and nothing
+    in the metrics or the rendered report captured the version -- two appended
+    runs were indistinguishable. It matters beyond the comparison: minigraf's
+    version materially changes ingestion cost (the #260 per-commit handle drop,
+    2.0.0's ~376ms contended-open retry, SyncMode), so every historical section
+    in benchmark.md is an unattributed number.
+    """
+
+    def test_runtime_versions_reports_the_installed_minigraf(self):
+        import importlib.metadata as md
+
+        from evals.at_scale.report import runtime_versions
+
+        versions = runtime_versions()
+        assert versions["minigraf"] == md.version("minigraf")
+        assert versions["python"].startswith(
+            f"{sys.version_info.major}.{sys.version_info.minor}"
+        )
+
+    def test_ingestion_report_renders_the_minigraf_version(self, tmp_path):
+        from evals.at_scale.report import append_ingestion_report
+
+        report_path = tmp_path / "benchmark.md"
+        metrics = dict(SAMPLE_METRICS, minigraf_version="9.9.9")
+        append_ingestion_report(metrics, report_path)
+        assert "9.9.9" in report_path.read_text()
+
+    def test_ingestion_report_survives_a_run_recorded_before_this_existed(self, tmp_path):
+        """Historical results JSONs have no minigraf_version key. Re-rendering
+        one must not crash -- it must say so instead."""
+        from evals.at_scale.report import append_ingestion_report
+
+        report_path = tmp_path / "benchmark.md"
+        metrics = dict(SAMPLE_METRICS)
+        metrics.pop("minigraf_version", None)
+        append_ingestion_report(metrics, report_path)
+        assert "unrecorded" in report_path.read_text()
+
+    def test_query_report_renders_the_minigraf_version(self, tmp_path):
+        from evals.at_scale.report import append_query_report
+
+        report_path = tmp_path / "benchmark.md"
+        append_query_report(
+            {"entries": [], "minigraf_version": "9.9.9"}, report_path
+        )
+        assert "9.9.9" in report_path.read_text()
