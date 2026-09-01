@@ -403,3 +403,101 @@ class TestFailuresAreRecordedNotRaised:
         _bind(graph_path)
         result = audit_graph_against_index(str(tmp_path / "does-not-exist.sqlite3"))
         assert result["audit_error"] is not None
+
+
+class TestIntroducedByDuplicates:
+    """#287: the two-value :introduced-by corruption from #235.
+
+    Read off the same full-graph scan the fact-index audit already runs, and
+    reported under its OWN key rather than folded into `divergence` -- see
+    evals/at_scale/introduced_by_audit.py for why the two are not the same
+    kind of finding.
+    """
+
+    @pytest.fixture
+    def duplicate_graph(self, tmp_path, monkeypatch):
+        """One entity carrying two live :introduced-by values.
+
+        The two facts are transacted in SEPARATE calls, and that is not
+        stylistic: project-minigraf/minigraf#287 is still open, so batching
+        two facts that share (entity, attribute, valid_from) into one transact
+        silently keeps only the last -- the fixture would build a healthy
+        graph and the test would pass for the wrong reason.
+        """
+        graph_path, index_path = _write_graph(
+            tmp_path, monkeypatch,
+            [
+                '[[:function/f :ident ":function/f"]]',
+                "[[:function/f :introduced-by :commit/aaa]]",
+                "[[:function/f :introduced-by :commit/bbb]]",
+            ],
+        )
+        yield graph_path, index_path
+        import mcp_server
+
+        mcp_server._reset_db_state()
+
+    def test_a_clean_graph_reports_zero_rather_than_nothing(self, graph_pair):
+        """Present and zero, not absent. A consumer must be able to tell "no
+        affected entities" from "this metrics file predates the check"."""
+        graph_path, index_path = graph_pair
+        _bind(graph_path)
+        result = audit_graph_against_index(str(index_path))
+        assert result["introduced_by_duplicates"] == {"entities": 0, "sample": []}
+
+    def test_the_graph_really_holds_both_values(self, duplicate_graph):
+        """The precondition. Without it a passing detection test proves only
+        that minigraf kept one value and the audit agreed."""
+        import mcp_server
+
+        graph_path, _ = duplicate_graph
+        _bind(graph_path)
+        rows = mcp_server.handle_minigraf_query(
+            "[:find ?c :where [:function/f :introduced-by ?c]]"
+        )["results"]
+        assert sorted(r[0] for r in rows) == [":commit/aaa", ":commit/bbb"], rows
+
+    def test_the_duplicate_is_detected_and_named(self, duplicate_graph):
+        graph_path, index_path = duplicate_graph
+        _bind(graph_path)
+        result = audit_graph_against_index(str(index_path))
+        assert result["introduced_by_duplicates"]["entities"] == 1
+        assert result["introduced_by_duplicates"]["sample"] == [
+            [":function/f", [":commit/aaa", ":commit/bbb"]]
+        ]
+
+    def test_the_corrupt_graph_still_diverges_by_zero(self, duplicate_graph):
+        """Why this is not part of `divergence`: the index faithfully holds
+        BOTH values, so the two witnesses agree perfectly about a graph that
+        is wrong. A single number covering both findings would be zero here
+        and the corruption would be invisible."""
+        graph_path, index_path = duplicate_graph
+        _bind(graph_path)
+        result = audit_graph_against_index(str(index_path))
+        assert result["divergence"] == 0
+        assert result["audit_error"] is None
+        assert result["introduced_by_duplicates"]["entities"] == 1
+
+    def test_a_scan_that_failed_reports_none_not_zero(self, graph_pair):
+        """A failed scan yields an empty fact set, and an empty fact set has
+        no duplicates. Reporting 0 there would say "clean" about a graph
+        nobody managed to read."""
+        graph_path, index_path = graph_pair
+        _bind(graph_path)
+
+        def boom(_query):
+            raise RuntimeError("Page 7 out of bounds (total pages: 3)")
+
+        result = audit_graph_against_index(str(index_path), query_fn=boom)
+        assert result["introduced_by_duplicates"] is None
+
+    def test_the_wrong_graphs_index_reports_none_not_zero(self, graph_pair, tmp_path):
+        """Same reasoning on the refusal path, which returns before any scan
+        happens at all."""
+        graph_path, index_path = graph_pair
+        _bind(graph_path)
+        result = audit_graph_against_index(
+            str(index_path), expected_graph_path=str(tmp_path / "other.graph")
+        )
+        assert result["audit_error"] is not None
+        assert result["introduced_by_duplicates"] is None

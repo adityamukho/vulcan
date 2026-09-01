@@ -122,6 +122,47 @@ is unguarded, and deliberately so — ingestion emits no `nil`, and if it ever
 did, a red gate is then the correct signal rather than a misattribution.
 Existing graphs are not repaired either way.
 
+**The same scan also answers a graph-only question: #287's two-value
+`:introduced-by`.** `fact_audit`'s full `[:find ?e ?a ?v]` scan is already in
+memory, so `evals/at_scale/introduced_by_audit.py` reads #235's corruption off
+it for one pass over a dict — no second query, no second scan, no second lease.
+It is reported under its own key, `introduced_by_duplicates`, and deliberately
+NOT folded into `divergence`, because it is not a two-witness finding: both
+values are faithfully in the index too, so the two witnesses agree perfectly
+about a graph that is wrong. **A run can read `divergence | 0` and still be
+condemned**, which is exactly why the report carries a separate row. The check
+is also narrowed to `:introduced-by` specifically — `:contains`, `:modified-in`
+and `:depends-on` are legitimately multi-valued, so a detector keyed on "this
+entity has two values for some attribute" would report every module in every
+healthy graph. It reports entities, not surplus facts, and the sample names
+each one by its own `:ident` fact, already in the same scan.
+
+**The at-scale gate fails on any nonzero count, with NO tolerance, and that
+was measured before it was wired.** The 831-commit at-scale graph carries 3150
+`:introduced-by` facts across 3150 entities, **every one of them holding
+exactly one** — so a clean graph is zero, not "small", and the count needed no
+threshold. The positive control matters as much as the zero: a check that
+scanned no `:introduced-by` facts at all would also report 0, so the
+distribution was read before the gate was believed. Cost is unchanged at 0.84s
+for the whole audit, because this rides the scan rather than paying for one.
+An absent `introduced_by_duplicates` key (a metrics file from a harness that
+had the fact audit but not this check) stays clean — it cannot be
+retro-audited, so it is not retro-failed.
+
+**Re-running ingestion repairs none of it, and that is mechanical, not policy.**
+A finished run parks `:ingestion/correction-sweep-through` at frontier-high's
+own `:hi-hash`, so the next run's `_correction_sweep_select_position` computes
+`pos = through + 1 > ceiling_pos` and returns None on its FIRST call —
+`_correction_sweep_apply`, which owns the repair, then runs zero times (measured
+during #235: watermark at position 13 of 13, one select call, zero apply calls).
+Later commits raise the ceiling but never lower the resume point, so a position
+already passed is not revisited either. The sweep heals only what it reaches
+while a run is still climbing. `_entity_introduced_by_query`'s docstring and its
+stderr warning both used to claim the repair unconditionally, which is false for
+every reader holding a finished graph — the one state in which anyone consults
+it — and #287 corrected both. An affected graph gets **rebuilt into a fresh
+graph path**, like every other condemned graph here.
+
 **Graph format version — there is no migration, by design.** `GRAPH_FORMAT_VERSION`
 (mcp_server.py) is stamped as `:ingestion/format-version` and ingestion refuses to
 run against any other version, including an absent stamp (which means the graph

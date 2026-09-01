@@ -1709,3 +1709,75 @@ Ingestion phase (#275) -- the graph these latencies were measured over:
 | Stderr capture (#256) | complete |
 | Commits dropped (#256) | 0 |
 | Error signatures (#251/#256) | 0 |
+
+## Ingestion Run — 20260901T132430Z
+
+- Repo: `.` @ `master`
+- minigraf: `2.0.0`
+- Metrics JSON: `results/ingestion-20260901T132430Z.json`
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 831 |
+| Final status | complete |
+| Wall-clock | 1440.16s |
+| Throughput | 34.6 commits/min |
+| Peak RSS | 798628 KB |
+| Graph size | 219869184 bytes |
+| Fact-index size | 96628736 bytes |
+| Status-query latency (min/p50/p99/max) | 0.1ms / 0.3ms / 6.8ms / 24.8ms |
+| Graph-query latency (min/p50/p99/max) | 0.8ms / 22.1ms / 972.8ms / 1202.5ms |
+| Poll duty cycle (#242) | 6.32% over 1173 polls |
+| Checkpoint duty cycle (#241) | 4.64% over 104 checkpoints (66.76s total, 1143 suppressed) |
+| Stderr tee (#256) | active (wall-clock and latencies measured with an fd-level tee in place) |
+| Stderr capture (#256) | complete |
+| Commits dropped (#256) | 0 |
+| Error signatures (#251/#256) | 0 |
+| Fact-index divergence (#302) | 0 (30121 facts cross-checked) |
+| Duplicate :introduced-by (#287) | 0 |
+
+## Duplicate `:introduced-by` — 287-detection-only-audit
+
+- Detector: `evals/at_scale/introduced_by_audit.py`, called from `fact_audit.audit_graph_against_index`
+- Result JSON: `results/ingestion-20260901T132430Z.json` (`fact_audit.introduced_by_duplicates`)
+- Graph: `.` @ `master`, 831 commits, 209 MB, 30,121 current facts, 4,261 entities
+- minigraf: 2.0.0
+
+**The question.** #235's forward walk could mint a second `:introduced-by`
+alongside the reverse stream's provisional guess. #244 proposed repairing that
+and was closed on the standing "rebuild, never migrate" decision — but nothing
+could tell a user *whether their graph is affected*, and rebuilding is not
+free. This is that detection, and nothing more: read-only, no writes, no
+watermark movement.
+
+**Result: zero affected entities, and the positive control is the load-bearing
+half.** A detector that scanned no `:introduced-by` facts at all would also
+report 0, so the distribution was read before the zero was believed:
+
+| measurement | value |
+|---|---|
+| `:introduced-by` facts | 3,150 |
+| entities holding at least one | 3,150 |
+| entities holding **exactly one** | 3,150 |
+| entities holding two or more | **0** |
+
+So a clean graph is zero exactly, not "small", and the gate needed no
+tolerance and no threshold.
+
+**Cost: none that is measurable.** The whole `fact_audit` step ran in 0.84s,
+unchanged — this reads the `[:find ?e ?a ?v]` scan `fact_audit` already holds
+in memory, so it is one pass over a dict rather than a second query, a second
+scan, or a second lease.
+
+**Why it is not part of `divergence`.** Both values reach the fact index
+faithfully, so the two witnesses agree perfectly about a graph that must be
+thrown away: this run shows `Fact-index divergence (#302) | 0` beside it, and
+that is the ONLY shape #287 has. A single number covering both findings would
+read clean on every affected graph.
+
+**Re-running ingestion repairs nothing.** A finished run parks
+`:ingestion/correction-sweep-through` at frontier-high's `:hi-hash`, so the
+next run's `_correction_sweep_select_position` returns None on its first call
+(`pos > ceiling_pos`) and `_correction_sweep_apply` runs zero times — measured
+during #235 at position 13 of 13. An affected graph is **rebuilt into a fresh
+graph path**, never repaired in place.
