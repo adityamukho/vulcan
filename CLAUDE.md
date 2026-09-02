@@ -163,6 +163,41 @@ every reader holding a finished graph — the one state in which anyone consults
 it — and #287 corrected both. An affected graph gets **rebuilt into a fresh
 graph path**, like every other condemned graph here.
 
+**A commit's write is a SEQUENCE of transacts, not an atomic unit, and #313 is
+what that costs on resume.** `_reverse_apply` writes the commit entity and the
+structural facts first, the provisional `:introduced-by` several calls later,
+and `_frontier_persist_claim` last of all. A process killed inside that window
+leaves an entity TORN: live `:ident`, no `:introduced-by`, no lineage marker —
+and because the claim never persisted, the resumed run re-walks that very
+position and meets its own wreckage.
+
+Reading live-but-unintroduced as *authoritative* was the defect. The
+already-authoritative branch only ever considers `:modified-in`, so the entity
+kept no lineage at all; `_correction_sweep_apply` could not repair it either,
+because its case 3 reads zero `:introduced-by` values as ambiguous and fail-safe
+skips. The run then reported `status: complete` with **zero bytes on stderr**.
+Neither at-scale detector saw it: `fact_audit`'s two witnesses agree perfectly
+(the index is missing exactly what the graph is missing, so `divergence` reads
+0), `stderr_capture` has nothing to read, and `introduced_by_audit` looks for
+entities with TWO values where this one has none. `_reverse_apply` now treats a
+live entity holding no `:introduced-by` as newly discovered — it is re-applying
+the commit whose interrupted write created it, so the guess it writes is the one
+an uninterrupted run would have.
+
+**Measure this class over many interrupts, never one.** Rate was 3 of 14
+interrupted resumes on an 80-commit linear repo (SIGKILL at ~43 of 80), 0 of 5
+uninterrupted — the first five interrupted trials of the original report passed
+and briefly read as "resume is clean". The two regression tests are
+deterministic instead: they produce the tear through the REAL write path, by
+killing the lineage batch mid-`_reverse_apply`, so nothing depends on hitting a
+timing window.
+
+A harness that SIGKILLs ingestion must kill the **process group**, not the PID.
+`_run_ingestion`'s spawn-context `ProcessPoolExecutor` leaves ~9 orphaned
+`spawn_main` interpreters per kill (~66 MB RSS each), reparented to init and
+blocked forever on a queue whose write end they hold open themselves. They do
+not exit on their own; 34 trials of that exhausts 15 GB.
+
 **R3's zero ident collisions is MEASURED, never proven — and #267 is what keeps
 measuring it.** `_canonical_ident`'s rule (keep `_`, drop the hyphen-run
 collapse) was chosen over R4's hash suffix in full knowledge that a contrived
