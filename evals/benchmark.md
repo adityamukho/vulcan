@@ -1,11 +1,163 @@
 # Skill Benchmark: temporal-reasoning
 
-**Date**: 2026-06-21  
-**Model**: claude-sonnet-4-6  
-**Iterations**: 8 (iteration-1 baseline → iteration-2 hardened evals → iteration-3 graph capabilities → iteration-4 ingestion + hooks → iteration-5 all 12 evals re-run with fixed assertions → iteration-6 minigraf rebrand + eval fixes + product bug fix → iteration-7 eval isolation framework → iteration-8 eval-8 fix)  
-**Tests**: 188 passing
+**Date**: 2026-09-02  
+**Model**: claude-sonnet-5 (iterations 1-8 ran claude-sonnet-4-6)  
+**Iterations**: 9 (iteration-1 baseline → iteration-2 hardened evals → iteration-3 graph capabilities → iteration-4 ingestion + hooks → iteration-5 all 12 evals re-run with fixed assertions → iteration-6 minigraf rebrand + eval fixes + product bug fix → iteration-7 eval isolation framework → iteration-8 eval-8 fix → iteration-9 harness repair + pinned model)  
+**Tests**: 1829 passing, 1 xfailed
+
+> **Iteration-9 is a break in the series.** Four harness defects were found and
+> fixed before it ran — the most serious being that the benchmark had been
+> measuring an untracked, months-old copy of `SKILL.md` rather than the
+> repository's own. The model is also pinned for the first time. Earlier
+> iterations' numbers are kept below as a record of what was measured at the
+> time; do not read a delta across the iteration-8/9 boundary as a behaviour
+> change.
 
 ## Summary
+
+### Iteration-9 (all 12 evals — harness repaired, model pinned)
+
+| Metric | With Skill | Without Skill | Delta |
+|--------|-----------|---------------|-------|
+| Pass Rate | **55/59 (93%)** | **8/59 (14%)** | **+0.80** |
+
+**Model**: `claude-sonnet-5`, pinned via a new `--model` flag. Every earlier
+iteration inherited whatever the CLI defaulted to and recorded the model by
+hand, so a model change and a skill change were indistinguishable in the
+numbers. Iterations 1-8 ran `claude-sonnet-4-6`; **iteration-9 is not
+comparable to them on model alone**, and the harness repairs below mean it is
+not comparable on instrument either.
+
+#### Four harness defects, found before a single transcript could be graded
+
+None of these are skill regressions. All four had been silently in force for
+some number of previous iterations, and each one alone is enough to invalidate
+a comparison.
+
+1. **The benchmark was measuring a stale copy of the skill.** `SKILL_MD`
+   pointed at `skills/temporal-reasoning/SKILL.md` — an **untracked** file that
+   only exists once `install.py --harness claude-code` has run, and is only as
+   fresh as the last install. On this machine it was written 2026-06-26 and had
+   been 29 KB ever since, while the canonical, version-controlled `SKILL.md` at
+   the repo root had taken 31 commits and grown to 52 KB. Now points at the root
+   file.
+2. **The two variants faced different permission postures.** Left to the CLI
+   default, `Bash` runs unprompted but every `mcp__temporal-reasoning__*` call
+   comes back `"Claude requested permissions to use ..., but you haven't granted
+   it yet"`. The first iteration-9 attempt scored the skill on tools it was
+   never allowed to call while the baseline ran unimpeded — eval-1 `with_skill`
+   read as a *refusal to store anything*. Both variants now pass
+   `--allowedTools mcp__temporal-reasoning`, a no-op for the baseline, which is
+   launched with no MCP config at all.
+3. **Eval 12 could never establish its own precondition.** Its SETUP named an
+   absolute path — `/home/aditya/workspaces/pycharm/temporal_reasoning` — from a
+   machine layout that no longer exists. Since the ingest handler began
+   validating repos with `git rev-parse`, that returns `ok: False`, so the
+   "already running" state was never reached and the eval tested nothing. The
+   path is now a `{repo_root}` token resolved at run time.
+4. **The transcript hid the evidence graders need.** Tool inputs were truncated
+   at 200 characters, which is shorter than any `minigraf_transact` block — so
+   assertions like *"relationship values are entity keyword idents"* and *"at
+   least 3 entity-reference edges are stored"* were ungradable from the
+   transcript and could only be inferred from prose. And `_parse_stream_json`
+   kept only the **last** assistant text block: a turn that answers the user and
+   then calls `memory_finalize_turn` emits a short trailing aside, and that aside
+   was rendered as the "Final Response". Eval-10 `with_skill`, which answered
+   *"We're using **FastAPI** for the API layer (not Flask)"*, rendered as *"No
+   new facts needed storing"* — a pass that reads as a non-answer. Inputs now
+   truncate at 2000 chars, all text blocks are kept, and the raw stream is saved
+   beside the transcript as `raw.jsonl`, with `--rerender` to rebuild
+   transcripts from it without paying for another sample.
+
+#### Per-eval pass rates (iteration-9)
+
+| Eval | With Skill | Without Skill | Notes |
+|------|-----------|---------------|-------|
+| 1 — decision-storage | 5/5 (100%) | 0/5 (0%) | Baseline made **zero tool calls** — acknowledged the decisions in prose and offered design advice |
+| 2 — memory-retrieval | 5/5 (100%) | 0/5 (0%) | Baseline searched the repo, concluded the project has no Postgres/auth-token cache, and said so |
+| 3 — preference-enforcement | 3/4 (75%) | 0/4 (0%) | Eval premise no longer holds — see below. Skill cited the no-mocks preference from memory but wrote no test |
+| 4 — conflict-detection | 4/4 (100%) | 0/4 (0%) | Baseline wrote the MySQL setup with no reference to the Postgres decision |
+| 5 — entity-ref-storage | 5/5 (100%) | 0/5 (0%) | 3 `:calls` edges, keyword idents, flat attributes. Baseline made zero tool calls |
+| 6 — transitive-impact | 5/5 (100%) | 3/5 (60%) | Skill ran a 3-hop join. **Baseline read the answer key** — see contamination below |
+| 7 — decision-traceability | 5/5 (100%) | 0/5 (0%) | Baseline reconstructed a story from specs and git blame and concluded the GIL was *not* the driver |
+| 8 — git-ingestion | 6/6 (100%) | 0/6 (timeout) | Status-first gate held; started the job and moved on. **Baseline never answered** — see below |
+| 9 — ingest-status | 5/5 (100%) | 2/5 (40%) | Skill reported `idle` with the progress fields, then started ingestion |
+| 10 — memory-prepare-turn | 5/5 (100%) | 0/5 (0%) | Baseline answered **"the MCP Python SDK"** — confidently wrong, sourced from real code |
+| 11 — audit | 4/5 (80%) | 1/5 (20%) | E3 unexercisable — the seed no longer contains violations |
+| 12 — already-running | 3/5 (60%) | 2/5 (40%) | SETUP is self-defeating — see below |
+
+#### The baseline is reading the answer key
+
+Iteration-7 recorded that `without_skill` agents query the live `memory.graph`
+via Bash. That is no longer the main leak. **5 of 11 baseline runs read the eval
+definitions themselves** — the sandbox's cwd is this repository, and
+`evals/evals.json` contains every prompt, its seed data, and its expectations:
+
+- **Eval 6** found `evals/evals.json`, quoted the seeded chain
+  (`api-gateway → auth-service → jwt-validator → key-store`) back verbatim,
+  correctly labelled it "the prompt used in this repo's own eval suite", and
+  produced the expected impact chain from the fixture. Its 3/5 is the answer key,
+  not traversal.
+- **Eval 7** read `temporal-reasoning-workspace/iteration-5/eval-7-.../response.md`
+  and `seed_eval7.py` — a previous iteration's *own graded output*.
+- **Eval 11** ran 61 tool calls, including `git diff` of the working tree, `ps
+  aux`, and the checksum file this session had written to its scratchpad, and
+  reported the state of the real `memory.graph` and its FTS index back to the user.
+- **Eval 9** noticed the benchmark harness itself running (`run_isolated.py
+  --iteration 9`, "~15 subprocesses a couple minutes ago") and told the user about it.
+
+A baseline that can read the expectations is not a baseline. Fixing it means
+running the subprocess somewhere other than the repo root, which changes what
+*both* variants can see — so it is a deliberate design change, not a patch, and
+is left for the next iteration.
+
+#### Two evals no longer test what they were written to test
+
+- **Evals 3 and 6 presuppose an application that is not there.** Eval 3 asks for
+  "a test for the user registration endpoint"; eval 6 asks what breaks if the
+  key-store service changes. The sandbox cwd is this repo, which has no
+  registration endpoint and no key-store service. Both variants now grep, find
+  nothing, and decline — correct behaviour, and a lost assertion. The skill run
+  still surfaced the memory-sourced no-mocks preference and cited it (E1-E3), but
+  E4 needs a test that was never written.
+- **Eval 11's seed contains no schema violations.** Its three seed blocks are
+  clean, so `minigraf_audit` correctly reports zero violations and E3 ("offers to
+  retract or correct them") can never fire. Earlier iterations describe the audit
+  finding 6 violations in seed data; that seed is gone. The eval currently tests
+  *"does it run the audit and report honestly"*, not *"does it detect and repair"*.
+- **Eval 12's SETUP defeats itself.** It instructs the agent to start ingestion
+  and then answer a user asking to start indexing. An agent following the skill
+  checks status **first**, sees `idle`, and starts the job — so the "already
+  running" state the eval scores against is never observed from the user turn.
+  Establishing it needs a fixture that starts ingestion *outside* the graded turn.
+
+#### What held up
+
+The skill's behaviour under `claude-sonnet-5` is unchanged on the mechanics the
+skill is actually about: memory is consulted before answering (12/12 runs),
+`minigraf_ingest_status` precedes `minigraf_ingest_git` in both ingestion evals,
+entity references are stored as keyword idents rather than strings, and the
+multi-hop traversal in eval 6 is a real 3-hop Datalog join. Eval 10 reproduces
+the benchmark's strongest failure mode for a fourth iteration: without memory the
+agent answers the API-framework question from `mcp_server.py`'s imports and says
+**"the MCP Python SDK"** — confident, sourced, and wrong.
+
+#### Eval 8's baseline never answered at all
+
+The `without_skill` run for eval 8 was killed by the harness timeout **twice** —
+first at 420 s, then on a dedicated re-run at 900 s. With no ingestion tool, the
+baseline sets about building the index by hand and is still working when the
+budget runs out, so there is no response to grade and no transcript to keep
+(outputs are written after the subprocess returns). It is recorded as 0/6.
+That is not a scoring artefact: fifteen minutes of unattended shell work in place
+of one backgrounded tool call is the behaviour the eval exists to contrast.
+
+#### Cost and provenance
+
+23 graded runs, **$2.29** total. All 12 `with_skill` transcripts carry
+`raw.jsonl`; the `without_skill` transcripts predate that change and were graded
+from the rendered transcript. Suite at the time of this iteration: **1829
+passed, 1 xfailed**.
 
 ### Iteration-8 (eval-8 only — SKILL.md ingest-status gate fix)
 

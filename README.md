@@ -330,29 +330,35 @@ code-structure types.
 
 ## Skill Benchmarks
 
-Twelve evals run in isolated sandboxes measure how the skill changes behavior versus a no-skill baseline. Each eval uses a fresh graph with pre-seeded state where relevant.
+Twelve evals run in isolated sandboxes measure how the skill changes behavior versus a no-skill baseline. Each eval uses a fresh graph with pre-seeded state where relevant. Latest run: **iteration-9**, 2026-09-02, on `claude-sonnet-5` (pinned).
 
 | Eval | What it tests | With Skill | Without Skill |
 |------|--------------|-----------|---------------|
 | 1 — Decision storage | Persists architectural decisions with correct naming + reasons | 5/5 | 0/5 |
-| 2 — Memory retrieval | Queries memory and cites stored facts by name | 4/5 | 3/5 |
-| 3 — Cross-session preference | Discovers and applies a constraint never stated in the current conversation | 4/4 | 0/4 |
+| 2 — Memory retrieval | Queries memory and cites stored facts by name | 5/5 | 0/5 |
+| 3 — Cross-session preference | Discovers and applies a constraint never stated in the current conversation | 3/4 | 0/4 |
 | 4 — Conflict detection | Surfaces architectural conflicts before silently overriding decisions | 4/4 | 0/4 |
 | 5 — Entity reference storage | Stores relationships as traversable graph edges, not dead-end strings | 5/5 | 0/5 |
-| 6 — Transitive impact analysis | Traverses a multi-hop dependency chain to find all affected services | 5/5 | 4/5 |
-| 7 — Decision traceability | Follows a `:motivated-by` edge to surface the constraint behind a decision | 5/5 | 1/5 |
+| 6 — Transitive impact analysis | Traverses a multi-hop dependency chain to find all affected services | 5/5 | 3/5 |
+| 7 — Decision traceability | Follows a `:motivated-by` edge to surface the constraint behind a decision | 5/5 | 0/5 |
 | 8 — Git ingestion | Checks status before starting ingestion; moves on without polling | 6/6 | 0/6 |
-| 9 — Ingest status | Reports idle/running/complete accurately; surfaces errors | 5/5 | 0/5 |
+| 9 — Ingest status | Reports idle/running/complete accurately; surfaces errors | 5/5 | 2/5 |
 | 10 — Memory prepare-turn | Injects relevant context before the agent responds | 5/5 | 0/5 |
-| 11 — Audit | Detects and retracts schema violations | 4/5 | 0/5 |
-| 12 — Already running | Does not re-trigger ingestion when already in progress | 4/5 | 2/5 |
-| **Total** | | **56/59 (95%)** | **10/59 (17%)** |
+| 11 — Audit | Runs the schema audit and reports what it found | 4/5 | 1/5 |
+| 12 — Already running | Does not re-trigger ingestion when already in progress | 3/5 | 2/5 |
+| **Total** | | **55/59 (93%)** | **8/59 (14%)** |
 
-The cross-session preference eval is the most discriminating for memory recall: the prompt says "make sure it fits with how we do things" with no hint that a relevant constraint exists. The skill queries memory, finds a stored no-mocks preference, and writes a test using real database connections.
+The cross-session preference eval is the most discriminating for memory recall: the prompt says "make sure it fits with how we do things" with no hint that a relevant constraint exists. The skill queries memory and surfaces a stored no-mocks preference the baseline never sees.
 
-The transitive impact eval is the most discriminating for graph traversal: given "key-store is being replaced — what breaks?" the skill executes a 2-hop Datalog join and returns a full impact chain; without it, the agent correctly admits it cannot name the affected services.
+The transitive impact eval is the most discriminating for graph traversal: given "key-store is being replaced — what breaks?" the skill executes a 3-hop Datalog join and returns the full impact chain, ranked by distance from the change.
 
-See [`evals/benchmark.md`](evals/benchmark.md) for full results and per-eval breakdowns.
+Eval 10 is the sharpest illustration of why memory matters. Asked which framework the API layer uses, the skill answers **FastAPI** from a stored decision. The baseline reads `mcp_server.py`'s imports and answers **"the MCP Python SDK"** — confident, sourced from real code, and wrong.
+
+Eval 8's baseline is worth noting separately: with no ingestion tool it sets about building the index by hand and was killed by the harness timeout twice, at 420 s and again at 900 s, without ever answering.
+
+Two caveats on the baseline column, both recorded in full in [`evals/benchmark.md`](evals/benchmark.md). The sandbox runs in this repository, so a baseline agent can read `evals/evals.json` — prompts, seed data and expectations alike; 5 of 11 baseline runs did, and eval 6's 3/5 is the answer key rather than traversal. And evals 3, 11 and 12 no longer fully exercise what they were written for: evals 3 and 6 presuppose an application this repo does not contain, eval 11's seed no longer carries schema violations, and eval 12's SETUP cannot establish its own "already running" precondition.
+
+See [`evals/benchmark.md`](evals/benchmark.md) for full results, per-eval breakdowns, and the four harness defects fixed before this iteration ran.
 
 ## Phases
 
