@@ -28,7 +28,10 @@ shows there never was. To read a graph outside the server, open a
 - `mcp_server.py` - Persistent MCP server (the only runtime interface to the graph)
 - `fact_index.py` - SQLite FTS5 fact index; retrieval, and the graph's only independent witness (#302)
 - `frontier_registry.py` - Per-position claim registry for the two ingestion streams
-- `SKILL.md` - Skill definition with all query syntax
+- `SKILL.md` - Skill definition with all query syntax. Every example is an MCP
+  tool call with named arguments, checked against `mcp_server._TOOLS` by
+  `tests/test_skill_doc.py` (#322) — nothing executes those examples, so the
+  dead `from minigraf import query, transact` form survived in them for months
 - `skill.json` + `tools/*.json` - Portable manifest, generated from `mcp_server._TOOLS` and guarded by `tests/test_tool_schemas.py`
 - `install.py` - Setup script (runs weekly updates)
 - `docs/testing-conventions.md` - Real-backend-only test conventions for `tests/test_mcp_server.py`
@@ -494,11 +497,11 @@ The plugin is published via a stub architecture — `install.py` handles all reg
 
 ```python
 # Basic query
-query("[:find ?x :where [?e :attr ?x]]")
+minigraf_query(datalog="[:find ?x :where [?e :attr ?x]]")
 
 # With temporal
-query("[:find ?x :as-of 5 :where [?e :attr ?x]]")
+minigraf_query(datalog="[:find ?x :as-of 5 :where [?e :attr ?x]]")
 
 # Count
-query("[:find (count ?e) :where [?e :description ?d]]")
+minigraf_query(datalog="[:find (count ?e) :where [?e :description ?d]]")
 ```
