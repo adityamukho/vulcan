@@ -11945,7 +11945,54 @@ def handle_minigraf_ingest_status() -> Dict[str, Any]:
 
 from mcp.types import Tool, TextContent  # noqa: E402
 
-server = Server("temporal-reasoning")
+# `pyproject.toml` carries this until `release.yml` stamps the real version
+# into it at build time, so a dev install's dist-info holds it as if it were
+# a version. It is not one, here or anywhere else.
+_VERSION_PLACEHOLDER = "0.0.0"
+
+
+def _plugin_json_version() -> Optional[str]:
+    """The canonical version, from the file that owns it -- or None.
+
+    `.claude-plugin/plugin.json` is NOT in the wheel (`py-modules` ships four
+    `.py` files and nothing else), so this returns None for an installed
+    package and a real version for a checkout. That is the right way round:
+    an installed package has stamped metadata, and a checkout does not.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        ".claude-plugin", "plugin.json")
+    try:
+        with open(path) as f:
+            return json.load(f)["version"] or None
+    except Exception:
+        return None
+
+
+def _package_version() -> str:
+    """The version reported to MCP clients in `serverInfo` (#312).
+
+    Passing no version at all makes the SDK substitute its own package
+    version, so clients were told this server was `mcp`'s version -- a number
+    that moved with a user's resolver and never with a release here.
+
+    Installed metadata first, since that is what a released wheel has and a
+    checkout does not. But a dev install writes a real dist-info holding the
+    `0.0.0` placeholder, which shadows nothing and answers nothing, so it is
+    treated as absent rather than trusted. `unknown` beats reporting a
+    placeholder as if it were a version.
+    """
+    import importlib.metadata
+
+    try:
+        installed = importlib.metadata.version("temporal-reasoning")
+    except Exception:
+        installed = None
+    if installed and installed != _VERSION_PLACEHOLDER:
+        return installed
+    return _plugin_json_version() or "unknown"
+
+
+server = Server("temporal-reasoning", version=_package_version())
 
 _TOOLS: List[Tool] = [
     Tool(
