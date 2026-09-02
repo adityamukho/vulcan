@@ -18390,6 +18390,149 @@ class _NoProgressAllocator:
         return self.pos
 
 
+class _SimulatedKill(Exception):
+    """Stands in for the SIGKILL in #313's reproduction. Raised from inside
+    _reverse_apply's write sequence so the facts already transacted stay in
+    the graph exactly as a hard-killed process leaves them."""
+
+
+class TestReverseApplyTornWriteResume:
+    """#313: a commit's reverse-stream write is a SEQUENCE of _transact
+    calls, not one atomic unit -- the structural facts (including the live
+    :ident) land first, the provisional :introduced-by lands several calls
+    later, and _frontier_persist_claim lands last. A run killed inside that
+    window leaves the entity TORN: live :ident, no :introduced-by, no
+    lineage marker, and the position still unclaimed in the frontier.
+
+    Nothing downstream saw that state. On resume _reverse_apply re-claims
+    the position, _entity_ident_is_live answers True, _lineage_is_provisional
+    answers False (the marker never got written), and the entity fell into
+    the already-authoritative branch -- which only ever considers
+    :modified-in. The correction sweep could not repair it either: its case
+    3 reads zero :introduced-by values as "ambiguous" and fail-safe skips.
+    So the entity stayed orphaned forever while the run reported
+    status: complete with zero bytes on stderr.
+
+    Measured at 3 of 14 interrupted resumes on an 80-commit linear repo
+    (SIGKILL at ~43 of 80, always the one commit sitting at the reverse
+    stream's frontier), against 0 of 5 uninterrupted runs.
+    """
+
+    @staticmethod
+    def _repo_with_one_commit(tmp_path):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        (repo / "auth.py").write_text("def login():\n    return 1\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "h0"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @staticmethod
+    def _tear_then_resume(monkeypatch, real_db, repo):
+        """Run _reverse_apply twice over position 0: once killed between the
+        structural transact and the provisional-lineage batch, once whole.
+
+        The tear is produced by the REAL write path rather than hand-seeded,
+        so the resumed call sees precisely the fact set a killed process
+        leaves behind -- a hand-built approximation would be free to omit
+        whichever fact the bug turns on.
+        """
+        import mcp_server
+        import frontier_registry
+
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        pos = 0
+        file_results, _g, _m, _r = mcp_server._extract_commit(str(repo), linearization[pos], ())
+
+        def die(*_a, **_k):
+            raise _SimulatedKill()
+
+        with monkeypatch.context() as mp:
+            mp.setattr(mcp_server, "_entity_introduced_by_set_provisional_batch", die)
+            with pytest.raises(_SimulatedKill):
+                mcp_server._reverse_apply(
+                    real_db, str(repo), linearization, commit_metadata, pos, file_results,
+                )
+
+        commit_ident = f":commit/{linearization[pos][:12]}"
+        return (
+            commit_ident,
+            lambda: mcp_server._reverse_apply(
+                real_db, str(repo), linearization, commit_metadata, pos, file_results,
+            ),
+        )
+
+    def test_resumed_commit_gives_lineage_to_an_entity_torn_by_the_kill(
+        self, real_db, tmp_path, monkeypatch
+    ):
+        import mcp_server
+
+        repo = self._repo_with_one_commit(tmp_path)
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        mod_ident = mcp_server._code_ident("module", "auth.py")
+        commit_ident, resume = self._tear_then_resume(monkeypatch, real_db, repo)
+
+        # The tear is real, and it is the state the bug report describes:
+        # the entity is live but holds no lineage at all. Asserted before
+        # the resume so a kill point that drifts away from #313's window
+        # fails here rather than silently making the test vacuous.
+        for ident in (fn_ident, mod_ident):
+            assert mcp_server._entity_ident_is_live(real_db, ident), (
+                f"{ident} must be live after the interrupted write -- if it is not, the "
+                "kill no longer lands after the structural transact and this test has "
+                "stopped reproducing #313"
+            )
+            assert mcp_server._entity_introduced_by_values_query(real_db, ident) == [], (
+                f"{ident} must hold no :introduced-by after the interrupted write"
+            )
+            assert not mcp_server._lineage_is_provisional(real_db, ident), (
+                f"{ident} must have no lineage marker after the interrupted write"
+            )
+
+        resume()
+
+        for ident in (fn_ident, mod_ident):
+            values = mcp_server._entity_introduced_by_values_query(real_db, ident)
+            assert values == [commit_ident], (
+                f"{ident} was torn by the interrupted write and must be re-introduced at "
+                f"{commit_ident} by the resumed run; got {values}"
+            )
+            assert mcp_server._lineage_is_provisional(real_db, ident), (
+                f"{ident}'s recovered :introduced-by is a reverse-stream GUESS and must "
+                "carry a lineage marker, or the correction sweep reads it as "
+                "authoritative and never confirms it"
+            )
+
+    def test_torn_entity_is_not_also_recorded_as_modified_in_that_commit(
+        self, real_db, tmp_path, monkeypatch
+    ):
+        """The recovered entity is INTRODUCED at this commit, so it must not
+        also be recorded as modified in it -- the self-introduction invariant
+        every other introduction path holds. Pins that the repair routes the
+        ident through the new-candidate path rather than bolting an
+        :introduced-by onto the already-authoritative branch, which would
+        emit :modified-in alongside it.
+        """
+        import mcp_server
+
+        repo = self._repo_with_one_commit(tmp_path)
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        commit_ident, resume = self._tear_then_resume(monkeypatch, real_db, repo)
+        resume()
+
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find ?c :where [{fn_ident} :modified-in ?c]])"
+        )
+        assert json.loads(raw)["results"] == [], (
+            f"{fn_ident} is introduced at {commit_ident}; it must not also be recorded "
+            f"as modified there, got {json.loads(raw)['results']}"
+        )
+
+
 class TestReverseBulkFillWalkProgressGuard:
     def test_breaks_loudly_when_claim_high_stops_decreasing(self, real_db, tmp_path, capsys):
         """The walk's loop is unbounded by construction and drives a git

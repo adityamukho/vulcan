@@ -9652,7 +9652,12 @@ def _reverse_apply(
     timestamp (looked up from commit_metadata), not this commit's.
     Already-authoritative entities are never touched, but a genuine later
     touch always gets :modified-in (unless #221's unchanged-body check
-    says the body is provably unchanged this commit).
+    says the body is provably unchanged this commit). "Already
+    authoritative" means a live :introduced-by that carries no lineage
+    marker -- an entity that is live but holds NO :introduced-by is a torn
+    write from an interrupted run, not an authoritative one, and is
+    re-introduced here rather than read as confirmed (#313; see the
+    classification loop's own comment).
 
     Does NOT re-date structural facts as a guess moves earlier (#233). They
     stay at the timestamp of the commit where this walk first SIGHTED the
@@ -9775,10 +9780,32 @@ def _reverse_apply(
             if _lineage_is_provisional(db, ident):
                 superseded_ident = _entity_introduced_by_query(db, ident)
                 provisional_moves.append((ident, superseded_ident))
-            else:
-                already_authoritative_touched.append(
-                    (ident, _entity_introduced_by_query(db, ident))
-                )
+                continue
+            intro_ident = _entity_introduced_by_query(db, ident)
+            if intro_ident is None:
+                # TORN by an interrupted run (#313). One commit's writes are
+                # a SEQUENCE of _transact calls, not one atomic unit: the
+                # structural facts above (:ident included) land first and
+                # the provisional :introduced-by lands several calls later,
+                # so a process killed in between leaves an entity that is
+                # live, has no lineage, and has no lineage marker either --
+                # and _frontier_persist_claim, last of all, never ran, so
+                # the resumed run re-claims this very position and arrives
+                # back here.
+                #
+                # Live-but-unintroduced is NOT authoritative. Reading it as
+                # such was the defect: the branch below only ever considers
+                # :modified-in, so the entity kept no :introduced-by at all,
+                # and _correction_sweep_apply could not repair it either --
+                # its case 3 reads zero values as ambiguous and fail-safe
+                # skips. The run then reported complete with nothing on
+                # stderr. Treating it as newly discovered is exactly right:
+                # this walk is re-applying the commit whose interrupted
+                # write created it, so the guess it gets here is the one an
+                # uninterrupted run would have written.
+                new_candidates.append(ident)
+                continue
+            already_authoritative_touched.append((ident, intro_ident))
 
     # Split :contains out before batching (#222 phase 2b1). Minigraf's EAVT
     # pending index lacks value bytes in the key, so batching multiple
