@@ -661,6 +661,24 @@ Unify multiple edge types under one name:
 
 Rules registered via `minigraf_rule` persist for the server session. After a server restart, re-register them or add them to `SESSION_RULES` in `mcp_server.py` to make them permanent.
 
+**Bounding a recursive rule: `:max-derived-facts` and `:max-results`.** A recursive
+rule over a large ingested graph can derive far more facts than you want to wait for.
+Both bounds default to 1,000,000 and can be set per query:
+
+```datalog
+; Cap the facts one rule iteration may derive
+[:find ?anc :where (ancestor :commit/abc123 ?anc) :max-derived-facts 50000]
+
+; Cap the total result set
+[:find ?desc :where (reachable ?e :module/src-auth-py) [?e :description ?desc] :max-results 500]
+```
+
+**Exceeding either is an error, not a truncation.** The query returns
+`{"ok": false, "error": "[INT-020] evaluator: iteration or result limit
+exceeded: ..."}` and no rows at all — so these are guard rails against a runaway
+rule, never a way to page through results. Use `:max-results` when you would
+rather be told the answer is too big than receive an arbitrary prefix of it.
+
 ### Multi-hop joins (fixed-depth, no rule needed)
 When you know the exact depth, explicit joins are simpler than registering a rule:
 ```datalog
