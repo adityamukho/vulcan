@@ -225,14 +225,40 @@ For messages containing temporal signals (e.g. "before", "last week", "as of") w
 
 ### Configuration
 
+**Storage**
+
+| Environment variable | Default | Effect |
+|----------------------|---------|--------|
+| `MINIGRAF_GRAPH_PATH` | `memory.graph` in cwd | Graph file location |
+| `MINIGRAF_INDEX_PATH` | `<graph_path>.fts.sqlite3` | Fact-index location |
+
+**Memory extraction and retrieval**
+
 | Environment variable | Default | Effect |
 |----------------------|---------|--------|
 | `MINIGRAF_EXTRACTION_STRATEGY` | `heuristic` | Finalize strategy: `heuristic`, `llm`, or `agent` |
-| `MINIGRAF_PREPARE_SCAN_LIMIT` | `50` | Max rows returned by the broad fallback scan in the prepare phase |
-| `MINIGRAF_LLM_MODEL` | `claude-haiku-4-5-20251001` | Model used when `MINIGRAF_EXTRACTION_STRATEGY=llm` |
-| `ANTHROPIC_API_KEY` | — | Required when `MINIGRAF_EXTRACTION_STRATEGY=llm` and using a Claude model |
-| `OPENAI_API_KEY` | — | Required when `MINIGRAF_EXTRACTION_STRATEGY=llm` and `MINIGRAF_LLM_MODEL` is an OpenAI model (e.g. `gpt-4o-mini`) |
-| `MINIGRAF_GRAPH_PATH` | `memory.graph` | Override the graph file location |
+| `MINIGRAF_LLM_MODEL` | `claude-haiku-4-5-20251001` | Model used when the strategy is `llm` |
+| `MINIGRAF_LLM_TIMEOUT_SECONDS` | `30` | Per-call timeout for the `llm` strategy |
+| `ANTHROPIC_API_KEY` | — | Required for the `llm` strategy with a Claude model |
+| `OPENAI_API_KEY` | — | Required for the `llm` strategy when `MINIGRAF_LLM_MODEL` is an OpenAI model (e.g. `gpt-4o-mini`) |
+| `MINIGRAF_PREPARE_SCAN_LIMIT` | `50` | Max facts returned by the prepare phase |
+| `MINIGRAF_MEMORY_BOOST` | `2.0` | Ranking boost for decision/preference/constraint/dependency facts over ingested code structure |
+| `MINIGRAF_HISTORICAL_DISCOUNT` | `0.5` | Ranking discount for historical facts; below 1.0 demotes them, 1.0 is neutral |
+| `MINIGRAF_MAX_FACT_VALUE_LENGTH` | `4096` | Cap on a string-valued fact; a longer value is a schema violation |
+
+**Git ingestion**
+
+| Environment variable | Default | Effect |
+|----------------------|---------|--------|
+| `MINIGRAF_NO_AUTO_INGEST` | unset | Set to `1` to suppress the ingestion that auto-starts at server boot |
+| `MINIGRAF_GIT_BRANCH` | auto-detected `main`/`master` | Branch to walk, falling back to `HEAD` if neither exists |
+| `MINIGRAF_INGEST_IGNORE` | — | Extra comma-separated globs/prefixes to skip, added to the defaults (see also a repo-local `.temporalignore`) |
+| `MINIGRAF_INGEST_WORKERS` | `min(32, cpu_count())` | Extraction worker processes |
+| `MINIGRAF_INGEST_STREAM_RATIO` | `1:1` | Commits per round for the forward:reverse walk; `1000000:1` is effectively oldest-first |
+| `MINIGRAF_INGEST_CHECKPOINT_DUTY` | `0.05` | Fraction of wall clock ingestion may spend on WAL compaction |
+| `MINIGRAF_INGEST_TRACE_PATH` | unset | Append one JSON object per applied commit for cost attribution |
+| `MINIGRAF_OWNER_HINT_TTL` | `30.0` | Seconds before the `<graph_path>.owner` advisory hint is treated as stale |
+| `MINIGRAF_MATCH_MAX_POOL` | `3000` | Cap on the rename matcher's candidate pool |
 
 ## Files
 
