@@ -1,6 +1,6 @@
 {
   "name": "memory_prepare_turn",
-  "description": "Retrieve relevant memory context for the current user message. Call this at the START of every turn, before reading the user's message. Returns a context block string to prepend to your working context.",
+  "description": "Retrieve relevant memory context for the current user message. Call this at the START of every turn, before reading the user's message. Returns a context block string to prepend to your working context. On build/fix/navigate-shaped messages, also appends a one-line nudge toward minigraf_query-based code-graph navigation when the repo has an ingested graph.",
   "parameters": {
     "type": "object",
     "properties": {
@@ -9,6 +9,8 @@
         "description": "The user's message for this turn"
       }
     },
-    "required": ["user_message"]
+    "required": [
+      "user_message"
+    ]
   }
 }

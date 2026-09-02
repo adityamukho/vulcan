@@ -1,0 +1,16 @@
+{
+  "name": "minigraf_rule",
+  "description": "Register a Datalog rule for use in subsequent queries. Rules enable recursive graph traversal (e.g. ancestor, reachable). A rule persists for the server session — re-register after a server restart. Syntax: [(rule-name ?arg ...) body-clause ...] — omit the outer (rule ...) wrapper.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "rule": {
+        "type": "string",
+        "description": "Rule vector, e.g. [(ancestor ?a ?d) [?a :parent ?d]] or [(ancestor ?a ?d) [?a :parent ?m] (ancestor ?m ?d)]"
+      }
+    },
+    "required": [
+      "rule"
+    ]
+  }
+}

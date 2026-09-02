@@ -7,7 +7,12 @@
       "issue_type": {
         "type": "string",
         "description": "Type of issue to report",
-        "enum": ["invalid_query", "transact_failure", "parse_error", "minigraf_bug"]
+        "enum": [
+          "invalid_query",
+          "transact_failure",
+          "parse_error",
+          "minigraf_bug"
+        ]
       },
       "description": {
         "type": "string",
@@ -22,6 +27,9 @@
         "description": "Optional error message returned by Minigraf"
       }
     },
-    "required": ["issue_type", "description"]
+    "required": [
+      "issue_type",
+      "description"
+    ]
   }
 }

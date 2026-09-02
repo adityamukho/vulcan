@@ -10,9 +10,12 @@
       },
       "reason": {
         "type": "string",
-        "description": "Why this fact is being retracted. This forces you to justify the removal."
+        "description": "Why this fact is being retracted. Forces you to justify the removal."
       }
     },
-    "required": ["facts", "reason"]
+    "required": [
+      "facts",
+      "reason"
+    ]
   }
 }
