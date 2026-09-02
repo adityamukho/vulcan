@@ -16,14 +16,15 @@ These queries are impossible with git log, vector search, or key-value memory:
 
 ; When did this coupling first appear — and what decision caused it?
 [:find ?reason
- :where [:project/service-a :depends-on :project/service-b]
+ :where [:dependency/service-a :depends-on :dependency/service-b]
         [?d :motivated-by ?c]
         [?c :description ?reason]]
 
 ; Which modules were coupled to the payment service when we made the DB decision?
-[:find ?module
+[:find ?desc
  :as-of 15
- :where [?module :depends-on :service/payment]]
+ :where [?module :depends-on :dependency/payment]
+        [?module :description ?desc]]
 ```
 
 This is the only tool where both the decision and the structural change live as datoms in the same graph and can be joined in a single query. See [Phase 5](ROADMAP.md) for code structure evolution from git history.
@@ -34,20 +35,23 @@ Most memory tools for agents are key-value stores or vector databases. They answ
 
 **Time travel.** Every write is stamped with a transaction number. You can query the graph as it existed at any past transaction:
 
-```python
+```
 # Decision made in session 1, transaction 3
-transact('[[:project/db :name "PostgreSQL"]]', reason="Initial choice")
+minigraf_transact(facts='[[:decision/db :description "PostgreSQL"]]',
+                  reason="Initial choice")
 
 # Changed in session 4, transaction 11
-retract('[[:project/db :name "PostgreSQL"]]', reason="Switching to CockroachDB for geo-distribution")
-transact('[[:project/db :name "CockroachDB"]]', reason="Switching to CockroachDB for geo-distribution")
+minigraf_retract(facts='[[:decision/db :description "PostgreSQL"]]',
+                 reason="Switching to CockroachDB for geo-distribution")
+minigraf_transact(facts='[[:decision/db :description "CockroachDB"]]',
+                  reason="Switching to CockroachDB for geo-distribution")
 
 # Later: what did we think the database was before session 4?
-query("[:find ?name :as-of 10 :where [:project/db :name ?name]]")
+minigraf_query(datalog='[:find ?d :as-of 10 :where [:decision/db :description ?d]]')
 # → "PostgreSQL"
 
 # What do we think now?
-query("[:find ?name :where [:project/db :name ?name]]")
+minigraf_query(datalog='[:find ?d :where [:decision/db :description ?d]]')
 # → "CockroachDB"
 ```
 
@@ -55,9 +59,9 @@ query("[:find ?name :where [:project/db :name ?name]]")
 
 **Exact Datalog queries, not fuzzy search.** Results are deterministic and reproducible — no embedding model, no similarity threshold, no hallucinated retrievals. A query either matches or it doesn't.
 
-**Graph traversal.** Entities are first-class nodes — not isolated key-value blobs. Store service-calls-service as a real graph edge (`:calls :project/auth-service`) and traverse it with Datalog joins. Fixed-depth transitive queries (2-hop, 3-hop) are expressed as multi-hop joins. Rules unify multiple edge types under a single named relation.
+**Graph traversal.** Entities are first-class nodes — not isolated key-value blobs. Store service-calls-service as a real graph edge (`:calls :dependency/auth-service`) and traverse it with Datalog joins. Fixed-depth transitive queries (2-hop, 3-hop) are expressed as multi-hop joins. Rules unify multiple edge types under a single named relation.
 
-**Local and offline.** A single binary and a file. No API key, no network dependency, no cloud service to go down.
+**Local and offline.** An embedded engine and a file on disk. No API key, no network dependency, no cloud service to go down.
 
 ## Architecture
 
@@ -156,22 +160,43 @@ This syncs the skill into `.agents/skills/temporal-reasoning` — Codex CLI's do
 
 ## Quick Start
 
-```python
-from minigraf import query, transact
+Everything goes through the MCP tools — there is no Python wrapper module to
+import. The agent calls these; you can also drive them from any MCP client.
 
+```
 # Store a decision
-transact("[[:decision/cache-strategy :description \"use Redis\"]]", 
-         reason="Architecture decision for low-latency caching")
+minigraf_transact(
+    facts='[[:decision/cache-strategy :description "use Redis"]]',
+    reason="Architecture decision for low-latency caching")
 
 # Query stored descriptions
-result = query("[:find ?d :where [?e :description ?d]]")
+minigraf_query(datalog='[:find ?d :where [?e :description ?d]]')
 ```
+
+To read the graph from your own Python without the server, use the `minigraf`
+package's `MiniGrafDb` directly:
+
+```python
+from minigraf import MiniGrafDb
+
+db = MiniGrafDb.open("memory.graph")
+print(db.execute('(query [:find ?d :where [?e :description ?d]])'))
+```
+
+Only one `MiniGrafDb` handle may be live per process, and the MCP server holds
+one whenever it is running — see "Single-handle invariant" in `CLAUDE.md`.
 
 ## Storage Location
 
 Default: `memory.graph` in the current working directory.
 
 Override: `MINIGRAF_GRAPH_PATH=/custom/path python ...`
+
+The memory-retrieval index lives beside it at `<graph_path>.fts.sqlite3`
+(override with `MINIGRAF_INDEX_PATH`). It is written from the same triples in
+the same transaction boundary but by a different storage engine, which is what
+lets `evals/at_scale/fact_audit.py` cross-check the graph against it. Delete
+both together when starting a graph over.
 
 ## Per-Turn Auto-Memory
 
@@ -213,22 +238,23 @@ For messages containing temporal signals (e.g. "before", "last week", "as of") w
 
 | File | Purpose |
 |------|---------|
-| `mcp_server.py` | Persistent stdio MCP server — primary interface to the graph |
-| `minigraf.py` | Python CLI wrapper (direct use outside MCP) |
+| `mcp_server.py` | Persistent stdio MCP server — the only runtime interface to the graph |
+| `fact_index.py` | SQLite FTS5 fact index behind `memory_prepare_turn` retrieval |
+| `frontier_registry.py` | Per-position claim registry for the two ingestion streams |
 | `hooks/prepare_hook.py` | Claude Code UserPromptSubmit hook — injects memory context |
-| `hooks/ingest_hook.py` | Claude Code UserPromptSubmit hook — triggers background git ingestion |
 | `hooks/finalize_hook.py` | Claude Code Stop hook — extracts and stores facts |
 | `hooks/claude-code.json` | Hook + MCP configuration for Claude Code |
 | `report_issue.py` | GitHub issue reporter |
-| `install.py` | Setup script |
+| `install.py` / `uninstall.py` | Setup script and its undo |
 | `pyproject.toml` | Python packaging |
-| `tools/*.json` | Tool schemas |
+| `skill.json`, `tools/*.json` | Portable skill manifest and the ten tool schemas, generated from `mcp_server._TOOLS` |
 
 ## Tools
 
 - **minigraf_query** — Query memory with Datalog
 - **minigraf_transact** — Store facts (reason required)
 - **minigraf_retract** — Retract facts (original stays in history)
+- **minigraf_rule** — Register a Datalog rule for the server session (recursive traversal)
 - **minigraf_report_issue** — File GitHub issues
 - **memory_prepare_turn** — Retrieve relevant context for the current user message
 - **memory_finalize_turn** — Extract and store memorable facts after a turn
@@ -238,30 +264,43 @@ For messages containing temporal signals (e.g. "before", "last week", "as of") w
 
 ## Query Examples
 
-```python
-# Basic query
-query("[:find ?x :where [?e :attr ?x]]")
+Passed as the `datalog` argument to `minigraf_query`.
 
-# Temporal query (state at transaction N)
-query("[:find ?x :as-of 5 :where [?e :attr ?x]]")
+```datalog
+; Basic query
+[:find ?x :where [?e :attr ?x]]
 
-# Aggregation
-query("[:find (count ?e) :where [?e :description ?d]]")
+; Transaction time — state as of write N
+[:find ?x :as-of 5 :where [?e :attr ?x]]
 
-# Single-hop graph traversal — what does api-gateway call?
-query("[:find ?name :where [:project/api-gateway :calls ?svc] [?svc :name ?name]]")
+; Valid time — what was true in the world on a date
+[:find ?x :valid-at "2026-01-15" :where [?e :attr ?x]]
 
-# Two-hop join — transitive impact: what depends on key-store (directly or via one intermediate)?
-query("""[:find ?svc
-          :where [?mid :depends-on :project/key-store]
-                 [?svc :depends-on ?mid]]""")
+; Aggregation
+[:find (count ?e) :where [?e :description ?d]]
 
-# Decision traceability — why did we choose asyncio?
-query("[:find ?reason :where [:decision/asyncio-choice :motivated-by ?c] [?c :description ?reason]]")
+; Single-hop graph traversal — what does api-gateway call?
+[:find ?desc :where [:dependency/api-gateway :calls ?svc] [?svc :description ?desc]]
 
-# Typed entity query — list all stored components
-query("[:find ?name :where [?e :entity-type :type/component] [?e :name ?name]]")
+; Two-hop join — what depends on key-store, directly or via one intermediate?
+[:find ?desc
+ :where [?mid :depends-on :dependency/key-store]
+        [?svc :depends-on ?mid]
+        [?svc :description ?desc]]
+
+; Decision traceability — why did we choose asyncio?
+[:find ?reason :where [:decision/asyncio :motivated-by ?c] [?c :description ?reason]]
+
+; Typed entity query — list every stored component
+[:find ?desc :where [?e :entity-type :type/dependency] [?e :description ?desc]]
 ```
+
+Entities carry `:description`, not `:name` — `:name` is not a registered
+attribute on any hand-written type, so `minigraf_audit` treats it as a schema
+violation and retracts the entity. The canonical types are `:type/decision`,
+`:type/dependency`, `:type/constraint` and `:type/preference`; there is no
+`:type/component`. See `SKILL.md` for the full schema and the git-ingested
+code-structure types.
 
 ## Skill Benchmarks
 

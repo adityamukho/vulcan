@@ -453,9 +453,29 @@ Vendored-in-tree code checked in as regular files (not a git submodule) is parse
 
 | Rule | Traverses | Use for |
 |---|---|---|
-| `(ancestor ?child ?anc)` | `:parent` (recursive) | commit graph ancestry |
-| `(reachable ?a ?b)` | `:depends-on`, `:calls`, `:contains` (recursive) | transitive code reachability |
-| `(linked ?a ?b)` | `:depends-on`, `:calls`, `:contains` (single hop) | direct cross-edge-type queries |
+| `(ancestor ?child ?anc)` | `:parent` (**recursive**) | commit graph ancestry, at any depth |
+| `(reachable ?a ?b)` | `:depends-on`, `:calls`, `:contains` (single hop) | one hop across mixed edge types |
+| `(linked ?a ?b)` | `:depends-on`, `:calls`, `:contains` (single hop) | one hop across mixed edge types |
+
+**`reachable` is not transitive, despite the name.** `ancestor` is the only
+pre-registered rule with a recursive clause. `reachable` and `linked` are
+identical: three single-hop clauses each, unifying `:depends-on`, `:calls` and
+`:contains` under one name so a query can cross edge types without knowing
+which kind it is. On `a → b → c`, `(reachable :dependency/a ?b)` returns `b`
+alone — `c` is silently absent, which is the failure mode to watch for when
+using it for blast-radius analysis.
+
+For genuine transitive traversal, register the recursive clause yourself. It
+accumulates onto the pre-registered ones, so the name keeps working for
+everything it already matched:
+
+```python
+minigraf_rule("[(reachable ?a ?b) [?a :depends-on ?mid] (reachable ?mid ?b)]")
+# (reachable :dependency/a ?b) now returns both b and c
+```
+
+Rules registered this way persist for the server session and are re-applied on
+every DB reopen — see `minigraf_rule`.
 
 ### Code Structure Query Examples
 
@@ -470,7 +490,9 @@ Once ingestion is complete, query code structure with `:valid-at` for point-in-t
 [:find ?caller :valid-at "2026-05-26"
  :where [?e :depends-on :module/src-auth-py] [?e :description ?caller]]
 
-; All modules transitively reachable from src/auth.py (via :contains and :depends-on)
+; One hop out from src/auth.py across :contains, :depends-on and :calls
+; (single hop -- see the note under SESSION_RULES; register the recursive
+;  clause first if you need this to be transitive)
 [:find ?dep :valid-at "2026-05-26"
  :where (reachable :module/src-auth-py ?d) [?d :description ?dep]]
 ```
@@ -481,9 +503,13 @@ For the highest-frequency developer task — "which parts of the codebase should
 modify to build feature X or fix bug Y" — treat the ingested graph as a navigation tool,
 not just a history log.
 
-**Blast radius / impact.** Use the pre-registered `reachable` rule against `:depends-on`
-in reverse to find every entity transitively affected by a change — read and test all of
-them before you're done:
+**Blast radius / impact.** Run `reachable` against `:depends-on` in reverse to find the
+entities affected by a change — read and test all of them before you're done. Register
+the recursive clause first: the pre-registered `reachable` is single hop, so without it
+this returns only the direct dependents and silently omits everything behind them.
+```python
+minigraf_rule("[(reachable ?a ?b) [?a :depends-on ?mid] (reachable ?mid ?b)]")
+```
 ```datalog
 [:find ?desc :where (reachable ?dependent :module/src-auth-py) [?dependent :description ?desc]]
 ```
@@ -752,20 +778,20 @@ query("""[:find ?desc
                  [?svc :description ?desc]]""")
 ```
 
-For unbounded transitive traversal, register a recursive rule first:
+For unbounded transitive traversal, register the recursive clause first. The base clause
+`[(reachable ?a ?b) [?a :depends-on ?b]]` is already in `SESSION_RULES`, so only the
+recursive one is missing — clauses accumulate under the name rather than replacing it:
 ```python
 # Register once per server session
-minigraf_rule("[(reachable ?a ?b) [?a :depends-on ?b]]")
 minigraf_rule("[(reachable ?a ?b) [?a :depends-on ?m] (reachable ?m ?b)]")
 
 # Then query — finds all transitive dependents at any depth
 query("[:find ?desc :where (reachable ?svc :dependency/key-store) [?svc :description ?desc]]")
 ```
 
-Use rules to unify multiple edge types when scanning across mixed relationships:
+`linked` already unifies `:depends-on`, `:calls` and `:contains` for a single hop, so
+scanning across mixed relationships needs no registration at all:
 ```python
-minigraf_rule("[(linked ?a ?d) [?a :depends-on ?d]]")
-minigraf_rule("[(linked ?a ?d) [?a :calls ?d]]")
 query("""[:find ?desc
           :where (linked :dependency/auth-service ?svc)
                  [?svc :description ?desc]]""")
@@ -873,23 +899,24 @@ report_issue("parse_error", "query returns unexpected output",
 
 | File | Purpose |
 |------|---------|
-| `mcp_server.py` | Persistent MCP server — primary interface via MCP tools |
-| `minigraf.py` | Python wrapper (import or CLI — for direct use outside MCP) |
+| `mcp_server.py` | Persistent MCP server — the primary and only runtime interface to the graph |
+| `fact_index.py` | SQLite FTS5 fact index — powers `memory_prepare_turn` retrieval, and is the graph's only independent witness |
+| `frontier_registry.py` | Per-position claim registry for the two ingestion streams |
 | `report_issue.py` | GitHub issue reporter for errors |
+| `install.py` | Setup script (`--harness claude-code`, `opencode`, or `codex`) |
+| `uninstall.py` | Removes what `install.py` wrote |
 | `hooks/claude-code.json` | Claude Code settings fragment (MCP server + auto-memory hooks) |
 | `hooks/prepare_hook.py` | UserPromptSubmit hook script for Claude Code |
 | `hooks/finalize_hook.py` | Stop hook script for Claude Code |
-| `hooks/ingest_hook.py` | Git ingestion trigger hook (fires at session start) |
 | `hooks/opencode.json` | OpenCode MCP config (degraded mode — no hook support yet) |
 | `hooks/openclaw.json` | OpenClaw MCP config (degraded mode — issue #28596) |
-| `hooks/codex.toml` | Codex CLI MCP config with commented hook stubs |
+| `hooks/codex.toml` | Codex CLI MCP config with hook wiring |
 | `hooks/hermes.yaml` | Hermes MCP config with commented hook stubs |
-| `tools/query.json` | Tool schema for minigraf_query |
-| `tools/transact.json` | Tool schema for minigraf_transact |
-| `tools/retract.json` | Tool schema for minigraf_retract |
-| `tools/rule.json` | Tool schema for minigraf_rule |
-| `tools/report_issue.json` | Tool schema for minigraf_report_issue |
-| `tools/memory_prepare_turn.json` | Tool schema for memory_prepare_turn |
-| `tools/memory_finalize_turn.json` | Tool schema for memory_finalize_turn |
-| `install.py` | Setup script |
+| `skill.json` | Portable skill manifest — mirrors `plugin.json` and `pyproject.toml` |
+| `tools/*.json` | Portable copies of the ten tool schemas, generated from `mcp_server._TOOLS` |
 | `ROADMAP.md` | Project roadmap |
+
+There is no `minigraf.py`. Every `from minigraf import query, transact` example
+predates the MCP server and never worked — the installed `minigraf` package
+exports `MiniGrafDb`, `MiniGrafError` and `minigraf_ffi`, and nothing else. Use
+the MCP tools, or `MiniGrafDb` directly.

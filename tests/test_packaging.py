@@ -116,3 +116,63 @@ class TestPyModulesCoverage:
                 for dep, importers in sorted(missing.items())
             )
         )
+
+
+class TestHookConfigsReferenceRealScripts:
+    """Every `PATH_TO_REPO/...` script a hook config names exists.
+
+    `hooks/codex.toml` wired `[hooks.pre_turn_ingest]` to
+    `hooks/ingest_hook.py` for three months after b4e9385 (2026-06-04) deleted
+    that script -- ingestion auto-starts inside the MCP server now, so the hook
+    had no reason to exist and nothing noticed it pointing at nothing. A Codex
+    user merging that config got a hook that fails on every turn.
+
+    The configs are templates for five different harnesses with three different
+    file formats, and none of them is executed by this suite, so the only thing
+    that can catch this is a scan for the path shape they all share.
+    """
+
+    CONFIG_SUFFIXES = (".json", ".toml", ".yaml", ".yml")
+
+    def _hook_configs(self) -> list:
+        hooks_dir = os.path.join(REPO_ROOT, "hooks")
+        return [
+            os.path.join(hooks_dir, name)
+            for name in sorted(os.listdir(hooks_dir))
+            if name.endswith(self.CONFIG_SUFFIXES)
+        ]
+
+    def test_referenced_scripts_exist(self):
+        # Matches the placeholder form the templates use, in any of the three
+        # syntaxes -- `"python PATH_TO_REPO/x.py"`, `["python",
+        # "PATH_TO_REPO/x.py"]`, and the YAML scalar -- since all three write
+        # the path itself identically.
+        pattern = re.compile(r"PATH_TO_REPO/(\S+?\.py)")
+
+        configs = self._hook_configs()
+        assert configs, "no hook config files found -- the scan proves nothing"
+
+        referenced = {}
+        for path in configs:
+            with open(path) as f:
+                for script in pattern.findall(f.read()):
+                    referenced.setdefault(script, set()).add(
+                        os.path.basename(path)
+                    )
+        assert referenced, (
+            "no PATH_TO_REPO script references found in any hook config -- "
+            "either the placeholder convention changed or this scan is broken"
+        )
+
+        missing = {
+            script: sources
+            for script, sources in referenced.items()
+            if not os.path.exists(os.path.join(REPO_ROOT, script))
+        }
+        assert not missing, (
+            "hook configs reference scripts that do not exist:\n"
+            + "\n".join(
+                f"  {script} -- named by {', '.join(sorted(sources))}"
+                for script, sources in sorted(missing.items())
+            )
+        )
