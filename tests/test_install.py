@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 
@@ -61,6 +62,51 @@ class TestCheckMcpServerImportable:
         mock_result.stderr = b"No module named 'mcp_server'"
         with patch("subprocess.run", return_value=mock_result):
             assert install.check_mcp_server_importable() is False
+
+
+class TestPluginVersion:
+    """`.claude-plugin/plugin.json` is the only source, and there is no fallback.
+
+    A wrong PLUGIN_VERSION is not inert. It names the cache directory Claude
+    Code is told to copy the stub into, and `_build_plugin_stub` deletes every
+    cache directory whose name is not it -- so a stale fallback deletes the
+    working install and registers a path nothing will ever populate. Silently:
+    the script prints a tick and exits 0.
+    """
+
+    def _repo_with(self, tmp_path, monkeypatch, contents):
+        (tmp_path / ".claude-plugin").mkdir()
+        (tmp_path / ".claude-plugin" / "plugin.json").write_text(contents)
+        monkeypatch.setattr(install, "REPO_DIR", str(tmp_path))
+
+    def test_reads_the_version_from_the_canonical_file(self, tmp_path, monkeypatch):
+        self._repo_with(tmp_path, monkeypatch, '{"version": "9.9.9"}')
+        assert install._plugin_version() == "9.9.9"
+
+    def test_module_constant_matches_the_repo_file(self):
+        with open(os.path.join(install.REPO_DIR, ".claude-plugin", "plugin.json")) as f:
+            assert install.PLUGIN_VERSION == json.load(f)["version"]
+
+    def test_refuses_when_plugin_json_is_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(install, "REPO_DIR", str(tmp_path))
+        with pytest.raises(SystemExit) as exc:
+            install._plugin_version()
+        assert ".claude-plugin/plugin.json" in str(exc.value)
+
+    def test_refuses_when_plugin_json_is_malformed(self, tmp_path, monkeypatch):
+        self._repo_with(tmp_path, monkeypatch, "{not json")
+        with pytest.raises(SystemExit):
+            install._plugin_version()
+
+    def test_refuses_when_the_version_key_is_absent(self, tmp_path, monkeypatch):
+        self._repo_with(tmp_path, monkeypatch, '{"name": "temporal-reasoning"}')
+        with pytest.raises(SystemExit):
+            install._plugin_version()
+
+    def test_refuses_when_the_version_is_empty(self, tmp_path, monkeypatch):
+        self._repo_with(tmp_path, monkeypatch, '{"version": ""}')
+        with pytest.raises(SystemExit):
+            install._plugin_version()
 
 
 class TestPyprojectPyModules:

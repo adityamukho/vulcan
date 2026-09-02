@@ -348,7 +348,7 @@ The plugin is published via a stub architecture — `install.py` handles all reg
 4. `~/.claude/plugins/installed_plugins.json` — `installPath` → versioned cache dir
 5. `~/.claude/plugins/known_marketplaces.json` — **authoritative store**; `source.path` and `installLocation` → stub dir (settings.json changes don't propagate here automatically)
 
-**Version bumps:** canonical version lives in `.claude-plugin/plugin.json`; `install.py` reads it via `PLUGIN_VERSION`. Stale versioned cache dirs are deleted on each run.
+**Version bumps:** canonical version lives in `.claude-plugin/plugin.json`; `install.py` reads it via `PLUGIN_VERSION`. Stale versioned cache dirs are deleted on each run. That read has **no fallback** and exits on failure, deliberately: the version names the cache dir Claude Code is told to copy the stub into, and the same run deletes every cache dir that is not it — so a guessed version deletes the working install and registers a path nothing will populate, while the script prints a tick and exits 0. It used to fall back to a hardcoded `0.3.0`.
 
 **Diagnosing failures:** `claude plugin list` shows per-plugin status and errors. "Plugin X not found in marketplace Y" means marketplace.json failed validation — check the `owner` field and run `claude plugin validate <stub-dir>`.
 
