@@ -32,13 +32,36 @@ VENV_DIR = os.path.join(REPO_DIR, ".venv")
 VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python")
 
 def _plugin_version() -> str:
-    """Read the canonical version from .claude-plugin/plugin.json."""
+    """Read the canonical version from .claude-plugin/plugin.json.
+
+    There is deliberately no fallback. A wrong version here is not inert: it
+    names the cache directory Claude Code is told to copy the stub into, and
+    `_build_plugin_stub` deletes every cache directory that is not it. So a
+    guessed version deletes the working install and registers a path nothing
+    will ever populate, while the script prints a tick and exits 0. This used
+    to fall back to a hardcoded "0.3.0" -- eleven releases stale by v0.7.0.
+
+    The file is committed next to this script, so failing to read it means a
+    broken checkout, not a condition to paper over.
+    """
     import json
     path = os.path.join(REPO_DIR, ".claude-plugin", "plugin.json")
     try:
-        return json.load(open(path))["version"]
-    except Exception:
-        return "0.3.0"
+        with open(path) as f:
+            version = json.load(f).get("version")
+    except (IOError, OSError, ValueError) as e:
+        raise SystemExit(
+            f"✗ Cannot read the plugin version from {path}: {e}\n"
+            "  .claude-plugin/plugin.json is the canonical version source and "
+            "ships with this checkout; restore it and re-run."
+        )
+    if not version:
+        raise SystemExit(
+            f"✗ No version in {path}\n"
+            "  .claude-plugin/plugin.json is the canonical version source; "
+            "it needs a non-empty \"version\" key."
+        )
+    return version
 
 PLUGIN_VERSION = _plugin_version()
 

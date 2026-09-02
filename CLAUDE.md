@@ -238,6 +238,22 @@ a `.mcp.json` pointing at the PyPI package, so this broke the full install as
 much as the MCP-only one. After changing a dependency bound, cut a release or
 the bound protects only developers.
 
+**`serverInfo.version` is a two-source ladder, and `0.0.0` counts as absent
+(#312).** `Server(name)` with no `version` makes the SDK report *its own*
+package version, so the published 0.7.0 told every client it was `1.29.1` — a
+number that moved with a user's `mcp` resolution and never with a release
+here. `_package_version()` (mcp_server.py) reads
+`importlib.metadata.version("temporal-reasoning")` first, then
+`.claude-plugin/plugin.json`, then gives up with `unknown`. Both sources are
+load-bearing and neither covers the other: plugin.json is NOT in the wheel
+(`py-modules` ships four `.py` files and nothing else), so an installed
+package has only metadata; and a dev install writes a real
+`temporal_reasoning-0.0.0.dist-info` carrying the placeholder that only
+`release.yml` stamps, so handling `PackageNotFoundError` alone would report
+`0.0.0` on every developer machine and in CI. That is why the placeholder is
+treated as absent rather than trusted — and why a fix here is verified
+against a built, stamped wheel, not just the checkout.
+
 **project-minigraf/minigraf#287 is still OPEN and is worked around here, not
 fixed.** Batching facts that share `(entity, attribute, valid_from)` into one
 transact silently keeps only the last, because the EAVT pending index omits
@@ -332,7 +348,7 @@ The plugin is published via a stub architecture — `install.py` handles all reg
 4. `~/.claude/plugins/installed_plugins.json` — `installPath` → versioned cache dir
 5. `~/.claude/plugins/known_marketplaces.json` — **authoritative store**; `source.path` and `installLocation` → stub dir (settings.json changes don't propagate here automatically)
 
-**Version bumps:** canonical version lives in `.claude-plugin/plugin.json`; `install.py` reads it via `PLUGIN_VERSION`. Stale versioned cache dirs are deleted on each run.
+**Version bumps:** canonical version lives in `.claude-plugin/plugin.json`; `install.py` reads it via `PLUGIN_VERSION`. Stale versioned cache dirs are deleted on each run. That read has **no fallback** and exits on failure, deliberately: the version names the cache dir Claude Code is told to copy the stub into, and the same run deletes every cache dir that is not it — so a guessed version deletes the working install and registers a path nothing will populate, while the script prints a tick and exits 0. It used to fall back to a hardcoded `0.3.0`.
 
 **Diagnosing failures:** `claude plugin list` shows per-plugin status and errors. "Plugin X not found in marketplace Y" means marketplace.json failed validation — check the `owner` field and run `claude plugin validate <stub-dir>`.
 
