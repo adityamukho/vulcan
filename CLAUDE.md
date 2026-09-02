@@ -190,13 +190,51 @@ gate runs on a fresh ingestion-only graph so it cannot fire there; on a mixed
 graph the row is informational. The graph carries no discriminator between an
 ingested and a memory-written code entity.
 
-**What no fact-level check can see is a whole COMMIT going missing** — graph
-and index are consistent about the absence, so `divergence` is 0 again. That
-needs an independent count against the repo (`git rev-list --count` vs
-`_count_commit_entities`) and is filed as #317, deliberately not folded in
-here: it needs a repo handle `fact_audit` does not take, and its clean
-difference is probably NOT zero (skipped commits, merge commits, path-ignore
-all have to be measured first, or it repeats the external-dependency trap).
+**What no fact-level check can see is a whole COMMIT going missing, and #317
+is the census that does.** Graph and index are consistent about the absence,
+so `divergence` reads 0 again; the two `:introduced-by` checks are
+well-formedness checks on entities that EXIST, and a commit that produced no
+entities produces nothing for either; `stderr_capture` has nothing to read;
+and `_exit_code`'s `graph_facts == 0` clause only fires when the graph reads
+back COMPLETELY empty — one commit in 847 is not zero facts. So
+`evals/at_scale/commit_census.py` compares THREE numbers, not one delta, and
+is wired beside the audit rather than inside it (it needs a repo handle
+`fact_audit` deliberately does not take): `git rev-list --count <branch>`,
+`_ingest_progress["processed"]`, and `_count_commit_entities`. **`walk_vs_graph`
+catches a commit walked and then lost; `repo_vs_walk` catches one NEVER
+WALKED** — the case no in-process counter can see, because the counter and the
+walk share the bug. Gated as clause 8.
+
+The clean difference **is** zero, which was the open question: **847 = 847 =
+847** on the 847-commit at-scale graph (`results/317-commit-census.json`), so
+the gate is zero-tolerance. Predicted from the code, then confirmed — shipping
+it as zero without measuring would have repeated the `:type/external-dependency`
+trap. The five hazards the issue required measuring all resolved clean: merges
+count on both sides (`build_linearization` and `rev-list` are the same set, and
+both apply functions write the `:type/commit` triple FIRST, before any file is
+looked at, so path-ignore changes nothing either); an extraction-skipped commit
+raises the walk count without raising the graph's, and is already failed by the
+`skipped_commits` clause. **`repo_commits` ships as the census's own
+denominator** — three counts that are all zero also agree, so an empty repo
+reports `proved_nothing` and is NOT failed. **An incomplete run is not failed
+for walking fewer**: `repo_vs_walk` is gated only when `final_status` is
+`complete`, while `walk_vs_graph` is gated always.
+
+Two things it depends on. The ref is **the resolved branch, never `HEAD`** —
+`_run_ingestion`'s own `repo_total` was hardcoded to `HEAD` while ingestion
+takes a `branch` argument, live in the very run that measured this (the harness
+resolves `master` while the checkout sits on a feature branch); fixed at source.
+And **`_count_commit_entities` now uses `count-distinct`, not `count`**:
+`(count ?e)` counts matching ROWS, so one duplicated commit entity would CANCEL
+one genuinely lost commit and the census would read clean on a graph that lost
+history. That duplicate is NOT reachable from ingestion (the commit triples are
+transacted at `commit_ts_iso`, so a #313 re-walk rewrites the identical triple
+at the identical valid-from and it collapses); it is reachable from the public
+handler, since `commit` is a registered `MINIGRAF_SCHEMA` type and
+`handle_minigraf_transact` writes `:entity-type` at wall-clock valid-from.
+`_STATUS_QUERY` keeps `count` deliberately — it is a latency instrument whose
+query is frozen for cross-run comparability, and its number is never read as a
+count. An absent `commit_census` key stays clean, same precedent as the rest.
 
 **Re-running ingestion repairs none of it, and that is mechanical, not policy.**
 A finished run parks `:ingestion/correction-sweep-through` at frontier-high's

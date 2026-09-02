@@ -5856,8 +5856,35 @@ def _count_commit_entities(db: Any) -> int:
 
     Unlike _total_ingested_query, this reflects reality even after a run was
     interrupted before it could write its completion watermark.
+
+    count-distinct, NOT count (#317). `(count ?e)` counts matching ROWS, not
+    distinct entities -- measured on minigraf 2.0.0: two :type/commit entities
+    read 2, and a second live :entity-type row on ONE of them makes the same
+    query read 3 while count-distinct still reads 2. That second row is
+    reachable because minigraf is not idempotent at the graph level for
+    re-transacting the same (entity, attribute, value) under a different
+    valid-from (#156) -- the same non-idempotency _watermark_update diffs its
+    constant attributes to avoid.
+
+    NOT reachable from ingestion, and the narrow claim is the honest one:
+    _reverse_apply and _forward_apply transact the commit triples at
+    commit_ts_iso, so a resumed run re-walking a position whose
+    _frontier_persist_claim never landed (#313) re-writes the identical triple
+    at the identical valid-from and it COLLAPSES rather than duplicating. The
+    reachable path is the public handler -- `commit` is a registered
+    MINIGRAF_SCHEMA type, so handle_minigraf_transact accepts
+    `[:commit/xyz :description "..."]` and writes its :entity-type at
+    wall-clock valid-from; twice, seconds apart, on a graph mixing memory
+    writes with ingested history, and the old query was wrong.
+
+    The over-count is invisible to this function's other caller
+    (prepare_turn's navigation nudge only asks `> 0`), but #317's commit census
+    compares this number against the repo's own `git rev-list --count`, where
+    one duplicated entity would CANCEL one genuinely lost commit and read
+    clean on a graph that lost history -- the precise failure that census
+    exists to catch.
     """
-    raw = _db_execute(db, "(query [:find (count ?e) :where [?e :entity-type :type/commit]])")
+    raw = _db_execute(db, "(query [:find (count-distinct ?e) :where [?e :entity-type :type/commit]])")
     results = json.loads(raw).get("results", [])
     return int(results[0][0]) if results else 0
 
@@ -11321,8 +11348,17 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             # (a post-watermark-only map would silently skip it).
             ts_by_commit_ident={f":commit/{h[:12]}": ts for h, ts, _a, _s in commit_metadata},
         )
+        # `branch`, NOT "HEAD" (#317). This was hardcoded to HEAD while every
+        # other git call in this function takes the branch argument, so the
+        # progress bar's denominator described a different ref than the walk
+        # for any run that is not on HEAD -- and silently, since both are
+        # plausible integers. The at-scale harness hits exactly that: it
+        # resolves the branch via _default_git_branch (e.g. "master") while
+        # the checkout sits on a feature branch. Found while building #317's
+        # commit census, which compares this same count against the graph and
+        # would have inherited the wrong ref.
         repo_total_result = _subprocess.run(
-            ["git", "rev-list", "--count", "HEAD"],
+            ["git", "rev-list", "--count", branch],
             cwd=repo_path, capture_output=True, text=True,
         )
         repo_total = int(repo_total_result.stdout.strip()) if repo_total_result.returncode == 0 else len(commit_metadata)

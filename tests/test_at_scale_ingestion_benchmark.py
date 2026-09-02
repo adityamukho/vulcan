@@ -28,6 +28,11 @@ _EXPECTED_METRIC_KEYS = {
     "correction_sweep_skipped", "stderr_capture_complete", "ingest_error",
     # #302: the one key derived from the graph's CONTENT rather than its logs.
     "fact_audit",
+    # #317: the only content key whose reference is not the graph itself. A
+    # commit that never reached the graph is absent from the fact index in
+    # exactly the same way, so fact_audit's two witnesses agree perfectly
+    # about it and only the repo can report it.
+    "commit_census",
     # #284 item 4: attribution. A wall-clock number is not comparable across
     # runs without the minigraf version that produced it.
     "minigraf_version", "python_version",
@@ -314,6 +319,126 @@ def git_repo(tmp_path):
     _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
     _subprocess.run(["git", "commit", "-m", "add models"], cwd=repo, check=True, capture_output=True)
     return repo
+
+
+class TestExitCodeCommitCensusClause:
+    """#317, clause 8. The generalisation of the `graph_facts == 0` clause:
+    that one catches a graph reading back COMPLETELY empty, this one catches
+    one commit missing out of 847."""
+
+    def test_a_failed_census_fails_the_run(self):
+        """Every other key here reads clean, and that is the whole point. A
+        commit that was never written is absent from the graph AND from its
+        fact index -- they are written from the same triples in the same
+        transaction boundary -- so clause 5's two witnesses agree perfectly;
+        clauses 6 and 7 are well-formedness checks on entities that exist, and
+        a commit that produced no entities produces nothing for either; and a
+        run that silently dropped one still prints nothing, so clauses 1-4
+        pass. Without this clause the graph is green."""
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [], "error_signals": [],
+            "stderr_capture_complete": True,
+            "commits_ingested": 846,
+            "fact_audit": {
+                "divergence": 0, "audit_error": None, "graph_facts": 31377,
+                "introduced_by_duplicates": {"entities": 0},
+                "entities_without_introduced_by": {
+                    "entities": 0, "code_entities_scanned": 3323,
+                },
+            },
+            "commit_census": {
+                "repo_commits": 847, "walk_claimed": 846,
+                "graph_commit_entities": 846, "ok": False,
+            },
+        }) == 1
+
+    def test_a_clean_census_passes(self):
+        assert _exit_code({
+            "final_status": "complete",
+            "commit_census": {
+                "repo_commits": 847, "walk_claimed": 847,
+                "graph_commit_entities": 847, "ok": True,
+            },
+        }) == 0
+
+    def test_an_absent_census_key_stays_clean(self):
+        """A metrics file from a harness that predates this census. Same
+        precedent as an absent fact_audit: a run that was never asked cannot
+        be retro-failed."""
+        assert _exit_code({
+            "final_status": "complete", "commits_ingested": 847,
+        }) == 0
+
+    def test_a_census_that_could_not_run_fails(self):
+        """Unverified is not verified-clean -- the reasoning of clause 4 and of
+        fact_audit's audit_error. commit_census sets ok False on a
+        census_error, so this clause needs no separate term for it."""
+        assert _exit_code({
+            "final_status": "complete",
+            "commit_census": {
+                "repo_commits": 0, "walk_claimed": 847,
+                "graph_commit_entities": 847, "ok": False,
+                "census_error": "FileNotFoundError: git",
+            },
+        }) == 1
+
+    def test_an_empty_repo_census_is_not_failed(self):
+        """`proved_nothing` is reported, not failed: a repo holding no commits
+        is not a defect. Mirrors clause 7's zero-denominator handling."""
+        assert _exit_code({
+            "final_status": "complete",
+            "commit_census": {
+                "repo_commits": 0, "walk_claimed": 0,
+                "graph_commit_entities": 0, "ok": True,
+                "proved_nothing": True,
+            },
+        }) == 0
+
+
+class TestCommitCensusReachesTheMetrics:
+    """The pure comparison is tested in tests/test_at_scale_commit_census.py.
+    What THIS needs to prove is that the harness hands it the right three
+    numbers off a real repo and a real graph -- a pure function cannot."""
+
+    @pytest.mark.asyncio
+    async def test_a_real_run_censuses_its_own_commits(self, git_repo, tmp_path):
+        graph_path = tmp_path / "bench.graph"
+        metrics = await run_ingestion_benchmark(
+            str(git_repo), "HEAD", graph_path, poll_interval=0.05
+        )
+        census = metrics["commit_census"]
+        # The fixture repo has exactly two commits. Asserted as a literal
+        # rather than against metrics["commits_ingested"], which is the very
+        # number under test -- comparing the census to its own input would
+        # pass on a census that echoed it.
+        assert census["repo_commits"] == 2
+        assert census["walk_claimed"] == 2
+        assert census["graph_commit_entities"] == 2
+        assert census["ok"] is True
+        assert census["census_error"] is None
+        assert _exit_code(metrics) == 0
+
+    @pytest.mark.asyncio
+    async def test_the_census_records_the_ref_it_used(self, git_repo, tmp_path):
+        """The ref is the half that was silently wrong in _run_ingestion's own
+        repo_total (#317), so the census must say which one it counted rather
+        than leaving a reader to assume."""
+        metrics = await run_ingestion_benchmark(
+            str(git_repo), "HEAD", tmp_path / "bench.graph", poll_interval=0.05
+        )
+        assert metrics["commit_census"]["ref"] == "HEAD"
+
+    @pytest.mark.asyncio
+    async def test_the_denominator_is_nonzero_on_a_real_run(self, git_repo, tmp_path):
+        """The positive control, in the test as well as in the artifact. Three
+        counts that are all zero also agree, so a census reporting ok True over
+        a repo it never read would look identical to a clean one."""
+        metrics = await run_ingestion_benchmark(
+            str(git_repo), "HEAD", tmp_path / "bench.graph", poll_interval=0.05
+        )
+        assert metrics["commit_census"]["repo_commits"] > 0
+        assert metrics["commit_census"]["proved_nothing"] is False
 
 
 class TestRunIngestionBenchmark:

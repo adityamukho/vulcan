@@ -28,6 +28,7 @@ REPO_ROOT = Path(__file__).parent.parent.parent.resolve()
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from evals.at_scale.commit_census import collect_commit_census  # noqa: E402
 from evals.at_scale.fact_audit import audit_graph_against_index  # noqa: E402
 from evals.at_scale.metrics import latency_stats, throughput_per_minute  # noqa: E402
 from evals.at_scale.stderr_capture import (  # noqa: E402
@@ -302,6 +303,40 @@ async def run_ingestion_benchmark(
         index_path, expected_graph_path=str(graph_path)
     )
 
+    # #317. BESIDE the audit, not inside it. Every check above this line is
+    # fact-level, and a commit that never reached the graph at all is invisible
+    # to all of them: fact_audit's two witnesses are written from the same
+    # triples in the same transaction boundary, so a commit that was never
+    # written is absent from BOTH and they agree perfectly. This is the one
+    # check here that holds a reference the graph did not produce -- the repo
+    # itself -- which is also why it cannot ride fact_audit's scan the way the
+    # two :introduced-by checks do. fact_audit deliberately takes no repo
+    # handle, and giving it one for this would cost that signature its honesty.
+    #
+    # `resolved_branch`, never "HEAD": those are different refs whenever the
+    # checkout is not on the branch being walked, which is the ordinary case
+    # here (see mcp_server._run_ingestion's repo_total, fixed in the same
+    # change). Two git subprocesses and one point query, so it costs
+    # milliseconds and needs no placement caveat of its own beyond running
+    # before the compare_ignore branch rebinds the module to a second graph.
+    #
+    # It counts whatever mcp_server is CURRENTLY BOUND TO, which is not visible
+    # in its arguments -- the same exposure fact_audit takes an
+    # expected_graph_path to close. It does not repeat that guard because the
+    # audit immediately above already made the assertion for this graph: a
+    # mismatch there is recorded as an audit_error and fails clause 5, so a
+    # census of the wrong graph cannot reach a green run. Moving this call
+    # above the audit, or reusing it anywhere the audit does not precede it,
+    # breaks that and needs its own check.
+    async with mcp_server.db_lease_async() as census_db:
+        commit_census = collect_commit_census(
+            repo_path=repo_path,
+            ref=resolved_branch,
+            walk_claimed=commits_ingested,
+            db=census_db,
+            final_status=final_status,
+        )
+
     from evals.at_scale.report import runtime_versions
 
     versions = runtime_versions()
@@ -334,6 +369,12 @@ async def run_ingestion_benchmark(
         # #302. divergence == 0 is the pass; see fact_audit.py for why it is
         # exactly zero on a clean run rather than "small".
         "fact_audit": fact_audit,
+        # #317. Its own key, beside the audit rather than inside it -- a
+        # different witness (the repo), a different failure mode (a whole
+        # commit missing, not a fact within one). `ok` is the gate's read; the
+        # three raw counts and three deltas ship alongside it so a mismatch
+        # says WHERE it happened.
+        "commit_census": commit_census,
         # #256. Not derivable from commits_ingested or final_status: the
         # per-commit handler isolates failures and increments `processed`
         # anyway, so both are blind to a dropped commit.
@@ -391,8 +432,8 @@ async def run_ingestion_benchmark(
 
 def _exit_code(metrics: dict[str, Any]) -> int:
     """Return 1 if ingestion ended in an error state, dropped any commit,
-    logged a #251 signature, diverged from its own fact index, or could not be
-    verified at all; else 0.
+    logged a #251 signature, diverged from its own fact index, lost a whole
+    commit against the repo, or could not be verified at all; else 0.
 
     Clauses 2 and 3 matter because `final_status` cannot see either --
     _run_ingestion isolates per-commit failures by design rather than
@@ -463,6 +504,34 @@ def _exit_code(metrics: dict[str, Any]) -> int:
     # two sides matched. Guarded on commits_ingested being truthy, so a
     # zero-commit run is not failed for having no facts.
     if metrics.get("commits_ingested") and audit and audit.get("graph_facts") == 0:
+        return 1
+    # Clause 8 (#317) is the generalisation of the clause immediately above.
+    # That one catches a graph that reads back COMPLETELY empty; this one
+    # catches ONE commit missing out of 847, which is not zero facts and which
+    # nothing else here can see. Every clause above is either stderr-derived
+    # (1-4) or a comparison between the graph and its own index (5-7), and a
+    # commit that was never written is absent from both witnesses equally --
+    # they agree perfectly about a graph that lost history.
+    #
+    # Gated on `ok`, which commit_census computes, rather than on the deltas
+    # directly: the deltas are not all believable on every run. A `stopped`
+    # run walked fewer commits than the repo holds BY DESIGN, so
+    # `repo_vs_walk` is gated only when final_status is "complete", while
+    # `walk_vs_graph` is gated always -- however few commits the walk claimed,
+    # the graph must hold that many. Putting that reasoning in the census
+    # keeps it next to the numbers it is about.
+    #
+    # NO TOLERANCE, on the strength of a measurement rather than by symmetry
+    # with its neighbours: the 847-commit at-scale graph reads 847 = 847 = 847,
+    # every delta exactly zero (results/317-commit-census.json). The census
+    # ships `repo_commits` as its own denominator, so a run cannot read clean
+    # by having counted nothing -- and a census over a repo with no commits
+    # reports `proved_nothing` and is NOT failed, since a repo holding no
+    # commits is not a defect. `is False` rather than `not ...`, matching
+    # stderr_capture_complete: an ABSENT key (a metrics file from a harness
+    # that predates this census) stays clean, because a run that was never
+    # asked cannot be retro-failed.
+    if (metrics.get("commit_census") or {}).get("ok") is False:
         return 1
     return 0
 
