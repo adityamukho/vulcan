@@ -17,6 +17,17 @@ Every session starts from zero — you ask questions already answered, write cod
 - **Write immediately** when the user establishes something worth keeping (decision, preference, constraint)
 - **Read before acting** when the user asks about the past, or when you're about to modify something where past decisions might apply
 
+**How you call these.** Every example below is an MCP tool call — `minigraf_query`,
+`minigraf_transact`, `minigraf_retract`, `minigraf_rule`, `minigraf_ingest_git`,
+`minigraf_ingest_status`, `minigraf_audit`, `minigraf_report_issue`,
+`memory_prepare_turn`, `memory_finalize_turn` — made through your harness's MCP
+client with **named arguments** (in Claude Code they appear as
+`mcp__temporal-reasoning__minigraf_query` and so on). There is no importable Python
+API and no CLI: the installed `minigraf` package exports `MiniGrafDb`,
+`MiniGrafError` and `minigraf_ffi`, so `from minigraf import query, transact` has
+never worked, and there is no `minigraf.py` in this project. To read a graph outside
+the server, open a `MiniGrafDb` directly.
+
 ## When to Write (minigraf_transact)
 
 Write to memory when the user's words signal a durable fact:
@@ -54,7 +65,7 @@ Say "Let me check memory..." before querying. Then:
 
 2. **To discover what attribute names exist on an entity**, query it directly — you don't need to know them in advance:
    ```python
-   query("[:find ?a ?v :where [:decision/postgres ?a ?v]]")
+   minigraf_query(datalog="[:find ?a ?v :where [:decision/postgres ?a ?v]]")
    # Returns all attribute/value pairs for that entity
    ```
    To scan all stored attributes across the graph: `[:find ?e ?a :where [?e ?a ?v]]`
@@ -89,7 +100,7 @@ Facts are stored as triples: `[entity attribute value]`. The entity ident is the
 
 To retrieve all facts for an entity, query by ident directly — no need to know attribute names in advance:
 ```python
-query("[:find ?a ?v :where [:decision/postgres ?a ?v]]")
+minigraf_query(datalog="[:find ?a ?v :where [:decision/postgres ?a ?v]]")
 ```
 
 Before adding new facts about an entity, query it first to find existing attributes and avoid duplication.
@@ -124,11 +135,12 @@ Run `minigraf_audit` periodically or after a session with heavy writes to detect
 Assign a type to every entity so you can query across categories without knowing individual entity names:
 
 ```python
-transact("""[[:dependency/auth-service :description "AuthService"]
-             [:dependency/auth-service :entity-type :type/dependency]
-             [:constraint/python-version :description "must support Python 3.8 minimum"]
-             [:constraint/python-version :entity-type :type/constraint]]""",
-         reason="Dependency and constraint with types")
+minigraf_transact(
+    facts="""[[:dependency/auth-service :description "AuthService"]
+              [:dependency/auth-service :entity-type :type/dependency]
+              [:constraint/python-version :description "must support Python 3.8 minimum"]
+              [:constraint/python-version :entity-type :type/constraint]]""",
+    reason="Dependency and constraint with types")
 ```
 
 Use these canonical type keywords:
@@ -213,42 +225,35 @@ memory_finalize_turn(conversation_delta="User: We'll use Redis for caching.\nAge
 
 ### minigraf_transact
 ```python
-from minigraf import transact
-
-transact("""[[:decision/postgres :description "PostgreSQL 15 — primary database"]
-             [:decision/postgres :entity-type :type/decision]
-             [:decision/postgres :rationale "ACID compliance + JSON support; tradeoff: lower write throughput"]]""",
-         reason="Database choice finalized — JSON support required for analytics queries")
+minigraf_transact(
+    facts="""[[:decision/postgres :description "PostgreSQL 15 — primary database"]
+              [:decision/postgres :entity-type :type/decision]
+              [:decision/postgres :rationale "ACID compliance + JSON support; tradeoff: lower write throughput"]]""",
+    reason="Database choice finalized — JSON support required for analytics queries")
 ```
 
-Or via CLI (from project directory):
-```bash
-python minigraf.py transact '[...]' --reason "why this is worth keeping"
-```
+Both arguments are required; a write with an empty `reason` is rejected.
 
 ### minigraf_query
 ```python
-from minigraf import query
-
 # All facts for a known entity
-query("[:find ?a ?v :where [:decision/postgres ?a ?v]]")
+minigraf_query(datalog="[:find ?a ?v :where [:decision/postgres ?a ?v]]")
 
 # Broad scan of everything in memory
-query("[:find ?e ?a ?v :where [?e ?a ?v]]")
+minigraf_query(datalog="[:find ?e ?a ?v :where [?e ?a ?v]]")
 
 # Search stored values by content (useful when entity ident is unknown)
-query('[:find ?e ?a ?v :where [?e ?a ?v] (contains? ?v "Redis")]')
-query('[:find ?e ?v :where [?e :rationale ?v] (starts-with? ?v "chosen")]')
+minigraf_query(datalog='[:find ?e ?a ?v :where [?e ?a ?v] (contains? ?v "Redis")]')
+minigraf_query(datalog='[:find ?e ?v :where [?e :rationale ?v] (starts-with? ?v "chosen")]')
 
 # Temporal — state at transaction N
-query("[:find ?a ?v :as-of 5 :where [:decision/postgres ?a ?v]]")
+minigraf_query(datalog="[:find ?a ?v :as-of 5 :where [:decision/postgres ?a ?v]]")
 ```
 
 ### minigraf_retract
 ```python
-from minigraf import retract
-retract("[[:dependency/old-service :description \"obsolete\"]]",
-        reason="Service decommissioned")
+minigraf_retract(facts='[[:dependency/old-service :description "obsolete"]]',
+                 reason="Service decommissioned")
 ```
 
 ### minigraf_rule
@@ -257,12 +262,12 @@ Register a Datalog rule for the current server session. Rules enable recursive g
 
 ```python
 # Base case (register first)
-minigraf_rule("[(ancestor ?a ?d) [?a :parent ?d]]")
+minigraf_rule(rule="[(ancestor ?a ?d) [?a :parent ?d]]")
 # Recursive case
-minigraf_rule("[(ancestor ?a ?d) [?a :parent ?m] (ancestor ?m ?d)]")
+minigraf_rule(rule="[(ancestor ?a ?d) [?a :parent ?m] (ancestor ?m ?d)]")
 
 # Now query using the rule
-minigraf_query("[:find ?anc :where (ancestor :commit/abc123def456 ?anc) [?anc :subject ?s]]")
+minigraf_query(datalog="[:find ?anc :where (ancestor :commit/abc123def456 ?anc) [?anc :subject ?s]]")
 ```
 
 Returns `{"ok": true, "rule": "..."}` on success, or `{"ok": false, "error": "..."}` if the rule has a syntax error or creates a negative cycle.
@@ -470,7 +475,7 @@ accumulates onto the pre-registered ones, so the name keeps working for
 everything it already matched:
 
 ```python
-minigraf_rule("[(reachable ?a ?b) [?a :depends-on ?mid] (reachable ?mid ?b)]")
+minigraf_rule(rule="[(reachable ?a ?b) [?a :depends-on ?mid] (reachable ?mid ?b)]")
 # (reachable :dependency/a ?b) now returns both b and c
 ```
 
@@ -508,7 +513,7 @@ entities affected by a change — read and test all of them before you're done. 
 the recursive clause first: the pre-registered `reachable` is single hop, so without it
 this returns only the direct dependents and silently omits everything behind them.
 ```python
-minigraf_rule("[(reachable ?a ?b) [?a :depends-on ?mid] (reachable ?mid ?b)]")
+minigraf_rule(rule="[(reachable ?a ?b) [?a :depends-on ?mid] (reachable ?mid ?b)]")
 ```
 ```datalog
 [:find ?desc :where (reachable ?dependent :module/src-auth-py) [?dependent :description ?desc]]
@@ -745,40 +750,43 @@ below 1.0 demote history, 1.0 is neutral).
 ### Storing a tech stack decision
 User: "We're using FastAPI over Flask — async support is critical for our Redis calls."
 ```python
-transact("""[[:decision/api-layer :description "use FastAPI over Flask"]
-             [:decision/api-layer :entity-type :type/decision]
-             [:decision/api-layer :rationale "async support required for Redis calls; rejected Flask"]]""",
-         reason="API framework finalized")
+minigraf_transact(
+    facts="""[[:decision/api-layer :description "use FastAPI over Flask"]
+              [:decision/api-layer :entity-type :type/decision]
+              [:decision/api-layer :rationale "async support required for Redis calls; rejected Flask"]]""",
+    reason="API framework finalized")
 ```
 
 ### Storing a component relationship (entity reference, not string)
 User: "The auth service calls the JWT module for token validation."
 ```python
-transact("""[[:dependency/auth-service :description "AuthService"]
-             [:dependency/auth-service :entity-type :type/dependency]
-             [:dependency/auth-service :calls :dependency/jwt-module]
-             [:dependency/jwt-module :description "JWTModule"]
-             [:dependency/jwt-module :entity-type :type/dependency]]""",
-         reason="Component dependency for impact analysis")
+minigraf_transact(
+    facts="""[[:dependency/auth-service :description "AuthService"]
+              [:dependency/auth-service :entity-type :type/dependency]
+              [:dependency/auth-service :calls :dependency/jwt-module]
+              [:dependency/jwt-module :description "JWTModule"]
+              [:dependency/jwt-module :entity-type :type/dependency]]""",
+    reason="Component dependency for impact analysis")
 ```
 `:calls` holds the entity ident `:dependency/jwt-module` — not the string `"jwt-module"`. This makes the edge traversable.
 
 ### Decision motivated by a constraint
 User: "We chose asyncio over threading because of the GIL."
 ```python
-transact("""[[:constraint/gil :description "Python GIL limits true thread parallelism"]
-             [:constraint/gil :entity-type :type/constraint]
-             [:decision/asyncio :description "use asyncio over threading"]
-             [:decision/asyncio :entity-type :type/decision]
-             [:decision/asyncio :motivated-by :constraint/gil]]""",
-         reason="Decision traceability — why asyncio was chosen")
+minigraf_transact(
+    facts="""[[:constraint/gil :description "Python GIL limits true thread parallelism"]
+              [:constraint/gil :entity-type :type/constraint]
+              [:decision/asyncio :description "use asyncio over threading"]
+              [:decision/asyncio :entity-type :type/decision]
+              [:decision/asyncio :motivated-by :constraint/gil]]""",
+    reason="Decision traceability — why asyncio was chosen")
 ```
 Query: "Why asyncio?" traverses the edge:
 ```python
-query("""[:find ?reason
-          :where [?d :description "use asyncio over threading"]
-                 [?d :motivated-by ?c]
-                 [?c :description ?reason]]""")
+minigraf_query(datalog="""[:find ?reason
+                          :where [?d :description "use asyncio over threading"]
+                                 [?d :motivated-by ?c]
+                                 [?c :description ?reason]]""")
 ```
 
 ### Impact analysis via multi-hop join
@@ -787,13 +795,13 @@ User: "What breaks if I change the key-store service?"
 For fixed-depth traversal, use explicit joins:
 ```python
 # Direct dependents (1 hop)
-query("[:find ?desc :where [?svc :depends-on :dependency/key-store] [?svc :description ?desc]]")
+minigraf_query(datalog="[:find ?desc :where [?svc :depends-on :dependency/key-store] [?svc :description ?desc]]")
 
 # 2-hop: also find services that depend on those services
-query("""[:find ?desc
-          :where [?mid :depends-on :dependency/key-store]
-                 [?svc :depends-on ?mid]
-                 [?svc :description ?desc]]""")
+minigraf_query(datalog="""[:find ?desc
+                          :where [?mid :depends-on :dependency/key-store]
+                                 [?svc :depends-on ?mid]
+                                 [?svc :description ?desc]]""")
 ```
 
 For unbounded transitive traversal, register the recursive clause first. The base clause
@@ -801,54 +809,55 @@ For unbounded transitive traversal, register the recursive clause first. The bas
 recursive one is missing — clauses accumulate under the name rather than replacing it:
 ```python
 # Register once per server session
-minigraf_rule("[(reachable ?a ?b) [?a :depends-on ?m] (reachable ?m ?b)]")
+minigraf_rule(rule="[(reachable ?a ?b) [?a :depends-on ?m] (reachable ?m ?b)]")
 
 # Then query — finds all transitive dependents at any depth
-query("[:find ?desc :where (reachable ?svc :dependency/key-store) [?svc :description ?desc]]")
+minigraf_query(datalog="[:find ?desc :where (reachable ?svc :dependency/key-store) [?svc :description ?desc]]")
 ```
 
 `linked` already unifies `:depends-on`, `:calls` and `:contains` for a single hop, so
 scanning across mixed relationships needs no registration at all:
 ```python
-query("""[:find ?desc
-          :where (linked :dependency/auth-service ?svc)
-                 [?svc :description ?desc]]""")
+minigraf_query(datalog="""[:find ?desc
+                          :where (linked :dependency/auth-service ?svc)
+                                 [?svc :description ?desc]]""")
+```
 
 ### Find all entities of a given type
 ```python
 # All dependencies/components
-query("[:find ?desc :where [?e :entity-type :type/dependency] [?e :description ?desc]]")
+minigraf_query(datalog="[:find ?desc :where [?e :entity-type :type/dependency] [?e :description ?desc]]")
 
 # All constraints that govern the auth service
-query("""[:find ?desc
-          :where [?c :governs :dependency/auth-service]
-                 [?c :description ?desc]]""")
+minigraf_query(datalog="""[:find ?desc
+                          :where [?c :governs :dependency/auth-service]
+                                 [?c :description ?desc]]""")
 ```
 
 ### Retrieving facts for a known entity
 ```python
-query("[:find ?a ?v :where [:decision/api-layer ?a ?v]]")
+minigraf_query(datalog="[:find ?a ?v :where [:decision/api-layer ?a ?v]]")
 # Returns: :description "use FastAPI over Flask", :rationale "async support..."
 ```
 
 ### Searching memory by content (entity ident unknown)
 User: "What did we decide about Redis?"
 ```python
-query('[:find ?e ?a ?v :where [?e ?a ?v] (contains? ?v "Redis")]')
+minigraf_query(datalog='[:find ?e ?a ?v :where [?e ?a ?v] (contains? ?v "Redis")]')
 # Finds any stored fact whose value mentions Redis
 ```
 
 ### Querying before modifying code
 User: "Add connection pooling to the DB layer."
 ```python
-result = query("[:find ?e ?a ?v :where [?e ?a ?v]]")
+result = minigraf_query(datalog="[:find ?e ?a ?v :where [?e ?a ?v]]")
 # Scan results for any DB-related decisions before touching anything
 ```
 
 ### Handling empty memory
 User: "What database did we decide on?"
 ```python
-result = query("[:find ?a ?v :where [:decision/postgres ?a ?v]]")
+result = minigraf_query(datalog="[:find ?a ?v :where [:decision/postgres ?a ?v]]")
 # result["results"] == []
 ```
 Response: "Let me check memory... Memory doesn't have anything recorded about a database choice. If you share the decision, I'll store it for future sessions."
@@ -856,7 +865,7 @@ Response: "Let me check memory... Memory doesn't have anything recorded about a 
 ### Surfacing a constraint conflict
 User: "Help me set up a MySQL connection."
 ```python
-result = query("[:find ?e ?a ?v :where [?e ?a ?v]]")
+result = minigraf_query(datalog="[:find ?e ?a ?v :where [?e ?a ?v]]")
 # Finds [:decision/postgres :description "PostgreSQL 15 — primary database"]
 ```
 Response: "Before we proceed — memory shows we're using PostgreSQL 15 as the primary database. Is this a new secondary database, or has the decision changed? If it's changed, I'll update memory to reflect that."
@@ -864,9 +873,10 @@ Response: "Before we proceed — memory shows we're using PostgreSQL 15 as the p
 ### Storing a preference with context
 User: "I hate mocks in DB tests — we got burned when mocked tests passed but the migration failed."
 ```python
-transact("""[[:preference/no-db-mocks :description "always use real database connections in tests"]
-             [:preference/no-db-mocks :rationale "mock/prod divergence caused silent migration failure"]]""",
-         reason="Strong team preference — backed by production incident")
+minigraf_transact(
+    facts="""[[:preference/no-db-mocks :description "always use real database connections in tests"]
+              [:preference/no-db-mocks :rationale "mock/prod divergence caused silent migration failure"]]""",
+    reason="Strong team preference — backed by production incident")
 ```
 
 ### Changing a decision — retraction with preserved history
@@ -874,21 +884,23 @@ User: "We're dropping PostgreSQL, switching to CockroachDB for geo-distribution.
 
 ```python
 # 1. Check what's currently stored
-result = query("[:find ?a ?v :where [:decision/db ?a ?v]]")
+result = minigraf_query(datalog="[:find ?a ?v :where [:decision/db ?a ?v]]")
 # → :description "PostgreSQL 15 — primary database", :rationale "ACID + JSON support"
 
 # 2. Retract the old facts (they stay in history — still queryable with :as-of)
-retract("""[[:decision/db :description "PostgreSQL 15 — primary database"]
-            [:decision/db :rationale "ACID + JSON support"]]""",
-        reason="Switching to CockroachDB for geo-distribution")
+minigraf_retract(
+    facts="""[[:decision/db :description "PostgreSQL 15 — primary database"]
+              [:decision/db :rationale "ACID + JSON support"]]""",
+    reason="Switching to CockroachDB for geo-distribution")
 
 # 3. Store the new decision
-transact("""[[:decision/db :description "CockroachDB — primary database"]
-             [:decision/db :rationale "geo-distribution requirement"]]""",
-         reason="Switching to CockroachDB for geo-distribution")
+minigraf_transact(
+    facts="""[[:decision/db :description "CockroachDB — primary database"]
+              [:decision/db :rationale "geo-distribution requirement"]]""",
+    reason="Switching to CockroachDB for geo-distribution")
 
 # 4. Old decision is still in history — what did we know at transaction 3?
-query("[:find ?desc :as-of 3 :where [:decision/db :description ?desc]]")
+minigraf_query(datalog="[:find ?desc :as-of 3 :where [:decision/db :description ?desc]]")
 # → "PostgreSQL 15 — primary database"
 ```
 
@@ -896,9 +908,9 @@ This is the key difference from a simple key-value store: changing your mind doe
 
 ## Error Responses
 
-All functions return `{"ok": bool, ...}`. Common errors:
+All tools return `{"ok": bool, ...}`. Common errors:
 - `minigraf not found` — run `python install.py --harness claude-code`
-- `No graph file at <path>` — call `transact()` first
+- `No graph file at <path>` — call `minigraf_transact` first
 - `as_of requires :as-of clause` — include `:as-of N` in query
 - `reason is required for all writes` — provide non-empty reason
 
@@ -907,10 +919,10 @@ All functions return `{"ok": bool, ...}`. Common errors:
 If an error persists after checking syntax and installation, use `minigraf_report_issue` to file a structured bug report with the failing query and error message:
 
 ```python
-from report_issue import report_issue
-report_issue("parse_error", "query returns unexpected output",
-             datalog="[:find ?x :where [?e :a ?x]]",
-             error="<error text from result['error']>")
+minigraf_report_issue(issue_type="parse_error",
+                      description="query returns unexpected output",
+                      datalog="[:find ?x :where [?e :a ?x]]",
+                      error="<error text from result['error']>")
 ```
 
 ## Files
@@ -934,7 +946,9 @@ report_issue("parse_error", "query returns unexpected output",
 | `tools/*.json` | Portable copies of the ten tool schemas, generated from `mcp_server._TOOLS` |
 | `ROADMAP.md` | Project roadmap |
 
-There is no `minigraf.py`. Every `from minigraf import query, transact` example
-predates the MCP server and never worked — the installed `minigraf` package
-exports `MiniGrafDb`, `MiniGrafError` and `minigraf_ffi`, and nothing else. Use
-the MCP tools, or `MiniGrafDb` directly.
+There is no `minigraf.py` and no `from minigraf import query, transact` — that
+import never worked, and the examples above are MCP tool calls, as described under
+["How you call these"](#the-core-idea). The installed `minigraf` package exports
+`MiniGrafDb`, `MiniGrafError` and `minigraf_ffi`, and nothing else; to read a graph
+outside the server, open a `MiniGrafDb` directly, subject to the single-handle
+invariant (at most one live handle per process).
