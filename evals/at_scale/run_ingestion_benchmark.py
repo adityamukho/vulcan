@@ -404,7 +404,7 @@ def _exit_code(metrics: dict[str, Any]) -> int:
     run into a green one: with an incomplete capture, `skipped_commits ==
     []` means "nothing was seen", not "nothing happened".
 
-    Clauses 5 and 6 are the only ones that read the graph's CONTENT. The four
+    Clauses 5, 6 and 7 are the only ones that read the graph's CONTENT. The four
     above it are all derived from what the run PRINTED, and a graph that
     silently drops facts prints nothing -- measured, ~11% of a graph gone with
     every stderr pattern reading clean. It gates on `divergence` with NO
@@ -440,6 +440,20 @@ def _exit_code(metrics: dict[str, Any]) -> int:
     # does. `None` (the audit could not scan) is already failed by
     # audit_error above, which is the only way this key becomes None.
     if audit and (audit.get("introduced_by_duplicates") or {}).get("entities"):
+        return 1
+    # Clause 7 (#316) is clause 6's opposite defect and needs its own clause
+    # for the same reason: a live code entity holding NO :introduced-by is
+    # missing from the fact index in exactly the same way it is missing from
+    # the graph, so clause 5's two witnesses agree perfectly and clause 6 --
+    # which skips anything with fewer than two values -- steps straight over
+    # it. #313's runs reported `status: complete` with zero bytes on stderr,
+    # so clauses 1-4 were clean too. Gated with NO tolerance, on the same
+    # terms as clause 6: a healthy graph is zero, and the check reports its
+    # own `code_entities_scanned` denominator so a run cannot read clean by
+    # having scanned nothing. `.get("entities")` so an older metrics file --
+    # fact audit present, this key absent -- still evaluates clean. `None`
+    # (the audit could not scan) is already failed by audit_error above.
+    if audit and (audit.get("entities_without_introduced_by") or {}).get("entities"):
         return 1
     # The audit's own blind spot, closed with the one reference it does not
     # have: a fact absent from BOTH witnesses is invisible to a comparison of

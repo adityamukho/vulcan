@@ -70,7 +70,10 @@ import uuid
 from collections import Counter
 from typing import Any, Optional
 
-from evals.at_scale.introduced_by_audit import introduced_by_duplicates
+from evals.at_scale.introduced_by_audit import (
+    entities_without_introduced_by,
+    introduced_by_duplicates,
+)
 
 # Every fact the graph can currently produce. Wildcard on all three positions:
 # a per-attribute scan would be blind to loss in any attribute nobody thought
@@ -172,6 +175,7 @@ def audit_graph_against_index(
             # entities" would be a claim about a graph never read. Same
             # reasoning as audit_error itself.
             "introduced_by_duplicates": None,
+            "entities_without_introduced_by": None,
             "audit_seconds": time.perf_counter() - t0,
             "audit_error": (
                 f"bound to {bound!r}, expected {expected_graph_path!r} -- "
@@ -189,6 +193,17 @@ def audit_graph_against_index(
     # an empty fact set trivially has no duplicates.
     duplicates = (
         None if scan_error else introduced_by_duplicates(graph_facts, sample_cap)
+    )
+
+    # #316, the opposite defect, riding the same pass. Kept OUT of
+    # `divergence` for the same reason and then some: the index is missing
+    # exactly the facts the graph is missing, so the two witnesses agree
+    # perfectly about an entity that has no lineage at all. None on a failed
+    # scan -- an empty fact set trivially has no orphans, and would report a
+    # `code_entities_scanned` of 0 that reads like a graph with no code in it
+    # rather than a graph never read.
+    orphans = (
+        None if scan_error else entities_without_introduced_by(graph_facts, sample_cap)
     )
 
     remaining = Counter(graph_facts)
@@ -248,6 +263,11 @@ def audit_graph_against_index(
         # #287. An affected graph must be REBUILT into a fresh graph path --
         # never repaired, never re-ingested in place.
         "introduced_by_duplicates": duplicates,
+        # #316. Same remedy, opposite defect: live code entities with NO
+        # lineage. Carries its own `code_entities_scanned` denominator, which
+        # is the positive control -- a check that matched nothing would also
+        # report 0 entities.
+        "entities_without_introduced_by": orphans,
         "audit_seconds": time.perf_counter() - t0,
         "audit_error": "; ".join(errors) if errors else None,
     }

@@ -285,6 +285,71 @@ def _introduced_by_duplicates_row(metrics: dict[str, Any]) -> str:
     )
 
 
+def _orphan_introduced_by_row(metrics: dict[str, Any]) -> str:
+    """The "Code entities with no :introduced-by" row (#316).
+
+    Adjacent to the duplicates row, and NOT part of it: #287's shape is two
+    values and this one is zero, and `introduced_by_duplicates` skips anything
+    holding fewer than two. It is out of the fact-index row above for the
+    stronger version of that row's own caveat -- the index is missing exactly
+    what the graph is missing, so the two witnesses agree perfectly about an
+    entity that has no lineage at all.
+
+    The clean rendering carries the DENOMINATOR, not a bare 0. A check that
+    matched no code entities would also report 0 entities, so "0" alone is not
+    evidence; "0 of 3150 code entities" is. That is the half CLAUDE.md
+    requires alongside a measured baseline before a zero-tolerance gate is
+    believed, and putting it in the row means every run re-states it.
+
+    "not measured" covers two different pasts and says the same true thing
+    about both -- a metrics file with no `fact_audit` at all, and one from a
+    harness that had the fact audit but not this check. Neither graph was ever
+    asked, and absence is not zero.
+    """
+    audit = metrics.get("fact_audit")
+    if audit is None or "entities_without_introduced_by" not in audit:
+        return (
+            "| Code entities with no :introduced-by (#316) | not measured "
+            "(pre-2026-09-02 harness; this graph was never asked) |"
+        )
+    orphans = audit["entities_without_introduced_by"]
+    if orphans is None:
+        return (
+            f"| Code entities with no :introduced-by (#316) | **UNVERIFIED** -- "
+            f"the audit could not scan the graph: "
+            f"`{audit.get('audit_error', 'unknown')}` |"
+        )
+    entities = orphans.get("entities", 0)
+    scanned = orphans.get("code_entities_scanned", 0)
+    if not entities:
+        if not scanned:
+            # Both halves are 0. Reported as a non-result rather than a pass:
+            # the check ran and found nothing to check, which is what a
+            # broken narrowing looks like as well as what an ingestion-free
+            # graph looks like. The gate does not fail on it -- there is
+            # nothing wrong with a graph that holds no code -- but the report
+            # must not call it clean.
+            return (
+                "| Code entities with no :introduced-by (#316) | 0, but **0 "
+                "code entities were scanned** -- this graph holds none, so "
+                "the check proved nothing about it |"
+            )
+        return (
+            f"| Code entities with no :introduced-by (#316) | 0 of {scanned} "
+            f"code entities |"
+        )
+    sample = ", ".join(f"`{name}`" for name in orphans.get("sample", []))
+    return (
+        f"| Code entities with no :introduced-by (#316) | **{entities}** of "
+        f"{scanned} are live with no lineage -- invisible to `:as-of` "
+        f"reasoning and to every lineage traversal. This graph must be "
+        f"**rebuilt into a fresh graph path**, not repaired or re-ingested "
+        f"in place"
+        + (f". e.g. {sample}" if sample else "")
+        + " |"
+    )
+
+
 def _residue_verdict_row(result: dict[str, Any]) -> str:
     """The "Verdict" row (#256/#276): the M <= N reading, in words.
 
@@ -430,6 +495,7 @@ def append_ingestion_report(
         _error_signals_row(metrics),
         _fact_audit_row(metrics),
         _introduced_by_duplicates_row(metrics),
+        _orphan_introduced_by_row(metrics),
     ]
     if "ignore_comparison" in metrics:
         comp = metrics["ignore_comparison"]
@@ -630,7 +696,8 @@ def _query_ingestion_block(report: dict[str, Any]) -> list[str]:
     latencies measured over a graph that had silently dropped commits.
 
     _stderr_capture_row / _skipped_commits_row / _error_signals_row /
-    _fact_audit_row / _introduced_by_duplicates_row are reused verbatim rather than re-rendered from the same
+    _fact_audit_row / _introduced_by_duplicates_row / _orphan_introduced_by_row
+    are reused verbatim rather than re-rendered from the same
     keys. That is the point: an Ingestion Run section and a Query Correctness
     Run section must not be able to disagree about how a dirty run reads.
     """
@@ -655,6 +722,7 @@ def _query_ingestion_block(report: dict[str, Any]) -> list[str]:
         _error_signals_row(metrics),
         _fact_audit_row(metrics),
         _introduced_by_duplicates_row(metrics),
+        _orphan_introduced_by_row(metrics),
     ]
 
 

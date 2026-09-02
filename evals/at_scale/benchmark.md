@@ -1862,3 +1862,97 @@ next run's `_correction_sweep_select_position` returns None on its first call
 (`pos > ceiling_pos`) and `_correction_sweep_apply` runs zero times — measured
 during #235 at position 13 of 13. An affected graph is **rebuilt into a fresh
 graph path**, never repaired in place.
+
+## Ingestion Run — 20260902T070610Z
+
+- Repo: `.` @ `HEAD`
+- minigraf: `2.0.0`
+- Metrics JSON: `results/ingestion-20260902T070610Z.json`
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 845 |
+| Final status | complete |
+| Wall-clock | 1591.75s |
+| Throughput | 31.9 commits/min |
+| Peak RSS | 849544 KB |
+| Graph size | 221106176 bytes |
+| Fact-index size | 97562624 bytes |
+| Status-query latency (min/p50/p99/max) | 0.1ms / 0.3ms / 10.4ms / 24.5ms |
+| Graph-query latency (min/p50/p99/max) | 0.7ms / 26.1ms / 1068.3ms / 1297.8ms |
+| Poll duty cycle (#242) | 6.53% over 1248 polls |
+| Checkpoint duty cycle (#241) | 4.59% over 101 checkpoints (72.95s total, 1167 suppressed) |
+| Stderr tee (#256) | active (wall-clock and latencies measured with an fd-level tee in place) |
+| Stderr capture (#256) | complete |
+| Commits dropped (#256) | 0 |
+| Error signatures (#251/#256) | 0 |
+| Fact-index divergence (#302) | 0 (31065 facts cross-checked) |
+| Duplicate :introduced-by (#287) | 0 |
+| Code entities with no :introduced-by (#316) | 0 of 3277 code entities |
+
+### #316 — code entities with no `:introduced-by` (2026-09-02)
+
+- Probe: `evals/at_scale/introduced_by_audit.py`, `entities_without_introduced_by`
+- Result JSON: `results/316-orphan-introduced-by.json`; measured on `results/ingestion-20260902T070610Z.json`
+
+**The question.** #313 fixed the write path that leaves an entity TORN — a
+process killed inside `_reverse_apply`'s multi-transact window leaves a live
+`:ident`, no `:introduced-by` and no lineage marker. The **detection** side was
+covered by nothing, and #313 was the second bug in this class to ship
+undetected. Such an entity answers structural queries and counts normally in
+entity totals while being invisible to `:as-of` reasoning and to every lineage
+traversal.
+
+**Result: zero, out of a denominator that is reported alongside it.**
+
+| measurement | value |
+|---|---|
+| live code entities scanned | 3,277 |
+| holding at least one `:introduced-by` | 3,277 |
+| holding **none** | **0** |
+
+The denominator is the load-bearing half and it ships in the result rather
+than living only here: a check that matched no code entities would also report
+0 entities, so every future run re-proves it scanned something instead of that
+being a fact about the day the gate was wired. The report row renders `0 of
+3277 code entities`, never a bare `0`, and a run whose denominator is itself 0
+renders as "proved nothing about it" rather than as a pass.
+
+**Every gate that already existed reads this shape clean, and that is the
+point rather than a caveat.** On an affected graph:
+
+| gate | reads | why |
+|---|---|---|
+| `divergence` (#302) | 0 | the index is missing exactly the fact the graph is missing — neither was ever written, so the two witnesses agree perfectly |
+| `introduced_by_duplicates` (#287) | 0 | narrowed to entities holding two or more (`if len(values) < 2: continue`); zero falls straight through |
+| `stderr_capture` (#256) | clean | #313's runs had zero bytes on stderr and zero `error_signals` |
+| `probe_provisional_residue` (#256) | clean | it asserts `M <= N` over lineage markers. A torn entity has **no marker**, so it never raises `M`, while the sweep does count it as unreconciled, raising `N`. That probe reads clean *more comfortably* when this defect is present. |
+
+So this is a separate gate clause, never a term in `divergence`.
+
+**`:type/external-dependency` is excluded, and the exclusion is measured.**
+All **72 of 72** external-dependency entities in this graph hold no
+`:introduced-by` (mid-run index reading — see the result JSON's caveat). Had
+the type been in `CODE_ENTITY_TYPES`, clause 7 would have reported 72 orphans
+and been permanently red on the first run it ever gated — the same trap
+`introduced_by_duplicates` avoided by narrowing to one attribute.
+`_forward_apply`'s dep-edge branch opens an unresolved-import stub with exactly
+`:entity-type`, `:ident` and `:description`, and `_reverse_apply`'s
+`candidate_idents` comes from `_build_code_triples`, which never yields one —
+so the lineage machinery cannot give a stub an `:introduced-by` later. Only
+the submodule branch writes one, and this repo has no submodules.
+
+**Cost: none that is measurable.** The whole `fact_audit` step ran in 0.93s
+against 0.84s before — this reads the `[:find ?e ?a ?v]` scan `fact_audit`
+already holds in memory, so it is one pass over a dict rather than a second
+query, a second scan, or a second lease.
+
+**Re-running ingestion repairs nothing**, for the same mechanical reason as
+#287: a finished run parks `:ingestion/correction-sweep-through` at
+frontier-high's `:hi-hash`, so `_correction_sweep_apply` runs zero times on the
+next run. An affected graph is **rebuilt into a fresh graph path**.
+
+**What this does not cover.** A whole commit going missing — no fact-level
+check can see it, because the graph and the index are again consistent about
+the absence. That needs an independent count against the repo itself and is
+filed as #317.
