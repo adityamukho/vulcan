@@ -24847,10 +24847,11 @@ class TestShippedExamplesValidateAgainstSchema:
             "matched nothing and would pass against any regression"
         )
 
-    #: Docs that ship a copy-pasteable `transact(...)` example. `SKILL.md` is
-    #: deliberately absent -- its examples are multi-line `transact("""...""")`
-    #: blocks in a different shape, and it was already correct when #271 was
-    #: filed. Add it here only alongside an extractor that handles that shape.
+    #: Docs that ship a copy-pasteable transact example. `SKILL.md` is
+    #: deliberately absent -- its examples are multi-line
+    #: `transact("""...""")` blocks in a different shape, and it was already
+    #: correct when #271 was filed. Add it here only alongside an extractor
+    #: that handles that shape.
     _EXAMPLE_DOCS = ("CLAUDE.md", "AGENTS.md", "README.md")
 
     def test_every_transact_example_in_the_docs_passes_validation(self):
@@ -24864,11 +24865,19 @@ class TestShippedExamplesValidateAgainstSchema:
             doc = repo_root / name
             assert doc.exists(), f"{name} is missing -- this guard would pass vacuously"
             text = doc.read_text()
-            for m in re.finditer(r"transact\(\s*\"(\[\[.*?\]\])\"", text, re.DOTALL):
-                # Markdown carries the Python source form, with the quotes
-                # around each value backslash-escaped. Undo that before the
-                # EDN parser sees it.
-                block = m.group(1).replace('\\"', '"')
+            # Two call shapes ship today, and both must be matched or this
+            # guard silently stops checking anything: the bare
+            # `transact("[[...]]")` pseudocode, and the MCP form
+            # `minigraf_transact(facts='[[...]]', reason=...)` -- whose
+            # `facts=` keyword may sit on the next line. Quote style differs
+            # between them, so the closing quote is backreferenced rather
+            # than hardcoded.
+            pattern = r"""(?:minigraf_)?transact\(\s*(?:facts\s*=\s*)?(['"])(\[\[.*?\]\])\1"""
+            for m in re.finditer(pattern, text, re.DOTALL):
+                # Markdown carries the Python source form; in the
+                # double-quoted shape the quotes around each value are
+                # backslash-escaped. Undo that before the EDN parser sees it.
+                block = m.group(2).replace('\\"', '"')
                 parsed = mcp_server._parse_transact_facts(block)
                 if not parsed:
                     continue  # keyword-valued: unvalidated by design

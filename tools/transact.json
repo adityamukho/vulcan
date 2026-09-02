@@ -6,13 +6,16 @@
     "properties": {
       "facts": {
         "type": "string",
-        "description": "A Datalog transact block, e.g. [[:component/auth :calls :component/jwt]] or [[:decision/cache-strategy :decision/description \"use Redis\"]]"
+        "description": "A Datalog transact block, e.g. [[:decision/cache-strategy :description \"use Redis\"]] -- attributes are bare (:description, :rationale, :date, :alias), NOT namespaced"
       },
       "reason": {
         "type": "string",
-        "description": "Why this fact deserves long-term storage. This forces you to justify writes — only store facts worth remembering."
+        "description": "Why this fact deserves long-term storage. Forces you to justify writes — only store facts worth remembering."
       }
     },
-    "required": ["facts", "reason"]
+    "required": [
+      "facts",
+      "reason"
+    ]
   }
 }

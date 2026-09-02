@@ -1,8 +1,9 @@
 # Temporal Reasoning - Roadmap
 
 ## Phase 1 (Complete ✓)
-- Python CLI wrapper (`minigraf_tool.py`)
-- Tool schemas (query.json, transact.json)
+- Python CLI wrapper — superseded by `mcp_server.py` in Phase 3 and removed;
+  no wrapper module ships today
+- Tool schemas (`tools/*.json`)
 - Operational prompts (system.txt, fewshots.txt)
 - Test harness
 
@@ -19,7 +20,7 @@
 | Item | Description | Status |
 |------|-------------|--------|
 | Persistent MCP server | `mcp_server.py` — replaces CLI wrapper; single-process, stdio, minigraf Python binding | Complete ✓ |
-| 6 MCP tools | `minigraf_query`, `minigraf_transact`, `minigraf_retract`, `minigraf_report_issue`, `memory_prepare_turn`, `memory_finalize_turn` | Complete ✓ |
+| 6 MCP tools | `minigraf_query`, `minigraf_transact`, `minigraf_retract`, `minigraf_report_issue`, `memory_prepare_turn`, `memory_finalize_turn` — later grown to ten by `minigraf_audit` (Phase 4), `minigraf_ingest_git`/`minigraf_ingest_status` (Phase 5) and `minigraf_rule` | Complete ✓ |
 | Auto-memory hooks (Claude Code) | `UserPromptSubmit` injects context; `Stop` hook extracts facts — `hooks/prepare_hook.py`, `hooks/finalize_hook.py` | Complete ✓ |
 | Hook config templates | `hooks/claude-code.json`, `hooks/codex.toml`, `hooks/hermes.yaml`, `hooks/opencode.json` (degraded), `hooks/openclaw.json` (degraded) | Complete ✓ |
 | Heuristic extraction | Regex-based signal detection; zero API calls; no configuration required | Complete ✓ |
@@ -38,10 +39,10 @@
 | Item | Description | Status |
 |------|-------------|--------|
 | Slug canonicalization | `_canonical_ident` + `_keyword_uuid`; heuristic extractor updated | Complete ✓ |
-| Closed-world schema | `MINIGRAF_SCHEMA` (4 entity types) + `_validate_facts`; pre-transact enforcement in extraction pipeline and `handle_minigraf_transact` | Complete ✓ |
+| Closed-world schema | `MINIGRAF_SCHEMA` (4 hand-written entity types: decision, preference, constraint, dependency) + `_validate_facts`; pre-transact enforcement in extraction pipeline and `handle_minigraf_transact`. Phase 5's ingestion added seven more — module, function, class, variable, field, commit, ingestion — for eleven today | Complete ✓ |
 | Alias datoms | `:alias` declared as optional attribute on all entity types | Complete ✓ |
 | Schema-aware prompts | `_query_canonical_entities` injects existing idents into LLM and agent extraction prompts | Complete ✓ |
-| `minigraf_audit` | 7th MCP tool; audits all entities against schema, retracts violators (bi-temporal — history preserved) | Complete ✓ |
+| `minigraf_audit` | Audits all entities against schema, retracts violators (bi-temporal — history preserved) | Complete ✓ |
 | Entity Resolution section | `SKILL.md` updated with resolution guidance and `minigraf_audit` instructions | Complete ✓ |
 
 ## Phase 5 (Feature-complete; production-hardening shipped, not yet re-validated at reported production scale) — Code Structure Evolution from Git History
@@ -133,13 +134,21 @@ added).
 
 **Validation status:** #120 added `evals/at_scale/`, a repeatable in-process
 benchmark tier measuring both git-ingestion performance and query
-correctness+latency against real repo history (see `evals/at_scale/benchmark.md`).
-Its current baseline is this repo's own history — 498 commits ingested in 78.87s —
-which validates the harness and confirms no regressions, but is roughly two orders
-of magnitude smaller than the 52,948-commit run that motivated this issue.
-Re-running the benchmark against a comparably large real-world repo is the
-natural next step to independently confirm production-viability at that scale;
-it has not been done as of this update.
+correctness+latency against real repo history (see `evals/at_scale/benchmark.md`,
+which is the authority on the numbers — this is a pointer, not a second copy).
+Its baseline is still this repo's own history: the most recent recorded run
+(`results/ingestion-20260902T085514Z.json`) ingested 847 commits in 1526s on
+minigraf 2.0.0, `final_status: complete`, with every correctness gate clean.
+The tier has since grown five zero-tolerance gates that the 2026-07 baseline
+did not have — graph/index divergence (#302), duplicate and absent
+`:introduced-by` (#287, #316), the commit census (#317), and the new-history
+ident-collision census (#267).
+
+Scale is the part that has not moved. 847 commits is still roughly two orders
+of magnitude below the 52,948-commit run that motivated #119, so the harness
+and the gates are validated while production-viability at that scale is not.
+Running the tier against a comparably large real-world repo remains the
+natural next step; it has not been done as of this update.
 
 ## Phase 6 — Observability and Trust for Automatic Memory
 
@@ -169,8 +178,6 @@ For a local single-user developer tool (the current Phase 5 target), stored data
 
 ## Backlog (unscheduled)
 
-- **Port Datalog grammar additions from minigraf 1.2.0 into `SKILL.md`** — minigraf#288 and its child issue #289 are fixed and will land in v1.2.0. That release adds two new Datalog query sections (`max-derived-facts-section` and `max-results-section`) that make the `ancestor` recursive rule usable on real repos. The inline Datalog reference in `SKILL.md` must be updated to document these sections once 1.2.0 is published. **Blocked on minigraf 1.2.0 release; no action until then.**
-
 - `minigraf_ingest_docs` (experiment) — ingest plain text/markdown files from git history using the existing heuristic/llm/agent extraction strategies, with commit timestamps as `:valid-from`. Enables backdated decision entities from committed ADRs and design docs. Risk: duplication against conversation-extracted entities; quality depends on extraction strategy. Spec before building.
 - WASM bindings (browser + edge) — no spec or concrete driver yet
 - Mobile embedding — no spec or concrete driver yet
@@ -182,4 +189,4 @@ For a local single-user developer tool (the current Phase 5 target), stored data
 
 Published as a GitHub-hosted Claude Code plugin. Users add the repo to `extraKnownMarketplaces` in `settings.json` — see README for instructions.
 
-`install.py` installs the `minigraf` Python package via pip (`>=0.22.0`, which introduced the Python binding). Rust/`cargo` is no longer required. Supported platforms: Linux x86_64, Linux aarch64, macOS arm64, macOS x86_64, Windows.
+`install.py` installs the `minigraf` Python package via pip (`>=2.0.0,<3.0.0`; `pyproject.toml` is canonical and `install.py`'s `_MINIGRAF_SPEC` mirrors it). Rust/`cargo` is not required. Supported platforms: Linux x86_64, Linux aarch64, macOS arm64, macOS x86_64, Windows.

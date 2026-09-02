@@ -1,0 +1,14 @@
+{
+  "name": "minigraf_audit",
+  "description": "Audit all graph entities against the built-in schema. Retracts entities with schema violations (missing required attributes, unknown types, unknown attributes). Run periodically or after heavy write sessions. Pass as_of (transaction number) for a read-only point-in-time audit without retractions.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "as_of": {
+        "type": "integer",
+        "description": "Optional transaction number for point-in-time audit (read-only, no retractions)"
+      }
+    },
+    "required": []
+  }
+}

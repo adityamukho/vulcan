@@ -1,0 +1,18 @@
+{
+  "name": "minigraf_ingest_git",
+  "description": "Ingest code structure from git history into the bi-temporal graph. Starts a background task and returns immediately. Call minigraf_ingest_status to poll progress.",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "repo_path": {
+        "type": "string",
+        "description": "Absolute path to the git repo root. Defaults to cwd."
+      },
+      "branch": {
+        "type": "string",
+        "description": "Branch or ref to walk. Defaults to MINIGRAF_GIT_BRANCH if set, otherwise auto-detects the repo's main/master branch, falling back to HEAD only if neither exists."
+      }
+    },
+    "required": []
+  }
+}

@@ -7,19 +7,29 @@ Temporal Reasoning provides persistent bi-temporal graph memory for AI coding ag
 ```bash
 # Install dependencies and sync skill (--harness is required: claude-code, opencode, or codex)
 python install.py --harness claude-code
-
-# Use in code
-from minigraf import query, transact
-
-transact("[[:decision/cache :description \"use Redis\"]]", reason="Caching strategy")
-result = query("[:find ?d :where [?e :description ?d]]")
 ```
+
+Everything else goes through the MCP tools — there is no wrapper module:
+
+```
+minigraf_transact(facts='[[:decision/cache :description "use Redis"]]',
+                  reason="Caching strategy")
+minigraf_query(datalog='[:find ?d :where [?e :description ?d]]')
+```
+
+`from minigraf import query, transact` has never worked. The installed
+`minigraf` package exports `MiniGrafDb`, `MiniGrafError` and `minigraf_ffi`;
+there is no `minigraf.py` in this repo and `git log --all --diff-filter=A`
+shows there never was. To read a graph outside the server, open a
+`MiniGrafDb` directly — subject to the single-handle invariant below.
 
 ## Key Files
 
-- `mcp_server.py` - Persistent MCP server (primary interface)
-- `minigraf.py` - Python wrapper for direct use outside MCP
+- `mcp_server.py` - Persistent MCP server (the only runtime interface to the graph)
+- `fact_index.py` - SQLite FTS5 fact index; retrieval, and the graph's only independent witness (#302)
+- `frontier_registry.py` - Per-position claim registry for the two ingestion streams
 - `SKILL.md` - Skill definition with all query syntax
+- `skill.json` + `tools/*.json` - Portable manifest, generated from `mcp_server._TOOLS` and guarded by `tests/test_tool_schemas.py`
 - `install.py` - Setup script (runs weekly updates)
 - `docs/testing-conventions.md` - Real-backend-only test conventions for `tests/test_mcp_server.py`
 - `hooks/claude-code.json` - Claude Code MCP + auto-memory hook config

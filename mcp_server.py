@@ -12306,15 +12306,20 @@ _TOOLS: List[Tool] = [
     Tool(
         name="minigraf_ingest_status",
         description=(
-            "Return the current git ingestion progress. "
-            "status is one of: idle, running, complete, error, skipped. "
-            "skipped means another live process already owns the graph lock "
-            "(see owner_pid) — this server will not start ingestion on its own; "
-            "call minigraf_ingest_git again later if you want to retry. "
-            "For error and skipped, a stale field may be present: stale=true means "
-            "the condition that caused this state (the cited or owning PID) is no "
-            "longer alive, so a minigraf_ingest_git retry is likely to succeed now; "
-            "error also includes error_at, the timestamp the failure occurred."
+            "Return the current git ingestion progress. status is one of: idle, "
+            "starting, running, complete, error, stopped, skipped. starting means "
+            "a background task exists but has not finished its preload phase, so "
+            "processed/total are not populated yet. stopped means a graceful "
+            "shutdown paused ingestion between commits — not a failure; the next "
+            "run resumes from the watermark. skipped means another live process "
+            "already owns the graph (see owner_pid) — this server will not start "
+            "ingestion on its own; call minigraf_ingest_git again later to retry. "
+            "For skipped only, a stale field may be present: stale=true means the "
+            "owning process stopped refreshing its ownership hint, so a retry is "
+            "likely to succeed now. error carries no stale field — it was derived "
+            "by scraping a holder PID out of minigraf's lock-contention message, "
+            "and minigraf 2.0.0 removed that PID from the text (#284) — but it "
+            "does include error_at, the timestamp the failure occurred."
         ),
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),

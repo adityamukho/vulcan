@@ -49,9 +49,15 @@ graph persists across open/close cycles exactly as it would in production.
 See `TestRunIngestionShutdown.test_resumes_from_watermark_after_shutdown`
 (two `_run_ingestion` calls against the same on-disk graph, second one
 resuming from the first's watermark) and `TestClosedEntityLifecyclePurge`
-(ingests, drops `mcp_server._db` to release the lock, then reopens the same
-path with `MiniGrafDb.open()` to query post-ingestion state) for worked
-examples.
+(ingests, calls `mcp_server._reset_db_state()` to release the lock, then
+reopens the same path with `MiniGrafDb.open()` to query post-ingestion state)
+for worked examples.
+
+`_reset_db_state()` is the release step, not `mcp_server._db = None`. That
+global was this module's release idiom until #255 replaced it with
+`_DbLeaseManager`; it no longer exists, in either `mcp_server.py` or the
+suite. Several code comments still describe it in the past tense -- read
+those as history.
 
 ## Always verify results
 
@@ -70,14 +76,21 @@ Very rarely, a test needs a plain-object double that isn't `MagicMock` and
 doesn't fake Datalog semantics — not because the test is avoiding Datalog
 concerns, but because a real `MiniGrafDb` instance is unsuitable for
 infrastructure reasons unrelated to correctness. These narrow cases are:
-- `SlowFakeDb` (around line 511 in `test_mcp_server.py`) — used by a
-  `_db_native_lock` serialization test. A real DB executes too fast to
-  expose lock-contention overlap; a deliberately slow plain-object double
-  detects when two threads enter concurrently.
-- `_FakeDb` (around line 6092 in `test_mcp_server.py`) — used by a
-  refcounting test. A real FFI handle's object identity and `sys.getrefcount()`
-  profile differ from a plain Python object; the test measures reference
-  leak patterns and can't use `MagicMock` for the same inflation reason.
+- `SlowFakeDb`, in
+  `TestDbNativeCallSerialization.test_db_execute_and_checkpoint_never_overlap_across_threads`.
+  A real DB executes too fast to expose lock-contention overlap; a
+  deliberately slow plain-object double detects when two threads enter
+  concurrently.
+- `_FakeDb`, in `TestRunIngestion`'s
+  `test_local_db_reference_dropped_before_repo_total_enumeration` and
+  `test_git_commits_runs_before_any_db_is_opened`. A real FFI handle's object
+  identity and `sys.getrefcount()` profile differ from a plain Python object;
+  the first test measures reference-leak patterns and can't use `MagicMock`
+  for the same inflation reason, and the second needs a handle that exists
+  without a real open having happened.
+
+Named rather than located by line number: both citations here were off by
+several thousand lines by 2026-09, pointing into unrelated tests.
 
 ## The one narrow exception: external, non-minigraf APIs
 
@@ -96,19 +109,40 @@ optional native-extension install requirement in CI — the underlying
 
 ## Manufacturing real error conditions instead of faking them
 
-The DB lock-retry cluster (`TestGetDbLockRetry`, `TestTryOpenWithSelfHealReuse`,
-`TestOpenDbAtWithExtendedRetry`) needs genuine lock contention, which a mock
-used to fake via a canned `MiniGrafError`. Locking is inherently file-based,
-so these tests use a real file-backed `MiniGrafDb.open()` plus a helper that
-spawns a subprocess to hold (or briefly open-then-release, for stale-lock
-scenarios) a real lock on the same path — producing the exact real
-`MiniGrafError` message (`"Database is locked by another process (lock file:
-..., holder PID: ...)"`) that `mcp_server._stale_lock_holder_pid`/
-`_pid_is_alive` parse. Only `mcp_server.time.sleep` is monkeypatched, purely
-to skip real backoff delays — that's test-speed plumbing, not faking
-minigraf's behavior. This is the pattern to reach for whenever a future test
-needs a real failure condition rather than a business-logic result: prefer
-manufacturing the condition for real over mocking the exception.
+`TestGetDbLockRetry` needs genuine lock contention, which a mock used to fake
+via a canned `MiniGrafError`. Locking is in the kernel, so these tests use a
+real file-backed `MiniGrafDb.open()` plus `_hold_lock_subprocess()`, which
+spawns a subprocess that opens a real `MiniGrafDb` at the same path and holds
+it — producing real contention and the real `MiniGrafError` the retry path
+sees. Only `mcp_server.time.sleep` is monkeypatched, purely to skip real
+backoff delays — that's test-speed plumbing, not faking minigraf's behavior.
+
+Even the non-lock case is manufactured rather than fabricated:
+`test_non_lock_errors_are_not_retried` points the graph path at a directory,
+so minigraf raises a genuine "Is a directory" on the first `open()`.
+
+This is the pattern to reach for whenever a future test needs a real failure
+condition rather than a business-logic result: prefer manufacturing the
+condition for real over mocking the exception.
+
+**Two things this section used to say are gone, and the reason matters.** It
+named `TestTryOpenWithSelfHealReuse` and `TestOpenDbAtWithExtendedRetry`, and
+described tests parsing a holder PID out of `"Database is locked by another
+process (lock file: ..., holder PID: ...)"` via
+`mcp_server._stale_lock_holder_pid`/`_pid_is_alive`. #284 deleted all four
+names along with mcp_server's stale-lock self-heal: minigraf 2.0.0 locks with
+`flock`/`LockFileEx` on the `.graph` file itself, so there is no PID sidecar
+to unlink, the kernel drops the lock however the process exits, and the error
+text is now `"[STG-026] Database is locked by another process (<path>)"` with
+no PID in it. Measured before deletion, the self-heal recovered nothing on
+either version.
+
+What survives is `test_a_dead_holders_leftover_lock_does_not_wedge_get_db`,
+and `_hold_lock_subprocess`'s `exit_immediately=True` mode with it — a real,
+verifiably-dead PID is still the honest way to build a stale on-disk artifact
+by hand. Read that helper's docstring before using it: on this platform a
+subprocess that exits cleanly removes its own lock, so "open() raises citing
+an already-dead holder" is not reachable through genuine process death.
 
 ## Observing real calls without faking them: `execute_spy()`
 
