@@ -4068,10 +4068,17 @@ class _CheckpointPolicy:
         dict there before clearing the policy, not after.
 
         `elapsed_seconds` is measured from this policy's construction, which
-        is a few statements into _run_ingestion, to whenever this is called,
-        which is a few statements before the run returns -- close enough to
-        the run's own wall clock to report a meaningful duty fraction
-        without threading a second timer through the caller.
+        is the FIRST statement in _run_ingestion's try, to whenever this is
+        called, which is a few statements before the run returns -- close
+        enough to the run's own wall clock to report a meaningful duty
+        fraction without threading a second timer through the caller.
+
+        That construction used to sit ~100 lines lower, below write_executor,
+        which put the two git enumerations and the whole preload OUTSIDE this
+        window; `realised_duty` was correspondingly overstated in every
+        benchmark.md row report.py wrote from it. Moved for #270 (see
+        _run_ingestion's own comment there). Duty numbers recorded before
+        that move are measured over the narrower window.
         """
         elapsed = max(self._clock() - self._created_at, 0.0)
         return {
@@ -11303,6 +11310,40 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
     owner_hint = _graph_owner_hint_held(_graph_path_current(), "ingestion")
     await owner_hint.__aenter__()
     try:
+        # Hold checkpointing to a fixed fraction of wall clock rather than
+        # once per commit. See _CheckpointPolicy for why the per-commit
+        # cadence was super-linear and why deferring is safe (#241).
+        #
+        # FIRST statement in the try, above every fallible one, and that
+        # position is the fix for #270 -- it used to sit ~100 lines below,
+        # just after write_executor. Both finally blocks publish
+        # summary() into _ingest_progress["checkpoint_summary"] guarded on
+        # this being non-None, so a failure in the git enumerations, in
+        # _load_ingestion_preload_state (which takes db_lease(extended=True)
+        # and raises when the graph file lock never clears) or in the
+        # `git rev-list --count` below published NOTHING, and the at-scale
+        # benchmark's summary assertion reported `assert None is not None`
+        # while the real exception sat unread in _ingest_progress["error"].
+        # That gap is why #270 spent 48 sampled runs unable to name a cause.
+        #
+        # It also fixes summary()'s window. elapsed_seconds runs from this
+        # construction to the clearing finally, so with the old position the
+        # preload and both git enumerations were OUTSIDE it -- minutes of
+        # them on a large graph -- and realised_duty, the acceptance
+        # criterion #241 is measured against and the number
+        # report.py writes into benchmark.md, was overstated by exactly that
+        # ratio. Duty rows recorded before this change are measured over a
+        # narrower window and are not comparable with later ones.
+        #
+        # Safe this high because __init__ touches no DB and no git: it reads
+        # one env var and one clock. _checkpoint_duty_from_env() raising on a
+        # malformed MINIGRAF_INGEST_CHECKPOINT_DUTY is the one remaining
+        # no-summary path, and deliberately so -- that is a deterministic
+        # config error, not a transient, and leaving it distinguishable keeps
+        # "the policy never existed" from being confused with "the policy
+        # existed and never checkpointed", which is the whole content of an
+        # all-zeros summary.
+        _ingest_checkpoint_policy = _CheckpointPolicy(_checkpoint_duty_from_env())
         # Enumerated BEFORE the preload (#238), which needs the positions to
         # bound its queries. Above the DB open too, not merely above the
         # lease release, so the graph file lock is held for no longer than
@@ -11399,10 +11440,6 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         # the extraction pool's own shutdown has already been submitted to it.
         write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-        # Hold checkpointing to a fixed fraction of wall clock rather than
-        # once per commit. See _CheckpointPolicy for why the per-commit
-        # cadence was super-linear and why deferring is safe (#241).
-        _ingest_checkpoint_policy = _CheckpointPolicy(_checkpoint_duty_from_env())
         _ingest_trace = _ingest_trace_from_env()
 
         # Single fact-index write connection for the whole ingestion run,

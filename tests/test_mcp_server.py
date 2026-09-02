@@ -23868,6 +23868,54 @@ class TestCheckpointDutySummaryPublication:
         assert summary["total_seconds"] == 0.0
         assert summary["realised_duty"] == 0.0
 
+    @pytest.mark.asyncio
+    async def test_summary_survives_a_pre_policy_failure(self, git_repo, monkeypatch):
+        """#270. The window this closes is the one that produced the flake.
+
+        _run_ingestion's try block used to run ~100 lines before constructing
+        _CheckpointPolicy: build_linearization, _git_commits,
+        _load_ignore_patterns, _load_ingestion_preload_state (which takes
+        db_lease(extended=True) and raises RuntimeError when the graph file
+        lock never clears) and the `git rev-list --count` that sets the
+        progress denominator. A failure anywhere in there left the policy
+        None, and BOTH publishing finally blocks are guarded on it being
+        non-None -- so the run published no summary at all, and
+        test_checkpoint_summary_is_present_and_self_consistent reported
+        `assert None is not None` with _run_ingestion's swallowed exception
+        sitting unread in _ingest_progress["error"]. That is why #270 spent
+        48 sampled runs unable to name a cause.
+
+        test_summary_survives_a_pre_write_scope_failure above injects into
+        _frontier_load, which runs AFTER the policy is built, so it does not
+        cover this window -- it never did. This one injects into
+        _load_ingestion_preload_state, which runs before it.
+
+        Ablation: with the construction back at its old position (below the
+        `git rev-list --count` block) this test fails at `summary is not
+        None`, since nothing publishes.
+        """
+        import mcp_server
+        mcp_server.open_db(str(git_repo / "memory.graph"))
+        mcp_server._ingest_progress = self._fresh_progress()
+
+        def boom(*a, **k):
+            raise RuntimeError("injected pre-policy failure")
+
+        monkeypatch.setattr(mcp_server, "_load_ingestion_preload_state", boom)
+        await mcp_server._run_ingestion(str(git_repo), "HEAD")
+
+        assert mcp_server._ingest_progress["status"] == "error"
+        assert "injected pre-policy failure" in str(mcp_server._ingest_progress["error"])
+        summary = mcp_server._ingest_progress.get("checkpoint_summary")
+        assert summary is not None, (
+            "a run that dies before the preload must still publish a summary "
+            "-- the policy is constructed above every fallible statement in "
+            "the try (#270)"
+        )
+        assert summary["checkpoints"] == 0, "no checkpoint ever ran before the injected failure"
+        assert summary["total_seconds"] == 0.0
+        assert summary["realised_duty"] == 0.0
+
 
 class TestSingleHandlePerProcess:
     """#253/#251: two live MiniGrafDb handles on one file must be impossible.

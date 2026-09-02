@@ -130,6 +130,64 @@ class TestAppendIngestionReport:
         assert "injected pre-policy failure" in text
         assert "once-per-commit cadence" not in text
 
+    def test_checkpoint_duty_cycle_row_does_not_report_an_all_zeros_summary_as_measured(
+        self, tmp_path,
+    ):
+        """#270. Closing the pre-policy window changed what an errored run
+        LOOKS like here, and the row had to change with it.
+
+        _CheckpointPolicy is now the first statement in _run_ingestion's try,
+        so a run that dies in the preload no longer leaves checkpoint_summary
+        absent -- it leaves an all-zeros one. Rendered by the summary-present
+        branch that would produce "0.00% over 0 checkpoints (0.00s total, 0
+        suppressed)": a formatted measurement, in benchmark.md, for a run that
+        measured nothing. That is the same false-claim-in-the-durable-record
+        shape the test above exists to prevent, arriving by a new route, so
+        ingest_error is consulted BEFORE the summary rather than only when it
+        is missing.
+
+        Deliberately keyed on `checkpoints == 0`, not on ingest_error alone: a
+        run that failed in Stage B after checkpointing 40 times has a real
+        duty figure, and that figure is a measurement worth keeping in the
+        record. Only a zeros summary is uninformative enough to suppress.
+        """
+        errored = dict(SAMPLE_METRICS)
+        errored["checkpoint_summary"] = {
+            "checkpoints": 0,
+            "suppressed": 0,
+            "total_seconds": 0.0,
+            "elapsed_seconds": 0.0031,
+            "realised_duty": 0.0,
+        }
+        errored["final_status"] = "error"
+        errored["ingest_error"] = "RuntimeError: injected pre-policy failure"
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(errored, report_path)
+        text = report_path.read_text()
+        assert "Checkpoint duty cycle (#241)" in text
+        assert "injected pre-policy failure" in text
+        assert "0.00%" not in text, (
+            "an all-zeros summary from a failed run must not render as a "
+            "measured duty figure"
+        )
+        assert "once-per-commit cadence" not in text
+
+    def test_checkpoint_duty_cycle_row_keeps_a_partial_runs_real_measurement(
+        self, tmp_path,
+    ):
+        """The other side of the rule above: an errored run that DID
+        checkpoint still reports its duty. Without this, "the run failed" and
+        "the run measured nothing" collapse into one branch and a Stage B
+        failure's 52 real checkpoints vanish from the record."""
+        errored = dict(SAMPLE_METRICS)
+        errored["final_status"] = "error"
+        errored["ingest_error"] = "RuntimeError: injected Stage B failure"
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(errored, report_path)
+        text = report_path.read_text()
+        assert "4.81%" in text
+        assert "52 checkpoints" in text
+
     # --- #256 stderr-capture rows -------------------------------------
     #
     # benchmark.md is the DURABLE HUMAN RECORD, and it is the artifact the

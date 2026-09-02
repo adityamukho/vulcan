@@ -29,6 +29,24 @@ that was wrong and has been corrected here.
 > margin. Entries from 2026-08-07 onward carry a "Poll duty cycle" row; treat
 > its absence as "unmeasured, assume inflated".
 >
+> **2026-09-02 — "Checkpoint duty cycle (#241)" rows before this date are
+> OVERSTATED (#270).** `_CheckpointPolicy.summary()` measures
+> `elapsed_seconds` from the policy's own construction, and that construction
+> used to sit ~100 lines into `_run_ingestion`'s try, below `write_executor` —
+> so the two git enumerations and the whole preload fell OUTSIDE the window,
+> while `total_seconds` (the numerator) covered checkpoints that are all
+> inside it. `realised_duty = total_seconds / elapsed` was therefore inflated
+> by exactly the ratio of run to post-preload run, which grows with graph
+> size because the preload does. The policy is now constructed as the first
+> statement in the try, so the window is the run. Rows recorded from
+> 2026-09-02 onward are measured over the wider window; do not read a duty
+> DROP across this date as the gate having become more conservative, and do
+> not compare a pre- and post-2026-09-02 row against #241's 5% budget as if
+> they were the same measurement. The budget itself is unchanged — only what
+> the denominator covers. The move landed with #270, whose real subject was
+> the same construction point: a failure above it published no summary at
+> all.
+>
 > **The latency percentiles are biased the OTHER way, and by a different
 > mechanism.** `_STATUS_QUERY` is unchanged across the fix, so the query being
 > timed is the same one — but comparability of the query is not comparability of
