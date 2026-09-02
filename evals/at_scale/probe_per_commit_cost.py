@@ -111,10 +111,13 @@ _CARRIED_METRICS_KEYS = (
     "stderr_capture_complete",
     "poll_duty_fraction",
     "checkpoint_summary",
-    # #270. For a run that failed before Stage A, error_signals is empty and
-    # checkpoint_summary is absent -- not because the run was clean, but
-    # because _run_ingestion swallowed the exception without printing it.
-    # This is the only key that carries the text of what actually happened.
+    # #270. For a run that failed before Stage A, checkpoint_summary is an
+    # all-zeros dict, which is exactly what a legitimate run that checkpointed
+    # nothing reports -- so it can never name the failure. error_signals does
+    # carry an `ingestion_failed` entry (that print and its pattern were the
+    # other half of #270), but this key is where the exception text lives in
+    # the metrics JSON itself, independent of whether the stderr tee was
+    # running.
     "ingest_error",
 )
 

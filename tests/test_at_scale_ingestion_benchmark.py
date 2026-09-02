@@ -518,15 +518,24 @@ class TestRunIngestionBenchmark:
 
         #270: the status/error check comes FIRST, and it is not decoration.
         _run_ingestion publishes the summary from two `finally` blocks, both
-        guarded on `_ingest_checkpoint_policy is not None`, so a run that
-        dies anywhere in _run_ingestion's first ~130 lines -- before the
-        policy is constructed (mcp_server.py, `_CheckpointPolicy(
-        _checkpoint_duty_from_env())`) -- publishes NOTHING and this test's
-        `summary is not None` was the assertion that fired. It reported
-        `assert None is not None` while _run_ingestion's swallowed exception
-        sat unread in _ingest_progress["error"], which is why #270 spent 48
-        sampled runs unable to name a cause. Asserting the status first puts
-        that error text in the failure message.
+        guarded on `_ingest_checkpoint_policy is not None`, and the policy
+        used to be constructed ~100 lines into the try -- so a run dying in
+        the git enumerations or the preload published NOTHING, and this
+        test's `summary is not None` was the assertion that fired. It
+        reported `assert None is not None` while _run_ingestion's swallowed
+        exception sat unread in _ingest_progress["error"], which is why #270
+        spent 48 sampled runs unable to name a cause.
+
+        Both halves of that are now closed, and they are independent
+        defences -- keep both. The policy is constructed as the FIRST
+        statement in the try (mcp_server.py, `_CheckpointPolicy(
+        _checkpoint_duty_from_env())`), so there is no longer a window in
+        which a failure publishes no summary; that is covered directly by
+        tests/test_mcp_server.py TestCheckpointDutySummaryPublication::
+        test_summary_survives_a_pre_policy_failure. And asserting the status
+        first puts the error text in the failure message, so any OTHER cause
+        of an incomplete run still names itself here rather than surfacing
+        as a bare assertion on a downstream key.
 
         The two assertions this test used to make about total_seconds and
         realised_duty were DELETED as tautologies, the same call
@@ -563,20 +572,32 @@ class TestRunIngestionBenchmark:
         assert metrics["ingest_error"] is None
 
     @pytest.mark.asyncio
-    async def test_surfaces_a_failure_that_predates_the_checkpoint_policy(
+    async def test_surfaces_a_failure_in_the_preload(
         self, git_repo, tmp_path, monkeypatch, capfd
     ):
-        """#270's root finding, pinned. _load_ingestion_preload_state runs
-        BEFORE _run_ingestion constructs its _CheckpointPolicy (the
-        _frontier_load failure that TestCheckpointDutySummaryPublication::
-        test_summary_survives_a_pre_write_scope_failure covers runs AFTER
-        it, and does publish an all-zeros summary). A failure in this
-        earlier window is the one shape that leaves checkpoint_summary
-        absent entirely -- and _run_ingestion swallows the exception into
-        _ingest_progress["error"] without printing it, so before this key
-        existed the cause reached neither the metrics JSON, nor
-        scan_ingestion_stderr's error_signals, nor the test's failure
-        message.
+        """#270. A failure in _load_ingestion_preload_state must name itself
+        in the metrics and on the tee.
+
+        This test was written when this injection point sat BEFORE
+        _run_ingestion constructed its _CheckpointPolicy, and it asserted
+        `checkpoint_summary is None` as the precondition that made the window
+        distinct. That window is CLOSED -- the policy is now the first
+        statement in the try -- so the assertion is inverted here rather than
+        deleted: an all-zeros summary is the positive control that the move
+        actually took effect on the path that motivated it. The
+        summary-publication behaviour itself is owned by
+        tests/test_mcp_server.py TestCheckpointDutySummaryPublication::
+        test_summary_survives_a_pre_policy_failure, which is ablation-proven
+        against the construction's old position; this one keeps its original
+        subject, which is the ERROR REPORTING.
+
+        That subject is undiminished by the fix, and deliberately still
+        tested: a zeros summary says a run checkpointed nothing, which is
+        also what a legitimate zero-commit run says, so it can never be the
+        thing that names a failure. _run_ingestion swallows the exception
+        into _ingest_progress["error"], and before `ingest_error` existed the
+        cause reached neither the metrics JSON, nor scan_ingestion_stderr's
+        error_signals, nor the test's failure message.
 
         Ablation-proven: with the `ingest_error` key removed from
         run_ingestion_benchmark's result dict, this test fails on the
@@ -602,9 +623,15 @@ class TestRunIngestionBenchmark:
                 str(git_repo), "HEAD", graph_path, poll_interval=0.05
             )
 
-        # The precondition that makes this window distinct: nothing was
-        # published, so checkpoint_summary alone cannot name what went wrong.
-        assert metrics["checkpoint_summary"] is None
+        # Positive control for #270's move: this failure lands above every
+        # statement that could have checkpointed, so the summary is present
+        # and all zeros. Before the move it was absent entirely.
+        assert metrics["checkpoint_summary"] is not None
+        assert metrics["checkpoint_summary"]["checkpoints"] == 0
+        assert metrics["checkpoint_summary"]["total_seconds"] == 0.0
+        # And it still cannot name the failure -- a zeros summary is
+        # indistinguishable from a legitimate run that checkpointed nothing.
+        # That is what the next three assertions are for.
         assert metrics["final_status"] == "error"
         assert "injected pre-policy failure" in metrics["ingest_error"]
         # And the gate still fails the run, as it did before.

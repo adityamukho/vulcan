@@ -86,25 +86,44 @@ def _poll_duty_row(metrics: dict[str, Any]) -> str:
 
 def _checkpoint_duty_row(metrics: dict[str, Any]) -> str:
     """The "Checkpoint duty cycle" row (#241), rendered the same defensive
-    way _poll_duty_row is: metrics from a pre-#241 run (or a run that failed
-    before _run_ingestion ever installed a policy) simply lack
+    way _poll_duty_row is: metrics from a pre-#241 run simply lack
     'checkpoint_summary', and re-rendering that JSON must not raise.
+
+    A run that failed before checkpointing is reported as such rather than as
+    a duty figure, whether it left no summary or an all-zeros one -- see the
+    #270 comment below for why both shapes exist and why the second one
+    appeared only once that window was closed.
     """
     summary = metrics.get("checkpoint_summary")
+    ingest_error = metrics.get("ingest_error")
+    # #270: a failed run that never checkpointed must SAY so, and it can now
+    # arrive in either of two shapes -- so this is tested before the summary
+    # is, not only when the summary is missing.
+    #
+    # It used to arrive only as an absent summary: _run_ingestion publishes
+    # from two `finally` blocks, both guarded on its _CheckpointPolicy being
+    # non-None, and the policy was constructed ~100 lines into the try, so a
+    # run dying in the preload published nothing. #270 moved the construction
+    # to the first statement in the try, which closes that window -- and
+    # therefore makes the SAME run render an all-zeros summary instead. Left
+    # to the branch below that is "0.00% over 0 checkpoints (0.00s total, 0
+    # suppressed)": a formatted measurement, in benchmark.md, for a run that
+    # measured nothing.
+    #
+    # Keyed on `checkpoints == 0` rather than on ingest_error alone. A run
+    # that failed in Stage B after checkpointing 40 times has a real duty
+    # figure and keeps it; only a zeros summary is uninformative enough that
+    # naming the error is strictly more useful than rendering it.
+    if ingest_error and (summary is None or summary.get("checkpoints", 0) == 0):
+        return (
+            "| Checkpoint duty cycle (#241) | not measured -- the run "
+            f"failed before it checkpointed: {ingest_error} |"
+        )
     if summary is None:
-        # #270: two different runs land here, and conflating them writes a
-        # false claim into the durable record. _run_ingestion publishes the
-        # summary from two `finally` blocks, both guarded on its
-        # _CheckpointPolicy being non-None, so a run that died BEFORE that
-        # policy was constructed also has no summary -- and "assume
-        # once-per-commit cadence" would describe the pre-#241 code, not the
-        # code that actually produced this run. ingest_error separates them.
-        ingest_error = metrics.get("ingest_error")
-        if ingest_error:
-            return (
-                "| Checkpoint duty cycle (#241) | not measured -- the run "
-                f"failed before it checkpointed: {ingest_error} |"
-            )
+        # No ingest_error, so this is a metrics JSON from a harness that
+        # predates the key: "assume once-per-commit cadence" describes the
+        # pre-#241 code, and would be a false claim about any run whose own
+        # code did install a policy.
         return (
             "| Checkpoint duty cycle (#241) | not measured "
             "(pre-2026-08-08 harness; assume once-per-commit cadence) |"

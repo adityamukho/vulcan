@@ -273,14 +273,18 @@ async def run_ingestion_benchmark(
     # 2, so scan_ingestion_stderr finds no error_signals) nor the caller.
     # final_status alone says "error" without saying of what.
     #
-    # It matters most for the failures that predate _run_ingestion's
-    # _CheckpointPolicy -- the linearization, the preload, `git rev-list`.
-    # Both `finally` blocks that publish checkpoint_summary are guarded on the
-    # policy being non-None, so that whole window publishes no summary at all,
-    # and before this key a run that died there produced a metrics JSON whose
-    # only trace of the cause was final_status. Absent from a metrics file
-    # written by an older harness; None (not absent) on a clean run, so a
-    # reader can tell "measured, no error" from "not measured".
+    # It matters most for the failures early in the run -- the linearization,
+    # the preload, `git rev-list`. Those used to publish no checkpoint_summary
+    # either (both publishing `finally` blocks are guarded on the
+    # _CheckpointPolicy being non-None, and it was constructed ~100 lines into
+    # the try), so a metrics JSON from a run that died there carried no trace
+    # of the cause but final_status. #270 moved the construction to the first
+    # statement in the try, so such a run now carries an all-zeros summary --
+    # which is an improvement in schema stability and NOT a second source for
+    # the cause: zeros is also what a legitimate run that checkpointed nothing
+    # reports. This key stays the only place the text lives. Absent from a
+    # metrics file written by an older harness; None (not absent) on a clean
+    # run, so a reader can tell "measured, no error" from "not measured".
     ingest_error = mcp_server._ingest_progress.get("error")
     peak_rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
 
