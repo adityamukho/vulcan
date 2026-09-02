@@ -92,6 +92,38 @@ query("[:find ?name :where [:project/db :name ?name]]")
 
 ## Install
 
+Two tiers. The difference is auto-memory, not the tool set.
+
+| | MCP server only | Full install |
+|---|---|---|
+| Clone required | no | yes |
+| MCP tools (`minigraf_query`, `minigraf_transact`, …) | ✓ | ✓ |
+| `SKILL.md` synced into the project | — | ✓ |
+| Per-turn auto-memory hooks | — | ✓ |
+| Graph pinned to the project directory | — | ✓ |
+
+### MCP server only
+
+Point any MCP-capable agent at the published package. No clone and no virtualenv — `uvx` fetches it:
+
+```json
+{
+  "mcpServers": {
+    "temporal-reasoning": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["temporal-reasoning[git-ingestion]"]
+    }
+  }
+}
+```
+
+`[git-ingestion]` is not decorative. A bare `uvx temporal-reasoning` resolves none of the tree-sitter packages, and code-structure extraction then silently does nothing (issue #93).
+
+What this tier leaves out: no skill file, so the agent gets each tool's own description — one example query apiece — rather than `SKILL.md`'s full syntax, entity-type model, and write policy; no hooks, so nothing is remembered unless the agent explicitly calls a tool; and no `MINIGRAF_GRAPH_PATH`, so the graph lands at `memory.graph` in whatever directory the server happened to start in.
+
+### Full install
+
 `install.py` requires an explicit `--harness` so it only touches the files for the agent you're setting up: `claude-code`, `opencode`, or `codex`.
 
 ```bash
@@ -103,6 +135,8 @@ python /path/to/temporal_reasoning/install.py --harness claude-code
 Run `install.py` from your project root. It creates a virtualenv, installs dependencies, syncs the skill into `.claude/skills/temporal-reasoning` (Claude Code's project-local skill scope), and — for `--harness claude-code` — writes `.mcp.json` and `.claude/settings*.json` into your project directory. That's it.
 
 **Optional — LLM extraction strategy:** `install.py` defaults to heuristic (regex) extraction, which requires no API key. To use LLM-based extraction, set `MINIGRAF_EXTRACTION_STRATEGY=llm` and `ANTHROPIC_API_KEY=<your key>` in `.claude/settings.local.json` after running the script.
+
+**Upgrading from the MCP-only tier:** clone the repo and run `install.py` on top — it rewrites the `temporal-reasoning` block in `.mcp.json` with the same `uvx` command plus explicit `MINIGRAF_GRAPH_PATH` and `MINIGRAF_INDEX_PATH`, and leaves any other MCP server in the file alone. Those paths point at `<your project>/memory.graph`, so if you were already starting the server from your project root it is the same file you were writing to; if you were not, move the old `memory.graph` there first or the existing memory is orphaned.
 
 ### OpenCode
 
