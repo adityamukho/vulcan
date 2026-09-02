@@ -149,6 +149,55 @@ An absent `introduced_by_duplicates` key (a metrics file from a harness that
 had the fact audit but not this check) stays clean — it cannot be
 retro-audited, so it is not retro-failed.
 
+**The OPPOSITE defect needed its own detector, and #316 is it.** An entity
+holding ZERO `:introduced-by` is what an interrupted run leaves behind (#313),
+and every gate the harness had read it clean — `introduced_by_duplicates` skips
+anything with fewer than two values; `divergence` compares two witnesses that
+are missing exactly the same fact, because neither was ever written;
+`stderr_capture` had nothing to read; and `probe_provisional_residue`'s
+`M <= N` reads clean MORE comfortably when the defect is present, because a
+torn entity raises N without ever raising M. So
+`entities_without_introduced_by` (introduced_by_audit.py) rides the same scan
+and reports under its own key, gated as clause 7 with no tolerance. Measured
+before wiring: **0 orphans of 3277 live code entities** on the 845-commit
+at-scale graph, whole audit 0.93s against 0.84s before.
+
+Two things it depends on. `CODE_ENTITY_TYPES` is the five types
+`_build_code_triples` writes an `:introduced-by` for —
+module/function/class/variable/field — and **`:type/external-dependency` is
+excluded deliberately**: unresolved-import stubs are opened with exactly
+`:entity-type`/`:ident`/`:description` and the lineage machinery can never give
+them one later (`_reverse_apply`'s `candidate_idents` comes from
+`_build_code_triples`, which never yields a stub), so all **72 of 72** on the
+at-scale graph legitimately hold none — including the type would have made the
+gate permanently red on its first run. And liveness is `:ident` PLUS the
+`:entity-type` FACT, never the ident prefix, because those same stubs carry a
+`:module/...` ident while being `:type/external-dependency`.
+
+The result carries its own denominator, `code_entities_scanned`, and that is
+not decoration: a check that matched no code entities would also report 0, so
+shipping the denominator makes every future run re-prove the positive control
+instead of it being a fact about the day the gate was wired. The report row
+renders `0 of 3277`, never a bare `0`; a run whose denominator is itself 0
+renders as "proved nothing about it" and does NOT fail the gate — a graph
+holding no code is not a defect. An absent key stays clean, same precedent.
+
+The one false positive it cannot rule out: `module`/`function`/`class`/
+`variable`/`field` are registered in `MINIGRAF_SCHEMA` with `:introduced-by`
+optional, so `handle_minigraf_transact` accepts `[:module/foo :description
+"x"]` and produces a legitimately lineage-free `:type/module`. The at-scale
+gate runs on a fresh ingestion-only graph so it cannot fire there; on a mixed
+graph the row is informational. The graph carries no discriminator between an
+ingested and a memory-written code entity.
+
+**What no fact-level check can see is a whole COMMIT going missing** — graph
+and index are consistent about the absence, so `divergence` is 0 again. That
+needs an independent count against the repo (`git rev-list --count` vs
+`_count_commit_entities`) and is filed as #317, deliberately not folded in
+here: it needs a repo handle `fact_audit` does not take, and its clean
+difference is probably NOT zero (skipped commits, merge commits, path-ignore
+all have to be measured first, or it repeats the external-dependency trap).
+
 **Re-running ingestion repairs none of it, and that is mechanical, not policy.**
 A finished run parks `:ingestion/correction-sweep-through` at frontier-high's
 own `:hi-hash`, so the next run's `_correction_sweep_select_position` computes

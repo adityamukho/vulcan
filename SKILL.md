@@ -441,7 +441,7 @@ Ident: `:module/<slugified-path-or-import-name>` (shares the module ident namesp
 | `:path` | submodule's repo path (submodules only; absent for unresolved-import placeholders — they have no path) |
 | `:pinned-commit` | pinned commit SHA the submodule currently points to (submodules only); bi-temporally closed and reopened on every bump — point-in-time queries see the SHA pinned at that time |
 | `:submodule-name` / `:submodule-url` | from `.gitmodules`, when parseable (submodules only) |
-| `:introduced-by` (keyword ref) | commit that first introduced this dependency |
+| `:introduced-by` (keyword ref) | commit that first introduced this dependency (**submodules only** — unresolved-import placeholders are opened with `:entity-type`/`:ident`/`:description` and never acquire one, so they are live entities with no lineage by design; the #316 orphan audit excludes this whole entity type for that reason) |
 | `:modified-in` (keyword ref) | one edge per commit that bumped a submodule's pinned commit |
 | `:resolves-to` (keyword ref, unresolved-import placeholders only) | points to the real submodule entity when this placeholder's import path falls under a known `.gitmodules`/gitlink path — bridges the two ident schemes (`_canonical_ident` from the raw import specifier vs. `_code_ident` from the submodule's declared path), which otherwise never produce the same ident string even once both entities exist. Set regardless of which one was ingested first. |
 

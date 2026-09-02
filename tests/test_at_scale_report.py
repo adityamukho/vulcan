@@ -339,6 +339,114 @@ class TestAppendIngestionReport:
         text = report_path.read_text()
         assert "| Duplicate :introduced-by (#287) | not measured" in text
 
+    def test_a_clean_run_reports_zero_orphans_with_its_denominator(self, tmp_path):
+        """0 is never rendered bare. A check that matched no code entities
+        would also report 0 entities, so the denominator is the half that
+        makes the zero mean anything -- CLAUDE.md's standing requirement for
+        a zero-tolerance gate, restated by every run instead of once."""
+        metrics = {
+            **self._clean_256_metrics(),
+            "fact_audit": {
+                "divergence": 0, "graph_facts": 1894, "audit_error": None,
+                "entities_without_introduced_by": {
+                    "entities": 0, "code_entities_scanned": 3150, "sample": [],
+                },
+            },
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert (
+            "| Code entities with no :introduced-by (#316) | 0 of 3150 "
+            "code entities |"
+        ) in text
+
+    def test_a_zero_denominator_is_not_rendered_as_clean(self, tmp_path):
+        """The state the denominator exists to distinguish. Both halves are
+        zero, which is also exactly what a broken narrowing looks like, so the
+        row says the check proved nothing rather than calling it a pass."""
+        metrics = {
+            **self._clean_256_metrics(),
+            "fact_audit": {
+                "divergence": 0, "graph_facts": 1894, "audit_error": None,
+                "entities_without_introduced_by": {
+                    "entities": 0, "code_entities_scanned": 0, "sample": [],
+                },
+            },
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "**0 code entities were scanned**" in text
+        assert "proved nothing about it" in text
+
+    def test_an_orphaned_graph_is_told_to_rebuild_not_repair(self, tmp_path):
+        metrics = {
+            **self._clean_256_metrics(),
+            "fact_audit": {
+                "divergence": 0, "graph_facts": 29465, "audit_error": None,
+                "entities_without_introduced_by": {
+                    "entities": 3, "code_entities_scanned": 3150,
+                    "sample": [":module/mcp_server-py"],
+                },
+            },
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "| Code entities with no :introduced-by (#316) | **3** of 3150" in text
+        assert "rebuilt into a fresh graph path" in text
+        assert ":module/mcp_server-py" in text
+
+    def test_an_orphaned_graph_reads_wrong_beside_two_clean_rows(self, tmp_path):
+        """#316's exact shape. The index is missing precisely the fact the
+        graph is missing, so `divergence` is 0; the duplicate check skips
+        anything holding fewer than two values, so that row is 0 too. Only
+        this row contradicts the clean sweep above it."""
+        metrics = {
+            **self._clean_256_metrics(),
+            "fact_audit": {
+                "divergence": 0, "graph_facts": 29465, "audit_error": None,
+                "introduced_by_duplicates": {"entities": 0, "sample": []},
+                "entities_without_introduced_by": {
+                    "entities": 3, "code_entities_scanned": 3150, "sample": [],
+                },
+            },
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "| Fact-index divergence (#302) | 0 (29465 facts cross-checked) |" in text
+        assert "| Duplicate :introduced-by (#287) | 0 |" in text
+        assert "| Code entities with no :introduced-by (#316) | **3** of 3150" in text
+
+    def test_an_audit_that_could_not_run_renders_unverified_for_orphans_too(
+        self, tmp_path
+    ):
+        metrics = {
+            **self._clean_256_metrics(),
+            "fact_audit": {
+                "divergence": 0, "audit_error": "OperationalError: no such table",
+                "entities_without_introduced_by": None,
+            },
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "| Code entities with no :introduced-by (#316) | **UNVERIFIED**" in text
+
+    def test_a_pre_316_fact_audit_renders_not_measured(self, tmp_path):
+        """Outer key present, this one absent. Absence is not zero: that graph
+        was never asked."""
+        metrics = {
+            **self._clean_256_metrics(),
+            "fact_audit": {"divergence": 0, "graph_facts": 1894, "audit_error": None},
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        text = report_path.read_text()
+        assert "| Code entities with no :introduced-by (#316) | not measured" in text
+
     def test_the_256_rows_still_render_for_a_pre_fix_result(self, tmp_path):
         """Same defensive precedent as the poll and checkpoint rows: a result
         JSON written before 2026-08-16 carries none of these keys. Absence
@@ -353,6 +461,7 @@ class TestAppendIngestionReport:
         assert "| Error signatures (#251/#256) | not measured" in text
         assert "| Fact-index divergence (#302) | not measured" in text
         assert "| Duplicate :introduced-by (#287) | not measured" in text
+        assert "| Code entities with no :introduced-by (#316) | not measured" in text
         assert "NOT zero" in text
 
 
@@ -490,6 +599,32 @@ class TestAppendQueryReport:
         append_query_report(report, report_path)
         text = report_path.read_text()
         assert "| Duplicate :introduced-by (#287) | **12**" in text
+        assert "rebuilt into a fresh graph path" in text
+
+    def test_an_orphaned_graph_is_flagged_in_the_query_section_too(self, tmp_path):
+        """#316, same reason as the #287 case above: query latencies measured
+        over a graph that must be thrown away are not comparable to ones
+        measured over a healthy graph, and NEITHER row above this one can say
+        so -- an orphaned graph diverges by zero and holds no duplicates.
+        Wiring the row into the ingestion section alone broke no test until
+        this one existed."""
+        report = {
+            **SAMPLE_QUERY_REPORT,
+            "ingestion": {
+                **SAMPLE_QUERY_REPORT["ingestion"],
+                "fact_audit": {
+                    "divergence": 0, "graph_facts": 29465, "audit_error": None,
+                    "introduced_by_duplicates": {"entities": 0, "sample": []},
+                    "entities_without_introduced_by": {
+                        "entities": 3, "code_entities_scanned": 3150, "sample": [],
+                    },
+                },
+            },
+        }
+        report_path = tmp_path / "benchmark.md"
+        append_query_report(report, report_path)
+        text = report_path.read_text()
+        assert "| Code entities with no :introduced-by (#316) | **3** of 3150" in text
         assert "rebuilt into a fresh graph path" in text
 
     def test_an_absent_ingestion_key_renders_not_measured(self, tmp_path):

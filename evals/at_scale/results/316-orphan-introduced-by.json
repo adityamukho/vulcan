@@ -1,0 +1,57 @@
+{
+  "issue": 316,
+  "what": "Baseline and positive control for the zero-tolerance gate on live code entities holding no :introduced-by (evals/at_scale/introduced_by_audit.py, entities_without_introduced_by). Read off fact_audit's existing whole-graph [:find ?e ?a ?v] scan.",
+  "measured_at": "20260902T070610Z",
+  "source_metrics": "results/ingestion-20260902T070610Z.json",
+  "repo": {
+    "path": ".",
+    "ref": "HEAD",
+    "commits_ingested": 845
+  },
+  "minigraf_version": "2.0.0",
+  "baseline": {
+    "entities_without_introduced_by": 0,
+    "code_entities_scanned": 3277,
+    "reading": "0 of 3277 code entities",
+    "note": "The denominator is the positive control and is why the zero is believable: a check that matched no code entities would also report 0 entities. It ships in the result rather than living only here, so every future run re-proves it."
+  },
+  "cost": {
+    "fact_audit_seconds_this_run": 0.9263729610001974,
+    "fact_audit_seconds_before_316": 0.84,
+    "note": "Rides the scan fact_audit already holds in memory -- one pass over a dict, not a second query, scan or lease. The 0.09s difference is within run-to-run variation of the whole audit step."
+  },
+  "the_other_gates_read_this_graph_clean": {
+    "divergence": 0,
+    "introduced_by_duplicates_entities": 0,
+    "skipped_commits": 0,
+    "error_signals": 0,
+    "note": "Not a caveat -- the point. On an AFFECTED graph these read clean too: the index is missing exactly the fact the graph is missing, so the two witnesses agree perfectly; introduced_by_duplicates skips anything holding fewer than two values; and #313's runs printed nothing. That is why this is a separate gate clause and not a term in divergence."
+  },
+  "external_dependency_exclusion": {
+    "entities": 72,
+    "of_which_hold_no_introduced_by": 72,
+    "measured_from": "the run's fact index, read read-only while the correction sweep was still running -- the final graph was in a TemporaryDirectory and is gone",
+    "caveat": "A mid-run reading, so the count is not the final one. It is recorded for its RATIO, not its magnitude: every external-dependency entity in this graph lacks :introduced-by. Had the type been in CODE_ENTITY_TYPES the gate would have been red on the first run it ever gated. This repo has no git submodules, so only the unresolved-import-stub branch is exercised here; the submodule branch does write an :introduced-by.",
+    "corroborated_by": [
+      "mcp_server.py, _forward_apply's dep-edge branch: a stub is opened with exactly :entity-type, :ident and :description",
+      "mcp_server.py, _build_close_triples' docstring: 'unresolved-import stubs reuse the module ident prefix but never have an :introduced-by fact'",
+      "_reverse_apply's candidate_idents comes from _build_code_triples, which never yields a dep stub, so the lineage machinery cannot give one",
+      "tests/test_at_scale_introduced_by_audit.py: adding the type to CODE_ENTITY_TYPES fails 3 tests (ablation-proven)"
+    ]
+  },
+  "entity_type_histogram_mid_run": {
+    "note": "Same mid-run index reading as above, and lower than the final graph for the same reason: the correction sweep closes entities as it goes.",
+    "counts": {
+      ":type/function": 2572,
+      ":type/lineage-marker": 1840,
+      ":type/commit": 845,
+      ":type/class": 365,
+      ":type/variable": 285,
+      ":type/field": 86,
+      ":type/external-dependency": 72,
+      ":type/module": 70,
+      ":type/ingestion": 4,
+      ":type/ingest-interval": 2
+    }
+  }
+}

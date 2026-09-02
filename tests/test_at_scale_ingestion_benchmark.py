@@ -198,6 +198,74 @@ class TestExitCodeGate:
             "stderr_capture_complete": True,
         }) == 0
 
+    def test_a_code_entity_with_no_introduced_by_fails_the_gate(self):
+        """#316, clause 7. Every other key here reads clean, and that is not
+        contrived -- it is the only case. The index is missing exactly the
+        fact the graph is missing (neither was ever written), so divergence is
+        0; `introduced_by_duplicates` skips anything with fewer than two
+        values, so clause 6 is 0; and #313's runs printed nothing, so clauses
+        1-4 pass. Without this clause the graph is green."""
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+            "fact_audit": {
+                "divergence": 0, "audit_error": None,
+                "introduced_by_duplicates": {"entities": 0, "sample": []},
+                "entities_without_introduced_by": {
+                    "entities": 3, "code_entities_scanned": 3150, "sample": [],
+                },
+            },
+        }) == 1
+
+    def test_a_zero_orphan_count_is_clean(self):
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+            "fact_audit": {
+                "divergence": 0, "audit_error": None,
+                "introduced_by_duplicates": {"entities": 0, "sample": []},
+                "entities_without_introduced_by": {
+                    "entities": 0, "code_entities_scanned": 3150, "sample": [],
+                },
+            },
+        }) == 0
+
+    def test_a_zero_denominator_does_not_fail_the_gate(self):
+        """A graph holding no code entities at all is not a defect -- the
+        query benchmark's own graph can be one. The report says the check
+        proved nothing about it; the gate does not turn that into a failure,
+        because there is no condemned graph here to warn anyone off."""
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+            "fact_audit": {
+                "divergence": 0, "audit_error": None,
+                "entities_without_introduced_by": {
+                    "entities": 0, "code_entities_scanned": 0, "sample": [],
+                },
+            },
+        }) == 0
+
+    def test_a_pre_316_audit_stays_clean_for_old_metrics(self):
+        """Outer key present, this one absent. Same precedent as the #287
+        clause above: a graph that was never asked cannot be retro-failed."""
+        assert _exit_code({
+            "final_status": "complete",
+            "skipped_commits": [],
+            "error_signals": [],
+            "stderr_capture_complete": True,
+            "fact_audit": {
+                "divergence": 0, "audit_error": None,
+                "introduced_by_duplicates": {"entities": 0, "sample": []},
+            },
+        }) == 0
+
     def test_a_graph_that_reads_back_empty_fails_even_with_a_matching_index(self):
         """The audit's blind spot: two empty witnesses agree perfectly.
         commits_ingested is the independent count that catches it."""

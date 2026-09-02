@@ -501,3 +501,156 @@ class TestIntroducedByDuplicates:
         )
         assert result["audit_error"] is not None
         assert result["introduced_by_duplicates"] is None
+
+
+class TestCodeEntitiesWithNoIntroducedBy:
+    """#316: the ABSENT case, on a real graph.
+
+    #313's torn entity -- live `:ident`, live `:entity-type`, no
+    `:introduced-by` -- is what a process killed inside `_reverse_apply`'s
+    multi-transact window leaves behind. The point of doing it against a real
+    backend is the two negative results below: the graph must still diverge by
+    zero and still report zero duplicates, because that is precisely the state
+    in which every other gate reads clean.
+    """
+
+    @pytest.fixture
+    def healthy_code_graph(self, tmp_path, monkeypatch):
+        """A module and a function, both with lineage. The denominator's
+        positive control on a real graph."""
+        graph_path, index_path = _write_graph(
+            tmp_path, monkeypatch,
+            [
+                '[[:module/a-py :ident ":module/a-py"] '
+                '[:module/a-py :description "a.py"] '
+                "[:module/a-py :entity-type :type/module] "
+                "[:module/a-py :introduced-by :commit/aaa]]",
+                '[[:function/a-py--f :ident ":function/a-py--f"] '
+                '[:function/a-py--f :description "f"] '
+                "[:function/a-py--f :entity-type :type/function] "
+                "[:function/a-py--f :introduced-by :commit/aaa]]",
+            ],
+        )
+        yield graph_path, index_path
+        import mcp_server
+
+        mcp_server._reset_db_state()
+
+    @pytest.fixture
+    def torn_code_graph(self, tmp_path, monkeypatch):
+        """The same two entities, but the module never got its
+        `:introduced-by` -- the exact state #313 fixed the write path for."""
+        graph_path, index_path = _write_graph(
+            tmp_path, monkeypatch,
+            [
+                '[[:module/a-py :ident ":module/a-py"] '
+                '[:module/a-py :description "a.py"] '
+                "[:module/a-py :entity-type :type/module]]",
+                '[[:function/a-py--f :ident ":function/a-py--f"] '
+                '[:function/a-py--f :description "f"] '
+                "[:function/a-py--f :entity-type :type/function] "
+                "[:function/a-py--f :introduced-by :commit/aaa]]",
+            ],
+        )
+        yield graph_path, index_path
+        import mcp_server
+
+        mcp_server._reset_db_state()
+
+    def test_a_healthy_code_graph_reports_zero_of_a_real_denominator(
+        self, healthy_code_graph
+    ):
+        """Zero AND a nonzero denominator. Zero alone is what a check that
+        matched nothing also reports, which is why the gate is not believed
+        without this half."""
+        graph_path, index_path = healthy_code_graph
+        _bind(graph_path)
+        result = audit_graph_against_index(str(index_path))
+        assert result["entities_without_introduced_by"] == {
+            "entities": 0, "code_entities_scanned": 2, "sample": [],
+        }
+
+    def test_the_torn_graph_really_holds_the_entity_with_no_lineage(
+        self, torn_code_graph
+    ):
+        """The precondition. Without it a passing detection test proves only
+        that the transact silently dropped the module."""
+        import mcp_server
+
+        graph_path, _ = torn_code_graph
+        _bind(graph_path)
+        live = mcp_server.handle_minigraf_query(
+            '[:find ?i :where [:module/a-py :ident ?i]]'
+        )["results"]
+        assert live == [[":module/a-py"]], live
+        lineage = mcp_server.handle_minigraf_query(
+            "[:find ?c :where [:module/a-py :introduced-by ?c]]"
+        )["results"]
+        assert lineage == [], lineage
+
+    def test_the_orphan_is_detected_and_named(self, torn_code_graph):
+        graph_path, index_path = torn_code_graph
+        _bind(graph_path)
+        result = audit_graph_against_index(str(index_path))
+        assert result["entities_without_introduced_by"]["entities"] == 1
+        assert result["entities_without_introduced_by"]["sample"] == [":module/a-py"]
+        assert result["entities_without_introduced_by"]["code_entities_scanned"] == 2
+
+    def test_the_torn_graph_still_diverges_by_zero(self, torn_code_graph):
+        """Why this cannot be part of `divergence`, and the reason it is a
+        stronger case than #287's: the index is missing exactly the fact the
+        graph is missing, because neither was ever written. The two witnesses
+        agree perfectly about an entity with no lineage at all."""
+        graph_path, index_path = torn_code_graph
+        _bind(graph_path)
+        result = audit_graph_against_index(str(index_path))
+        assert result["divergence"] == 0
+        assert result["audit_error"] is None
+        assert result["entities_without_introduced_by"]["entities"] == 1
+
+    def test_the_duplicate_check_reads_the_torn_graph_as_clean(self, torn_code_graph):
+        """The other gate that steps over it. `introduced_by_duplicates` skips
+        anything holding fewer than two values, so zero falls straight
+        through -- this is #316's whole reason to exist as a separate key."""
+        graph_path, index_path = torn_code_graph
+        _bind(graph_path)
+        result = audit_graph_against_index(str(index_path))
+        assert result["introduced_by_duplicates"]["entities"] == 0
+
+    def test_a_graph_with_no_code_entities_reports_a_zero_denominator(
+        self, graph_pair
+    ):
+        """30 `:decision/...` entities and no code. Present with both halves
+        zero, so a consumer can tell "nothing was checkable here" from
+        "checked and clean" -- and from "this metrics file predates the
+        check"."""
+        graph_path, index_path = graph_pair
+        _bind(graph_path)
+        result = audit_graph_against_index(str(index_path))
+        assert result["entities_without_introduced_by"] == {
+            "entities": 0, "code_entities_scanned": 0, "sample": [],
+        }
+
+    def test_a_scan_that_failed_reports_none_not_zero(self, graph_pair):
+        """A failed scan yields an empty fact set, and an empty fact set has
+        no orphans -- and a `code_entities_scanned` of 0 that reads like a
+        graph holding no code rather than a graph nobody could read."""
+        graph_path, index_path = graph_pair
+        _bind(graph_path)
+
+        def boom(_query):
+            raise RuntimeError("Page 7 out of bounds (total pages: 3)")
+
+        result = audit_graph_against_index(str(index_path), query_fn=boom)
+        assert result["entities_without_introduced_by"] is None
+
+    def test_the_wrong_graphs_index_reports_none_not_zero(self, graph_pair, tmp_path):
+        """Same reasoning on the refusal path, which returns before any scan
+        happens at all."""
+        graph_path, index_path = graph_pair
+        _bind(graph_path)
+        result = audit_graph_against_index(
+            str(index_path), expected_graph_path=str(tmp_path / "other.graph")
+        )
+        assert result["audit_error"] is not None
+        assert result["entities_without_introduced_by"] is None
