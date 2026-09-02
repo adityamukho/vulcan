@@ -245,6 +245,59 @@ def _fact_audit_row(metrics: dict[str, Any]) -> str:
     )
 
 
+def _commit_census_row(metrics: dict[str, Any]) -> str:
+    """The "Commits: repo / walk / graph" row (#317).
+
+    Its own row, beside the fact-audit rows rather than inside them, because
+    it is the only content check here whose reference is not the graph itself.
+    A commit that never reached the graph is absent from the fact index in
+    exactly the same way -- the two witnesses agree perfectly about a graph
+    that lost history -- so nothing above this row can report it.
+
+    The clean rendering carries all THREE counts, not a bare tick. `847 / 847
+    / 847` says which of the three numbers a future run moved; a single "0
+    divergence" would not, and three counts that are all zero also agree
+    perfectly. Same argument as the orphan row's denominator, and the same
+    reason it is restated on every run rather than once in a results file.
+
+    "not measured" is for a metrics file written before this census existed.
+    Absence is not zero, and such a graph was never asked.
+    """
+    census = metrics.get("commit_census")
+    if census is None:
+        return (
+            "| Commits: repo / walk / graph (#317) | not measured "
+            "(pre-2026-09-02 harness; this run was never asked) |"
+        )
+    if census.get("census_error"):
+        return (
+            f"| Commits: repo / walk / graph (#317) | **UNVERIFIED** -- the "
+            f"census could not run: `{census['census_error']}` |"
+        )
+    counts = (
+        f"{census.get('repo_commits')} / {census.get('walk_claimed')} / "
+        f"{census.get('graph_commit_entities')}"
+    )
+    if census.get("proved_nothing"):
+        # Both halves are 0. Reported as a non-result rather than a pass, on
+        # the same terms as the orphan row: the census ran and found nothing
+        # to census, which is what a broken ref looks like as well as what an
+        # empty repo looks like. The gate does not fail it.
+        return (
+            "| Commits: repo / walk / graph (#317) | 0 / 0 / 0 -- the repo "
+            "holds **no commits**, so this census proved nothing about the "
+            "graph |"
+        )
+    if census.get("ok"):
+        ref = census.get("ref")
+        suffix = "" if ref is None else f" (ref `{ref}`)"
+        return f"| Commits: repo / walk / graph (#317) | {counts}{suffix} |"
+    return (
+        f"| Commits: repo / walk / graph (#317) | **{counts}** -- "
+        f"{census.get('interpretation', 'census failed')} |"
+    )
+
+
 def _introduced_by_duplicates_row(metrics: dict[str, Any]) -> str:
     """The "Duplicate :introduced-by" row (#287).
 
@@ -496,6 +549,7 @@ def append_ingestion_report(
         _fact_audit_row(metrics),
         _introduced_by_duplicates_row(metrics),
         _orphan_introduced_by_row(metrics),
+        _commit_census_row(metrics),
     ]
     if "ignore_comparison" in metrics:
         comp = metrics["ignore_comparison"]
@@ -697,8 +751,8 @@ def _query_ingestion_block(report: dict[str, Any]) -> list[str]:
 
     _stderr_capture_row / _skipped_commits_row / _error_signals_row /
     _fact_audit_row / _introduced_by_duplicates_row / _orphan_introduced_by_row
-    are reused verbatim rather than re-rendered from the same
-    keys. That is the point: an Ingestion Run section and a Query Correctness
+    / _commit_census_row are reused verbatim rather than re-rendered from the
+    same keys. That is the point: an Ingestion Run section and a Query Correctness
     Run section must not be able to disagree about how a dirty run reads.
     """
     metrics = report.get("ingestion")
@@ -723,6 +777,7 @@ def _query_ingestion_block(report: dict[str, Any]) -> list[str]:
         _fact_audit_row(metrics),
         _introduced_by_duplicates_row(metrics),
         _orphan_introduced_by_row(metrics),
+        _commit_census_row(metrics),
     ]
 
 

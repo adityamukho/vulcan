@@ -591,6 +591,11 @@ This is what makes a genuine single-query cross-layer join possible — see the 
 ### Aggregations
 - `(count ?e)` / `(count-distinct ?e)` / `(sum ?n)` / `(min ?x)` / `(max ?x)`
 - Group by: `[:find ?role (count ?e) :where [?e :role ?role]]`
+- **`count` counts matching ROWS, `count-distinct` counts distinct values.**
+  They differ whenever one entity has more than one live fact matching the
+  clause — including the same `(entity, attribute, value)` asserted twice
+  under different valid-froms, which is a live row each time. To count
+  ENTITIES, use `count-distinct`.
 
 ### Bi-temporal
 - `:as-of N` — state at transaction N

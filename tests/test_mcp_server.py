@@ -14032,6 +14032,139 @@ class TestRunIngestionShutdown:
         mcp_server._reset_db_state()  # release the real file lock for subsequent tests
 
 
+class TestRepoTotalCountsTheBranchNotHead:
+    """#317. `_run_ingestion`'s repo_total was `git rev-list --count HEAD`
+    while every other git call in the function takes the `branch` argument.
+
+    For any run whose branch is not HEAD the progress denominator described a
+    DIFFERENT ref than the walk -- and silently, because both are plausible
+    integers and neither is checked against the other. Not hypothetical: the
+    at-scale harness resolves its branch with `_default_git_branch` (e.g.
+    "master") while the checkout sits on whatever feature branch the work is
+    on, which is exactly how this was found.
+
+    The repo below makes the two refs disagree on purpose: HEAD is master with
+    two commits, `side` is a branch at the first commit with one. Under the old
+    hardcoded HEAD this reports 2 for a one-commit walk.
+    """
+
+    @pytest.mark.asyncio
+    async def test_total_follows_the_branch_argument(self, git_repo, tmp_path, monkeypatch):
+        import mcp_server
+
+        _subprocess.run(
+            ["git", "branch", "side", "HEAD~1"], cwd=git_repo, check=True,
+            capture_output=True,
+        )
+        head_count = _subprocess.run(
+            ["git", "rev-list", "--count", "HEAD"], cwd=git_repo, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        side_count = _subprocess.run(
+            ["git", "rev-list", "--count", "side"], cwd=git_repo, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        # The premise of the test, asserted rather than assumed: if these ever
+        # agreed, the test would pass against the old hardcoded HEAD too.
+        assert (head_count, side_count) == ("2", "1")
+
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(tmp_path / "branch-total.graph"))
+        mcp_server._ingest_progress = {
+            "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
+            "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
+        }
+        try:
+            await mcp_server._run_ingestion(str(git_repo), "side")
+            assert mcp_server._ingest_progress["total"] == 1, (
+                "the denominator must count the branch being walked, not HEAD"
+            )
+        finally:
+            mcp_server._reset_db_state()
+
+
+class TestCountCommitEntitiesCountsEntitiesNotRows:
+    """#317. `(count ?e)` counts matching ROWS, not distinct entities.
+
+    Measured against minigraf 2.0.0: two `:type/commit` entities read 2, and a
+    SECOND live `:entity-type` row on one of them makes the same query read 3
+    while `(count-distinct ?e)` still reads 2. minigraf is not idempotent at
+    the graph level for re-transacting the same (entity, attribute, value)
+    under a different valid-from (#156) -- which is why `_watermark_update`
+    diffs its constant attributes before writing them.
+
+    THE DUPLICATE NEEDS TWO DIFFERENT VALID-FROMS, and that is why these tests
+    pass them explicitly rather than transacting twice in a row. Two writes of
+    one triple landing at the SAME valid-from collapse to a single row
+    (measured: back-to-back in-memory transacts read 1, the same pair 1.1s
+    apart read 2) -- project-minigraf/minigraf#287's pending-index behaviour.
+    A sleep-based version of this test would be both slow and timing-dependent.
+
+    WHICH ALSO BOUNDS THE REACHABILITY, and it is narrower than it first looks.
+    Ingestion CANNOT produce this duplicate on a commit entity: `_reverse_apply`
+    and `_forward_apply` transact the commit triples at `commit_ts_iso`, the
+    commit's own timestamp, so a resumed run re-walking a position whose
+    `_frontier_persist_claim` never landed (#313) re-writes the identical
+    triple at the identical valid-from and it collapses. The reachable path is
+    the PUBLIC handler: `commit` is a registered MINIGRAF_SCHEMA type, so
+    `handle_minigraf_transact` accepts `[:commit/xyz :description "..."]` and
+    writes its `:entity-type` at wall-clock valid-from -- twice, seconds apart,
+    on a mixed memory-and-ingestion graph, and the count is wrong.
+
+    WHY IT MATTERS BEYOND BEING WRONG BY ONE: #317's commit census compares
+    this number against the repo's own `git rev-list --count`. Under `count`,
+    one duplicated commit entity CANCELS one genuinely lost commit and the
+    census reads clean on a graph that lost history. The census is meant to be
+    a witness that does not inherit the write path's invariants, and using
+    `count` would make its third number correct only for as long as an
+    assumption held somewhere else.
+    """
+
+    def test_a_second_live_row_does_not_inflate_the_count(self, real_db):
+        import mcp_server
+
+        mcp_server._transact(
+            real_db, "[[:commit/aaa :entity-type :type/commit]]", "2020-01-01T00:00:00Z"
+        )
+        mcp_server._transact(
+            real_db, "[[:commit/bbb :entity-type :type/commit]]", "2020-01-01T00:00:00Z"
+        )
+        assert mcp_server._count_commit_entities(real_db) == 2
+
+        # The same (entity, attribute, value) at a LATER valid-from. Not a
+        # no-op: it leaves a second live row for :commit/aaa.
+        mcp_server._transact(
+            real_db, "[[:commit/aaa :entity-type :type/commit]]", "2021-01-01T00:00:00Z"
+        )
+        assert mcp_server._count_commit_entities(real_db) == 2, (
+            "still two commit ENTITIES -- a second live row for one of them is "
+            "not a third commit"
+        )
+
+    def test_the_second_row_really_is_there(self, real_db):
+        """The positive control for the test above. Without it, a query that
+        matched nothing would also report the expected 2, and so would a
+        minigraf that quietly deduplicated the second write -- in which case
+        the assertion above proves nothing about the AGGREGATE at all.
+        Asserting the raw rows is what makes this a test of `count` vs
+        `count-distinct` rather than a test that two entities exist."""
+        import json
+
+        import mcp_server
+
+        for ts in ("2020-01-01T00:00:00Z", "2021-01-01T00:00:00Z"):
+            mcp_server._transact(
+                real_db, "[[:commit/aaa :entity-type :type/commit]]", ts
+            )
+        rows = json.loads(
+            mcp_server._db_execute(
+                real_db, "(query [:find ?e :where [?e :entity-type :type/commit]])"
+            )
+        )["results"]
+        assert len(rows) == 2, "two live rows is the state this test needs to exist"
+        assert len({r[0] for r in rows}) == 1, "and they are for ONE entity"
+
+
 class TestMainShutdown:
     @pytest.mark.asyncio
     async def test_shutdown_event_cancels_server_run_and_returns(self, monkeypatch):

@@ -465,6 +465,89 @@ class TestAppendIngestionReport:
         assert "NOT zero" in text
 
 
+class TestCommitCensusRow:
+    """#317. The one content row whose reference is not the graph itself."""
+
+    def _clean(self):
+        # Mirrors TestAppendIngestionReport's own clean-metrics shape closely
+        # enough for the row under test; the other rows' rendering is covered
+        # by their own tests.
+        return {
+            "repo_path": ".", "branch": "master", "commits_ingested": 847,
+            "wall_clock_seconds": 10.0, "throughput_per_minute": 5082.0,
+            "peak_rss_kb": 1000, "graph_size_bytes": 1, "index_size_bytes": 1,
+            "status_latency": {"min": 0.0, "p50": 0.0, "p99": 0.0, "max": 0.0},
+            "query_latency": {"min": 0.0, "p50": 0.0, "p99": 0.0, "max": 0.0},
+            "final_status": "complete", "poll_count": 1,
+            "poll_duty_fraction": 0.0, "poll_offsets": [],
+            "checkpoint_summary": None, "ingest_error": None,
+            "skipped_commits": [], "error_signals": [],
+            "stderr_capture_complete": True,
+        }
+
+    def _render(self, tmp_path, census):
+        metrics = {**self._clean()}
+        if census is not None:
+            metrics["commit_census"] = census
+        report_path = tmp_path / "benchmark.md"
+        append_ingestion_report(metrics, report_path)
+        return report_path.read_text()
+
+    def test_a_clean_run_renders_all_three_counts(self, tmp_path):
+        """Never a bare tick. `847 / 847 / 847` says which of the three numbers
+        a future run moved; a single "0 divergence" would not, and three counts
+        that are all zero also agree perfectly."""
+        text = self._render(tmp_path, {
+            "ref": "master", "repo_commits": 847, "walk_claimed": 847,
+            "graph_commit_entities": 847, "ok": True, "proved_nothing": False,
+            "census_error": None,
+        })
+        assert "| Commits: repo / walk / graph (#317) | 847 / 847 / 847" in text
+
+    def test_the_clean_row_names_the_ref_it_counted(self, tmp_path):
+        text = self._render(tmp_path, {
+            "ref": "master", "repo_commits": 847, "walk_claimed": 847,
+            "graph_commit_entities": 847, "ok": True, "proved_nothing": False,
+            "census_error": None,
+        })
+        assert "(ref `master`)" in text
+
+    def test_a_lost_commit_renders_bold_with_its_interpretation(self, tmp_path):
+        text = self._render(tmp_path, {
+            "ref": "master", "repo_commits": 847, "walk_claimed": 847,
+            "graph_commit_entities": 846, "ok": False, "proved_nothing": False,
+            "census_error": None,
+            "interpretation": "the walk claimed 847 commits but the graph holds 846",
+        })
+        assert "**847 / 847 / 846**" in text
+        assert "the graph holds 846" in text
+
+    def test_an_absent_census_reads_as_not_measured(self, tmp_path):
+        """Absence is not zero: such a run was never asked."""
+        text = self._render(tmp_path, None)
+        assert "| Commits: repo / walk / graph (#317) | not measured" in text
+
+    def test_a_failed_census_reads_as_unverified_not_clean(self, tmp_path):
+        text = self._render(tmp_path, {
+            "ref": "master", "repo_commits": 0, "walk_claimed": 847,
+            "graph_commit_entities": 847, "ok": False, "proved_nothing": False,
+            "census_error": "FileNotFoundError: git",
+        })
+        assert "**UNVERIFIED**" in text
+        assert "FileNotFoundError: git" in text
+
+    def test_an_empty_repo_is_not_rendered_as_clean(self, tmp_path):
+        """The state the denominator exists to distinguish. All three counts
+        are zero, which is also exactly what a wrong ref looks like, so the row
+        says the census proved nothing rather than calling it a pass."""
+        text = self._render(tmp_path, {
+            "ref": "master", "repo_commits": 0, "walk_claimed": 0,
+            "graph_commit_entities": 0, "ok": True, "proved_nothing": True,
+            "census_error": None,
+        })
+        assert "proved nothing about the" in text
+
+
 class TestMetricsJsonBullet:
     """#276: a reader of an Ingestion Run section had no way to find the
     results JSON it was rendered from, and therefore no way to find the

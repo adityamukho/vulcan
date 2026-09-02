@@ -1,0 +1,85 @@
+{
+  "issue": 317,
+  "what": "Baseline and positive control for the zero-tolerance commit-entity census (evals/at_scale/commit_census.py). Compares what the repo holds, what the walk claims it applied, and what the graph can actually produce -- the one loss no fact-level check can see, because graph and index are consistent about a commit that was never written.",
+  "measured_at": "20260902T085514Z",
+  "source_metrics": "results/ingestion-20260902T085514Z.json",
+  "measured_by": "the shipping collect_commit_census(), against the persisted graph in a separate process -- not a reimplementation, so the recorded baseline is produced by the exact function that is gated",
+  "repo": {
+    "path": ".",
+    "ref": "master",
+    "commits": 847,
+    "merge_commits": 66
+  },
+  "minigraf_version": "2.0.0",
+  "baseline": {
+    "repo_commits": 847,
+    "walk_claimed": 847,
+    "graph_commit_entities": 847,
+    "repo_vs_walk": 0,
+    "walk_vs_graph": 0,
+    "repo_vs_graph": 0,
+    "reading": "repo, walk and graph agree at 847 commits",
+    "note": "The clean difference IS zero, which was the open question and is why the gate is zero-tolerance. It was PREDICTED from the code and then confirmed here, not assumed: shipping a zero-tolerance gate whose clean difference was actually nonzero is the trap #316 had to avoid with :type/external-dependency, and this issue was split out of #316 partly to avoid repeating it."
+  },
+  "the_five_hazards_the_issue_required_measuring": {
+    "merge_commits": {
+      "resolved": "counted on both sides, no adjustment needed",
+      "evidence": "frontier_registry.build_linearization is `git log --topo-order --reverse --format=%H <branch>`, the same commit set `git rev-list --count <branch>` reports. Both _forward_apply and _reverse_apply write [commit_ident :entity-type :type/commit] unconditionally as the FIRST triple in their list, before any extracted file is consulted. 66 of the 847 are merges and the census reads 0 across all three deltas."
+    },
+    "skipped_commits": {
+      "resolved": "raises walk_claimed without raising graph_commit_entities",
+      "evidence": "_run_ingestion's per-commit extraction handler does _ingest_progress['processed'] += 1 and `continue` from ABOVE the db lease, so nothing is written for that commit. Such a run is already failed by _exit_code's skipped_commits clause; the census fires too, independently, which is the point -- that clause is stderr-derived and reads clean when the capture itself fails.",
+      "measured": "0 skipped on this run, so this path was not exercised and the baseline does not depend on it"
+    },
+    "path_ignore": {
+      "resolved": "changes nothing",
+      "evidence": "the :type/commit triple is written before any extracted file is looked at, so a commit touching only ignored paths still gets its entity."
+    },
+    "ref_mismatch": {
+      "resolved": "fixed at the source, and it was LIVE in this very run",
+      "evidence": "_run_ingestion's repo_total was hardcoded to `git rev-list --count HEAD` while ingestion takes a branch argument. This run resolved branch to 'master' (via _default_git_branch) while the process's HEAD was the feature branch fix-317-commit-entity-census -- two different refs. They agreed at 847 here only because the feature branch carried no commits yet. Fixed to use the branch argument; the census takes its ref explicitly and never defaults it."
+    },
+    "positive_control": {
+      "resolved": "shipped in the result as repo_commits, and checked",
+      "evidence": "847 is nonzero and equals the repo's own `git rev-list --count master`. Three counts that are all zero also match perfectly, so a census over an empty repo would otherwise be indistinguishable from a census over a healthy one -- commit_census reports proved_nothing for that case and does NOT fail it, exactly as #316's code_entities_scanned == 0 renders as 'proved nothing about it'."
+    }
+  },
+  "a_sixth_hazard_the_issue_did_not_name": {
+    "what": "the 12-character commit ident prefix",
+    "detail": "The commit ident is :commit/{hash[:12]}. Two commits sharing a 12-character hash prefix collapse into ONE entity, so the graph legitimately holds fewer than the repo through no fault of the write path the other deltas point at. Without a number for it the census would MISATTRIBUTE such a loss to the write path and send a reader to the wrong code.",
+    "measured": "847 distinct 12-character prefixes of 847 commits -- 0 collisions",
+    "handling": "reported as ident_collisions, still fails the gate (it is a genuine loss), and its branch is checked BEFORE the generic write-loss branch so the interpretation names the more specific cause"
+  },
+  "the_count_aggregate_finding": {
+    "what": "(count ?e) counts matching ROWS, not distinct entities",
+    "measured_directly_on_minigraf_2_0_0": {
+      "two_entities_count": 2,
+      "after_a_second_live_row_on_one_of_them_count": 3,
+      "count_distinct": 2,
+      "note": "The duplicate needs two DIFFERENT valid-froms. Two writes of one triple at the same valid-from collapse to a single row (back-to-back in-memory transacts read 1; the same pair 1.1s apart read 2) -- project-minigraf/minigraf#287's pending-index behaviour."
+    },
+    "why_it_mattered_here": "_count_commit_entities used (count ?e), so under it ONE duplicated commit entity CANCELS one genuinely lost commit and the census reads clean on a graph that lost history -- the precise failure the census exists to catch. Changed to (count-distinct ?e).",
+    "reachability_is_narrower_than_it_first_looks": "Ingestion CANNOT produce this duplicate on a commit entity: _reverse_apply and _forward_apply transact the commit triples at commit_ts_iso, the commit's own timestamp, so a resumed run re-walking a position whose _frontier_persist_claim never landed (#313) re-writes the identical triple at the identical valid-from and it collapses. The reachable path is the PUBLIC handler -- `commit` is a registered MINIGRAF_SCHEMA type, so handle_minigraf_transact writes its :entity-type at wall-clock valid-from, and two such writes seconds apart on a mixed memory-and-ingestion graph over-count.",
+    "on_this_graph": {
+      "count": 847,
+      "count_distinct": 847,
+      "raw_rows": 847,
+      "unique_entities_in_rows": 847,
+      "agree": true,
+      "note": "Latent here, not live -- consistent with the reachability above. Recorded so a future divergence between these two numbers is a signal rather than a surprise."
+    },
+    "not_changed": "_STATUS_QUERY (run_ingestion_benchmark) keeps (count ?e). Its docstring states it is deliberately frozen so the QUERY being timed stays comparable across runs; it is a latency instrument and its number is never read as a count."
+  },
+  "the_other_gates_read_this_graph_clean": {
+    "divergence": 0,
+    "introduced_by_duplicates_entities": 0,
+    "entities_without_introduced_by": 0,
+    "skipped_commits": 0,
+    "error_signals": 0,
+    "note": "Not a caveat -- the point, and the same argument #316 recorded. On a graph MISSING A WHOLE COMMIT these all read clean too: fact_audit's two witnesses are written from the same triples in the same transaction boundary, so a commit that was never written is absent from BOTH and they agree perfectly; the two :introduced-by checks are well-formedness checks on entities that EXIST, and a commit that produced no entities produces nothing for either to find; and _exit_code's graph_facts == 0 clause only fires when the graph reads back COMPLETELY empty. That is why this is a separate gate clause and not a term in divergence."
+  },
+  "cost": {
+    "two_git_subprocesses_and_one_point_query": true,
+    "note": "Milliseconds. It does not ride fact_audit's scan the way the two :introduced-by checks do, because it needs a repo handle fact_audit deliberately does not take -- so it is wired beside the audit rather than inside it, keeping the audit's signature honest."
+  }
+}

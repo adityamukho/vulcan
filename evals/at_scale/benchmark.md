@@ -1956,3 +1956,118 @@ next run. An affected graph is **rebuilt into a fresh graph path**.
 check can see it, because the graph and the index are again consistent about
 the absence. That needs an independent count against the repo itself and is
 filed as #317.
+
+## Ingestion Run — 20260902T085514Z
+
+- Repo: `.` @ `master`
+- minigraf: `2.0.0`
+- Metrics JSON: `results/ingestion-20260902T085514Z.json`
+
+| Metric | Value |
+|---|---|
+| Commits ingested | 847 |
+| Final status | complete |
+| Wall-clock | 1526.35s |
+| Throughput | 33.3 commits/min |
+| Peak RSS | 796132 KB |
+| Graph size | 220991488 bytes |
+| Fact-index size | 97374208 bytes |
+| Status-query latency (min/p50/p99/max) | 0.1ms / 0.3ms / 5.3ms / 20.6ms |
+| Graph-query latency (min/p50/p99/max) | 1.1ms / 24.5ms / 1067.9ms / 1215.9ms |
+| Poll duty cycle (#242) | 6.59% over 1149 polls |
+| Checkpoint duty cycle (#241) | 4.65% over 102 checkpoints (70.77s total, 1169 suppressed) |
+| Stderr tee (#256) | active (wall-clock and latencies measured with an fd-level tee in place) |
+| Stderr capture (#256) | complete |
+| Commits dropped (#256) | 0 |
+| Error signatures (#251/#256) | 0 |
+| Fact-index divergence (#302) | 0 (31377 facts cross-checked) |
+| Duplicate :introduced-by (#287) | 0 |
+| Code entities with no :introduced-by (#316) | 0 of 3323 code entities |
+| Commits: repo / walk / graph (#317) | 847 / 847 / 847 (ref `master`) |
+
+*(The census row above was measured separately, from the same persisted graph
+and metrics, by the shipping `collect_commit_census()` — the run itself
+predates the harness wiring, so its own metrics JSON carries no
+`commit_census` key. Every later run writes the row itself.)*
+
+### #317 — commit-entity census: repo vs walk vs graph (2026-09-02)
+
+- Module: `evals/at_scale/commit_census.py`; wired in `run_ingestion_benchmark`
+  beside the fact audit, gated as `_exit_code` clause 8
+- Result JSON: `results/317-commit-census.json`; measured on
+  `results/ingestion-20260902T085514Z.json`
+- **Baseline: 847 repo commits / 847 walk-claimed / 847 graph entities — every
+  delta exactly 0**, on the 847-commit `master` at-scale graph
+- Cost: two `git` subprocesses and one point query. It does NOT ride
+  `fact_audit`'s scan the way the two `:introduced-by` checks do, because it
+  needs a repo handle `fact_audit` deliberately does not take
+
+**The blind spot it closes.** Every other content check here is fact-level, and
+a commit that never reached the graph at all is invisible to all of them.
+`fact_audit`'s two witnesses are written from the same triples in the same
+transaction boundary, so a commit that was never written is absent from BOTH
+and `divergence` reads 0. `introduced_by_duplicates` (#287) and
+`entities_without_introduced_by` (#316) are well-formedness checks on entities
+that EXIST; a commit that produced no entities produces nothing for either.
+`stderr_capture` only sees corruption that prints. And `_exit_code`'s
+`graph_facts == 0` clause — the one existing gesture at this — fires only when
+the graph reads back COMPLETELY empty; one commit in 847 is not zero facts.
+
+**Three numbers, not one delta**, so a mismatch says where it happened.
+`walk_vs_graph` (the walk's own claim against the graph's answer) catches a
+commit walked and then lost, and needs no repo handle. `repo_vs_walk` catches a
+commit **never walked at all** — a linearization that dropped a position, a
+frontier claim that skipped one — which is the case no in-process counter can
+see, because the counter and the walk share the bug. That second comparison is
+the reason this is a separate module rather than another `fact_audit` key.
+
+**Why the gate is zero-tolerance.** The clean difference was the open question:
+per the issue it was probably NOT zero, and shipping it as if it were would
+have repeated the `:type/external-dependency` trap #316 had to avoid. It was
+predicted from the code and then confirmed on a real run. All five hazards the
+issue required measuring resolved clean:
+
+| Hazard | Resolution |
+| --- | --- |
+| Merge commits | Counted on both sides. `build_linearization` is `git log --topo-order --reverse` over the same set `rev-list --count` reports; 66 of 847 are merges, all deltas 0 |
+| Path-ignore | Changes nothing. Both apply functions write the `:type/commit` triple FIRST, before any extracted file is consulted |
+| Skipped commits | Raise `walk_claimed` without raising `graph_commit_entities` (the handler `continue`s from above the lease). 0 on this run; already failed by the `skipped_commits` clause, and the census fires independently since that clause is stderr-derived |
+| Ref mismatch | **Was live.** `_run_ingestion`'s `repo_total` was hardcoded to `HEAD` while ingestion takes a `branch`; this run walked `master` while the checkout sat on a feature branch. Fixed at source; the census takes its ref explicitly |
+| Positive control | `repo_commits` = 847, nonzero, and ships in the result. Three counts that are all zero also agree, so an empty repo reports `proved_nothing` and is **not** failed |
+
+**A sixth hazard the issue did not name: the 12-character commit ident.** The
+ident is `:commit/{hash[:12]}`, so two commits sharing a 12-character prefix
+collapse into ONE entity — the graph legitimately holds fewer than the repo,
+through no fault of the write path the other deltas point at. Measured **847
+distinct prefixes of 847**. It is reported as `ident_collisions` and still
+fails the gate (it is a genuine loss); its branch is checked before the generic
+write-loss branch so the `interpretation` names the more specific cause rather
+than sending a reader to the wrong code.
+
+**An incomplete run is not failed for walking fewer.** `final_status` has five
+non-running values and only `complete` means the walk was supposed to reach the
+end; a `stopped` run walked fewer BY DESIGN. So `repo_vs_walk` is gated only on
+a completed run, while `walk_vs_graph` is gated always — however few commits
+the walk claimed, the graph must hold that many.
+
+**`_count_commit_entities` had to be fixed first: `(count ?e)` counts ROWS, not
+entities.** Measured on minigraf 2.0.0 — two `:type/commit` entities read 2,
+and a second live `:entity-type` row on one of them makes the same query read 3
+while `count-distinct` reads 2. Under `count`, **one duplicated commit entity
+CANCELS one genuinely lost commit** and the census reads clean on a graph that
+lost history, which is precisely the failure it exists to catch.
+
+The duplicate needs two DIFFERENT valid-froms (two writes at the same
+valid-from collapse — back-to-back in-memory transacts read 1, the same pair
+1.1s apart read 2, project-minigraf/minigraf#287's pending index), and that
+bounds the reachability more narrowly than it first appears: **ingestion cannot
+produce it**, because the commit triples are transacted at `commit_ts_iso`, so
+a resumed run re-walking a position whose `_frontier_persist_claim` never
+landed (#313) rewrites the identical triple at the identical valid-from. The
+reachable path is the public handler — `commit` is a registered
+`MINIGRAF_SCHEMA` type, so `handle_minigraf_transact` writes its `:entity-type`
+at wall-clock valid-from. On this graph `count` and `count-distinct` both read
+847, so it was latent here, not live; recorded so a future divergence between
+the two is a signal rather than a surprise. `_STATUS_QUERY` deliberately keeps
+`count`: it is a latency instrument whose query is frozen for cross-run
+comparability, and its number is never read as a count.
