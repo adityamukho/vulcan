@@ -7818,6 +7818,65 @@ class TestCompletedRegionRecord:
         assert json.loads(raw_z)["results"] == [[1]]
 
 
+class TestFrontierLoadArchivesDiscardedInterval:
+    """#326: the discard branch's bounds ARE the completion witness --
+    _frontier_persist_claim is the last write of a position, so every position
+    inside the persisted interval provably completed. Recording them before the
+    retract is what makes the witness survive the one case (#325's tip growth)
+    that ruled out reading the live interval directly."""
+
+    def _seed_high(self, db, lo_hash, hi_hash):
+        import mcp_server
+        facts = [
+            f"[{mcp_server._FRONTIER_HIGH_IDENT} :entity-type :type/ingest-interval]",
+            f"[{mcp_server._FRONTIER_HIGH_IDENT} :tag :provisional]",
+            f'[{mcp_server._FRONTIER_HIGH_IDENT} :lo-hash "{lo_hash}"]',
+            f'[{mcp_server._FRONTIER_HIGH_IDENT} :hi-hash "{hi_hash}"]',
+        ]
+        mcp_server._transact(db, "[" + " ".join(facts) + "]", "2026-01-01T00:00:00Z")
+
+    def test_discarded_interval_is_archived_as_a_provisional_region(self, real_db):
+        import mcp_server
+        self._seed_high(real_db, "h1", "h2")
+        grown = ["h0", "h1", "h2", "h3", "h4"]
+
+        mcp_server._frontier_load(real_db, grown, "2026-01-02T00:00:00Z")
+
+        assert mcp_server._completed_regions_read(real_db) == [("h1", "h2", ":provisional")]
+        assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) is None
+
+    def test_a_kept_interval_archives_nothing(self, real_db):
+        """A live interval is already its own witness. Archiving one that was
+        never discarded would grow the region set on every single run."""
+        import mcp_server
+        self._seed_high(real_db, "h2", "h3")
+
+        mcp_server._frontier_load(real_db, ["h0", "h1", "h2", "h3"], "2026-01-02T00:00:00Z")
+
+        assert mcp_server._completed_regions_read(real_db) == []
+
+    def test_an_inverted_interval_is_discarded_but_not_archived(self, real_db):
+        """An inverted pair (lo above hi) is what the pre-2b1 persist path
+        produced; it does not describe a region that completed, so archiving it
+        would license skipping positions that were never written."""
+        import mcp_server
+        self._seed_high(real_db, "h3", "h1")
+
+        mcp_server._frontier_load(real_db, ["h0", "h1", "h2", "h3"], "2026-01-02T00:00:00Z")
+
+        assert mcp_server._completed_regions_read(real_db) == []
+        assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) is None
+
+    def test_two_discards_across_runs_coalesce_into_one_region(self, real_db):
+        import mcp_server
+        self._seed_high(real_db, "h3", "h4")
+        mcp_server._frontier_load(real_db, ["h0", "h1", "h2", "h3", "h4", "h5"], "2026-01-02T00:00:00Z")
+        self._seed_high(real_db, "h1", "h4")
+        mcp_server._frontier_load(real_db, ["h0", "h1", "h2", "h3", "h4", "h5", "h6"], "2026-01-03T00:00:00Z")
+
+        assert mcp_server._completed_regions_read(real_db) == [("h1", "h4", ":provisional")]
+
+
 class TestFrontierPersistClaim:
     def test_first_claim_from_low_creates_interval(self, real_db):
         import mcp_server

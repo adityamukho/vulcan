@@ -6149,6 +6149,20 @@ def _frontier_load(
             # (no re-walk at all) needs :ingestion/correction-sweep-through
             # and spans all three streams -- that is 2d's, see the 2b1 design
             # spec's "Why re-ingest is made safe, not efficient".
+            # #326: the bounds are the completion witness -- archive before
+            # retracting. _frontier_persist_claim is the LAST write of a
+            # position, so every position inside this interval provably
+            # completed; dropping the facts is what made that proof
+            # unavailable in exactly the case (#325 tip growth) that most
+            # needs it. Only a REPRESENTABLE interval is archived: the
+            # inverted case below reaches the same branch and describes no
+            # completed region at all.
+            if hi_lo_pos <= hi_hi_pos:
+                _completed_region_record(
+                    db, high_bounds[0], high_bounds[1], ":provisional",
+                    run_ts_iso, index_con=index_con,
+                    order={h: i for i, h in enumerate(linearization)},
+                )
             _frontier_discard_interval(
                 db, _FRONTIER_HIGH_IDENT, high_bounds, index_con=index_con
             )
