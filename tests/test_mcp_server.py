@@ -7877,6 +7877,78 @@ class TestFrontierLoadArchivesDiscardedInterval:
         assert mcp_server._completed_regions_read(real_db) == [("h1", "h4", ":provisional")]
 
 
+class TestCompletedRegionsLoad:
+    """#326: regions are persisted as HASHES (a position number is meaningless
+    against a linearization that has grown) and consumed as POSITIONS. This is
+    the mapping step, plus the two ways a region leaves the set."""
+
+    def _record(self, db, lo, hi, tag=":provisional"):
+        import mcp_server
+        mcp_server._completed_region_record(db, lo, hi, tag, "2026-01-01T00:00:00Z")
+
+    def test_maps_hashes_to_positions(self, real_db):
+        import mcp_server
+        import frontier_registry
+        self._record(real_db, "h1", "h3")
+        allocator = frontier_registry.FrontierAllocator(5, [])
+
+        regions = mcp_server._completed_regions_load(
+            real_db, ["h0", "h1", "h2", "h3", "h4"], allocator
+        )
+
+        assert regions == [frontier_registry.Interval(1, 3, frontier_registry.TAG_PROVISIONAL)]
+
+    def test_region_covered_by_a_live_same_tag_interval_is_pruned_and_retracted(self, real_db):
+        """The live interval is already its own witness, so the archive is
+        redundant. Left in place it accumulates a fact set per run forever."""
+        import mcp_server
+        import frontier_registry
+        self._record(real_db, "h1", "h2")
+        allocator = frontier_registry.FrontierAllocator(
+            4, [frontier_registry.Interval(1, 3, frontier_registry.TAG_PROVISIONAL)]
+        )
+
+        regions = mcp_server._completed_regions_load(real_db, ["h0", "h1", "h2", "h3"], allocator)
+
+        assert regions == []
+        assert mcp_server._completed_regions_read(real_db) == [], "the facts must go too"
+
+    def test_region_covered_by_a_live_interval_of_the_OTHER_tag_is_kept(self, real_db):
+        import mcp_server
+        import frontier_registry
+        self._record(real_db, "h1", "h2", ":provisional")
+        allocator = frontier_registry.FrontierAllocator(
+            4, [frontier_registry.Interval(0, 3, frontier_registry.TAG_AUTHORITATIVE)]
+        )
+
+        regions = mcp_server._completed_regions_load(real_db, ["h0", "h1", "h2", "h3"], allocator)
+
+        assert regions == [frontier_registry.Interval(1, 2, frontier_registry.TAG_PROVISIONAL)]
+
+    def test_unmappable_region_is_dropped_from_the_list_but_its_facts_are_kept(self, real_db):
+        """A hash absent from this linearization means the branch moved under
+        us -- mirrors _frontier_load's own precedent for a bound it cannot map.
+        Dropping it only costs a re-walk; RETRACTING it would throw the witness
+        away for good, and the branch may well come back."""
+        import mcp_server
+        import frontier_registry
+        self._record(real_db, "gone1", "gone2")
+        allocator = frontier_registry.FrontierAllocator(3, [])
+
+        regions = mcp_server._completed_regions_load(real_db, ["h0", "h1", "h2"], allocator)
+
+        assert regions == []
+        assert mcp_server._completed_regions_read(real_db) == [
+            ("gone1", "gone2", ":provisional")
+        ]
+
+    def test_no_regions_yields_an_empty_list(self, real_db):
+        import mcp_server
+        import frontier_registry
+        allocator = frontier_registry.FrontierAllocator(3, [])
+        assert mcp_server._completed_regions_load(real_db, ["h0", "h1", "h2"], allocator) == []
+
+
 class TestFrontierPersistClaim:
     def test_first_claim_from_low_creates_interval(self, real_db):
         import mcp_server

@@ -6312,6 +6312,56 @@ def _completed_region_record(
             )
 
 
+_REGION_TAG_TO_FRONTIER_TAG = {
+    ":provisional": frontier_registry.TAG_PROVISIONAL,
+    ":authoritative": frontier_registry.TAG_AUTHORITATIVE,
+}
+
+
+def _completed_regions_load(
+    db: Any,
+    linearization: List[str],
+    allocator: "frontier_registry.FrontierAllocator",
+    index_con: Optional[Any] = None,
+) -> List["frontier_registry.Interval"]:
+    """Archived regions mapped into this run's position space, pruned.
+
+    Kept separate from _frontier_load on purpose: the ARCHIVING has to live
+    there (that is where the doomed bounds are), but widening _frontier_load's
+    return to a tuple would break roughly a dozen call sites and tests that use
+    its result directly as an allocator, for no gain.
+
+    Two ways a region leaves the set, and they are not the same:
+      * fully covered by a live SAME-TAG interval -- redundant, so the facts are
+        RETRACTED as well, or the set grows by one per run forever;
+      * an endpoint not in this linearization -- the branch moved under us, so
+        it is dropped from the returned list but its facts are KEPT. Dropping
+        costs a re-walk; retracting would destroy the witness for good.
+    """
+    hash_to_pos = {h: i for i, h in enumerate(linearization)}
+    out: List["frontier_registry.Interval"] = []
+    for lo_hash, hi_hash, tag in _completed_regions_read(db):
+        frontier_tag = _REGION_TAG_TO_FRONTIER_TAG.get(str(tag))
+        if frontier_tag is None:
+            continue
+        if lo_hash not in hash_to_pos or hi_hash not in hash_to_pos:
+            continue
+        lo_pos, hi_pos = hash_to_pos[lo_hash], hash_to_pos[hi_hash]
+        if lo_pos > hi_pos:
+            continue
+        covered = any(
+            iv.tag == frontier_tag and iv.lo_pos <= lo_pos and hi_pos <= iv.hi_pos
+            for iv in allocator.intervals()
+        )
+        if covered:
+            _retract(
+                db, _completed_region_facts(lo_hash, hi_hash, str(tag)), index_con=index_con
+            )
+            continue
+        out.append(frontier_registry.Interval(lo_pos, hi_pos, frontier_tag))
+    return sorted(out, key=lambda iv: iv.lo_pos)
+
+
 def _frontier_persist_claim(
     db: Any,
     linearization: List[str],
