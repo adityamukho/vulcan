@@ -8605,6 +8605,19 @@ class TestSkipFastPathEndToEnd:
         self._repo(tmp_path, 2, start=12)
         await mcp_server._run_ingestion(str(repo), "HEAD")
 
+        # Everything below reasons from "the reverse stream skips 2..11", and
+        # nothing below can SEE whether it did: the coverage assertion is
+        # satisfiable by a run that skipped nothing and walked every position
+        # for real, so it would stay green under a _skip_claim that silently
+        # stopped matching. This one line is what keeps the rest of this test
+        # about the flush rather than about ingestion in general.
+        assert mcp_server.handle_minigraf_ingest_status()[
+            "positions_skipped_this_run"
+        ] > 0, (
+            "run 2 skipped no positions at all, so the end-of-walk flush this "
+            "test exists to check was never exercised"
+        )
+
         grown = frontier_registry.build_linearization(str(repo))
         high = mcp_server._frontier_read_bounds(
             mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT
@@ -8874,6 +8887,110 @@ class TestSkipFastPathInterleavedCommitIsNotSkipped:
             "and every at-scale detector reads that graph clean"
         )
 
+
+class TestSkipFlushNeverCoversFailedWrites:
+    """#326: the end-of-walk flush's hi bound must be the highest SKIPPED
+    position, never the highest reverse position CLAIMED.
+
+    A reverse position whose write fails takes the per-commit `except`, which
+    does `processed += 1` and persists no claim, and leaves `completed_all`
+    True. _frontier_persist_span moves :hi-hash UP (which
+    _frontier_persist_claim never does for the high interval), so a flush
+    bounded by the highest claim raises the persisted top bound over those
+    failed positions. Once :hi-hash reaches the tip the interval is
+    REPRESENTABLE, so the next _frontier_load RETAINS it instead of discarding
+    it -- and those commits are never re-walked by any later run.
+    """
+
+    def _repo(self, tmp_path, n, start=0):
+        repo = tmp_path / "repo"
+        if not repo.exists():
+            repo.mkdir()
+            _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(start, start + n):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_a_later_run_still_walks_positions_whose_write_failed(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server
+        import frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = self._repo(tmp_path, 10)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        assert mcp_server._frontier_read_bounds(
+            mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT
+        ) is not None, "run 1 must persist a frontier-high to be discarded"
+
+        # Two new tip commits, so run 2 discards + archives the old interval
+        # (skipping into it) AND has genuinely-new positions above it.
+        self._repo(tmp_path, 2, start=10)
+        grown = frontier_registry.build_linearization(str(repo))
+        failing = set(grown[-2:])
+
+        real_reverse_apply = mcp_server._reverse_apply
+
+        def failing_reverse_apply(db, repo_path, linearization, commit_metadata,
+                                  pos, file_results, index_con=None):
+            if linearization[pos] in failing:
+                raise RuntimeError("simulated per-commit write failure")
+            return real_reverse_apply(
+                db, repo_path, linearization, commit_metadata, pos, file_results,
+                index_con,
+            )
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", failing_reverse_apply)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_reverse_apply)
+
+        status = mcp_server.handle_minigraf_ingest_status()
+        assert status["positions_skipped_this_run"] > 0, (
+            "run 2 skipped nothing, so the end-of-walk flush this test is about "
+            "never ran and the assertion below would prove nothing"
+        )
+        missing_after_run2 = [
+            h for h in failing
+            if json.loads(mcp_server._db_execute(
+                mcp_server.get_db(),
+                f"(query [:find (count-distinct ?t) :where "
+                f"[:commit/{h[:12]} :entity-type ?t]])",
+            ))["results"][0][0] == 0
+        ]
+        assert len(missing_after_run2) == 2, (
+            "precondition: both tip writes must actually have failed in run 2, "
+            f"but {2 - len(missing_after_run2)} of them wrote a commit entity"
+        )
+
+        # Run 3 is clean. It must re-walk what run 2 failed to write.
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        missing = []
+        for h in grown:
+            raw = mcp_server._db_execute(
+                mcp_server.get_db(),
+                f"(query [:find (count-distinct ?t) :where "
+                f"[:commit/{h[:12]} :entity-type ?t]])",
+            )
+            if json.loads(raw)["results"][0][0] == 0:
+                missing.append(h)
+
+        assert not missing, (
+            f"commits {[h[:12] for h in missing]} still have no :commit/... "
+            "entity after a clean third run. The end-of-walk flush raised "
+            "frontier-high's :hi-hash over positions whose write FAILED, so the "
+            "interval reached the tip, stayed representable, and was retained "
+            "rather than discarded -- nothing will ever re-walk them"
+        )
 
 class TestLineageProvisionalMarker:
     def test_unmarked_entity_reads_as_authoritative(self, real_db):

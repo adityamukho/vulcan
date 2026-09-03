@@ -12064,8 +12064,25 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # position below the skips persists a bound covering them. These
                 # exist for the one case that is not covered: the walk ending
                 # while still inside a run of skips.
+                # #326 FIX: the flush's hi bound is the highest SKIPPED
+                # position, never the highest rev position claimed. The two
+                # differ on exactly the case that matters. `highest_rev_pos`
+                # was updated for every rev claim BEFORE the skip test, so it
+                # includes positions that were claimed, walked, and whose
+                # write FAILED -- the per-commit `except` does
+                # `processed += 1` and persists no claim, and `completed_all`
+                # stays True. _frontier_persist_span moves :hi-hash UP (while
+                # _frontier_persist_claim never does for the high interval),
+                # so passing highest_rev_pos would raise the persisted top
+                # bound over those failed positions. Once :hi-hash reaches the
+                # tip the interval is REPRESENTABLE, so the next
+                # _frontier_load retains it instead of discarding it, and
+                # those positions are never re-walked: permanent silent loss.
+                # The skipped span is the only thing this flush is entitled to
+                # assert; positions above it either persisted their own claim
+                # or legitimately did not.
                 lowest_skipped_pos: Optional[int] = None
-                highest_rev_pos: Optional[int] = None
+                highest_skipped_pos: Optional[int] = None
 
                 # #222 phase 2d: positions come from the shared-gap claimer,
                 # not a plain commit iterator, and each pipeline entry carries
@@ -12087,20 +12104,20 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # interval scan, so a long run of skips costs microseconds per
                 # position and never stalls the event loop.
                 def submit_next() -> bool:
-                    nonlocal lowest_skipped_pos, highest_rev_pos
+                    nonlocal lowest_skipped_pos, highest_skipped_pos
                     while True:
                         claim = claimer.next_claim()
                         if claim is None:
                             return False
                         tag, pos = claim
-                        if tag == "rev":
-                            highest_rev_pos = (
-                                pos if highest_rev_pos is None else max(highest_rev_pos, pos)
-                            )
                         if not _skip_claim(tag, pos, completed_regions):
                             break
                         lowest_skipped_pos = (
                             pos if lowest_skipped_pos is None else min(lowest_skipped_pos, pos)
+                        )
+                        highest_skipped_pos = (
+                            pos if highest_skipped_pos is None
+                            else max(highest_skipped_pos, pos)
                         )
                         _ingest_progress["positions_skipped"] += 1
                         # `processed` keeps its meaning -- positions retired by
@@ -12270,22 +12287,22 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # covers it), so the next run re-skips the same region at
                 # microsecond cost -- exactly what this feature makes cheap.
                 #
-                # `highest_rev_pos is not None` is belt-and-braces, not a
-                # reachable case: lowest_skipped_pos is only ever set on a
-                # "rev" claim, which sets highest_rev_pos first. It is kept so
-                # the commit_metadata[highest_rev_pos] subscript below is
+                # `highest_skipped_pos is not None` is belt-and-braces, not a
+                # reachable case: the two are set in the same branch, so
+                # either both are None or neither is. It is kept so the
+                # commit_metadata[highest_skipped_pos] subscript below is
                 # guarded at the point of use rather than by an argument made
                 # thirty lines away.
                 if (
                     completed_all
                     and lowest_skipped_pos is not None
-                    and highest_rev_pos is not None
+                    and highest_skipped_pos is not None
                 ):
                     async with db_lease_async() as db:
                         await loop.run_in_executor(
                             write_executor, _frontier_persist_span, db, linearization,
-                            lowest_skipped_pos, highest_rev_pos, False,
-                            commit_metadata[highest_rev_pos][1], index_con,
+                            lowest_skipped_pos, highest_skipped_pos, False,
+                            commit_metadata[highest_skipped_pos][1], index_con,
                         )
 
                 # Stage B: the correction sweep. A third, strictly
