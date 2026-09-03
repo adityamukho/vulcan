@@ -7949,6 +7949,61 @@ class TestCompletedRegionsLoad:
         assert mcp_server._completed_regions_load(real_db, ["h0", "h1", "h2"], allocator) == []
 
 
+class TestSkipClaim:
+    """#326: the predicate. It consults NEITHER the :commit/<hash> entity NOR
+    any lineage fact.
+
+    #325 words the fast path as "skips a position whose :commit/<hash> entity
+    already exists". That is unsound: in _reverse_apply the commit entity is the
+    FIRST element of all_triples, written before any file result is looked at,
+    while _frontier_persist_claim runs LAST -- so its presence is the WEAKEST
+    available witness of a completed write, and it is present on exactly the
+    torn positions #313 needs re-walked.
+    """
+
+    PROV = frontier_registry.TAG_PROVISIONAL
+    AUTH = frontier_registry.TAG_AUTHORITATIVE
+
+    def test_reverse_claim_inside_a_provisional_region_is_skipped(self):
+        import mcp_server
+        regions = [frontier_registry.Interval(2, 5, self.PROV)]
+        assert mcp_server._skip_claim("rev", 3, regions) is True
+        assert mcp_server._skip_claim("rev", 2, regions) is True
+        assert mcp_server._skip_claim("rev", 5, regions) is True
+
+    def test_reverse_claim_outside_every_region_is_not_skipped(self):
+        import mcp_server
+        regions = [frontier_registry.Interval(2, 5, self.PROV)]
+        assert mcp_server._skip_claim("rev", 1, regions) is False
+        assert mcp_server._skip_claim("rev", 6, regions) is False
+
+    def test_forward_claim_is_never_skipped_even_inside_a_region(self):
+        """Two reasons, either one sufficient. A forward claim inside a
+        provisional region is the authority upgrade that must still happen --
+        skipping would make a provisional region look confirmed. And
+        _forward_apply mutates _ForwardWalkState's ten cross-position preload
+        dicts in place, so a skipped forward position leaves that state
+        desynchronized for every later forward position, silently.
+        _reverse_apply takes no state object and reads what it needs from the
+        graph, which is why reverse skips carry no equivalent hazard."""
+        import mcp_server
+        regions = [frontier_registry.Interval(2, 5, self.PROV)]
+        assert mcp_server._skip_claim("fwd", 3, regions) is False
+
+    def test_reverse_claim_inside_an_authoritative_region_is_not_skipped(self):
+        """Tags are checked, never assumed. _frontier_load only ever discards
+        frontier-high today, so archived regions are provisional in practice --
+        but a future discard of an authoritative interval must not silently
+        license a reverse skip over it."""
+        import mcp_server
+        regions = [frontier_registry.Interval(2, 5, self.AUTH)]
+        assert mcp_server._skip_claim("rev", 3, regions) is False
+
+    def test_empty_region_set_skips_nothing(self):
+        import mcp_server
+        assert mcp_server._skip_claim("rev", 3, []) is False
+
+
 class TestFrontierPersistClaim:
     def test_first_claim_from_low_creates_interval(self, real_db):
         import mcp_server

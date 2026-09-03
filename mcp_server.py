@@ -6362,6 +6362,29 @@ def _completed_regions_load(
     return sorted(out, key=lambda iv: iv.lo_pos)
 
 
+def _skip_claim(
+    tag: str, pos: int, regions: Sequence["frontier_registry.Interval"]
+) -> bool:
+    """True iff this claim can be retired without parsing or writing the commit.
+
+    Sound because of what it does NOT read. The witness is membership in an
+    archived completed region, whose bounds came from a persisted frontier
+    interval, whose last write per position is _frontier_persist_claim. A #313
+    torn position's claim never persisted, so that position was never inside the
+    interval that got archived, so it is in no region and is never skipped --
+    correct by construction rather than by care.
+
+    'fwd' never skips: see TestSkipClaim's forward case for the two independent
+    reasons. Restricting to same-tag skipping gets both from one clause.
+    """
+    if tag != "rev":
+        return False
+    return any(
+        iv.tag == frontier_registry.TAG_PROVISIONAL and iv.lo_pos <= pos <= iv.hi_pos
+        for iv in regions
+    )
+
+
 def _frontier_persist_claim(
     db: Any,
     linearization: List[str],
