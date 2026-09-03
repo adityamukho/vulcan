@@ -7670,6 +7670,100 @@ class TestFrontierLoadNormalisesUnrepresentableIntervals:
         assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) == ("h2", "h3")
 
 
+class TestCompletedRegionRecord:
+    """#326: the skip fast-path's completion witness. `_frontier_persist_claim`
+    is the LAST write of a position, so a position inside a persisted interval
+    provably completed. `_frontier_load` throws that interval away on tip
+    growth; these facts are the archive that keeps the proof.
+
+    Deliberately NOT in MINIGRAF_SCHEMA: handle_minigraf_audit iterates exactly
+    the registered types and retracts any attribute outside a registered type's
+    allowed set, so an unregistered companion type is invisible to it -- the
+    same status :type/ingest-interval already holds.
+    """
+
+    def test_records_a_region_and_reads_it_back(self, real_db):
+        import mcp_server
+        mcp_server._completed_region_record(
+            real_db, "h1", "h4", ":provisional", "2026-01-01T00:00:00Z"
+        )
+        assert mcp_server._completed_regions_read(real_db) == [("h1", "h4", ":provisional")]
+
+    def test_recording_the_same_region_twice_does_not_duplicate_facts(self, real_db):
+        import mcp_server
+        mcp_server._completed_region_record(
+            real_db, "h1", "h4", ":provisional", "2026-01-01T00:00:00Z"
+        )
+        mcp_server._completed_region_record(
+            real_db, "h1", "h4", ":provisional", "2026-01-02T00:00:00Z"
+        )
+        assert mcp_server._completed_regions_read(real_db) == [("h1", "h4", ":provisional")]
+        # Count RAW facts. minigraf is not idempotent at the graph level for a
+        # re-transact of the same (entity, attribute, value) at a new
+        # valid-from (#156), and _completed_regions_read's own dedup would
+        # collapse a duplicate live datom and hide a broken guard.
+        ident = mcp_server._completed_region_ident("h1")
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find (count ?lo) :where [{ident} :lo-hash ?lo]])"
+        )
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_re_recording_an_older_smaller_region_does_not_clobber_an_advanced_one(self, real_db):
+        """The direction a "same value stays the same" test cannot see. If the
+        guard were ignored, the second (larger) region would be recorded and the
+        third call would either duplicate it or shrink it back."""
+        import mcp_server
+        mcp_server._completed_region_record(
+            real_db, "h3", "h4", ":provisional", "2026-01-01T00:00:00Z"
+        )
+        mcp_server._completed_region_record(
+            real_db, "h1", "h4", ":provisional", "2026-01-02T00:00:00Z"
+        )
+        mcp_server._completed_region_record(
+            real_db, "h3", "h4", ":provisional", "2026-01-03T00:00:00Z"
+        )
+        assert mcp_server._completed_regions_read(real_db) == [("h1", "h4", ":provisional")]
+
+    def test_overlapping_regions_coalesce(self, real_db):
+        import mcp_server
+        mcp_server._completed_region_record(
+            real_db, "h3", "h6", ":provisional", "2026-01-01T00:00:00Z"
+        )
+        mcp_server._completed_region_record(
+            real_db, "h1", "h4", ":provisional", "2026-01-02T00:00:00Z"
+        )
+        assert mcp_server._completed_regions_read(real_db) == [("h1", "h6", ":provisional")]
+
+    def test_disjoint_regions_stay_separate(self, real_db):
+        import mcp_server
+        mcp_server._completed_region_record(
+            real_db, "h5", "h6", ":provisional", "2026-01-01T00:00:00Z"
+        )
+        mcp_server._completed_region_record(
+            real_db, "h1", "h2", ":provisional", "2026-01-02T00:00:00Z"
+        )
+        assert mcp_server._completed_regions_read(real_db) == [
+            ("h1", "h2", ":provisional"),
+            ("h5", "h6", ":provisional"),
+        ]
+
+    def test_regions_of_different_tags_never_coalesce(self, real_db):
+        """The authoritative/provisional boundary is the lineage frontier, and
+        merging across it would license a forward skip over a provisional
+        region -- the exact thing _skip_claim's tag check exists to prevent."""
+        import mcp_server
+        mcp_server._completed_region_record(
+            real_db, "h1", "h4", ":provisional", "2026-01-01T00:00:00Z"
+        )
+        mcp_server._completed_region_record(
+            real_db, "h2", "h5", ":authoritative", "2026-01-02T00:00:00Z"
+        )
+        assert sorted(mcp_server._completed_regions_read(real_db)) == [
+            ("h1", "h4", ":provisional"),
+            ("h2", "h5", ":authoritative"),
+        ]
+
+
 class TestFrontierPersistClaim:
     def test_first_claim_from_low_creates_interval(self, real_db):
         import mcp_server

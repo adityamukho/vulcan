@@ -6172,6 +6172,115 @@ def _frontier_discard_interval(
     _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
 
 
+_COMPLETED_REGION_ENTITY_TYPE = ":type/completed-region"
+
+
+def _completed_region_ident(lo_hash: str) -> str:
+    """Deterministic ident for the archived region starting at lo_hash.
+
+    Not a public schema type -- :type/completed-region is deliberately absent
+    from MINIGRAF_SCHEMA, so handle_minigraf_audit's registered-type loop never
+    scans for it (same status as :type/ingest-interval). Every write below goes
+    through the internal _transact/_retract helpers; the public handler's
+    _validate_facts would reject an unregistered type outright.
+    """
+    return f":ingestion/completed-region-{lo_hash[:12]}"
+
+
+def _completed_regions_read(db: Any) -> List[Tuple[str, str, str]]:
+    """Every archived completed region, as (lo_hash, hi_hash, tag), sorted by
+    lo_hash.
+
+    Binds ?ident rather than ?e. `[?e :entity-type :type/completed-region]`
+    answers in UUID space -- _count_commit_entities gets away with that pattern
+    only because it counts and never reads ?e back. The string-valued :ident
+    fact each region carries is what makes this enumeration (and the retract in
+    _completed_region_record) work without UUID-to-ident resolution.
+    """
+    raw = _db_execute(
+        db,
+        "(query [:find ?ident ?lo ?hi ?tag :where"
+        f" [?e :entity-type {_COMPLETED_REGION_ENTITY_TYPE}]"
+        " [?e :ident ?ident] [?e :lo-hash ?lo] [?e :hi-hash ?hi] [?e :tag ?tag]])",
+    )
+    seen = set()
+    out: List[Tuple[str, str, str]] = []
+    for _ident, lo, hi, tag in json.loads(raw).get("results", []):
+        key = (lo, hi, str(tag))
+        if key not in seen:
+            seen.add(key)
+            out.append(key)
+    return sorted(out)
+
+
+def _completed_region_facts(lo_hash: str, hi_hash: str, tag: str) -> str:
+    ident = _completed_region_ident(lo_hash)
+    return "[" + " ".join([
+        f"[{ident} :entity-type {_COMPLETED_REGION_ENTITY_TYPE}]",
+        f'[{ident} :ident "{ident}"]',
+        f'[{ident} :lo-hash "{_edn_escape(lo_hash)}"]',
+        f'[{ident} :hi-hash "{_edn_escape(hi_hash)}"]',
+        f"[{ident} :tag {tag}]",
+    ]) + "]"
+
+
+def _completed_region_record(
+    db: Any,
+    lo_hash: str,
+    hi_hash: str,
+    tag: str,
+    run_ts_iso: str,
+    index_con: Optional[Any] = None,
+    order: Optional[Dict[str, int]] = None,
+) -> None:
+    """Archive [lo_hash, hi_hash] as a completed region, coalescing it into the
+    existing same-tag set.
+
+    Query-before-write, the guard _watermark_update and _frontier_persist_claim
+    established: a deterministic ident only guarantees repeated writes target
+    the SAME entity, it does not stop minigraf creating a duplicate live datom
+    for a re-transact at a new valid-from (#156). The current set is read first
+    and only the difference is written -- a call that changes nothing writes
+    nothing.
+
+    `order` maps hash -> position for the current linearization. Regions can
+    only be compared (and therefore coalesced) when both endpoints are
+    orderable; a region whose hashes are not in `order` is kept as-is and never
+    merged. Callers inside a run pass the linearization's map; the coalescing
+    tests pass a lexicographic fallback via order=None, which sorts by hash.
+    """
+    def key(h: str) -> Any:
+        return order[h] if order is not None and h in order else h
+
+    current = _completed_regions_read(db)
+    same_tag = sorted(
+        [(lo, hi) for lo, hi, t in current if t == tag] + [(lo_hash, hi_hash)],
+        key=lambda p: key(p[0]),
+    )
+    merged: List[Tuple[str, str]] = []
+    for lo, hi in same_tag:
+        if merged and key(lo) <= key(merged[-1][1]):
+            prev_lo, prev_hi = merged[-1]
+            merged[-1] = (prev_lo, hi if key(hi) > key(prev_hi) else prev_hi)
+        else:
+            merged.append((lo, hi))
+
+    target = sorted(
+        [(lo, hi, tag) for lo, hi in merged] + [r for r in current if r[2] != tag]
+    )
+    if target == current:
+        return
+
+    for lo, hi, t in current:
+        if (lo, hi, t) not in target:
+            _retract(db, _completed_region_facts(lo, hi, t), index_con=index_con)
+    for lo, hi, t in target:
+        if (lo, hi, t) not in current:
+            _transact(
+                db, _completed_region_facts(lo, hi, t), run_ts_iso, index_con=index_con
+            )
+
+
 def _frontier_persist_claim(
     db: Any,
     linearization: List[str],
