@@ -91,19 +91,23 @@ goes quiet and the fast path reads live intervals instead.
 A new entity type, one entity per archived region:
 
 ```
-:ingestion/completed-region-<lo_hash[:12]>
+:ingestion/completed-region-<tag>-<lo_hash[:12]>
   :entity-type  :type/completed-region
-  :ident        ":ingestion/completed-region-<lo_hash[:12]>"
+  :ident        ":ingestion/completed-region-<tag>-<lo_hash[:12]>"
   :lo-hash      "<full hash>"
   :hi-hash      "<full hash>"
   :tag          :provisional
+  :pos-count    <positions the bounds spanned when the region was proven>
 ```
+
+The TAG is part of the ident, not just of the fact set (see "The denominators",
+item 3), and `:pos-count` is the stored denominator of item 1.
 
 Positions are stored as HASHES, not linearization positions, exactly as
 `:ingestion/frontier-low`/`-high` are -- a position number is meaningless
 against a linearization that has grown.
 
-The ident is derived from the region's low hash so it is deterministic, but
+The ident is derived from the region's tag and low hash so it is deterministic, but
 that determinism is NOT the idempotency argument (see below). Coalescing can
 change a region's low bound and therefore its ident; the write path handles
 that as an ordinary retract-plus-assert of the changed set.
@@ -304,26 +308,91 @@ would be misread as one of those two on sight.
 `submit_next`. This preserves its existing meaning -- positions retired by the
 walk -- which is what #317's `commit_census.walk_claimed` reads.
 
-That choice interacts with the census in a way worth stating, because it makes
-an existing gate do useful new work:
-
-* `walk_vs_graph` (walk_claimed vs `_count_commit_entities`) is gated ALWAYS.
-  A skipped position increments `walk_claimed`, and its `:type/commit` entity is
-  already in the graph from the earlier run, so the comparison still balances --
-  **but only because the witness guarantees the graph already holds that
-  commit.** If the skip predicate were ever wrong about a position, the census
-  would go red. `walk_vs_graph` therefore becomes an independent gate on the
-  predicate's soundness, at no extra cost.
-* `repo_vs_walk` is gated only on `final_status == complete`. A complete resume
-  run over a discarded region over-counts: `prior_ingested` already counted
-  those positions and this run counts them again. **That over-count exists today
-  and is unchanged by this work** -- today those positions are re-walked and
-  `processed += 1` for each. #326 neither fixes nor worsens it. The at-scale
-  gate runs on a fresh ingestion-only graph, so it cannot fire there.
-
 The alternative -- excluding skips from `processed` -- was rejected precisely
 because it would silently redefine the number `commit_census` gates on, turning
 a clean skip-heavy resume into a reported lost commit.
+
+**An earlier revision of this section claimed `walk_vs_graph` becomes an
+independent gate on the predicate's soundness. That is FALSE and is struck.**
+`_ingest_progress["processed"]` is seeded with
+`prior_ingested = _count_commit_entities(db)` and then incremented for every
+position retired this run, INCLUDING positions already counted in that seed. So
+`walk_vs_graph` is nonzero on any resume that touches already-ingested
+territory, skip or no skip -- measured 10 with the fast path against 9 without,
+on the same scenario. It cannot discriminate a wrong skip from an ordinary
+resume, and it was the only stated backstop, which made it the worst possible
+place for a wrong safety-net claim.
+
+`repo_vs_walk` is gated only on `final_status == complete`. A complete resume
+run over a discarded region over-counts, for the same reason. **That over-count
+exists today and is unchanged by this work** -- today those positions are
+re-walked and `processed += 1` for each. #326 neither fixes nor worsens it. The
+at-scale gate runs on a fresh ingestion-only graph, so it cannot fire there.
+
+State the consequence plainly rather than substituting a different overclaim:
+**no existing gate catches a wrong skip.** `fact_audit`'s `divergence` reads 0,
+because a skipped commit reaches neither the graph nor the index and the two
+witnesses agree about its absence; `introduced_by_duplicates` and
+`entities_without_introduced_by` only examine entities that EXIST;
+`stderr_capture` has nothing to read; and `commit_census` runs on a fresh
+ingestion-only graph where no archived region exists. The predicate's soundness
+rests on the witness, on its positive control (the #313 torn-position test), and
+on the two stored denominators below -- not on anything downstream noticing
+afterwards.
+
+## The denominators
+
+Two guards, added after the first whole-branch review, both of the
+"ship the positive control with the number" kind #316 established.
+
+**1. A region is stored as HASHES but consumed as a closed POSITION RANGE.**
+Every position between the bounds is treated as proven-complete, which is sound
+only if the linearization grew by APPENDING above the region.
+`git log --topo-order --reverse` guarantees no such thing: it places a new
+commit immediately after its branch point whenever the old tip's line stalls
+behind it, and "branch off an old commit, merge the mainline in, fast-forward
+the mainline" produces exactly that. Such a commit lands INSIDE the archived
+bounds and is skipped -- lost permanently and silently, since it reaches
+neither graph nor index.
+
+So `:ingestion/frontier-high` (and `-low`) carries `:pos-count`, the span it was
+CLAIMED under, written at claim time in the same transact as the bound that
+moved -- different attributes, so minigraf#287 does not reach the batch, and the
+per-commit persist stays at two DB calls. `_frontier_load` archives a discarded
+interval only when its stored count still equals its current span. The count
+MUST originate at claim time: one computed where the region is archived is
+computed from the very span it would then be compared against, so it always
+agrees and discriminates nothing. Archived regions carry the same denominator
+and `_completed_regions_load` re-checks it against the current linearization,
+which covers an insertion arriving in a LATER run. An interval or region
+carrying no count is not trusted -- "no denominator" and "a denominator that
+still checks out" must not be the same branch here. A mismatch costs one full
+re-walk, which is exactly master's behaviour.
+
+**2. The end-of-walk flush's hi bound is the highest SKIPPED position, never
+the highest reverse position CLAIMED.** `_frontier_persist_span` moves
+`:hi-hash` UP, which `_frontier_persist_claim` never does for the high interval.
+A reverse position whose write fails takes the per-commit `except`, which does
+`processed += 1`, persists no claim, and leaves `completed_all` True; a flush
+bounded by the highest claim raises the persisted top bound over it. Once
+`:hi-hash` reaches the tip the interval is representable, so the next
+`_frontier_load` RETAINS it instead of discarding it and nothing re-walks those
+positions ever again. The skipped span is the only thing the flush is entitled
+to assert.
+
+**3. The region's ident carries its TAG.** Two regions sharing a low hash but
+differing in tag would otherwise collide onto one entity, and
+`_completed_regions_read`'s join returns their cross product -- including a
+provisional region larger than anything proven, which `_skip_claim` would
+honour. Not reachable while only `:provisional` is archived, but the tag is
+stored and checked precisely so a future authoritative discard cannot silently
+license a forward skip, and the collision does the opposite.
+
+**4. Ordering.** `_completed_region_record`'s merge loop compares regions
+archived under DIFFERENT linearizations using CURRENT positions, so a stale
+region left in the candidate set manufactures coverage over positions in
+neither original region. The denominator guard is therefore applied BEFORE the
+coalescing, never after.
 
 Per-stream positions in `minigraf_ingest_status` (forward watermark, reverse
 `lo`, tip-gap size) are #325's OTHER smaller change and #222 phase 4's

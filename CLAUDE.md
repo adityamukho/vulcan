@@ -504,15 +504,64 @@ enumerating by `:entity-type` binds the entity in UUID space.
 
 **A skipped position still costs `processed`, and that is not sloppiness.**
 #317's `commit_census` reads `_ingest_progress["processed"]` as `walk_claimed`,
-and `walk_vs_graph` is gated ALWAYS. A skipped position increments it while its
-`:type/commit` entity is already in the graph, so the comparison balances — but
-only because the witness guarantees the graph holds that commit. **If the skip
-predicate were ever wrong, that existing gate goes red.** Excluding skips from
-`processed` would have thrown that away and turned a clean skip-heavy resume
-into a reported lost commit. The counter is `positions_skipped`, never
-`skipped`: `status` already takes the value `"skipped"` (run declined, another
-process owns the graph) and `commit_census` already reports `skipped_commits`
-(extraction failures).
+so excluding skips would silently redefine the number that gate compares against
+`git rev-list` and turn a clean skip-heavy resume into a reported lost commit.
+The counter is `positions_skipped`, never `skipped`: `status` already takes the
+value `"skipped"` (run declined, another process owns the graph) and
+`commit_census` already reports `skipped_commits` (extraction failures).
+
+**`walk_vs_graph` is NOT a backstop on the skip predicate, and an earlier draft
+of this section said it was.** `_ingest_progress["processed"]` is SEEDED with
+`prior_ingested = _count_commit_entities(db)` and then incremented for every
+position retired this run, including positions already counted in that seed. So
+`walk_vs_graph` is nonzero on ANY resume that touches already-ingested
+territory, skip or no skip — measured 10 with the fast path against 9 without,
+on the same scenario. It cannot discriminate a wrong skip from an ordinary
+resume.
+
+State plainly what follows: **no existing gate catches a wrong skip.**
+`fact_audit`'s `divergence` reads 0 because a skipped commit reaches neither
+the graph nor the index, so the two witnesses agree about its absence; both
+`:introduced-by` checks only examine entities that EXIST; `stderr_capture` has
+nothing to read; and the at-scale `commit_census` runs on a fresh
+ingestion-only graph where no archived region exists at all. The predicate's
+soundness therefore rests entirely on the witness above and on its positive
+control (the #313 torn-position test), plus the two stored denominators
+described next — not on anything downstream noticing afterwards.
+
+**A region is stored as two HASHES but consumed as a closed POSITION RANGE, and
+that needs a denominator to be sound.** Every position between the bounds is
+treated as proven-complete, which holds only if the linearization grew by
+APPENDING above the region. `git log --topo-order --reverse` guarantees no such
+thing: it places a new commit immediately after its branch point whenever the
+old tip's line stalls behind it — "branch off an old commit, merge the mainline
+in, fast-forward the mainline" is enough. That commit lands INSIDE the archived
+bounds and is skipped, permanently and silently.
+
+So the frontier interval carries `:pos-count`, the span it was CLAIMED under,
+written at claim time in the same transact as the bound that moved, and
+`_frontier_load` archives only an interval whose stored count still matches its
+current span. The count MUST come from the interval, not be computed where the
+region is archived: a count computed at archive time is computed from the very
+span it would then be compared against, so it always agrees and discriminates
+nothing. Archived regions carry the same denominator and
+`_completed_regions_load` re-checks it, which covers an insertion that lands in
+a LATER run. An interval or region carrying NO count is not trusted — "no
+denominator" and "a denominator that still checks out" must not be the same
+branch when the failure mode is silent permanent loss. Cost of a mismatch is one
+full re-walk, i.e. exactly master's behaviour. This is #316's
+`code_entities_scanned` idiom: every run re-proves its own positive control.
+
+**The end-of-walk flush's hi bound is the highest SKIPPED position, never the
+highest reverse position claimed.** `_frontier_persist_span` moves `:hi-hash`
+UP, which `_frontier_persist_claim` never does for the high interval. A reverse
+position whose write FAILS takes the per-commit `except`, which does
+`processed += 1`, persists no claim, and leaves `completed_all` True — so a
+flush bounded by the highest claim would raise the persisted top bound over it.
+Once `:hi-hash` reaches the tip the interval is representable, so the next
+`_frontier_load` RETAINS it instead of discarding it and nothing ever re-walks
+those positions. The skipped span is the only thing the flush is entitled to
+assert.
 
 There is no `GRAPH_FORMAT_VERSION` bump — this only adds facts going forward.
 Existing graphs are not repaired and need no migration: a region is only
