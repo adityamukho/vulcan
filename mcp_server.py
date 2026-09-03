@@ -6248,17 +6248,32 @@ def _completed_region_record(
     orderable; a region whose hashes are not in `order` is kept as-is and never
     merged. Callers inside a run pass the linearization's map; the coalescing
     tests pass a lexicographic fallback via order=None, which sorts by hash.
+
+    Orderability is tested per REGION, not per hash: `order` may cover only
+    some of the hashes in play (e.g. a caller passes the map for its own two
+    endpoints but an unrelated archived region's hashes have since fallen out
+    of `order`). Comparing an int position key against a raw string key raises
+    TypeError, so a region with even one endpoint missing from `order` is
+    partitioned out of the merge entirely and passed through to the target set
+    untouched -- including the newly-recorded region itself, which becomes a
+    standalone entry rather than merging into anything.
     """
+    def region_orderable(lo: str, hi: str) -> bool:
+        return order is None or (lo in order and hi in order)
+
     def key(h: str) -> Any:
-        return order[h] if order is not None and h in order else h
+        return order[h] if order is not None else h
 
     current = _completed_regions_read(db)
-    same_tag = sorted(
-        [(lo, hi) for lo, hi, t in current if t == tag] + [(lo_hash, hi_hash)],
-        key=lambda p: key(p[0]),
+    other_tag = [r for r in current if r[2] != tag]
+    candidates = [(lo, hi) for lo, hi, t in current if t == tag] + [(lo_hash, hi_hash)]
+    orderable_regions = sorted(
+        {r for r in candidates if region_orderable(*r)}, key=lambda p: key(p[0])
     )
+    non_orderable_regions = sorted({r for r in candidates if not region_orderable(*r)})
+
     merged: List[Tuple[str, str]] = []
-    for lo, hi in same_tag:
+    for lo, hi in orderable_regions:
         if merged and key(lo) <= key(merged[-1][1]):
             prev_lo, prev_hi = merged[-1]
             merged[-1] = (prev_lo, hi if key(hi) > key(prev_hi) else prev_hi)
@@ -6266,7 +6281,9 @@ def _completed_region_record(
             merged.append((lo, hi))
 
     target = sorted(
-        [(lo, hi, tag) for lo, hi in merged] + [r for r in current if r[2] != tag]
+        [(lo, hi, tag) for lo, hi in merged]
+        + [(lo, hi, tag) for lo, hi in non_orderable_regions]
+        + other_tag
     )
     if target == current:
         return

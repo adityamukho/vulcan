@@ -7763,6 +7763,60 @@ class TestCompletedRegionRecord:
             ("h2", "h5", ":authoritative"),
         ]
 
+    def test_partial_order_map_does_not_raise_and_leaves_non_orderable_region_intact(
+        self, real_db
+    ):
+        """`order` covers only the hashes touched by THIS call, not the
+        already-archived h5/h6 region. Orderability is a per-region test: h5/h6
+        has neither endpoint in `order`, so it must be carried through
+        untouched rather than entering the merge comparison, where comparing
+        its raw-string key against the new region's int position key would
+        raise TypeError."""
+        import mcp_server
+        mcp_server._completed_region_record(
+            real_db, "h5", "h6", ":provisional", "2026-01-01T00:00:00Z"
+        )
+        order = {"h1": 0, "h2": 1}  # does not cover h5 or h6
+        mcp_server._completed_region_record(
+            real_db, "h1", "h2", ":provisional", "2026-01-02T00:00:00Z", order=order
+        )
+        assert mcp_server._completed_regions_read(real_db) == [
+            ("h1", "h2", ":provisional"),
+            ("h5", "h6", ":provisional"),
+        ]
+
+    def test_full_order_map_coalesces_by_position_not_lexicographic_order(self, real_db):
+        """Constructed so lexicographic and position order disagree: "z" sorts
+        after "q" and "b" alphabetically, so a merge comparison that ignored
+        `order` and fell back to raw string comparison would sort ("b", "q")
+        before ("z", "b") and then find "z" > "q" and refuse to merge them,
+        leaving two regions. Position order says z(0) -> b(1) -> q(2), so the
+        two calls describe one contiguous span and must coalesce into it."""
+        import mcp_server
+        order = {"z": 0, "b": 1, "q": 2}
+        mcp_server._completed_region_record(
+            real_db, "z", "b", ":provisional", "2026-01-01T00:00:00Z", order=order
+        )
+        mcp_server._completed_region_record(
+            real_db, "b", "q", ":provisional", "2026-01-02T00:00:00Z", order=order
+        )
+        assert mcp_server._completed_regions_read(real_db) == [("z", "q", ":provisional")]
+
+        # Raw fact counts: the merge must retract the superseded (b, q) entity
+        # down to zero live facts, and the surviving (z, ...) entity's
+        # :hi-hash must be updated in place, never duplicated (#156).
+        b_ident = mcp_server._completed_region_ident("b")
+        raw_b = mcp_server._db_execute(
+            real_db, f"(query [:find (count ?lo) :where [{b_ident} :lo-hash ?lo]])"
+        )
+        assert json.loads(raw_b)["results"] == [[0]]
+
+        z_ident = mcp_server._completed_region_ident("z")
+        raw_z = mcp_server._db_execute(
+            real_db, f"(query [:find (count ?hi) :where [{z_ident} :hi-hash ?hi]])"
+        )
+        assert json.loads(raw_z)["results"] == [[1]]
+
 
 class TestFrontierPersistClaim:
     def test_first_claim_from_low_creates_interval(self, real_db):
