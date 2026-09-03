@@ -8187,6 +8187,128 @@ class TestFrontierPersistSpan:
         assert json.loads(raw)["results"] == [[1]]
 
 
+class TestSkipFastPathEndToEnd:
+    """#326 acceptance test 1: a real re-walk of an ingested region, driven by
+    #325's actual trigger (the branch tip growing past the persisted :hi-hash)
+    rather than a simulation of it.
+
+    Two independent witnesses that the work did not happen:
+      * the per-commit trace (MINIGRAF_INGEST_TRACE_PATH) emits one record per
+        APPLIED commit, so a skipped position appears in no record -- an
+        existing mechanism, not one built for this test;
+      * positions_skipped_this_run, incremented in the one branch that skips.
+    """
+
+    def _repo(self, tmp_path, n, start=0):
+        repo = tmp_path / "repo"
+        if not repo.exists():
+            repo.mkdir()
+            _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(start, start + n):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_archived_region_is_skipped_on_the_next_run(self, tmp_path, monkeypatch):
+        import mcp_server
+        import frontier_registry
+
+        # 1:20 forward:reverse, not the (1,1) default. The two streams
+        # partition ONE gap, so at 1:1 the forward stream claims the archived
+        # positions before the reverse stream walks down to them and the
+        # reverse stream skips NOTHING -- the test would then pass its "no rev
+        # writes" assertion vacuously, which is precisely the failure this
+        # acceptance test exists to rule out.
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = self._repo(tmp_path, 12)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        first_high = mcp_server._frontier_read_bounds(
+            mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT
+        )
+        assert first_high is not None, (
+            "run 1 must leave a persisted frontier-high, or there is nothing to "
+            "discard and this test proves nothing"
+        )
+
+        # #325's trigger, reproduced: the tip moves past the persisted :hi-hash,
+        # so _frontier_load's discard branch fires on its own.
+        self._repo(tmp_path, 2, start=12)
+        grown = frontier_registry.build_linearization(str(repo))
+        archived_lo, archived_hi = first_high
+        archived_positions = set(
+            range(grown.index(archived_lo), grown.index(archived_hi) + 1)
+        )
+        assert len(archived_positions) >= 3, (
+            f"only {len(archived_positions)} positions archived; raise the commit "
+            "count or the reverse ratio, or this test measures almost nothing"
+        )
+
+        trace = tmp_path / "trace.jsonl"
+        monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(trace))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        records = [
+            json.loads(line)
+            for line in trace.read_text().splitlines() if line.strip()
+        ]
+        rev_applied = {r["pos"] for r in records if r["tag"] == "rev"}
+        assert not (rev_applied & archived_positions), (
+            f"reverse re-applied positions {sorted(rev_applied & archived_positions)}; "
+            "the archived region must cost the reverse stream no write at all"
+        )
+        assert rev_applied, "run 2 must still apply the genuinely-new tip commits"
+
+        # Forward records are deliberately NOT asserted on. A forward claim
+        # landing inside a provisional archived region is the authority
+        # upgrade that must still happen -- _skip_claim never skips 'fwd', and
+        # TestSkipClaim covers that direction at the unit level with its own
+        # ablation.
+
+        status = mcp_server.handle_minigraf_ingest_status()
+        assert status["positions_skipped_this_run"] > 0, (
+            "the reverse stream reached the archived region but skipped nothing"
+        )
+
+    @pytest.mark.asyncio
+    async def test_skipped_positions_still_advance_the_persisted_frontier(self, tmp_path, monkeypatch):
+        """#326 requirement 3. Skipping the work is not skipping the
+        bookkeeping: a position skipped without the interval growing leaves the
+        same region unclaimed for the next run to replay again."""
+        import mcp_server
+        import frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = self._repo(tmp_path, 12)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        self._repo(tmp_path, 2, start=12)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        grown = frontier_registry.build_linearization(str(repo))
+        high = mcp_server._frontier_read_bounds(
+            mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT
+        )
+        assert high is not None, (
+            "the reverse stream claimed positions, so it must leave a persisted "
+            "interval -- skipping the work is not skipping the bookkeeping"
+        )
+        lo_pos, hi_pos = grown.index(high[0]), grown.index(high[1])
+        assert lo_pos <= hi_pos, f"persisted frontier-high is inverted: {high}"
+        assert hi_pos == len(grown) - 1, (
+            "a completed run's high interval must reach the tip, or the next run "
+            "discards it again and the skip bought nothing"
+        )
+
+
 class TestLineageProvisionalMarker:
     def test_unmarked_entity_reads_as_authoritative(self, real_db):
         import mcp_server

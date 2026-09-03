@@ -169,6 +169,12 @@ _ingest_progress: Dict[str, Any] = {
     "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
     "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
     "phase": None,
+    # #326. Deliberately NOT named "skipped": _ingest_progress["status"] already
+    # takes the value "skipped" (the whole run declined because another process
+    # owns the graph) and commit_census already reports skipped_commits (commits
+    # dropped for extraction failure). A third bare "skipped" reads as one of
+    # those two on sight.
+    "positions_skipped": 0,
 }
 _shutdown_requested = asyncio.Event()
 
@@ -11679,6 +11685,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
         _ingest_progress["phase"] = "converging"
         _ingest_progress["processed"] = prior_ingested
         _ingest_progress["prior_ingested"] = prior_ingested
+        _ingest_progress["positions_skipped"] = 0   # #326: per-run, like prior_ingested
 
         last_hash = watermark or ""
 
@@ -11747,6 +11754,14 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             allocator = await loop.run_in_executor(
                 write_executor, _frontier_load, db, linearization, run_ts_iso, index_con,
             )
+            # #326: archived completion witnesses, mapped into this run's
+            # position space. _frontier_load does the ARCHIVING (that is where
+            # the doomed bounds are) but not the loading -- widening its return
+            # would break a dozen call sites that use it directly as an
+            # allocator.
+            completed_regions = await loop.run_in_executor(
+                write_executor, _completed_regions_load, db, linearization, allocator, index_con,
+            )
         claimer = _RoundRobinClaimer(
             allocator, *_parse_stream_ratio(os.environ.get("MINIGRAF_INGEST_STREAM_RATIO"))
         )
@@ -11775,6 +11790,15 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
             try:
                 pending: Any = deque()
 
+                # #326: the end-of-walk flush's bounds. A run of skips is
+                # normally subsumed for free -- _frontier_persist_claim moves
+                # :lo-hash, a RANGE bound, so the next genuinely-walked reverse
+                # position below the skips persists a bound covering them. These
+                # exist for the one case that is not covered: the walk ending
+                # while still inside a run of skips.
+                lowest_skipped_pos: Optional[int] = None
+                highest_rev_pos: Optional[int] = None
+
                 # #222 phase 2d: positions come from the shared-gap claimer,
                 # not a plain commit iterator, and each pipeline entry carries
                 # the tag of the stream that claimed it. Extraction is stream-
@@ -11788,11 +11812,36 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # ascending (its state machine's precondition) and "rev"
                 # positions reach _reverse_apply strictly descending (its
                 # monotonicity and progress guards' precondition).
+                # #326: a skippable claim is retired here, BEFORE the parse is
+                # queued, so it costs neither the git show + tree-sitter parse
+                # nor _reverse_apply's write batch nor the checkpoint nor the
+                # per-commit handle drop. The loop body is a pure in-memory
+                # interval scan, so a long run of skips costs microseconds per
+                # position and never stalls the event loop.
                 def submit_next() -> bool:
-                    claim = claimer.next_claim()
-                    if claim is None:
-                        return False
-                    tag, pos = claim
+                    nonlocal lowest_skipped_pos, highest_rev_pos
+                    while True:
+                        claim = claimer.next_claim()
+                        if claim is None:
+                            return False
+                        tag, pos = claim
+                        if tag == "rev":
+                            highest_rev_pos = (
+                                pos if highest_rev_pos is None else max(highest_rev_pos, pos)
+                            )
+                        if not _skip_claim(tag, pos, completed_regions):
+                            break
+                        lowest_skipped_pos = (
+                            pos if lowest_skipped_pos is None else min(lowest_skipped_pos, pos)
+                        )
+                        _ingest_progress["positions_skipped"] += 1
+                        # `processed` keeps its meaning -- positions retired by
+                        # the walk -- which is what #317's commit_census reads
+                        # as walk_claimed. Excluding skips would silently
+                        # redefine the number that gate compares against
+                        # git rev-list, turning a clean skip-heavy resume into
+                        # a reported lost commit.
+                        _ingest_progress["processed"] += 1
                     fut = loop.run_in_executor(
                         executor, _extract_commit, repo_path, linearization[pos], ignore_patterns
                     )
@@ -11925,6 +11974,19 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         )
                     _ingest_progress["processed"] += 1
                     await asyncio.sleep(0)  # yield to event loop
+
+                # #326: the walk may have ended -- gap empty, or shutdown --
+                # while still inside a run of skips, which nothing below
+                # persisted. Not _frontier_persist_claim: after a discard the
+                # interval's facts are gone, so its `existing is None` branch
+                # would write lo == hi and lose the top bound.
+                if lowest_skipped_pos is not None and highest_rev_pos is not None:
+                    async with db_lease_async() as db:
+                        await loop.run_in_executor(
+                            write_executor, _frontier_persist_span, db, linearization,
+                            lowest_skipped_pos, highest_rev_pos, False,
+                            commit_metadata[highest_rev_pos][1], index_con,
+                        )
 
                 # Stage B: the correction sweep. A third, strictly
                 # SEQUENTIAL pass, not a third concurrent task -- claim_low()
@@ -12243,7 +12305,7 @@ async def handle_minigraf_ingest_git(
     _ingest_progress = {
         "status": "starting", "processed": 0, "total": 0, "prior_ingested": 0,
         "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
-        "phase": None,
+        "phase": None, "positions_skipped": 0,
     }
     _ingest_task = asyncio.create_task(_run_ingestion(repo, branch or _default_git_branch(repo)))
     return {"ok": True, "job_id": "git-ingest", "message": f"Ingestion started for {repo}"}
@@ -12258,6 +12320,11 @@ def handle_minigraf_ingest_status() -> Dict[str, Any]:
     result["processed_this_run"] = (
         _ingest_progress["processed"] - _ingest_progress.get("prior_ingested", 0)
     )
+    # #326: a run whose positions_skipped_this_run climbs alongside
+    # processed_this_run is REPLAYING an already-ingested region, not making
+    # progress. #325's incident looked healthy for 98 minutes because
+    # `processed` advances on replayed positions and nothing else did.
+    result["positions_skipped_this_run"] = _ingest_progress.get("positions_skipped", 0)
     # Staleness: a terminal error/skipped state can outlive the condition
     # that caused it (e.g. the orphaned holder it names has since died) —
     # re-check liveness on every poll instead of echoing a dead PID forever.
