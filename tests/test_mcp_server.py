@@ -8359,6 +8359,95 @@ class TestSkipFastPathEndToEnd:
             "skipped and the skip bought nothing"
         )
 
+    @pytest.mark.asyncio
+    async def test_interrupted_run_never_persists_completion_for_unwritten_positions(
+        self, tmp_path, monkeypatch
+    ):
+        """#326: the end-of-walk flush must not run on the shutdown path.
+
+        When the `while pending:` loop breaks on _shutdown_requested, `pending`
+        is still non-empty -- those entries are positions CLAIMED and queued for
+        extraction but never applied, and nothing persisted a claim for them.
+        :lo-hash is a RANGE bound, so an ungated flush down to
+        lowest_skipped_pos swallows them and declares them complete; the next
+        run's _frontier_load then reads the gap as closed and never re-walks
+        commits that have no entity in the graph at all.
+
+        #326's own shape makes this the likely case rather than an exotic one:
+        skips are retired inline in submit_next and never occupy `pending`, so
+        the genuine tip claims sit there while lowest_skipped_pos is driven far
+        below them. _shutdown_requested is also set by plain stdin EOF at
+        session end, not only by a signal.
+
+        The assertion is the INVARIANT -- no position inside the persisted
+        interval lacks a commit entity -- not a particular interval value, so it
+        keeps stating the property when the numbers move.
+        """
+        import mcp_server
+        import frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = self._repo(tmp_path, 12)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        self._repo(tmp_path, 2, start=12)
+
+        # Interrupt from inside the walk, on the third skip -- late enough that
+        # lowest_skipped_pos has been driven well below the tip claims still
+        # sitting unapplied in `pending`, which is the configuration that makes
+        # an ungated flush swallow them.
+        real_skip_claim = mcp_server._skip_claim
+        skips_seen = [0]
+
+        def interrupting_skip_claim(tag, pos, regions):
+            result = real_skip_claim(tag, pos, regions)
+            if result:
+                skips_seen[0] += 1
+                if skips_seen[0] >= 3:
+                    mcp_server._shutdown_requested.set()
+            return result
+
+        monkeypatch.setattr(mcp_server, "_skip_claim", interrupting_skip_claim)
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+        finally:
+            # Never leak the flag into another test in this session: it is a
+            # module-level asyncio.Event, and every later _run_ingestion would
+            # break out of its walk immediately.
+            mcp_server._shutdown_requested.clear()
+
+        assert skips_seen[0] >= 3, (
+            f"only {skips_seen[0]} skips occurred, so the interrupt never fired "
+            "mid-walk and this test proves nothing about the shutdown path"
+        )
+
+        grown = frontier_registry.build_linearization(str(repo))
+        high = mcp_server._frontier_read_bounds(
+            mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT
+        )
+        if high is None:
+            return  # nothing persisted at all: trivially sound
+
+        lo_pos, hi_pos = grown.index(high[0]), grown.index(high[1])
+        uncovered = []
+        for pos in range(lo_pos, hi_pos + 1):
+            raw = mcp_server._db_execute(
+                mcp_server.get_db(),
+                f"(query [:find (count-distinct ?t) :where "
+                f"[:commit/{grown[pos][:12]} :entity-type ?t]])",
+            )
+            if json.loads(raw)["results"][0][0] == 0:
+                uncovered.append(pos)
+
+        assert not uncovered, (
+            f"persisted frontier-high covers positions {lo_pos}..{hi_pos}, but "
+            f"{uncovered} have no :commit/... entity in the graph -- the "
+            "interrupted run declared complete what it never wrote, so the next "
+            "run reads the gap as closed and those commits are lost silently"
+        )
+
 
 class TestLineageProvisionalMarker:
     def test_unmarked_entity_reads_as_authoritative(self, real_db):

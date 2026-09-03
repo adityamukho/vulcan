@@ -11975,12 +11975,44 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     _ingest_progress["processed"] += 1
                     await asyncio.sleep(0)  # yield to event loop
 
-                # #326: the walk may have ended -- gap empty, or shutdown --
-                # while still inside a run of skips, which nothing below
-                # persisted. Not _frontier_persist_claim: after a discard the
-                # interval's facts are gone, so its `existing is None` branch
-                # would write lo == hi and lose the top bound.
-                if lowest_skipped_pos is not None and highest_rev_pos is not None:
+                # #326: the walk may have ended with the gap empty while still
+                # inside a run of skips, which nothing below persisted. Not
+                # _frontier_persist_claim: after a discard the interval's facts
+                # are gone, so its `existing is None` branch would write
+                # lo == hi and lose the top bound.
+                #
+                # Gated on completed_all, like Stage B and both folds below,
+                # and NOT merely for symmetry. On the shutdown break `pending`
+                # is still non-empty, and those entries are positions claimed
+                # and queued for extraction but never applied -- nothing
+                # persisted a claim for them. :lo-hash is a RANGE bound, so an
+                # ungated flush down to lowest_skipped_pos would swallow them
+                # and declare them complete: the next run's _frontier_load
+                # would read the gap as closed and never re-walk commits that
+                # have no entity in the graph at all. #326's own shape makes
+                # that the LIKELY case rather than an exotic one -- skips are
+                # retired inline in submit_next and never occupy `pending`, so
+                # the genuine tip claims sit there while lowest_skipped_pos is
+                # driven far below them. And _shutdown_requested is set by
+                # plain stdin EOF at session end, not just by a signal.
+                #
+                # Skipping the flush costs nothing real: the completed-region
+                # facts survive an interrupted run (_completed_regions_load
+                # retracts a region only when a live same-tag interval fully
+                # covers it), so the next run re-skips the same region at
+                # microsecond cost -- exactly what this feature makes cheap.
+                #
+                # `highest_rev_pos is not None` is belt-and-braces, not a
+                # reachable case: lowest_skipped_pos is only ever set on a
+                # "rev" claim, which sets highest_rev_pos first. It is kept so
+                # the commit_metadata[highest_rev_pos] subscript below is
+                # guarded at the point of use rather than by an argument made
+                # thirty lines away.
+                if (
+                    completed_all
+                    and lowest_skipped_pos is not None
+                    and highest_rev_pos is not None
+                ):
                     async with db_lease_async() as db:
                         await loop.run_in_executor(
                             write_executor, _frontier_persist_span, db, linearization,
