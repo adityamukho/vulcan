@@ -11504,7 +11504,7 @@ class _RoundRobinClaimer:
 
 @dataclass
 class _ForwardWalkState:
-    """The forward walk's ten mutable preload dicts, threaded as one object.
+    """The forward walk's twelve mutable preload dicts, threaded as one object.
 
     Held by reference, not by value: _forward_apply mutates these in place
     exactly as the inline loop body it was extracted from did (issue #222

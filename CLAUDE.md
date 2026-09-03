@@ -489,7 +489,7 @@ the same branch and describes no completed region at all.
 
 `fwd` never skips, and one clause buys two properties. A forward claim inside a
 provisional region is the authority upgrade that must still happen; and
-`_forward_apply` mutates `_ForwardWalkState`'s ten cross-position preload dicts
+`_forward_apply` mutates `_ForwardWalkState`'s cross-position preload dicts
 in place, so a skipped forward position would desynchronize that state for every
 later forward position, silently. `_reverse_apply` takes no state object and
 reads what it needs from the graph, which is why reverse carries no equivalent
