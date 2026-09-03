@@ -93,6 +93,7 @@ A new entity type, one entity per archived region:
 ```
 :ingestion/completed-region-<lo_hash[:12]>
   :entity-type  :type/completed-region
+  :ident        ":ingestion/completed-region-<lo_hash[:12]>"
   :lo-hash      "<full hash>"
   :hi-hash      "<full hash>"
   :tag          :provisional
@@ -107,8 +108,17 @@ that determinism is NOT the idempotency argument (see below). Coalescing can
 change a region's low bound and therefore its ident; the write path handles
 that as an ordinary retract-plus-assert of the changed set.
 
-No `:ident` or `:description` attribute, matching `_frontier_persist_claim`'s
-own four-fact shape.
+**The `:ident` fact is load-bearing, not decoration.** Unlike frontier-low and
+frontier-high, which are fixed idents a query can name literally, the region set
+has to be ENUMERATED. `[?e :entity-type :type/completed-region]` binds `?e` to
+the entity, and minigraf answers that in UUID space -- `_count_commit_entities`
+gets away with the same pattern only because it counts and never reads `?e`
+back. Carrying a string-valued `:ident` lets the enumeration query bind and
+return `?ident` instead, so no UUID-to-ident resolution is needed to find a
+region or to retract one. `:ingestion/format-version` already carries an
+`:ident` fact for its own reasons, so this is an established shape here.
+
+No `:description` attribute.
 
 ### Against the four fact-model checks
 
@@ -217,11 +227,18 @@ In `submit_next()` inside `_run_ingestion`, before
 makes a skipped position cost neither the parse nor the write batch nor the
 checkpoint nor the handle drop -- #326's requirement 2.
 
-The region set is loaded once, by `_frontier_load`, which already reads the
-persisted interval facts and is already the one function that maps hashes to
-positions against this run's linearization. It returns the mapped, pruned region
-list alongside the allocator, and `_run_ingestion` threads it into `submit_next`
-as a plain in-memory list -- `_skip_claim` performs no query.
+The region set is loaded once per run, by a new `_completed_regions_load`
+called from `_run_ingestion` immediately after `_frontier_load`, on the same
+write_executor and under the same lease. It maps hashes to positions against
+this run's linearization, prunes, and returns a plain list of
+`frontier_registry.Interval`. `_run_ingestion` threads that list into
+`submit_next` -- `_skip_claim` performs no query.
+
+**`_frontier_load`'s own signature and return type do NOT change.** It gains
+only the archiving call inside its discard branch. Widening its return to a
+tuple would break roughly a dozen existing call sites and tests that use its
+result directly as an allocator, for no gain: the archiving must live there
+(that is where the doomed bounds are), but the loading need not.
 
 `submit_next` becomes a loop: take a claim, and while the claim is skippable,
 count it and take the next one; queue the first non-skippable claim and return
