@@ -8143,6 +8143,11 @@ class TestFrontierPersistSpan:
         assert mcp_server._frontier_read_bounds(
             real_db, mcp_server._FRONTIER_LOW_IDENT
         ) == ("h0", "h3")
+        raw = mcp_server._db_execute(
+            real_db,
+            f"(query [:find (count ?hi) :where [{mcp_server._FRONTIER_LOW_IDENT} :hi-hash ?hi]])",
+        )
+        assert json.loads(raw)["results"] == [[1]], "the stale :hi-hash datom must be retracted"
 
     def test_a_span_that_would_shrink_the_interval_is_a_no_op(self, real_db):
         """The flush is bookkeeping catching up with the allocator; it must
