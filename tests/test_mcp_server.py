@@ -19362,6 +19362,107 @@ class TestReverseApplyTornWriteResume:
         )
 
 
+class TestSkipFastPathDoesNotSkipTornWrites:
+    """#326 acceptance test 2, and the one that matters. A fast path whose
+    predicate quietly matched nothing would pass the skip test by doing no
+    skipping at all; this is the test that would catch the OPPOSITE error.
+
+    #325 words the fast path as skipping a position whose :commit/<hash> entity
+    already exists. That entity is the FIRST element of _reverse_apply's
+    all_triples, written before any file result is looked at, while
+    _frontier_persist_claim runs LAST -- so it is present on exactly the torn
+    positions #313 needs re-walked. Skipping one would make the orphaned lineage
+    permanent, surfacing later as #316's entities_without_introduced_by going
+    red on a graph with no other symptom, or on an older graph not at all.
+    """
+
+    def _tear_position_zero(self, monkeypatch, real_db, repo):
+        """Tear position 0 through the REAL write path -- kill the lineage batch
+        mid-_reverse_apply, exactly as TestReverseApplyTornWriteResume does, so
+        nothing here depends on hitting a timing window."""
+        import mcp_server
+        import frontier_registry
+
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        file_results, _g, _m, _r = mcp_server._extract_commit(str(repo), linearization[0], ())
+
+        def die(*_a, **_k):
+            raise _SimulatedKill()
+
+        with monkeypatch.context() as mp:
+            mp.setattr(mcp_server, "_entity_introduced_by_set_provisional_batch", die)
+            with pytest.raises(_SimulatedKill):
+                mcp_server._reverse_apply(
+                    real_db, str(repo), linearization, commit_metadata, 0, file_results,
+                )
+        return linearization
+
+    def test_a_torn_position_is_in_no_archived_region(self, real_db, tmp_path, monkeypatch):
+        """The soundness argument, asserted rather than reasoned about: the torn
+        position's _frontier_persist_claim never ran, so it was never inside the
+        interval an archive could be taken from."""
+        import mcp_server
+
+        repo = TestReverseApplyTornWriteResume._repo_with_one_commit(tmp_path)
+        linearization = self._tear_position_zero(monkeypatch, real_db, repo)
+
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT
+        ) is None, "the torn write must not have persisted a claim"
+        regions = mcp_server._completed_regions_load(
+            real_db, linearization,
+            frontier_registry.FrontierAllocator(len(linearization), []),
+        )
+        assert mcp_server._skip_claim("rev", 0, regions) is False, (
+            "the torn position must be re-walked; skipping it makes #313's "
+            "orphaned lineage permanent"
+        )
+
+    def test_the_unsound_commit_entity_predicate_WOULD_have_skipped_it(
+        self, real_db, tmp_path, monkeypatch
+    ):
+        """The trap is real, not hypothetical. Pins that the commit entity IS
+        present on a torn position -- so this test goes red the day someone
+        'simplifies' _skip_claim to the lookup #325 proposed."""
+        import mcp_server
+
+        repo = TestReverseApplyTornWriteResume._repo_with_one_commit(tmp_path)
+        linearization = self._tear_position_zero(monkeypatch, real_db, repo)
+
+        commit_ident = f":commit/{linearization[0][:12]}"
+        raw = mcp_server._db_execute(
+            real_db,
+            f"(query [:find ?t :where [{commit_ident} :entity-type ?t]])",
+        )
+        assert json.loads(raw)["results"], (
+            "the commit entity must be present on the torn position -- if it is "
+            "not, the kill no longer lands after the first transact and this "
+            "test has stopped guarding the predicate #326 rejected"
+        )
+
+    def test_the_torn_position_still_recovers_its_lineage_when_re_walked(
+        self, real_db, tmp_path, monkeypatch
+    ):
+        """End of the chain: not skipped, therefore re-walked, therefore
+        repaired -- #313's fix still reachable with the fast path in place."""
+        import mcp_server
+
+        repo = TestReverseApplyTornWriteResume._repo_with_one_commit(tmp_path)
+        fn_ident = mcp_server._code_ident("function", "auth.py", "login")
+        linearization = self._tear_position_zero(monkeypatch, real_db, repo)
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        file_results, _g, _m, _r = mcp_server._extract_commit(str(repo), linearization[0], ())
+
+        assert mcp_server._entity_introduced_by_values_query(real_db, fn_ident) == []
+        mcp_server._reverse_apply(
+            real_db, str(repo), linearization, commit_metadata, 0, file_results,
+        )
+        assert mcp_server._entity_introduced_by_values_query(real_db, fn_ident) == [
+            f":commit/{linearization[0][:12]}"
+        ]
+
+
 class TestReverseBulkFillWalkProgressGuard:
     def test_breaks_loudly_when_claim_high_stops_decreasing(self, real_db, tmp_path, capsys):
         """The walk's loop is unbounded by construction and drives a git
