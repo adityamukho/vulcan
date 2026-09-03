@@ -5962,6 +5962,43 @@ def _frontier_read_bounds(db: Any, ident: str) -> Optional[Tuple[str, str]]:
     return (results[0][0], results[0][1]) if results else None
 
 
+def _frontier_read_pos_count(db: Any, ident: str) -> Optional[int]:
+    """#326: the interval's stored position-count denominator, or None if it
+    carries none (a graph written before this attribute existed).
+
+    Read by its own query rather than joined into _frontier_read_bounds: an
+    interval with no :pos-count must still be READABLE -- a five-way join would
+    make it invisible, which is a different and much worse failure than
+    reporting the count as absent.
+    """
+    raw = _db_execute(
+        db, f"(query [:find ?c :where [{ident} :pos-count ?c]])"
+    )
+    results = json.loads(raw).get("results", [])
+    if not results:
+        return None
+    try:
+        return int(results[0][0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _frontier_span_count(
+    linearization: List[str], lo_hash: str, hi_hash: str
+) -> Optional[int]:
+    """Positions spanned by [lo_hash, hi_hash] under THIS linearization, or
+    None if either bound is absent from it.
+
+    One list scan per bound rather than a hash->pos dict: this is called once
+    per persisted claim, and building an O(n) dict there would make a 20k-commit
+    ingestion pay 20k dict constructions.
+    """
+    try:
+        return linearization.index(hi_hash) - linearization.index(lo_hash) + 1
+    except ValueError:
+        return None
+
+
 # Bumped whenever a change makes facts already in a graph unreadable by the
 # current code -- today that means the ident rule in _canonical_ident (#263),
 # since ingestion recomputes every ident from scratch rather than reading it
@@ -6099,6 +6136,13 @@ def _frontier_seed_from_watermark(
         f'[{_FRONTIER_LOW_IDENT} :hi-hash "{_edn_escape(watermark_hash)}"]',
         f"[{_FRONTIER_LOW_IDENT} :tag :authoritative]",
     ]
+    # #326: every interval carries the denominator, seeded ones included -- an
+    # interval with no :pos-count is treated as untrustworthy downstream, and
+    # a migration is exactly the wrong place to manufacture one gratuitously
+    # missing case.
+    seeded_count = _frontier_span_count(linearization, linearization[0], watermark_hash)
+    if seeded_count is not None:
+        facts.append(f"[{_FRONTIER_LOW_IDENT} :pos-count {seeded_count}]")
     _transact(db, "[" + " ".join(facts) + "]", run_ts_iso, index_con=index_con)
 
 
@@ -6163,24 +6207,60 @@ def _frontier_load(
             # needs it. Only a REPRESENTABLE interval is archived: the
             # inverted case below reaches the same branch and describes no
             # completed region at all.
-            if hi_lo_pos <= hi_hi_pos:
+            #
+            # The archive is gated on the interval's OWN :pos-count, which was
+            # written at claim time against the linearization the positions
+            # were claimed under. A region is stored as two hashes but consumed
+            # as a closed POSITION RANGE, and that is sound only if the
+            # linearization grew by APPENDING above it.
+            # `git log --topo-order --reverse` gives no such guarantee: it
+            # places a new commit immediately after its branch point whenever
+            # the old tip's line stalls behind it -- "branch off an old commit,
+            # merge the mainline in, fast-forward the mainline" is enough. Such
+            # a commit lands INSIDE the archived bounds, is covered by a proof
+            # that was never about it, is skipped, and is lost permanently and
+            # silently: it reaches neither the graph nor the index, so
+            # fact_audit's two witnesses agree, both :introduced-by checks only
+            # look at entities that exist, and stderr carries nothing.
+            #
+            # The count must come from the interval, NOT be computed here. A
+            # count computed at archive time is computed from the very span it
+            # is then compared against, so it always agrees and discriminates
+            # nothing. An interval with no stored count (written before this
+            # attribute existed) is not archived either -- "no denominator" and
+            # "a denominator that still checks out" must not be the same
+            # branch when the failure mode is silent permanent loss. The cost
+            # of not archiving is one full re-walk, which is exactly what
+            # master does here.
+            high_count = _frontier_read_pos_count(db, _FRONTIER_HIGH_IDENT)
+            if hi_lo_pos <= hi_hi_pos and high_count == hi_hi_pos - hi_lo_pos + 1:
                 _completed_region_record(
                     db, high_bounds[0], high_bounds[1], ":provisional",
                     run_ts_iso, index_con=index_con,
                     order={h: i for i, h in enumerate(linearization)},
                 )
             _frontier_discard_interval(
-                db, _FRONTIER_HIGH_IDENT, high_bounds, index_con=index_con
+                db, _FRONTIER_HIGH_IDENT, high_bounds, index_con=index_con,
+                pos_count=high_count,
             )
     return frontier_registry.FrontierAllocator(len(linearization), intervals)
 
 
 def _frontier_discard_interval(
-    db: Any, ident: str, bounds: Tuple[str, str], index_con: Optional[Any] = None
+    db: Any,
+    ident: str,
+    bounds: Tuple[str, str],
+    index_con: Optional[Any] = None,
+    pos_count: Optional[int] = None,
 ) -> None:
-    """Retract an interval's four persisted facts, mirroring the set
+    """Retract an interval's persisted facts, mirroring the set
     _frontier_persist_claim creates. Used by _frontier_load when a persisted
     pair cannot faithfully describe the claimed region (see its call site).
+
+    `pos_count` is #326's denominator, retracted with the rest when the caller
+    read one. Left behind it would attach to whatever interval the next
+    _frontier_persist_claim creates at this ident and license a comparison
+    against a span it was never measured from.
     """
     tag = ":authoritative" if ident == _FRONTIER_LOW_IDENT else ":provisional"
     facts = [
@@ -6189,14 +6269,26 @@ def _frontier_discard_interval(
         f'[{ident} :lo-hash "{_edn_escape(bounds[0])}"]',
         f'[{ident} :hi-hash "{_edn_escape(bounds[1])}"]',
     ]
+    if pos_count is not None:
+        facts.append(f"[{ident} :pos-count {int(pos_count)}]")
     _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
 
 
 _COMPLETED_REGION_ENTITY_TYPE = ":type/completed-region"
 
 
-def _completed_region_ident(lo_hash: str) -> str:
-    """Deterministic ident for the archived region starting at lo_hash.
+def _completed_region_ident(lo_hash: str, tag: str) -> str:
+    """Deterministic ident for the archived `tag` region starting at lo_hash.
+
+    The TAG is part of the ident, not just of the fact set. Two regions sharing
+    a low hash but differing in tag would otherwise collide onto one entity and
+    _completed_regions_read's join would return their CROSS PRODUCT -- including
+    a (lo, hi, tag) triple that was never recorded. In the concrete case
+    (":provisional" [h1,h4] plus ":authoritative" [h1,h9]) the phantom row is a
+    provisional region LARGER than anything ever proven, which _skip_claim would
+    honour. Only :provisional is archived today, but the tag is stored and
+    checked precisely so a future authoritative discard cannot silently license
+    a forward skip, and the collision does exactly the opposite.
 
     Not a public schema type -- :type/completed-region is deliberately absent
     from MINIGRAF_SCHEMA, so handle_minigraf_audit's registered-type loop never
@@ -6204,18 +6296,23 @@ def _completed_region_ident(lo_hash: str) -> str:
     through the internal _transact/_retract helpers; the public handler's
     _validate_facts would reject an unregistered type outright.
     """
-    return f":ingestion/completed-region-{lo_hash[:12]}"
+    return f":ingestion/completed-region-{tag.lstrip(':')}-{lo_hash[:12]}"
 
 
-def _completed_regions_read(db: Any) -> List[Tuple[str, str, str]]:
-    """Every archived completed region, as (lo_hash, hi_hash, tag), sorted by
-    lo_hash.
+def _completed_regions_read_full(db: Any) -> List[Tuple[str, str, str, Optional[int]]]:
+    """Every archived completed region, as (lo_hash, hi_hash, tag, pos_count),
+    sorted.
 
     Binds ?ident rather than ?e. `[?e :entity-type :type/completed-region]`
     answers in UUID space -- _count_commit_entities gets away with that pattern
     only because it counts and never reads ?e back. The string-valued :ident
     fact each region carries is what makes this enumeration (and the retract in
     _completed_region_record) work without UUID-to-ident resolution.
+
+    :pos-count is read by a SECOND query rather than being joined into the
+    first. A region that carries no :pos-count is untrustworthy but must still
+    be enumerable -- it has to be retractable and carryable -- and a single
+    five-way join would make it invisible instead, leaking its facts forever.
     """
     raw = _db_execute(
         db,
@@ -6223,25 +6320,55 @@ def _completed_regions_read(db: Any) -> List[Tuple[str, str, str]]:
         f" [?e :entity-type {_COMPLETED_REGION_ENTITY_TYPE}]"
         " [?e :ident ?ident] [?e :lo-hash ?lo] [?e :hi-hash ?hi] [?e :tag ?tag]])",
     )
+    raw_counts = _db_execute(
+        db,
+        "(query [:find ?ident ?c :where"
+        f" [?e :entity-type {_COMPLETED_REGION_ENTITY_TYPE}]"
+        " [?e :ident ?ident] [?e :pos-count ?c]])",
+    )
+    counts: Dict[str, Optional[int]] = {}
+    for ident, c in json.loads(raw_counts).get("results", []):
+        try:
+            counts[str(ident)] = int(c)
+        except (TypeError, ValueError):
+            counts[str(ident)] = None
+
     seen = set()
-    out: List[Tuple[str, str, str]] = []
-    for _ident, lo, hi, tag in json.loads(raw).get("results", []):
+    out: List[Tuple[str, str, str, Optional[int]]] = []
+    for ident, lo, hi, tag in json.loads(raw).get("results", []):
         key = (lo, hi, str(tag))
         if key not in seen:
             seen.add(key)
-            out.append(key)
-    return sorted(out)
+            out.append((lo, hi, str(tag), counts.get(str(ident))))
+    return sorted(out, key=lambda r: (r[0], r[1], r[2]))
 
 
-def _completed_region_facts(lo_hash: str, hi_hash: str, tag: str) -> str:
-    ident = _completed_region_ident(lo_hash)
-    return "[" + " ".join([
+def _completed_regions_read(db: Any) -> List[Tuple[str, str, str]]:
+    """Every archived completed region, as (lo_hash, hi_hash, tag), sorted.
+
+    The bounds-only view of _completed_regions_read_full, for callers and tests
+    that assert on the region set itself rather than on its stored denominator.
+    """
+    return [(lo, hi, tag) for lo, hi, tag, _count in _completed_regions_read_full(db)]
+
+
+def _completed_region_facts(
+    lo_hash: str, hi_hash: str, tag: str, pos_count: Optional[int] = None
+) -> str:
+    ident = _completed_region_ident(lo_hash, tag)
+    facts = [
         f"[{ident} :entity-type {_COMPLETED_REGION_ENTITY_TYPE}]",
         f'[{ident} :ident "{ident}"]',
         f'[{ident} :lo-hash "{_edn_escape(lo_hash)}"]',
         f'[{ident} :hi-hash "{_edn_escape(hi_hash)}"]',
         f"[{ident} :tag {tag}]",
-    ]) + "]"
+    ]
+    # #326: the region's position-count denominator, absent only when the
+    # caller had no position map to compute it from. See
+    # _completed_regions_load for why an absent count is untrustworthy.
+    if pos_count is not None:
+        facts.append(f"[{ident} :pos-count {int(pos_count)}]")
+    return "[" + " ".join(facts) + "]"
 
 
 def _completed_region_record(
@@ -6269,6 +6396,12 @@ def _completed_region_record(
     merged. Callers inside a run pass the linearization's map; the coalescing
     tests pass a lexicographic fallback via order=None, which sorts by hash.
 
+    Each written region also carries `:pos-count`, the number of positions its
+    bounds spanned under `order` -- the denominator _completed_regions_load
+    re-checks before believing the region covers anything. A merged region's
+    count is recomputed against the current `order`; a region carried through
+    unmerged keeps the stored count it was archived with.
+
     Orderability is tested per REGION, not per hash: `order` may cover only
     some of the hashes in play (e.g. a caller passes the map for its own two
     endpoints but an unrelated archived region's hashes have since fallen out
@@ -6284,9 +6417,31 @@ def _completed_region_record(
     def key(h: str) -> Any:
         return order[h] if order is not None else h
 
-    current = _completed_regions_read(db)
+    def count_of(lo: str, hi: str) -> Optional[int]:
+        if order is not None and lo in order and hi in order:
+            return order[hi] - order[lo] + 1
+        return None
+
+    current = _completed_regions_read_full(db)
     other_tag = [r for r in current if r[2] != tag]
-    candidates = [(lo, hi) for lo, hi, t in current if t == tag] + [(lo_hash, hi_hash)]
+
+    # #326 FIX: drop stale-denominator regions BEFORE the merge, never after.
+    # The merge compares regions archived under DIFFERENT linearizations using
+    # CURRENT positions, so a stale region left in the candidate set can
+    # manufacture coverage over positions that were in neither original
+    # region. This is _completed_regions_load's guard one level up, and it has
+    # to be ordered ahead of the coalescing or the merge re-introduces the hole
+    # the load-time guard exists to close.
+    same_tag: List[Tuple[str, str]] = []
+    for lo, hi, t, stored in current:
+        if t != tag:
+            continue
+        live = count_of(lo, hi)
+        if live is not None and live != stored:
+            continue  # positions shifted unevenly under it: not a proof any more
+        same_tag.append((lo, hi))
+
+    candidates = same_tag + [(lo_hash, hi_hash)]
     orderable_regions = sorted(
         {r for r in candidates if region_orderable(*r)}, key=lambda p: key(p[0])
     )
@@ -6300,22 +6455,47 @@ def _completed_region_record(
         else:
             merged.append((lo, hi))
 
-    target = sorted(
-        [(lo, hi, tag) for lo, hi in merged]
-        + [(lo, hi, tag) for lo, hi in non_orderable_regions]
-        + other_tag
-    )
+    stored_counts = {(lo, hi, t): c for lo, hi, t, c in current}
+    target: List[Tuple[str, str, str, Optional[int]]] = []
+    for lo, hi in merged:
+        # A merged (or freshly recorded) region's denominator is computed
+        # against the CURRENT order, which is the linearization the merge was
+        # decided under.
+        target.append((lo, hi, tag, count_of(lo, hi)))
+    for lo, hi in non_orderable_regions:
+        # Carried through untouched, so its stored denominator is carried too:
+        # it describes the linearization the region was archived under, which
+        # this call knows nothing about.
+        target.append((lo, hi, tag, stored_counts.get((lo, hi, tag))))
+    target.extend(other_tag)
+    target = sorted(target, key=lambda r: (r[0], r[1], r[2]))
+
     if target == current:
         return
 
-    for lo, hi, t in current:
-        if (lo, hi, t) not in target:
-            _retract(db, _completed_region_facts(lo, hi, t), index_con=index_con)
-    for lo, hi, t in target:
-        if (lo, hi, t) not in current:
+    target_keys = {(lo, hi, t) for lo, hi, t, _c in target}
+    current_keys = {(lo, hi, t): c for lo, hi, t, c in current}
+    for lo, hi, t, c in current:
+        if (lo, hi, t) not in target_keys:
+            _retract(db, _completed_region_facts(lo, hi, t, c), index_con=index_con)
+    for lo, hi, t, c in target:
+        if (lo, hi, t) not in current_keys:
             _transact(
-                db, _completed_region_facts(lo, hi, t), run_ts_iso, index_con=index_con
+                db, _completed_region_facts(lo, hi, t, c), run_ts_iso, index_con=index_con
             )
+        elif current_keys[(lo, hi, t)] != c:
+            # Same bounds, different denominator (a re-record under a grown
+            # linearization). Move only the :pos-count fact -- #156 means a
+            # re-transact of the whole set at a new valid-from would duplicate
+            # every live datom rather than being a no-op.
+            ident = _completed_region_ident(lo, t)
+            old = current_keys[(lo, hi, t)]
+            if old is not None:
+                _retract(db, f"[[{ident} :pos-count {int(old)}]]", index_con=index_con)
+            if c is not None:
+                _transact(
+                    db, f"[[{ident} :pos-count {int(c)}]]", run_ts_iso, index_con=index_con
+                )
 
 
 _REGION_TAG_TO_FRONTIER_TAG = {
@@ -6343,10 +6523,42 @@ def _completed_regions_load(
       * an endpoint not in this linearization -- the branch moved under us, so
         it is dropped from the returned list but its facts are KEPT. Dropping
         costs a re-walk; retracting would destroy the witness for good.
+
+    The stored :pos-count is the third way, and it is the one that makes the
+    hash-to-position mapping SOUND rather than merely well-defined. A region is
+    persisted as two hashes but consumed as a CLOSED POSITION RANGE: every
+    position between the bounds is treated as proven-complete. That is only
+    true if the linearization grew by APPENDING above the region.
+    `git log --topo-order --reverse` gives no such guarantee -- it places a new
+    commit immediately after its branch point whenever the old tip's line
+    stalls behind it, which is exactly what "branch off an old commit, merge
+    master in, fast-forward master" produces. Such a commit lands INSIDE the
+    archived bounds, is covered by a proof that was never about it, is skipped,
+    and is lost permanently and silently: it is written to neither the graph
+    nor the index, so fact_audit's two witnesses agree, both :introduced-by
+    checks only examine entities that exist, and stderr carries nothing.
+
+    Pure tip growth shifts both endpoints by the same amount, so the position
+    COUNT is preserved and there are no false drops. An insertion inside the
+    range breaks the count, and the region falls back to no region at all -- a
+    full re-walk, which is correct and merely slower. This is #316's
+    `code_entities_scanned` idiom: a stored denominator makes every run
+    re-prove its own positive control instead of trusting the day it was
+    written.
+
+    A region carrying NO stored count is dropped for the same reason, not
+    trusted. There are none in the wild (nothing released has ever written a
+    :type/completed-region fact), but "no denominator" and "a denominator that
+    still checks out" must not be the same branch: an absent count cannot
+    distinguish an append from an insertion, and the fail-safe direction for a
+    predicate whose failure mode is permanent data loss is to re-walk.
+
+    Dropped-for-count regions are NOT retracted, for the same reason an
+    unmappable one is not: the branch may straighten out on a later run.
     """
     hash_to_pos = {h: i for i, h in enumerate(linearization)}
     out: List["frontier_registry.Interval"] = []
-    for lo_hash, hi_hash, tag in _completed_regions_read(db):
+    for lo_hash, hi_hash, tag, pos_count in _completed_regions_read_full(db):
         frontier_tag = _REGION_TAG_TO_FRONTIER_TAG.get(str(tag))
         if frontier_tag is None:
             continue
@@ -6361,8 +6573,12 @@ def _completed_regions_load(
         )
         if covered:
             _retract(
-                db, _completed_region_facts(lo_hash, hi_hash, str(tag)), index_con=index_con
+                db,
+                _completed_region_facts(lo_hash, hi_hash, str(tag), pos_count),
+                index_con=index_con,
             )
+            continue
+        if pos_count is None or hi_pos - lo_pos + 1 != pos_count:
             continue
         out.append(frontier_registry.Interval(lo_pos, hi_pos, frontier_tag))
     return sorted(out, key=lambda iv: iv.lo_pos)
@@ -6416,18 +6632,60 @@ def _frontier_persist_claim(
         to_transact.append(f"[{ident} :tag {tag}]")
         to_transact.append(f'[{ident} :lo-hash "{_edn_escape(moved_hash)}"]')
         to_transact.append(f'[{ident} :hi-hash "{_edn_escape(moved_hash)}"]')
+        new_count: Optional[int] = 1
     else:
         lo_hash, hi_hash = existing
         if from_low:
             to_retract.append(f'[{ident} :hi-hash "{_edn_escape(hi_hash)}"]')
             to_transact.append(f'[{ident} :hi-hash "{_edn_escape(moved_hash)}"]')
+            new_count = _frontier_span_count(linearization, lo_hash, moved_hash)
         else:
             to_retract.append(f'[{ident} :lo-hash "{_edn_escape(lo_hash)}"]')
             to_transact.append(f'[{ident} :lo-hash "{_edn_escape(moved_hash)}"]')
+            new_count = _frontier_span_count(linearization, moved_hash, hi_hash)
+
+    # #326: the interval's position-count denominator, written in the SAME
+    # transact as the bound it belongs to. It has to be recorded HERE, at claim
+    # time, and not later where the interval is archived: the count is a
+    # statement about THIS run's linearization, and _frontier_load's archiving
+    # branch runs against a linearization that has already changed -- which is
+    # precisely the change that has to be detected. A count computed at archive
+    # time always agrees with the span it was computed from and discriminates
+    # nothing.
+    _frontier_pos_count_delta(db, ident, new_count, to_retract, to_transact)
 
     if to_retract:
         _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
     _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
+
+
+def _frontier_pos_count_delta(
+    db: Any,
+    ident: str,
+    new_count: Optional[int],
+    to_retract: List[str],
+    to_transact: List[str],
+) -> None:
+    """Append the :pos-count moves for `ident` onto an in-progress bound write.
+
+    Batched with the bound triples rather than written separately: the two
+    carry DIFFERENT attributes, so minigraf#287 (a batch sharing
+    (entity, attribute, valid_from) keeps only the last value) does not reach
+    them, and folding them in keeps the per-commit persist at the same two DB
+    calls it has always cost.
+
+    Never leaves a stale count behind: if the new span is unknowable (a bound
+    absent from this linearization) the old count is retracted and none is
+    written, so the interval reads as carrying no denominator -- the fail-safe
+    state, which downstream treats as "do not trust this interval".
+    """
+    old_count = _frontier_read_pos_count(db, ident)
+    if old_count == new_count:
+        return
+    if old_count is not None:
+        to_retract.append(f"[{ident} :pos-count {int(old_count)}]")
+    if new_count is not None:
+        to_transact.append(f"[{ident} :pos-count {int(new_count)}]")
 
 
 def _frontier_persist_span(
@@ -6463,6 +6721,7 @@ def _frontier_persist_span(
                 f"[{ident} :tag {tag}]",
                 f'[{ident} :lo-hash "{_edn_escape(lo_hash)}"]',
                 f'[{ident} :hi-hash "{_edn_escape(hi_hash)}"]',
+                f"[{ident} :pos-count {hi_pos - lo_pos + 1}]",
             ]) + "]",
             commit_ts_iso,
             index_con=index_con,
@@ -6482,9 +6741,18 @@ def _frontier_persist_span(
     if new_hi != cur_hi:
         to_retract.append(f'[{ident} :hi-hash "{_edn_escape(cur_hi)}"]')
         to_transact.append(f'[{ident} :hi-hash "{_edn_escape(new_hi)}"]')
+    # #326: same denominator the per-claim path maintains, kept in step with
+    # the bounds this flush moved.
+    _frontier_pos_count_delta(
+        db, ident, _frontier_span_count(linearization, new_lo, new_hi),
+        to_retract, to_transact,
+    )
     if not to_transact:
+        if to_retract:
+            _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
         return
-    _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+    if to_retract:
+        _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
     _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
 
 

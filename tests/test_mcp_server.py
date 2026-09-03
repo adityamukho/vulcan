@@ -7623,7 +7623,14 @@ class TestFrontierLoadNormalisesUnrepresentableIntervals:
     review verified that re-processing an already-processed position is
     idempotent)."""
 
-    def _seed_high(self, db, lo_hash, hi_hash):
+    def _seed_high(self, db, lo_hash, hi_hash, pos_count=None):
+        """Seeds the interval as a real run would leave it, :pos-count
+        included (#326). The count is the span the positions were CLAIMED
+        under -- the "h<i> is at position i" shape these tests use -- and
+        defaults to that rather than to the span under whatever grown
+        linearization the test then loads against, which is the whole point of
+        storing it.
+        """
         import mcp_server
         facts = [
             f"[{mcp_server._FRONTIER_HIGH_IDENT} :entity-type :type/ingest-interval]",
@@ -7631,6 +7638,10 @@ class TestFrontierLoadNormalisesUnrepresentableIntervals:
             f'[{mcp_server._FRONTIER_HIGH_IDENT} :lo-hash "{lo_hash}"]',
             f'[{mcp_server._FRONTIER_HIGH_IDENT} :hi-hash "{hi_hash}"]',
         ]
+        if pos_count is None and lo_hash[:1] == "h" and hi_hash[:1] == "h":
+            pos_count = int(hi_hash[1:]) - int(lo_hash[1:]) + 1
+        if pos_count is not None:
+            facts.append(f"[{mcp_server._FRONTIER_HIGH_IDENT} :pos-count {pos_count}]")
         mcp_server._transact(db, "[" + " ".join(facts) + "]", "2026-01-01T00:00:00Z")
 
     def test_discards_and_retracts_high_interval_that_no_longer_tops_out(self, real_db):
@@ -7702,7 +7713,7 @@ class TestCompletedRegionRecord:
         # re-transact of the same (entity, attribute, value) at a new
         # valid-from (#156), and _completed_regions_read's own dedup would
         # collapse a duplicate live datom and hide a broken guard.
-        ident = mcp_server._completed_region_ident("h1")
+        ident = mcp_server._completed_region_ident("h1", ":provisional")
         raw = mcp_server._db_execute(
             real_db, f"(query [:find (count ?lo) :where [{ident} :lo-hash ?lo]])"
         )
@@ -7805,17 +7816,131 @@ class TestCompletedRegionRecord:
         # Raw fact counts: the merge must retract the superseded (b, q) entity
         # down to zero live facts, and the surviving (z, ...) entity's
         # :hi-hash must be updated in place, never duplicated (#156).
-        b_ident = mcp_server._completed_region_ident("b")
+        b_ident = mcp_server._completed_region_ident("b", ":provisional")
         raw_b = mcp_server._db_execute(
             real_db, f"(query [:find (count ?lo) :where [{b_ident} :lo-hash ?lo]])"
         )
         assert json.loads(raw_b)["results"] == [[0]]
 
-        z_ident = mcp_server._completed_region_ident("z")
+        z_ident = mcp_server._completed_region_ident("z", ":provisional")
         raw_z = mcp_server._db_execute(
             real_db, f"(query [:find (count ?hi) :where [{z_ident} :hi-hash ?hi]])"
         )
         assert json.loads(raw_z)["results"] == [[1]]
+
+    def test_regions_sharing_a_low_hash_but_differing_in_tag_do_not_collide(self, real_db):
+        """#326: the TAG is part of the region's ident, not just of its facts.
+
+        With the tag absent from the ident these two regions land on ONE
+        entity, and _completed_regions_read's join then returns their CROSS
+        PRODUCT -- four rows, including ("h1", "h9", ":provisional"), a
+        provisional region LARGER than anything ever proven, which _skip_claim
+        would honour and skip on.
+
+        test_regions_of_different_tags_never_coalesce does not reach this: it
+        uses DISTINCT low hashes, so the two idents differ even without the
+        tag. Only a shared low hash collides.
+        """
+        import mcp_server
+        order = {f"h{i}": i for i in range(10)}
+        mcp_server._completed_region_record(
+            real_db, "h1", "h4", ":provisional", "2026-01-01T00:00:00Z", order=order
+        )
+        mcp_server._completed_region_record(
+            real_db, "h1", "h9", ":authoritative", "2026-01-02T00:00:00Z", order=order
+        )
+
+        assert mcp_server._completed_regions_read(real_db) == [
+            ("h1", "h4", ":provisional"),
+            ("h1", "h9", ":authoritative"),
+        ]
+        assert mcp_server._completed_region_ident(
+            "h1", ":provisional"
+        ) != mcp_server._completed_region_ident("h1", ":authoritative")
+
+    def test_a_recorded_region_stores_its_position_count(self, real_db):
+        import mcp_server
+        order = {f"h{i}": i for i in range(10)}
+        mcp_server._completed_region_record(
+            real_db, "h1", "h4", ":provisional", "2026-01-01T00:00:00Z", order=order
+        )
+        assert mcp_server._completed_regions_read_full(real_db) == [
+            ("h1", "h4", ":provisional", 4)
+        ]
+
+    def test_no_order_map_records_no_position_count(self, real_db):
+        """A caller with no position map cannot compute the denominator, so
+        none is written -- and _completed_regions_load then refuses to trust
+        the region rather than treating "no denominator" as "a denominator
+        that checks out"."""
+        import mcp_server
+        mcp_server._completed_region_record(
+            real_db, "h1", "h4", ":provisional", "2026-01-01T00:00:00Z"
+        )
+        assert mcp_server._completed_regions_read_full(real_db) == [
+            ("h1", "h4", ":provisional", None)
+        ]
+
+    def test_a_stale_count_region_is_dropped_BEFORE_the_merge_not_after(self, real_db):
+        """#326 ordering: the stale-denominator guard must run ahead of
+        coalescing, not after it.
+
+        The merge compares regions archived under DIFFERENT linearizations
+        using CURRENT positions, so a stale region left in the candidate set
+        manufactures coverage over positions that were in neither original
+        region. Here [h1, h5] was archived when it spanned 5 positions; an
+        insertion ("x" at position 2) has since stretched it to 6. Merging it
+        with the freshly-proven [h5, h7] would yield [h1, h7] -- a region
+        asserting that "x" completed, which nothing ever proved. Guard first,
+        and only [h5, h7] survives.
+        """
+        import mcp_server
+        old_order = {f"h{i}": i for i in range(10)}
+        mcp_server._completed_region_record(
+            real_db, "h1", "h5", ":provisional", "2026-01-01T00:00:00Z", order=old_order
+        )
+        assert mcp_server._completed_regions_read_full(real_db) == [
+            ("h1", "h5", ":provisional", 5)
+        ], "precondition: the region must carry the count it was archived with"
+
+        new_order = {"h0": 0, "h1": 1, "x": 2, "h2": 3, "h3": 4,
+                     "h4": 5, "h5": 6, "h6": 7, "h7": 8}
+        mcp_server._completed_region_record(
+            real_db, "h5", "h7", ":provisional", "2026-01-02T00:00:00Z", order=new_order
+        )
+
+        assert mcp_server._completed_regions_read(real_db) == [
+            ("h5", "h7", ":provisional")
+        ], (
+            "the stale [h1, h5] region was merged instead of dropped, so the "
+            "surviving region now claims position 2 (an interleaved commit) "
+            "completed when nothing ever proved it"
+        )
+
+    def test_re_recording_a_region_under_a_grown_span_moves_only_its_count(self, real_db):
+        """#156: a re-transact of the same (entity, attribute, value) at a new
+        valid-from creates a DUPLICATE live datom rather than being a no-op.
+        The count is the one attribute that legitimately changes for unchanged
+        bounds, so it must be retracted and re-asserted on its own."""
+        import mcp_server
+        mcp_server._completed_region_record(
+            real_db, "h1", "h3", ":provisional", "2026-01-01T00:00:00Z",
+            order={"h1": 0, "h2": 1, "h3": 2},
+        )
+        mcp_server._completed_region_record(
+            real_db, "h1", "h3", ":provisional", "2026-01-02T00:00:00Z",
+            order={"h1": 0, "x": 1, "h2": 2, "h3": 3},
+        )
+
+        assert mcp_server._completed_regions_read_full(real_db) == [
+            ("h1", "h3", ":provisional", 4)
+        ]
+        ident = mcp_server._completed_region_ident("h1", ":provisional")
+        for attr in (":lo-hash", ":hi-hash", ":pos-count"):
+            raw = mcp_server._db_execute(
+                real_db, f"(query [:find (count ?v) :where [{ident} {attr} ?v]])"
+            )
+            assert json.loads(raw)["results"] == [[1]], f"{attr} duplicated"
 
 
 class TestFrontierLoadArchivesDiscardedInterval:
@@ -7825,7 +7950,14 @@ class TestFrontierLoadArchivesDiscardedInterval:
     retract is what makes the witness survive the one case (#325's tip growth)
     that ruled out reading the live interval directly."""
 
-    def _seed_high(self, db, lo_hash, hi_hash):
+    def _seed_high(self, db, lo_hash, hi_hash, pos_count=None):
+        """Seeds the interval as a real run would leave it, :pos-count
+        included (#326). The count is the span the positions were CLAIMED
+        under -- the "h<i> is at position i" shape these tests use -- and
+        defaults to that rather than to the span under whatever grown
+        linearization the test then loads against, which is the whole point of
+        storing it.
+        """
         import mcp_server
         facts = [
             f"[{mcp_server._FRONTIER_HIGH_IDENT} :entity-type :type/ingest-interval]",
@@ -7833,6 +7965,10 @@ class TestFrontierLoadArchivesDiscardedInterval:
             f'[{mcp_server._FRONTIER_HIGH_IDENT} :lo-hash "{lo_hash}"]',
             f'[{mcp_server._FRONTIER_HIGH_IDENT} :hi-hash "{hi_hash}"]',
         ]
+        if pos_count is None and lo_hash[:1] == "h" and hi_hash[:1] == "h":
+            pos_count = int(hi_hash[1:]) - int(lo_hash[1:]) + 1
+        if pos_count is not None:
+            facts.append(f"[{mcp_server._FRONTIER_HIGH_IDENT} :pos-count {pos_count}]")
         mcp_server._transact(db, "[" + " ".join(facts) + "]", "2026-01-01T00:00:00Z")
 
     def test_discarded_interval_is_archived_as_a_provisional_region(self, real_db):
@@ -7867,6 +8003,67 @@ class TestFrontierLoadArchivesDiscardedInterval:
         assert mcp_server._completed_regions_read(real_db) == []
         assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) is None
 
+    def test_an_interval_whose_span_grew_under_it_is_discarded_but_not_archived(self, real_db):
+        """#326: the archive is gated on the interval's OWN :pos-count, written
+        at claim time against the linearization the positions were claimed
+        under. Here h1..h3 spanned 3 positions when it was claimed; a commit
+        interleaved at position 2 has stretched it to 4, so the bounds no
+        longer enclose only what was proven and archiving them would license a
+        skip over a commit nothing ever wrote.
+
+        The count CANNOT be computed here instead of read: a count computed at
+        archive time is computed from the very span it is then compared
+        against, so it always agrees and discriminates nothing."""
+        import mcp_server
+        self._seed_high(real_db, "h1", "h3", pos_count=3)
+
+        mcp_server._frontier_load(
+            real_db, ["h0", "h1", "x", "h2", "h3", "h4"], "2026-01-02T00:00:00Z"
+        )
+
+        assert mcp_server._completed_regions_read(real_db) == []
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT
+        ) is None
+
+    def test_an_interval_with_no_stored_count_is_not_archived(self, real_db):
+        """"No denominator" is not "a denominator that checks out". Nothing
+        released has ever written a :pos-count, so a graph carrying an
+        interval without one pays a single full re-walk -- exactly master's
+        behaviour -- and every interval written from here on has one."""
+        import mcp_server
+        facts = [
+            f"[{mcp_server._FRONTIER_HIGH_IDENT} :entity-type :type/ingest-interval]",
+            f"[{mcp_server._FRONTIER_HIGH_IDENT} :tag :provisional]",
+            f'[{mcp_server._FRONTIER_HIGH_IDENT} :lo-hash "h1"]',
+            f'[{mcp_server._FRONTIER_HIGH_IDENT} :hi-hash "h2"]',
+        ]
+        mcp_server._transact(real_db, "[" + " ".join(facts) + "]", "2026-01-01T00:00:00Z")
+        assert mcp_server._frontier_read_pos_count(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT
+        ) is None, "precondition: this interval must genuinely carry no count"
+
+        mcp_server._frontier_load(
+            real_db, ["h0", "h1", "h2", "h3", "h4"], "2026-01-02T00:00:00Z"
+        )
+
+        assert mcp_server._completed_regions_read(real_db) == []
+
+    def test_the_discard_takes_the_pos_count_fact_with_it(self, real_db):
+        """A count left behind attaches to whatever interval the next
+        _frontier_persist_claim creates at this ident, licensing a comparison
+        against a span it was never measured from."""
+        import mcp_server
+        self._seed_high(real_db, "h1", "h2")
+
+        mcp_server._frontier_load(
+            real_db, ["h0", "h1", "h2", "h3", "h4"], "2026-01-02T00:00:00Z"
+        )
+
+        assert mcp_server._frontier_read_pos_count(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT
+        ) is None
+
     def test_two_discards_across_runs_coalesce_into_one_region(self, real_db):
         import mcp_server
         self._seed_high(real_db, "h3", "h4")
@@ -7882,9 +8079,19 @@ class TestCompletedRegionsLoad:
     against a linearization that has grown) and consumed as POSITIONS. This is
     the mapping step, plus the two ways a region leaves the set."""
 
-    def _record(self, db, lo, hi, tag=":provisional"):
+    def _record(self, db, lo, hi, tag=":provisional", order=None):
         import mcp_server
-        mcp_server._completed_region_record(db, lo, hi, tag, "2026-01-01T00:00:00Z")
+        # #326: a region must carry the :pos-count denominator it was archived
+        # with, or _completed_regions_load drops it as untrustworthy. The real
+        # caller (_frontier_load) passes the run's linearization map; these
+        # tests use the same "h<i> is at position i" shape the linearizations
+        # below do. Hashes outside it (e.g. "gone1") are deliberately left
+        # countless -- they are unmappable anyway.
+        if order is None:
+            order = {f"h{i}": i for i in range(10)}
+        mcp_server._completed_region_record(
+            db, lo, hi, tag, "2026-01-01T00:00:00Z", order=order
+        )
 
     def test_maps_hashes_to_positions(self, real_db):
         import mcp_server
@@ -7948,6 +8155,79 @@ class TestCompletedRegionsLoad:
         allocator = frontier_registry.FrontierAllocator(3, [])
         assert mcp_server._completed_regions_load(real_db, ["h0", "h1", "h2"], allocator) == []
 
+    def test_region_whose_position_span_changed_is_dropped_but_not_retracted(self, real_db):
+        """#326's soundness guard. A region is persisted as two HASHES but
+        consumed as a closed POSITION RANGE, so every position between the
+        bounds is treated as proven-complete. That holds only if the
+        linearization grew by APPENDING above the region.
+        `git log --topo-order --reverse` gives no such guarantee: it places a
+        new commit immediately after its branch point when the old tip's line
+        stalls behind it, which is what "branch off an old commit, merge master
+        in, fast-forward master" produces. Here h1..h3 spanned 3 positions when
+        it was archived; an interleaved "x" has stretched it to 4, so the proof
+        no longer covers what the bounds now enclose.
+
+        Dropped from the returned list, NOT retracted -- same precedent as an
+        unmappable region: the branch may straighten out on a later run.
+        """
+        import mcp_server
+        import frontier_registry
+        self._record(real_db, "h1", "h3")
+        allocator = frontier_registry.FrontierAllocator(5, [])
+
+        regions = mcp_server._completed_regions_load(
+            real_db, ["h0", "h1", "x", "h2", "h3"], allocator
+        )
+
+        assert regions == []
+        assert mcp_server._completed_regions_read(real_db) == [
+            ("h1", "h3", ":provisional")
+        ], "the facts must survive: the branch may straighten out later"
+
+    def test_pure_tip_growth_preserves_the_count_so_the_region_is_kept(self, real_db):
+        """The positive control for the guard above. Appending above a region
+        shifts NEITHER endpoint, so the count is preserved and there are no
+        false drops -- a guard that dropped everything would pass the test
+        above while making the whole fast path dead code."""
+        import mcp_server
+        import frontier_registry
+        self._record(real_db, "h1", "h3")
+        allocator = frontier_registry.FrontierAllocator(6, [])
+
+        regions = mcp_server._completed_regions_load(
+            real_db, ["h0", "h1", "h2", "h3", "h4", "h5"], allocator
+        )
+
+        assert regions == [
+            frontier_registry.Interval(1, 3, frontier_registry.TAG_PROVISIONAL)
+        ]
+
+    def test_region_with_no_stored_count_is_dropped(self, real_db):
+        """"No denominator" and "a denominator that still checks out" must not
+        be the same branch: an absent count cannot distinguish an append from
+        an insertion, and the fail-safe direction for a predicate whose failure
+        mode is permanent silent data loss is to re-walk. There are none in the
+        wild -- nothing released has ever written a :type/completed-region
+        fact -- so this is explicitness, not compatibility."""
+        import mcp_server
+        import frontier_registry
+        mcp_server._completed_region_record(
+            real_db, "h1", "h3", ":provisional", "2026-01-01T00:00:00Z"
+        )
+        assert mcp_server._completed_regions_read_full(real_db) == [
+            ("h1", "h3", ":provisional", None)
+        ], "precondition: this region must genuinely carry no count"
+        allocator = frontier_registry.FrontierAllocator(5, [])
+
+        regions = mcp_server._completed_regions_load(
+            real_db, ["h0", "h1", "h2", "h3", "h4"], allocator
+        )
+
+        assert regions == []
+        assert mcp_server._completed_regions_read(real_db) == [
+            ("h1", "h3", ":provisional")
+        ], "dropped from the list, not retracted"
+
 
 class TestSkipClaim:
     """#326: the predicate. It consults NEITHER the :commit/<hash> entity NOR
@@ -8005,6 +8285,30 @@ class TestSkipClaim:
 
 
 class TestFrontierPersistClaim:
+    def test_each_claim_keeps_the_pos_count_denominator_in_step(self, real_db):
+        """#326: the interval carries the span it was CLAIMED under, written in
+        the same transact as the bound that moved. It is what _frontier_load's
+        archiving branch compares against, and it can only be measured here --
+        by the time the interval is archived, the linearization it is being
+        compared to has already changed."""
+        import mcp_server
+        linearization = ["h0", "h1", "h2", "h3"]
+        ident = mcp_server._FRONTIER_HIGH_IDENT
+
+        mcp_server._frontier_persist_claim(real_db, linearization, 3, False, "2026-01-01T00:00:00Z")
+        assert mcp_server._frontier_read_pos_count(real_db, ident) == 1
+        mcp_server._frontier_persist_claim(real_db, linearization, 2, False, "2026-01-02T00:00:00Z")
+        assert mcp_server._frontier_read_pos_count(real_db, ident) == 2
+        mcp_server._frontier_persist_claim(real_db, linearization, 1, False, "2026-01-03T00:00:00Z")
+        assert mcp_server._frontier_read_pos_count(real_db, ident) == 3
+
+        # #156: a re-transact at a new valid-from creates a DUPLICATE live
+        # datom rather than overwriting. The count must move, never accumulate.
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find (count ?c) :where [{ident} :pos-count ?c]])"
+        )
+        assert json.loads(raw)["results"] == [[1]]
+
     def test_first_claim_from_low_creates_interval(self, real_db):
         import mcp_server
         db = real_db
@@ -8446,6 +8750,128 @@ class TestSkipFastPathEndToEnd:
             f"{uncovered} have no :commit/... entity in the graph -- the "
             "interrupted run declared complete what it never wrote, so the next "
             "run reads the gap as closed and those commits are lost silently"
+        )
+
+
+class TestSkipFastPathInterleavedCommitIsNotSkipped:
+    """#326: the archived region is stored as two HASHES but CONSUMED as a
+    closed position range, so every position between the bounds is treated as
+    proven-complete. That is sound only if the linearization is
+    append-at-the-top between runs, and topo-order does not guarantee it:
+    `git log --topo-order --reverse` places a new commit immediately after its
+    branch point whenever the old tip's line stalls behind it.
+
+    The canonical shape is built below -- branch off an old commit, merge the
+    mainline into it, fast-forward the mainline -- and it puts a brand-new
+    commit INSIDE the archived bounds. Without the stored :pos-count
+    denominator that commit is covered by a proof that was never about it, is
+    skipped, and is lost PERMANENTLY and SILENTLY: it reaches neither the graph
+    nor the index, so fact_audit's two witnesses agree, both :introduced-by
+    checks only examine entities that exist, stderr carries nothing, and the
+    run reports status complete.
+
+    Master was accidentally safe here only because the discard forced a full
+    re-walk; archiving the bounds is what turns a self-healing case into a
+    permanent one, so the guard belongs to this branch.
+    """
+
+    def _repo(self, tmp_path, n, start=0):
+        repo = tmp_path / "repo"
+        if not repo.exists():
+            repo.mkdir()
+            _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(start, start + n):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_a_commit_interleaved_inside_an_archived_region_is_still_ingested(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server
+        import frontier_registry
+
+        # Same 1:20 forward:reverse as the other end-to-end skip tests: at the
+        # 1:1 default the forward stream claims the archived positions before
+        # the reverse stream descends into them, so nothing is skipped and the
+        # test would pass vacuously.
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = self._repo(tmp_path, 10)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        first_high = mcp_server._frontier_read_bounds(
+            mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT
+        )
+        assert first_high is not None, (
+            "run 1 must leave a persisted frontier-high, or nothing is archived "
+            "and this test proves nothing"
+        )
+        original = frontier_registry.build_linearization(str(repo))
+        archived_span = (
+            original.index(first_high[1]) - original.index(first_high[0]) + 1
+        )
+
+        # The topology. `branch` is read rather than assumed: git's default
+        # initial branch name is configurable and differs across versions.
+        branch = _subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=repo,
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        base = original[1]  # inside the archived region's low bound
+        for cmd in (
+            ["git", "checkout", "-q", "-b", "upstream", base],
+        ):
+            _subprocess.run(cmd, cwd=repo, check=True, capture_output=True)
+        (repo / "other.py").write_text("def other():\n    return 99\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "-m", "u1"], cwd=repo, check=True, capture_output=True)
+        interleaved = _subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        for cmd in (
+            ["git", "merge", "--no-ff", "-q", "-m", "merge mainline", branch],
+            ["git", "checkout", "-q", branch],
+            ["git", "merge", "--ff-only", "-q", "upstream"],
+        ):
+            _subprocess.run(cmd, cwd=repo, check=True, capture_output=True)
+
+        grown = frontier_registry.build_linearization(str(repo))
+        lo_pos, hi_pos = grown.index(first_high[0]), grown.index(first_high[1])
+        assert grown.index(interleaved) < hi_pos, (
+            "the new commit did not land inside the archived region's position "
+            "range, so this test is not exercising the defect it exists for"
+        )
+        assert hi_pos - lo_pos + 1 != archived_span, (
+            "the archived region's position span is unchanged, so the stored "
+            "denominator could not discriminate anything here"
+        )
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        missing = []
+        for h in grown:
+            raw = mcp_server._db_execute(
+                mcp_server.get_db(),
+                f"(query [:find (count-distinct ?t) :where "
+                f"[:commit/{h[:12]} :entity-type ?t]])",
+            )
+            if json.loads(raw)["results"][0][0] == 0:
+                missing.append(h)
+
+        assert not missing, (
+            f"commits {[h[:12] for h in missing]} have no :commit/... entity "
+            f"(the interleaved commit is {interleaved[:12]}). The archived "
+            "region's HASH bounds still map into the linearization, but a new "
+            "commit landed between them, so consuming the region as a closed "
+            "position range skipped a position nothing ever proved complete -- "
+            "and every at-scale detector reads that graph clean"
         )
 
 
