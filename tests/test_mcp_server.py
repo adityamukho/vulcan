@@ -8290,6 +8290,14 @@ class TestSkipFastPathEndToEnd:
         mcp_server.open_db(str(repo / "memory.graph"))
 
         await mcp_server._run_ingestion(str(repo), "HEAD")
+        first_high = mcp_server._frontier_read_bounds(
+            mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT
+        )
+        assert first_high is not None, (
+            "run 1 must leave a persisted frontier-high, or there is no region to "
+            "archive and this test proves nothing"
+        )
+
         self._repo(tmp_path, 2, start=12)
         await mcp_server._run_ingestion(str(repo), "HEAD")
 
@@ -8306,6 +8314,49 @@ class TestSkipFastPathEndToEnd:
         assert hi_pos == len(grown) - 1, (
             "a completed run's high interval must reach the tip, or the next run "
             "discards it again and the skip bought nothing"
+        )
+
+        # The LOW bound of frontier-high is what the end-of-walk flush owns,
+        # and neither assertion above can see it. Run 2's reverse stream makes
+        # two genuine claims at the tip (13, then 12) BEFORE it descends into
+        # the archived region, and those two alone create a frontier-high whose
+        # hi is the tip -- so `hi_pos == len(grown) - 1` stays green with the
+        # flush removed, over an interval of merely [12, 13].
+        #
+        # The invariant that does discriminate it is COVERAGE: the two streams
+        # partition one gap, so on a completed run their two intervals must
+        # meet, leaving no position unclaimed. Measured on this scenario the
+        # archived region is [1, 11]; run 2's forward stream claims position 1
+        # (the authority upgrade -- _skip_claim never skips "fwd"), the reverse
+        # stream skips 2..11 and the flush persists frontier-high = [2, 13],
+        # against frontier-low = [0, 1]. They meet. Delete the flush and the
+        # reverse stream persists only its two real claims, [12, 13], while
+        # frontier-low still ends at 1 -- positions 2..11 are then claimed by
+        # NOBODY and the next run replays the very region this one skipped.
+        #
+        # Note this is deliberately NOT `lo_pos <= <archived region's low>`.
+        # That is unsatisfiable by correct behaviour: the bottom of the
+        # archived region goes to the forward stream, so frontier-high's low
+        # bound legitimately never reaches it.
+        low = mcp_server._frontier_read_bounds(
+            mcp_server.get_db(), mcp_server._FRONTIER_LOW_IDENT
+        )
+        assert low is not None, (
+            "the forward stream claimed positions too, so frontier-low must "
+            "exist -- without it there is no second bound to meet and the "
+            "coverage assertion below would prove nothing"
+        )
+        low_lo_pos, low_hi_pos = grown.index(low[0]), grown.index(low[1])
+        assert low_lo_pos == 0, (
+            f"frontier-low starts at position {low_lo_pos}, not 0; the coverage "
+            "check below assumes the forward stream covers everything beneath it"
+        )
+        assert low_hi_pos + 1 >= lo_pos, (
+            f"frontier-low ends at position {low_hi_pos} and frontier-high starts "
+            f"at {lo_pos}, so positions {low_hi_pos + 1}..{lo_pos - 1} are claimed "
+            "by neither stream -- the walk ended inside a run of skips and nothing "
+            "persisted them, so the next run replays the very region this one "
+            "skipped and the skip bought nothing"
         )
 
 
