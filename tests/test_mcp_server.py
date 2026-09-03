@@ -8087,6 +8087,101 @@ class TestFrontierPersistClaim:
         ]
 
 
+class TestFrontierPersistSpan:
+    """#326: _frontier_persist_claim cannot serve the skip flush. After a
+    discard the interval's facts are gone, so its `existing is None` branch
+    fires and writes lo == hi == moved_hash -- collapsing the interval to a
+    point and losing the top bound. _frontier_persist_span writes BOTH bounds
+    when the interval is absent and moves only the one bound when it is not."""
+
+    def test_absent_interval_gets_both_bounds(self, real_db):
+        import mcp_server
+        linearization = ["h0", "h1", "h2", "h3", "h4"]
+
+        mcp_server._frontier_persist_span(
+            real_db, linearization, 1, 4, from_low=False,
+            commit_ts_iso="2026-01-01T00:00:00Z",
+        )
+
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT
+        ) == ("h1", "h4")
+
+    def test_present_interval_moves_only_the_low_bound_when_growing_downward(self, real_db):
+        import mcp_server
+        linearization = ["h0", "h1", "h2", "h3", "h4"]
+        mcp_server._frontier_persist_claim(
+            real_db, linearization, 4, from_low=False, commit_ts_iso="2026-01-01T00:00:00Z"
+        )
+
+        mcp_server._frontier_persist_span(
+            real_db, linearization, 1, 4, from_low=False,
+            commit_ts_iso="2026-01-01T00:00:01Z",
+        )
+
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT
+        ) == ("h1", "h4")
+        raw = mcp_server._db_execute(
+            real_db,
+            f"(query [:find (count ?lo) :where [{mcp_server._FRONTIER_HIGH_IDENT} :lo-hash ?lo]])",
+        )
+        assert json.loads(raw)["results"] == [[1]], "the stale :lo-hash datom must be retracted"
+
+    def test_present_interval_moves_only_the_high_bound_when_growing_upward(self, real_db):
+        import mcp_server
+        linearization = ["h0", "h1", "h2", "h3", "h4"]
+        mcp_server._frontier_persist_claim(
+            real_db, linearization, 0, from_low=True, commit_ts_iso="2026-01-01T00:00:00Z"
+        )
+
+        mcp_server._frontier_persist_span(
+            real_db, linearization, 0, 3, from_low=True,
+            commit_ts_iso="2026-01-01T00:00:01Z",
+        )
+
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_LOW_IDENT
+        ) == ("h0", "h3")
+
+    def test_a_span_that_would_shrink_the_interval_is_a_no_op(self, real_db):
+        """The flush is bookkeeping catching up with the allocator; it must
+        never retreat a bound another write already advanced."""
+        import mcp_server
+        linearization = ["h0", "h1", "h2", "h3", "h4"]
+        mcp_server._frontier_persist_claim(
+            real_db, linearization, 4, from_low=False, commit_ts_iso="2026-01-01T00:00:00Z"
+        )
+        mcp_server._frontier_persist_claim(
+            real_db, linearization, 1, from_low=False, commit_ts_iso="2026-01-01T00:00:01Z"
+        )
+
+        mcp_server._frontier_persist_span(
+            real_db, linearization, 3, 4, from_low=False,
+            commit_ts_iso="2026-01-01T00:00:02Z",
+        )
+
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT
+        ) == ("h1", "h4")
+
+    def test_repeating_the_same_span_writes_nothing(self, real_db):
+        import mcp_server
+        linearization = ["h0", "h1", "h2", "h3", "h4"]
+        mcp_server._frontier_persist_span(
+            real_db, linearization, 1, 4, from_low=False, commit_ts_iso="2026-01-01T00:00:00Z"
+        )
+        mcp_server._frontier_persist_span(
+            real_db, linearization, 1, 4, from_low=False, commit_ts_iso="2026-01-01T00:00:01Z"
+        )
+
+        raw = mcp_server._db_execute(
+            real_db,
+            f"(query [:find (count ?lo) :where [{mcp_server._FRONTIER_HIGH_IDENT} :lo-hash ?lo]])",
+        )
+        assert json.loads(raw)["results"] == [[1]]
+
+
 class TestLineageProvisionalMarker:
     def test_unmarked_entity_reads_as_authoritative(self, real_db):
         import mcp_server

@@ -6424,6 +6424,64 @@ def _frontier_persist_claim(
     _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
 
 
+def _frontier_persist_span(
+    db: Any,
+    linearization: List[str],
+    lo_pos: int,
+    hi_pos: int,
+    from_low: bool,
+    commit_ts_iso: str,
+    index_con: Optional[Any] = None,
+) -> None:
+    """Persist a whole claimed SPAN in one write, for #326's end-of-walk flush.
+
+    _frontier_persist_claim cannot do this job. After a discard the interval's
+    facts are gone, so its `existing is None` branch writes lo == hi ==
+    moved_hash: the interval collapses to a point and the top bound is lost.
+
+    Advance-only in both directions -- the flush is bookkeeping catching up with
+    the allocator, and must never retreat a bound a real per-commit claim
+    already moved. A span that changes nothing writes nothing (#156: a
+    re-transact at a new valid-from is not a graph-level no-op).
+    """
+    ident = _FRONTIER_LOW_IDENT if from_low else _FRONTIER_HIGH_IDENT
+    tag = ":authoritative" if from_low else ":provisional"
+    lo_hash, hi_hash = linearization[lo_pos], linearization[hi_pos]
+    existing = _frontier_read_bounds(db, ident)
+
+    if existing is None:
+        _transact(
+            db,
+            "[" + " ".join([
+                f"[{ident} :entity-type :type/ingest-interval]",
+                f"[{ident} :tag {tag}]",
+                f'[{ident} :lo-hash "{_edn_escape(lo_hash)}"]',
+                f'[{ident} :hi-hash "{_edn_escape(hi_hash)}"]',
+            ]) + "]",
+            commit_ts_iso,
+            index_con=index_con,
+        )
+        return
+
+    pos_of = {h: i for i, h in enumerate(linearization)}
+    cur_lo, cur_hi = existing
+    new_lo = cur_lo if pos_of.get(cur_lo, lo_pos) <= lo_pos else lo_hash
+    new_hi = cur_hi if pos_of.get(cur_hi, hi_pos) >= hi_pos else hi_hash
+
+    to_retract: List[str] = []
+    to_transact: List[str] = []
+    if new_lo != cur_lo:
+        to_retract.append(f'[{ident} :lo-hash "{_edn_escape(cur_lo)}"]')
+        to_transact.append(f'[{ident} :lo-hash "{_edn_escape(new_lo)}"]')
+    if new_hi != cur_hi:
+        to_retract.append(f'[{ident} :hi-hash "{_edn_escape(cur_hi)}"]')
+        to_transact.append(f'[{ident} :hi-hash "{_edn_escape(new_hi)}"]')
+    if not to_transact:
+        return
+    _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+    _transact(db, "[" + " ".join(to_transact) + "]", commit_ts_iso, index_con=index_con)
+
+
 _LINEAGE_MARKER_ENTITY_TYPE = ":type/lineage-marker"
 
 
