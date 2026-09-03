@@ -12689,7 +12689,12 @@ _TOOLS: List[Tool] = [
             "likely to succeed now. error carries no stale field — it was derived "
             "by scraping a holder PID out of minigraf's lock-contention message, "
             "and minigraf 2.0.0 removed that PID from the text (#284) — but it "
-            "does include error_at, the timestamp the failure occurred."
+            "does include error_at, the timestamp the failure occurred. "
+            "positions_skipped_this_run counts positions retired without "
+            "parsing or writing them because an earlier run had already "
+            "written them completely (#326); it climbing while the commit "
+            "count stays flat means the run is replaying an already-ingested "
+            "region."
         ),
         inputSchema={"type": "object", "properties": {}, "required": []},
     ),

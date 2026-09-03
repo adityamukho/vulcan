@@ -469,6 +469,70 @@ times per commit, measured at 48% of write time and growing 3.47x within a
 220-commit run (#280). See `evals/at_scale/benchmark.md`, "Per-Commit Cost
 Attribution".
 
+**Re-walking an already-ingested position is now skipped, and the witness is
+the thing that decides whether that is safe (#326).** The obvious predicate is
+unsound: in `_reverse_apply` `[:commit/<hash> :entity-type :type/commit]` is the
+FIRST element of `all_triples`, written before any file result is looked at,
+while `_frontier_persist_claim` runs LAST. So the commit entity's presence is
+the WEAKEST available witness of a completed write — and it is present on
+exactly the torn positions #313 needs re-walked. A fast path keyed on it would
+make that orphaned lineage permanent.
+
+The witness is membership in a `:type/completed-region` fact set, archived by
+`_frontier_load` from the high interval it is about to discard. Because
+`_frontier_persist_claim` is the last write of a position, every position inside
+a persisted interval provably completed, and the archive inherits that. A torn
+position's claim never persisted, so it was never inside the interval that got
+archived: it is in no region and is never skipped, by construction rather than
+by care. Only a REPRESENTABLE interval is archived — the inverted case reaches
+the same branch and describes no completed region at all.
+
+`fwd` never skips, and one clause buys two properties. A forward claim inside a
+provisional region is the authority upgrade that must still happen; and
+`_forward_apply` mutates `_ForwardWalkState`'s ten cross-position preload dicts
+in place, so a skipped forward position would desynchronize that state for every
+later forward position, silently. `_reverse_apply` takes no state object and
+reads what it needs from the graph, which is why reverse carries no equivalent
+hazard.
+
+The region type is deliberately absent from `MINIGRAF_SCHEMA`, like
+`:type/ingest-interval` — `handle_minigraf_audit` iterates exactly the registered
+types and would otherwise retract its attributes — and every write goes through
+the internal `_transact`/`_retract`, since the public handler rejects an
+unregistered type outright. Regions carry a string-valued `:ident` because
+enumerating by `:entity-type` binds the entity in UUID space.
+
+**A skipped position still costs `processed`, and that is not sloppiness.**
+#317's `commit_census` reads `_ingest_progress["processed"]` as `walk_claimed`,
+and `walk_vs_graph` is gated ALWAYS. A skipped position increments it while its
+`:type/commit` entity is already in the graph, so the comparison balances — but
+only because the witness guarantees the graph holds that commit. **If the skip
+predicate were ever wrong, that existing gate goes red.** Excluding skips from
+`processed` would have thrown that away and turned a clean skip-heavy resume
+into a reported lost commit. The counter is `positions_skipped`, never
+`skipped`: `status` already takes the value `"skipped"` (run declined, another
+process owns the graph) and `commit_census` already reports `skipped_commits`
+(extraction failures).
+
+There is no `GRAPH_FORMAT_VERSION` bump — this only adds facts going forward.
+Existing graphs are not repaired and need no migration: a region is only
+knowable from an interval that exists at discard time, so there is nothing to
+seed. They simply never skip until their first discard, and because archiving
+happens in `_frontier_load` at LOAD time, the run that discards is the run that
+skips.
+
+`handle_minigraf_ingest_status`'s report carries `positions_skipped_this_run`
+alongside a bare `positions_skipped` that is always the same number today — the
+counter resets at the start of every run rather than being derived from a
+process-lifetime total the way `processed_this_run` is derived from
+`prior_ingested`, so there is no separate lifetime figure to look for under the
+unqualified name. The per-run figure is the one worth watching: #325's incident
+read as healthy for 98 minutes because `processed` climbs on a replayed
+position exactly as it does on a new one, and nothing distinguished the two. A
+run whose `positions_skipped_this_run` climbs alongside `processed_this_run`
+while the graph's own commit count stays flat is re-walking territory it
+already holds, not making progress.
+
 ## Claude Code Plugin Publishing
 
 The plugin is published via a stub architecture — `install.py` handles all registration automatically.
