@@ -19398,21 +19398,114 @@ class TestSkipFastPathDoesNotSkipTornWrites:
                 )
         return linearization
 
+    @staticmethod
+    def _repo_with_independent_commits(tmp_path, n):
+        """n commits, each touching its OWN file and function -- unlike
+        TestReverseFillResumeOnGrownLinearization._repo, which rewrites the same
+        function every commit so later positions keep moving its lineage guess
+        earlier. Independence means walking positions above 0 cannot touch
+        position 0's entity at all, so tearing position 0 afterward still
+        reproduces the classic #313 shape (live entity, ZERO :introduced-by)
+        rather than a guess that merely failed to move."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(n):
+            (repo / f"e{i}.py").write_text(f"def fn{i}():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
     def test_a_torn_position_is_in_no_archived_region(self, real_db, tmp_path, monkeypatch):
-        """The soundness argument, asserted rather than reasoned about: the torn
-        position's _frontier_persist_claim never ran, so it was never inside the
-        interval an archive could be taken from."""
+        """The soundness argument, demonstrated against a REAL archived region
+        rather than an always-empty one. Positions 3, 2, 1 are walked normally
+        (each completes and persists its claim, from the tip down -- the shape
+        _frontier_persist_claim's from_low=False produces), then archived as a
+        completed region exactly as _frontier_load does on a discard. Position
+        0 is torn instead of walked.
+
+        Two assertions, and the second is what makes the first mean something:
+        without it, `_skip_claim("rev", 0, regions) is False` would pass just
+        as well against an empty region list, which was this test's original
+        defect -- a torn position reading as "not skipped" for a reason that
+        has nothing to do with the tear. Asserting a genuinely-completed
+        position from the SAME region reads True proves the region is real and
+        non-empty, so the False above is about the boundary, not about an
+        empty list.
+        """
         import mcp_server
 
-        repo = TestReverseApplyTornWriteResume._repo_with_one_commit(tmp_path)
-        linearization = self._tear_position_zero(monkeypatch, real_db, repo)
+        n = 4
+        repo = self._repo_with_independent_commits(tmp_path, n)
+        linearization = frontier_registry.build_linearization(str(repo))
+        commit_metadata = mcp_server._git_commits(str(repo), watermark_hash=None)
+        fn0_ident = mcp_server._code_ident("function", "e0.py", "fn0")
 
+        for pos in range(n - 1, 0, -1):  # 3, 2, 1 -- upper positions, tip down
+            file_results, _g, _m, _r = mcp_server._extract_commit(str(repo), linearization[pos], ())
+            mcp_server._reverse_apply(
+                real_db, str(repo), linearization, commit_metadata, pos, file_results,
+            )
+
+        high_bounds_before_tear = mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT
+        )
+        assert high_bounds_before_tear == (linearization[1], linearization[3]), (
+            "positions 3, 2, 1 must have completed and persisted their claims, "
+            "or there is no genuine completed region to archive"
+        )
+
+        file_results_0, _g, _m, _r = mcp_server._extract_commit(str(repo), linearization[0], ())
+
+        def die(*_a, **_k):
+            raise _SimulatedKill()
+
+        with monkeypatch.context() as mp:
+            mp.setattr(mcp_server, "_entity_introduced_by_set_provisional_batch", die)
+            with pytest.raises(_SimulatedKill):
+                mcp_server._reverse_apply(
+                    real_db, str(repo), linearization, commit_metadata, 0, file_results_0,
+                )
+
+        # The tear is real, and it is the state the bug report describes --
+        # asserted before it is relied on, so a kill point that drifts away
+        # from #313's window fails here rather than silently making the rest
+        # of this test vacuous.
+        assert mcp_server._entity_ident_is_live(real_db, fn0_ident), (
+            f"{fn0_ident} must be live after the interrupted write -- if it is "
+            "not, the kill no longer lands after the structural transact and "
+            "this test has stopped reproducing #313"
+        )
+        assert mcp_server._entity_introduced_by_values_query(real_db, fn0_ident) == [], (
+            f"{fn0_ident} must hold no :introduced-by after the interrupted write"
+        )
         assert mcp_server._frontier_read_bounds(
             real_db, mcp_server._FRONTIER_HIGH_IDENT
-        ) is None, "the torn write must not have persisted a claim"
+        ) == high_bounds_before_tear, (
+            "the torn write must not have persisted a claim -- the archived "
+            "high bound must still stop at position 1, never reach position 0"
+        )
+
+        mcp_server._completed_region_record(
+            real_db, linearization[1], linearization[3], ":provisional",
+            "2026-01-01T00:00:00Z",
+            order={h: i for i, h in enumerate(linearization)},
+        )
         regions = mcp_server._completed_regions_load(
             real_db, linearization,
             frontier_registry.FrontierAllocator(len(linearization), []),
+        )
+        assert any(
+            iv.tag == frontier_registry.TAG_PROVISIONAL and iv.lo_pos == 1 and iv.hi_pos == 3
+            for iv in regions
+        ), f"expected an archived provisional region [1, 3]; got {regions}"
+
+        assert mcp_server._skip_claim("rev", 2, regions) is True, (
+            "position 2 genuinely completed inside the archived region and must "
+            "be skippable -- if this is False the region carries no weight and "
+            "the assertion below proves nothing about a boundary"
         )
         assert mcp_server._skip_claim("rev", 0, regions) is False, (
             "the torn position must be re-walked; skipping it makes #313's "
