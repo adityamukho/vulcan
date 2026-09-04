@@ -317,7 +317,8 @@ Poll the current git ingestion progress.
 ```python
 minigraf_ingest_status()
 # → {"ok": true, "status": "running", "processed": 21717, "processed_this_run": 2,
-#    "total": 47, "current_commit": "a3f2bc...", "error": null}
+#    "positions_skipped_this_run": 0, "total": 47, "current_commit": "a3f2bc...",
+#    "error": null}
 ```
 
 `status` is one of: `idle`, `starting`, `running`, `complete`, `error`, `stopped`, `skipped`.
@@ -346,6 +347,18 @@ is how many commits *this* run-attempt has ingested, useful for distinguishing
 fresh progress from work already persisted by earlier runs. When idle,
 `total_ingested` similarly reflects the true persisted count, not a
 potentially stale watermark.
+
+`positions_skipped_this_run` counts positions this run retired WITHOUT parsing
+or writing them, because they were already written completely by an earlier run
+(#326). It is the signal that distinguishes a run replaying an already-ingested
+region from one making progress: if it climbs alongside `processed_this_run`
+while the graph's commit count stays flat, the run is re-walking territory it
+already holds. Skipped positions are still counted in `processed`, since they
+are genuinely retired. The response also carries a bare `positions_skipped` —
+the same number, unqualified by run — but the counter itself is reset at the
+start of every run rather than accumulated across runs the way `processed` is,
+so the two keys are always equal today; there is no separate process-lifetime
+figure to look for under the unqualified name.
 
 ### Git-Ingested Data Schema
 
