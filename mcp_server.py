@@ -6402,6 +6402,14 @@ def _completed_region_record(
     count is recomputed against the current `order`; a region carried through
     unmerged keeps the stored count it was archived with.
 
+    A region whose stored count no longer matches its current span is dropped
+    from the MERGE (it can no longer manufacture coverage) but is NOT
+    retracted, matching _completed_regions_load, the design spec and #326
+    Finding D. Retracting it would destroy the witness permanently over a
+    branch that may straighten out later; leaving it costs one untrusted entity
+    and no skip, because both this function and the load path re-check the
+    denominator every time.
+
     Orderability is tested per REGION, not per hash: `order` may cover only
     some of the hashes in play (e.g. a caller passes the map for its own two
     endpoints but an unrelated archived region's hashes have since fallen out
@@ -6433,12 +6441,17 @@ def _completed_region_record(
     # to be ordered ahead of the coalescing or the merge re-introduces the hole
     # the load-time guard exists to close.
     same_tag: List[Tuple[str, str]] = []
+    stale_count_regions: List[Tuple[str, str]] = []
     for lo, hi, t, stored in current:
         if t != tag:
             continue
         live = count_of(lo, hi)
         if live is not None and live != stored:
-            continue  # positions shifted unevenly under it: not a proof any more
+            # Positions shifted unevenly under it: not a proof any more. Kept
+            # OUT OF THE MERGE, but kept in the graph -- see the passthrough
+            # below.
+            stale_count_regions.append((lo, hi))
+            continue
         same_tag.append((lo, hi))
 
     candidates = same_tag + [(lo_hash, hi_hash)]
@@ -6466,6 +6479,22 @@ def _completed_region_record(
         # Carried through untouched, so its stored denominator is carried too:
         # it describes the linearization the region was archived under, which
         # this call knows nothing about.
+        target.append((lo, hi, tag, stored_counts.get((lo, hi, tag))))
+    # #326 Finding D: a stale-denominator region is DROPPED FROM THE MERGE but
+    # KEPT IN THE GRAPH, which is what _completed_regions_load's docstring and
+    # the design spec both say happens to it. Falling out of `target` here
+    # would have sent it to the retract loop below instead -- destroying the
+    # witness for good over a branch that may yet straighten out. Note the
+    # ordering with the unmappable case: an endpoint missing from `order` is
+    # the STRONGER symptom of the same thing (the branch moved under us) and is
+    # already carried through, so treating the weaker symptom more harshly was
+    # incoherent as well as undocumented. A region whose bounds the freshly
+    # recorded region already occupies is skipped: that entry is in `target`
+    # with a count computed against the CURRENT order, which is the better one.
+    passthrough_bounds = {(lo, hi) for lo, hi, _t, _c in target}
+    for lo, hi in stale_count_regions:
+        if (lo, hi) in passthrough_bounds:
+            continue
         target.append((lo, hi, tag, stored_counts.get((lo, hi, tag))))
     target.extend(other_tag)
     target = sorted(target, key=lambda r: (r[0], r[1], r[2]))

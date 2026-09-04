@@ -7891,8 +7891,13 @@ class TestCompletedRegionRecord:
         region. Here [h1, h5] was archived when it spanned 5 positions; an
         insertion ("x" at position 2) has since stretched it to 6. Merging it
         with the freshly-proven [h5, h7] would yield [h1, h7] -- a region
-        asserting that "x" completed, which nothing ever proved. Guard first,
-        and only [h5, h7] survives.
+        asserting that "x" completed, which nothing ever proved.
+
+        #326 Finding D: dropped from the MERGE is not dropped from the GRAPH.
+        The stale region survives as its own entry -- see
+        test_a_stale_count_region_is_kept_not_retracted below -- and it is the
+        load-time denominator re-check, not a retract, that stops it being
+        believed.
         """
         import mcp_server
         old_order = {f"h{i}": i for i in range(10)}
@@ -7910,12 +7915,55 @@ class TestCompletedRegionRecord:
         )
 
         assert mcp_server._completed_regions_read(real_db) == [
-            ("h5", "h7", ":provisional")
+            ("h1", "h5", ":provisional"), ("h5", "h7", ":provisional")
         ], (
-            "the stale [h1, h5] region was merged instead of dropped, so the "
-            "surviving region now claims position 2 (an interleaved commit) "
-            "completed when nothing ever proved it"
+            "the stale [h1, h5] region was merged instead of being held out of "
+            "the merge, so the surviving region now claims position 2 (an "
+            "interleaved commit) completed when nothing ever proved it"
         )
+        assert not any(
+            lo == "h1" and hi == "h7"
+            for lo, hi, _t in mcp_server._completed_regions_read(real_db)
+        ), "the two regions coalesced across linearizations"
+
+    def test_a_stale_count_region_is_kept_not_retracted(self, real_db):
+        """#326 Finding D: _completed_region_record must KEEP a region whose
+        stored denominator no longer matches its span, not retract it.
+
+        _completed_regions_load's docstring and the design spec both say a
+        dropped-for-count region keeps its facts, for the same reason an
+        unmappable one does -- the branch may straighten out on a later run,
+        and retracting destroys the witness for good. The code used to let it
+        fall out of `target` and into the retract loop, which is the opposite.
+        The direction is fail-safe either way (it costs a re-walk, never a
+        skip), but the two paths must agree.
+        """
+        import mcp_server
+        mcp_server._completed_region_record(
+            real_db, "h1", "h5", ":provisional", "2026-01-01T00:00:00Z",
+            order={f"h{i}": i for i in range(10)},
+        )
+        # A disjoint region recorded under a linearization that stretched
+        # [h1, h5] from 5 positions to 6.
+        mcp_server._completed_region_record(
+            real_db, "h7", "h8", ":provisional", "2026-01-02T00:00:00Z",
+            order={"h0": 0, "h1": 1, "x": 2, "h2": 3, "h3": 4, "h4": 5,
+                   "h5": 6, "h6": 7, "h7": 8, "h8": 9},
+        )
+
+        assert ("h1", "h5", ":provisional", 5) in \
+            mcp_server._completed_regions_read_full(real_db), (
+                "the stale-denominator region was retracted; its witness is "
+                "now gone for good even if the branch straightens out"
+            )
+        # And it is still not believed: the load-time denominator re-check is
+        # what stops it, so the kept facts cost a re-walk and never a skip.
+        ident = mcp_server._completed_region_ident("h1", ":provisional")
+        for attr in (":lo-hash", ":hi-hash", ":pos-count"):
+            raw = mcp_server._db_execute(
+                real_db, f"(query [:find (count ?v) :where [{ident} {attr} ?v]])"
+            )
+            assert json.loads(raw)["results"] == [[1]], f"{attr} duplicated"
 
     def test_re_recording_a_region_under_a_grown_span_moves_only_its_count(self, real_db):
         """#156: a re-transact of the same (entity, attribute, value) at a new
@@ -8300,6 +8348,33 @@ class TestFrontierPersistClaim:
         mcp_server._frontier_persist_claim(real_db, linearization, 2, False, "2026-01-02T00:00:00Z")
         assert mcp_server._frontier_read_pos_count(real_db, ident) == 2
         mcp_server._frontier_persist_claim(real_db, linearization, 1, False, "2026-01-03T00:00:00Z")
+        assert mcp_server._frontier_read_pos_count(real_db, ident) == 3
+
+        # #156: a re-transact at a new valid-from creates a DUPLICATE live
+        # datom rather than overwriting. The count must move, never accumulate.
+        raw = mcp_server._db_execute(
+            real_db, f"(query [:find (count ?c) :where [{ident} :pos-count ?c]])"
+        )
+        assert json.loads(raw)["results"] == [[1]]
+
+    def test_each_low_claim_keeps_the_pos_count_denominator_in_step(self, real_db):
+        """#326 Finding E: the from_low path writes its count through the same
+        helper, so the #156 guard has to be asserted on it too. The code is
+        symmetric; a guard on only one direction is not.
+
+        frontier-low grows UPWARD -- _frontier_persist_claim moves :hi-hash for
+        from_low=True -- so the span is measured from a fixed :lo-hash, the
+        mirror image of the high interval's case above.
+        """
+        import mcp_server
+        linearization = ["h0", "h1", "h2", "h3"]
+        ident = mcp_server._FRONTIER_LOW_IDENT
+
+        mcp_server._frontier_persist_claim(real_db, linearization, 0, True, "2026-01-01T00:00:00Z")
+        assert mcp_server._frontier_read_pos_count(real_db, ident) == 1
+        mcp_server._frontier_persist_claim(real_db, linearization, 1, True, "2026-01-02T00:00:00Z")
+        assert mcp_server._frontier_read_pos_count(real_db, ident) == 2
+        mcp_server._frontier_persist_claim(real_db, linearization, 2, True, "2026-01-03T00:00:00Z")
         assert mcp_server._frontier_read_pos_count(real_db, ident) == 3
 
         # #156: a re-transact at a new valid-from creates a DUPLICATE live
