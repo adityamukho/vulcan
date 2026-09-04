@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 TAG_AUTHORITATIVE = "authoritative"
 TAG_PROVISIONAL = "provisional"
@@ -21,6 +21,22 @@ class Interval:
     lo_pos: int
     hi_pos: int
     tag: str
+    anchor_pos: Optional[int] = None
+    is_base: bool = False
+
+
+@dataclass
+class ClaimResult:
+    """What a claim did, for the persistence layer to mirror without
+    re-reading the persisted interval set once per commit.
+
+    `interval` is the post-coalesce interval the position now belongs to;
+    `absorbed` are the intervals that coalesce merged away, whose persisted
+    entities must be retracted in the same write.
+    """
+    pos: int
+    interval: "Interval"
+    absorbed: List["Interval"]
 
 
 def build_linearization(repo_path: str, branch: str = "HEAD") -> List[str]:
@@ -40,30 +56,51 @@ def build_linearization(repo_path: str, branch: str = "HEAD") -> List[str]:
 class FrontierAllocator:
     """In-memory shared-gap allocator over a fixed linearization.
 
-    Holds at most two intervals: one anchored at position 0
-    (tag=authoritative, grows upward via claim_low) and one anchored at the
-    last position (tag=provisional, grows downward via claim_high). They are
-    never merged into each other even once adjacent -- the boundary between
-    them is the lineage-authority frontier later phases read.
+    Positions accumulate into tagged intervals: authoritative grows upward
+    from claim_low(), provisional grows downward from claim_high(). Same-tag
+    intervals coalesce on touch/overlap, but authoritative and provisional
+    are never merged into each other even once adjacent -- the boundary
+    between them is the lineage-authority frontier later phases read. The
+    provisional side can hold more than one interval at once (a reload of a
+    persisted high interval that no longer reaches the tip, plus a fresh one
+    opened above it by new commits) -- see _adjacent_interval. The gap is
+    the complement of the interval set, not the space between two anchored
+    intervals; see _unclaimed.
     """
 
     def __init__(self, total_positions: int, intervals: Optional[List[Interval]] = None):
         self.total_positions = total_positions
         self._intervals: List[Interval] = list(intervals or [])
+        self.last_claim: Optional[ClaimResult] = None
+
+    def _unclaimed(self) -> List[Tuple[int, int]]:
+        """Maximal runs of unclaimed positions, ascending. The gap is the
+        COMPLEMENT of the interval set, not the space between two anchored
+        intervals -- a fragmented provisional side has more than one hole,
+        and the old 'interval covering position 0 / the last position'
+        definition hands out positions an interval already owns."""
+        holes: List[Tuple[int, int]] = []
+        cursor = 0
+        for iv in sorted(self._intervals, key=lambda i: i.lo_pos):
+            if iv.lo_pos > cursor:
+                holes.append((cursor, iv.lo_pos - 1))
+            cursor = max(cursor, iv.hi_pos + 1)
+        if cursor <= self.total_positions - 1:
+            holes.append((cursor, self.total_positions - 1))
+        return holes
 
     @property
     def gap_lo(self) -> int:
-        low = self._interval_covering(0)
-        return low.hi_pos + 1 if low else 0
+        holes = self._unclaimed()
+        return holes[0][0] if holes else self.total_positions
 
     @property
     def gap_hi(self) -> int:
-        last = self.total_positions - 1
-        high = self._interval_covering(last)
-        return high.lo_pos - 1 if high else last
+        holes = self._unclaimed()
+        return holes[-1][1] if holes else -1
 
     def is_gap_empty(self) -> bool:
-        return self.gap_lo > self.gap_hi
+        return not self._unclaimed()
 
     def intervals(self) -> List[Interval]:
         return list(self._intervals)
@@ -111,36 +148,58 @@ class FrontierAllocator:
                 return iv
         return None
 
-    def _coalesce(self, tag: str) -> None:
+    def _coalesce(self, tag: str) -> List[Interval]:
         """Merge same-tag intervals that overlap or touch, keeping intervals
-        disjoint and sorted.
+        disjoint and sorted. Returns the intervals that were merged AWAY, so
+        the persistence layer can retract their entities.
 
-        Growing toward a stale interval eventually makes the two meet; left
-        overlapping, _interval_covering's first-match lookup becomes
-        order-dependent and gap_lo/gap_hi stop describing a coherent gap.
+        Survivor rule: the base wins if either participant is base;
+        otherwise the LOWER one wins and keeps its anchor_pos. The base is
+        what persists at the fixed :ingestion/frontier-high ident, so it must
+        survive every merge it takes part in or that ident would have to be
+        re-pointed at a different entity.
+
         Only same-tag intervals merge -- the authoritative/provisional
         boundary is the lineage frontier later phases read, and must survive
         the two sides becoming adjacent.
         """
         same = sorted((iv for iv in self._intervals if iv.tag == tag), key=lambda iv: iv.lo_pos)
         merged: List[Interval] = []
+        absorbed: List[Interval] = []
         for iv in same:
             if merged and iv.lo_pos <= merged[-1].hi_pos + 1:
                 prev = merged[-1]
-                merged[-1] = Interval(prev.lo_pos, max(prev.hi_pos, iv.hi_pos), tag)
+                keeper, loser = (prev, iv) if (prev.is_base or not iv.is_base) else (iv, prev)
+                absorbed.append(loser)
+                merged[-1] = Interval(
+                    prev.lo_pos, max(prev.hi_pos, iv.hi_pos), tag,
+                    keeper.anchor_pos, prev.is_base or iv.is_base,
+                )
             else:
                 merged.append(iv)
         others = [iv for iv in self._intervals if iv.tag != tag]
         self._intervals = sorted(others + merged, key=lambda iv: iv.lo_pos)
+        return absorbed
 
     def _extend(self, pos: int, tag: str, from_low: bool) -> None:
         target = self._adjacent_interval(pos, tag, from_low)
         if target is not None:
             idx = next(i for i, iv in enumerate(self._intervals) if iv is target)
             if from_low:
-                self._intervals[idx] = Interval(target.lo_pos, pos, tag)
+                grown = Interval(target.lo_pos, pos, tag, target.anchor_pos, target.is_base)
             else:
-                self._intervals[idx] = Interval(pos, target.hi_pos, tag)
+                grown = Interval(pos, target.hi_pos, tag, target.anchor_pos, target.is_base)
+            self._intervals[idx] = grown
         else:
-            self._intervals.append(Interval(pos, pos, tag))
-        self._coalesce(tag)
+            # A brand-new interval. It is the base only if no same-tag
+            # interval exists yet -- claim_high() serves the topmost hole, so
+            # every later provisional interval is created ABOVE the base.
+            is_base = not any(iv.tag == tag for iv in self._intervals)
+            grown = Interval(pos, pos, tag, anchor_pos=pos, is_base=is_base)
+            self._intervals.append(grown)
+        absorbed = self._coalesce(tag)
+        surviving = next(
+            iv for iv in self._intervals
+            if iv.tag == tag and iv.lo_pos <= pos <= iv.hi_pos
+        )
+        self.last_claim = ClaimResult(pos=pos, interval=surviving, absorbed=absorbed)

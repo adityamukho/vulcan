@@ -134,13 +134,21 @@ class TestFrontierAllocatorClaiming:
         assert allocator.claim_low() == 0
         assert allocator.claim_low() == 1
         assert allocator.claim_low() == 2
-        assert allocator.intervals() == [Interval(0, 2, TAG_AUTHORITATIVE)]
+        # A brand-new interval is the base for its tag (#325: is_base marks
+        # the first same-tag interval, anchor_pos the position it was
+        # created at) -- so the grown interval carries real identity, not
+        # the dataclass defaults.
+        assert allocator.intervals() == [
+            Interval(0, 2, TAG_AUTHORITATIVE, anchor_pos=0, is_base=True)
+        ]
 
     def test_claim_high_grows_provisional_interval_downward(self):
         allocator = FrontierAllocator(10)
         assert allocator.claim_high() == 9
         assert allocator.claim_high() == 8
-        assert allocator.intervals() == [Interval(8, 9, TAG_PROVISIONAL)]
+        assert allocator.intervals() == [
+            Interval(8, 9, TAG_PROVISIONAL, anchor_pos=9, is_base=True)
+        ]
 
     def test_streams_converge_and_stay_separate_by_tag(self):
         allocator = FrontierAllocator(4)
@@ -150,8 +158,8 @@ class TestFrontierAllocatorClaiming:
         assert allocator.claim_high() == 2
         assert allocator.is_gap_empty()
         assert sorted(allocator.intervals(), key=lambda iv: iv.lo_pos) == [
-            Interval(0, 1, TAG_AUTHORITATIVE),
-            Interval(2, 3, TAG_PROVISIONAL),
+            Interval(0, 1, TAG_AUTHORITATIVE, anchor_pos=0, is_base=True),
+            Interval(2, 3, TAG_PROVISIONAL, anchor_pos=3, is_base=True),
         ]
 
     def test_seeded_authoritative_interval_extends_correctly(self):
@@ -204,3 +212,72 @@ class TestFrontierAllocatorGrownLinearization:
             assert a.hi_pos < b.lo_pos or b.hi_pos < a.lo_pos, (
                 f"intervals must stay disjoint, got {ivs}"
             )
+
+
+class TestFragmentedProvisionalSet:
+    """#325: after tip growth the provisional side holds two disjoint
+    intervals with a hole above the lower one. The old gap_lo/gap_hi, defined
+    off 'the interval covering position 0 / the last position', hand out a
+    position an interval already owns."""
+
+    def _alloc(self):
+        # 20 positions. Authoritative [0,3]; provisional base [4,11].
+        # Positions 12..19 are the "new tip" hole.
+        return frontier_registry.FrontierAllocator(20, [
+            frontier_registry.Interval(0, 3, frontier_registry.TAG_AUTHORITATIVE,
+                                       anchor_pos=0, is_base=True),
+            frontier_registry.Interval(4, 11, frontier_registry.TAG_PROVISIONAL,
+                                       anchor_pos=11, is_base=True),
+        ])
+
+    def test_gap_lo_does_not_return_a_claimed_position(self):
+        a = self._alloc()
+        assert a.gap_lo == 12
+
+    def test_gap_hi_is_the_topmost_unclaimed_position(self):
+        a = self._alloc()
+        assert a.gap_hi == 19
+
+    def test_claim_high_serves_the_topmost_gap_first(self):
+        a = self._alloc()
+        assert [a.claim_high() for _ in range(3)] == [19, 18, 17]
+
+    def test_claim_high_falls_through_to_the_bulk_gap_when_the_tip_closes(self):
+        # A real bulk gap below the base: authoritative [0,1], base [8,11],
+        # so positions 2..7 are unclaimed underneath and 12..19 above.
+        b = frontier_registry.FrontierAllocator(20, [
+            frontier_registry.Interval(0, 1, frontier_registry.TAG_AUTHORITATIVE,
+                                       anchor_pos=0, is_base=True),
+            frontier_registry.Interval(8, 11, frontier_registry.TAG_PROVISIONAL,
+                                       anchor_pos=11, is_base=True),
+        ])
+        for _ in range(8):           # 19..12, closing the tip hole
+            b.claim_high()
+        assert b.claim_high() == 7, (
+            "once the tip hole merges into the base, the topmost unclaimed "
+            "position is the bulk gap's top"
+        )
+
+    def test_merge_keeps_the_base_and_reports_the_absorbed_interval(self):
+        a = self._alloc()
+        for _ in range(7):           # 19..13
+            a.claim_high()
+        result_before = a.last_claim
+        assert result_before.absorbed == []
+        assert a.claim_high() == 12  # this claim makes [12,19] touch [4,11]
+        merged = a.last_claim
+        assert merged.interval.lo_pos == 4 and merged.interval.hi_pos == 19
+        assert merged.interval.is_base is True
+        assert merged.interval.anchor_pos == 11
+        assert [iv.anchor_pos for iv in merged.absorbed] == [19]
+
+    def test_claim_low_still_ascends_across_a_fragmented_high_side(self):
+        a = self._alloc()
+        assert [a.claim_low() for _ in range(3)] == [12, 13, 14]
+
+    def test_is_gap_empty_requires_every_hole_closed(self):
+        a = self._alloc()
+        assert a.is_gap_empty() is False
+        for _ in range(8):
+            a.claim_high()
+        assert a.is_gap_empty() is True
