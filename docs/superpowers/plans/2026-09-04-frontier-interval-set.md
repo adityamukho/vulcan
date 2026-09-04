@@ -606,6 +606,22 @@ Expected: FAIL with `TypeError: _frontier_persist_claim() got an unexpected keyw
 
 In `_frontier_persist_claim`, replace the ident line and add the creation/absorb handling:
 
+> **CORRECTION (ruled during execution).** An earlier draft of this step
+> stopped at the retract loop below and left the survivor's bound moving by
+> one position, as an ordinary claim does. That is WRONG for a merging claim
+> and shipped once before the review caught it: with base `[h4,h11]`
+> absorbing upper `[h12,h19]` on a claim at 12, `from_low=False` moves
+> `:lo-hash` to `h12` and persists `('h12','h11')` with `:pos-count -1` — an
+> inverted pair with a negative denominator, and the absorbed span described
+> by nobody. The other geometry fails too: `[100,120]` absorbing `[50,98]`
+> via a claim at 99 yields `[99,120]` and loses `[50,98]`. It is not commit
+> loss, because `_frontier_load`'s `lo <= hi` guard refuses to archive an
+> inverted pair — but that guard then discards frontier-high and throws away
+> the completion witness #326's archiving exists to preserve, and Task 5
+> cannot merge through this API at all. **On a merging claim the survivor
+> takes the UNION of its own bounds, every absorbed interval's bounds, and
+> the claimed position**, with `:pos-count` computed over the merged bounds.
+
 ```python
     if ident is None:
         ident = _FRONTIER_LOW_IDENT if from_low else _FRONTIER_HIGH_IDENT
@@ -615,6 +631,12 @@ In `_frontier_persist_claim`, replace the ident line and add the creation/absorb
     # between the two then leaves a DUPLICATE description of a region, which
     # the next _frontier_load re-walks; the other order leaves a HOLE, which
     # is silent permanent loss.
+    #
+    # Collect their bounds on the way past: the survivor must end up
+    # describing the UNION, or the absorbed span is retracted and described
+    # by nobody. The tag reuse below is sound only because
+    # frontier_registry.FrontierAllocator._coalesce(tag) filters on
+    # `iv.tag == tag`, so a merge can only ever absorb SAME-TAG intervals.
     for absorbed in absorbed_idents or []:
         absorbed_bounds = _frontier_read_bounds(db, absorbed)
         if absorbed_bounds is not None:
@@ -623,6 +645,11 @@ In `_frontier_persist_claim`, replace the ident line and add the creation/absorb
                 pos_count=_frontier_read_pos_count(db, absorbed), tag=tag,
             )
 ```
+
+The survivor's write then spans the union rather than moving one bound, and
+`_frontier_span_count` is computed over the merged bounds. Guard it: assert
+the survivor's bounds AFTER a merge, not only that the absorbed entity is
+gone — asserting the retract alone is why the inverted pair shipped green.
 
 and in the `existing is None` branch, add the `:ident` fact for a minted ident:
 
