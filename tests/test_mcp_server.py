@@ -7965,6 +7965,71 @@ class TestCompletedRegionRecord:
             )
             assert json.loads(raw)["results"] == [[1]], f"{attr} duplicated"
 
+    def test_stale_region_sharing_a_low_hash_with_the_target_does_not_collide(
+        self, real_db
+    ):
+        """#326 collision fix: _completed_region_ident is keyed on (lo_hash,
+        tag) ONLY, so a stale region and a freshly-recorded region that share
+        a low hash but differ in `hi` render onto the SAME entity even though
+        their BOUNDS differ. The two existing stale-region tests above
+        (test_a_stale_count_region_is_dropped_BEFORE_the_merge_not_after and
+        test_a_stale_count_region_is_kept_not_retracted) both use disjoint low
+        hashes, so neither reaches this: their stale and fresh regions land on
+        different idents regardless of how the passthrough dedups.
+
+        Archive [h1, h5] (5 positions). Then, under an order that both makes
+        [h1, h5] stale (an insertion stretches it to 6 positions) AND records
+        a fresh [h1, h9] region -- same low hash, different high hash -- a
+        bounds-keyed passthrough (`(lo, hi) in passthrough_bounds`) fails to
+        recognize [h1, h5] as already covered by [h1, h9]'s ident, so BOTH
+        get appended to `target` and the write loop transacts both fact sets
+        onto :ingestion/completed-region-provisional-h1. The entity ends up
+        with two :hi-hash values (h5 and h9) and two :pos-count values (5 and
+        10) -- the collision this test pins to exactly one of each.
+        """
+        import mcp_server
+        old_order = {f"h{i}": i for i in range(10)}
+        mcp_server._completed_region_record(
+            real_db, "h1", "h5", ":provisional", "2026-01-01T00:00:00Z", order=old_order
+        )
+        assert mcp_server._completed_regions_read_full(real_db) == [
+            ("h1", "h5", ":provisional", 5)
+        ], "precondition: the region must carry the count it was archived with"
+
+        # "x" inserted inside [h1, h5] makes its stored count (5) stale (the
+        # live span is now 6), while this same call also records a fresh
+        # region starting at the SAME low hash "h1" but ending at "h9".
+        new_order = {
+            "h0": 0, "h1": 1, "x": 2, "h2": 3, "h3": 4, "h4": 5,
+            "h5": 6, "h6": 7, "h7": 8, "h8": 9, "h9": 10,
+        }
+        mcp_server._completed_region_record(
+            real_db, "h1", "h9", ":provisional", "2026-01-02T00:00:00Z", order=new_order
+        )
+
+        ident = mcp_server._completed_region_ident("h1", ":provisional")
+
+        def raw_count(attr: str) -> int:
+            raw = mcp_server._db_execute(
+                real_db, f"(query [:find (count ?v) :where [{ident} {attr} ?v]])"
+            )
+            return json.loads(raw)["results"][0][0]
+
+        assert raw_count(":ident") == 1, "duplicate :ident -- the collision reproduced"
+        assert raw_count(":hi-hash") == 1, "duplicate :hi-hash -- the collision reproduced"
+        assert raw_count(":pos-count") == 1, "duplicate :pos-count -- the collision reproduced"
+        assert raw_count(":lo-hash") == 1, "duplicate :lo-hash -- the collision reproduced"
+
+        # And the surviving entry is the fresh one, not a clobbered mix.
+        raw_hi = mcp_server._db_execute(
+            real_db, f"(query [:find ?v :where [{ident} :hi-hash ?v]])"
+        )
+        assert json.loads(raw_hi)["results"] == [["h9"]]
+        raw_count_v = mcp_server._db_execute(
+            real_db, f"(query [:find ?v :where [{ident} :pos-count ?v]])"
+        )
+        assert json.loads(raw_count_v)["results"] == [[10]]
+
     def test_re_recording_a_region_under_a_grown_span_moves_only_its_count(self, real_db):
         """#156: a re-transact of the same (entity, attribute, value) at a new
         valid-from creates a DUPLICATE live datom rather than being a no-op.

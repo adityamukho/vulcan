@@ -6488,12 +6488,31 @@ def _completed_region_record(
     # ordering with the unmappable case: an endpoint missing from `order` is
     # the STRONGER symptom of the same thing (the branch moved under us) and is
     # already carried through, so treating the weaker symptom more harshly was
-    # incoherent as well as undocumented. A region whose bounds the freshly
-    # recorded region already occupies is skipped: that entry is in `target`
-    # with a count computed against the CURRENT order, which is the better one.
-    passthrough_bounds = {(lo, hi) for lo, hi, _t, _c in target}
+    # incoherent as well as undocumented. A region already represented in
+    # `target` is skipped: that entry has a count computed against the CURRENT
+    # order, which is the better one.
+    #
+    # #326 Finding (post-214d8fc): dedup on the IDENT, not the (lo, hi) BOUNDS.
+    # _completed_region_ident is keyed on (lo_hash, tag) ONLY -- two regions
+    # sharing a low hash but differing in `hi` render onto the SAME entity
+    # regardless of their bounds. A bounds-keyed passthrough check lets a
+    # stale [A, T1] slip past a fresh [A, T2] (same lo, different hi) and both
+    # get appended to `target`, so the write loop below transacts both fact
+    # sets onto one ident -- the entity ends up with two :hi-hash values and
+    # two :pos-count values, and the count read back is whichever one
+    # last-write-wins picks, nondeterministically across runs.
+    #
+    # Dropping the stale region here in that case is safe and is NOT the
+    # witness-destroying drop Finding D guards against: the ident survives in
+    # `target` via the other (surviving) entry, and the write loop below
+    # retracts the stale entry's old facts and re-transacts the surviving
+    # entry's in the same call -- retract-then-transact, exactly what the
+    # pre-#326 code did for a single region at one ident. What would destroy
+    # the witness is dropping an ident out of `target` ENTIRELY, which this
+    # does not do.
+    passthrough_idents = {_completed_region_ident(lo, tag) for lo, _hi, _t, _c in target}
     for lo, hi in stale_count_regions:
-        if (lo, hi) in passthrough_bounds:
+        if _completed_region_ident(lo, tag) in passthrough_idents:
             continue
         target.append((lo, hi, tag, stored_counts.get((lo, hi, tag))))
     target.extend(other_tag)
@@ -12204,6 +12223,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # strictly the weaker case). The forward stream is untouched --
                 # it claims frontier-low and its failure semantics are out of
                 # scope for #326.
+                #
                 rev_claim_floor_pos: Optional[int] = None
 
                 def _note_incomplete_rev(claim_tag: str, claim_pos: int) -> None:
