@@ -8748,6 +8748,13 @@ class TestFrontierPersistClaimTargetsAnInterval:
             real_db, mcp_server._FRONTIER_HIGH_IDENT) is None, (
             "the fixed high ident must be untouched when a claim names another"
         )
+        # #325 review Finding 2: the bounds/count assertions above pass even
+        # if the minted ident never got its own :ident fact -- they read by
+        # fixed ident, not through the enumeration join. Without the write,
+        # _intervals_read_extra's `[?e :ident ?ident]` clause can never bind
+        # this entity at all, so it stays permanently invisible to
+        # enumeration and to _frontier_discard_interval's retract set.
+        assert mcp_server._intervals_read_extra(real_db) == [(ident, "h8", "h9", 2)]
 
     def test_absorbed_idents_are_retracted_by_the_merging_claim(self, real_db):
         import mcp_server
@@ -8759,13 +8766,67 @@ class TestFrontierPersistClaimTargetsAnInterval:
         for p, t in ((5, "02"), (4, "03")):
             mcp_server._frontier_persist_claim(
                 real_db, lin, p, False, f"2026-09-04T00:00:{t}Z")
-        # the claim at 6 makes [6,?] touch nothing yet; the claim at 7 merges.
+        # Positive control (#325 review Finding 2): confirm "upper" is
+        # genuinely enumerable BEFORE the merge. Without this, an entity that
+        # was NEVER made enumerable (a missing :ident write) would also leave
+        # the post-merge `== []` assertion below vacuously true.
+        assert mcp_server._intervals_read_extra(real_db) == [(upper, "h8", "h9", 2)]
+
+        # The claim at 7 merges the default-ident interval [h4,h5] with
+        # "upper" [h8,h9]; nothing claims position 6 explicitly.
         mcp_server._frontier_persist_claim(
             real_db, lin, 7, False, "2026-09-04T00:00:04Z",
             ident=mcp_server._FRONTIER_HIGH_IDENT, absorbed_idents=[upper],
         )
         assert mcp_server._intervals_read_extra(real_db) == [], (
             "the absorbed entity's facts must be gone, not merely unreferenced"
+        )
+        # #325 review Finding 1: the survivor must describe the UNION of its
+        # own span [h4,h5], the absorbed span [h8,h9], and the claimed
+        # position h7 -- [h4,h9], count 6 -- not just the one bound a
+        # non-merging claim would have moved.
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) == ("h4", "h9")
+        assert mcp_server._frontier_read_pos_count(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) == 6
+
+    def test_absorb_retracts_before_the_survivor_transacts(self, real_db):
+        """#325 review Finding 3: the crash-safety property this API exists
+        for is about EMITTED ORDER, not end state -- retract-then-extend
+        leaves a re-walkable duplicate if a crash lands between them;
+        extend-then-retract would leave a silent hole. Assert the order
+        directly with execute_spy rather than only checking end state."""
+        import mcp_server
+        lin = [f"h{i}" for i in range(10)]
+        upper = mcp_server._interval_ident("h9")
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 9, False, "2026-09-04T00:00:00Z", ident=upper)
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 8, False, "2026-09-04T00:00:01Z", ident=upper)
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 5, False, "2026-09-04T00:00:02Z")
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 4, False, "2026-09-04T00:00:03Z")
+
+        with execute_spy() as calls:
+            mcp_server._frontier_persist_claim(
+                real_db, lin, 7, False, "2026-09-04T00:00:04Z",
+                ident=mcp_server._FRONTIER_HIGH_IDENT, absorbed_idents=[upper],
+            )
+
+        retract_of_absorbed = [
+            i for i, c in enumerate(calls)
+            if c.startswith("(retract") and upper in c
+        ]
+        transact_of_survivor = [
+            i for i, c in enumerate(calls)
+            if c.startswith("(transact") and mcp_server._FRONTIER_HIGH_IDENT in c
+        ]
+        assert retract_of_absorbed, "expected a (retract ...) call naming the absorbed ident"
+        assert transact_of_survivor, "expected a (transact ...) call naming the survivor ident"
+        assert max(retract_of_absorbed) < min(transact_of_survivor), (
+            "the absorbed entity's retract must be emitted before the "
+            "survivor's extending transact"
         )
 
     def test_span_flush_targets_a_named_ident(self, real_db):
@@ -8776,6 +8837,10 @@ class TestFrontierPersistClaimTargetsAnInterval:
             real_db, lin, 6, 9, False, "2026-09-04T00:00:00Z", ident=ident)
         assert mcp_server._frontier_read_bounds(real_db, ident) == ("h6", "h9")
         assert mcp_server._frontier_read_pos_count(real_db, ident) == 4
+        # #325 review Finding 2: same rationale as the claim-path test above
+        # -- prove the minted interval is actually enumerable, not just
+        # readable by its own fixed ident.
+        assert mcp_server._intervals_read_extra(real_db) == [(ident, "h6", "h9", 4)]
 
 
 class TestSkipFastPathEndToEnd:

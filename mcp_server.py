@@ -6798,21 +6798,53 @@ def _frontier_persist_claim(
     interval named by `ident` and one or more others have just become
     contiguous, and the others stop existing as their own entities. They are
     retracted BEFORE `ident`'s bound is extended: a crash between the two
-    then leaves a DUPLICATE description of the merged region (both entities
-    still describe their own span, so the next _frontier_load re-walks the
-    overlap and nothing is lost), where extending first would leave a WINDOW
-    in which `ident` already claims the full merged span but the absorbed
-    entity's now-redundant facts are still live -- and a crash there is
-    invisible right up until _frontier_discard_interval never runs, silently
-    leaking a phantom entity into _intervals_read_extra forever.
+    then leaves a DUPLICATE description of the merged region (both the
+    survivor's old, narrower bounds and the absorbed entity's own facts are
+    still live and each still faithfully describes its own span, so the next
+    _frontier_load re-walks the overlap and nothing is lost), where extending
+    first would leave a WINDOW in which `ident` already claims the full
+    merged span but the absorbed entity's now-redundant facts are still live
+    -- and a crash there is invisible right up until _frontier_discard_interval
+    never runs, silently leaking a phantom entity into _intervals_read_extra
+    forever.
+
+    #325 review Finding 1: a merging claim's survivor takes the UNION of its
+    own existing bounds, every absorbed interval's bounds, and the claimed
+    position -- never just the one bound the non-merging branch below moves.
+    An earlier version of this function moved only that one bound on a merge
+    too, which retracted the absorbed entity's facts while its span ended up
+    described by NOBODY: measured producing an inverted survivor with a
+    NEGATIVE :pos-count (`('h7','h5')`, count -1) from claims that had built
+    `('h4','h5')` and `('h8','h9')` before the merge. `_frontier_load`'s
+    `lo <= hi` guard happens to catch that specific shape today by discarding
+    frontier-high outright -- but that throws away the completion witness for
+    the WHOLE interval, which is exactly the loss #326's archiving exists to
+    prevent, and an absorbed interval BELOW the survivor is not caught at all
+    ([100,120] absorbing [50,98] via a claim at 99 would silently produce
+    [99,120], losing the proven [50,98] region with no inversion to trip the
+    guard).
+
+    `_coalesce`'s same-tag filter (frontier_registry.py) is what makes
+    passing the survivor's own `tag` to every absorbed entity's discard
+    correct -- a merge can only ever absorb an interval carrying the SAME tag
+    as the survivor. If that invariant is ever relaxed, a mismatched `:tag`
+    literal here matches nothing on retract, leaving a live `:tag` fact on an
+    entity whose `:entity-type` and `:ident` are already gone -- silently,
+    since `_intervals_read_extra` can never surface it again to notice.
     """
     if ident is None:
         ident = _FRONTIER_LOW_IDENT if from_low else _FRONTIER_HIGH_IDENT
     tag = ":authoritative" if from_low else ":provisional"
 
+    absorbed_bounds_list: List[Tuple[str, str]] = []
     for absorbed in absorbed_idents or []:
         absorbed_bounds = _frontier_read_bounds(db, absorbed)
+        # An absorbed ident can name an interval that was minted and merged
+        # away again within the same run before its first claim ever
+        # persisted -- there is nothing on disk to retract or fold into the
+        # union below, so it is skipped rather than treated as an error.
         if absorbed_bounds is not None:
+            absorbed_bounds_list.append(absorbed_bounds)
             _frontier_discard_interval(
                 db, absorbed, absorbed_bounds, index_con=index_con,
                 pos_count=_frontier_read_pos_count(db, absorbed), tag=tag,
@@ -6823,7 +6855,35 @@ def _frontier_persist_claim(
 
     to_retract: List[str] = []
     to_transact: List[str] = []
-    if existing is None:
+    if absorbed_bounds_list:
+        # #325: the merged span is the union of the claimed position, the
+        # survivor's own current bounds (if it already existed), and every
+        # absorbed interval's bounds -- see the docstring's Finding 1 note
+        # for what moving only one bound produced instead.
+        candidate_hashes = [moved_hash]
+        if existing is not None:
+            candidate_hashes.extend(existing)
+        for absorbed_lo, absorbed_hi in absorbed_bounds_list:
+            candidate_hashes.extend((absorbed_lo, absorbed_hi))
+        positions = [linearization.index(h) for h in candidate_hashes]
+        new_lo_hash = linearization[min(positions)]
+        new_hi_hash = linearization[max(positions)]
+
+        if existing is None:
+            to_transact.append(f"[{ident} :entity-type :type/ingest-interval]")
+            to_transact.append(f"[{ident} :tag {tag}]")
+        else:
+            lo_hash, hi_hash = existing
+            if lo_hash != new_lo_hash:
+                to_retract.append(f'[{ident} :lo-hash "{_edn_escape(lo_hash)}"]')
+            if hi_hash != new_hi_hash:
+                to_retract.append(f'[{ident} :hi-hash "{_edn_escape(hi_hash)}"]')
+        to_transact.append(f'[{ident} :lo-hash "{_edn_escape(new_lo_hash)}"]')
+        to_transact.append(f'[{ident} :hi-hash "{_edn_escape(new_hi_hash)}"]')
+        if existing is None and ident.startswith(_INTERVAL_PROVISIONAL_IDENT_PREFIX):
+            to_transact.append(f'[{ident} :ident "{_edn_escape(ident)}"]')
+        new_count: Optional[int] = _frontier_span_count(linearization, new_lo_hash, new_hi_hash)
+    elif existing is None:
         to_transact.append(f"[{ident} :entity-type :type/ingest-interval]")
         to_transact.append(f"[{ident} :tag {tag}]")
         to_transact.append(f'[{ident} :lo-hash "{_edn_escape(moved_hash)}"]')
@@ -6836,7 +6896,7 @@ def _frontier_persist_claim(
         # contract.
         if ident.startswith(_INTERVAL_PROVISIONAL_IDENT_PREFIX):
             to_transact.append(f'[{ident} :ident "{_edn_escape(ident)}"]')
-        new_count: Optional[int] = 1
+        new_count = 1
     else:
         lo_hash, hi_hash = existing
         if from_low:
