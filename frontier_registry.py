@@ -23,6 +23,19 @@ class Interval:
     tag: str
     anchor_pos: Optional[int] = None
     is_base: bool = False
+    # #325 review round 3 (Finding 3): the caller's persisted-entity identity
+    # for this interval, opaque to the allocator (it never reads or computes
+    # one, only carries it through _extend/_coalesce the same way it already
+    # carries anchor_pos). Set by the caller on a LOADED interval whose real
+    # ident cannot be re-derived from anchor_pos alone -- an extra interval
+    # whose anchor hash has dropped out of the current linearization falls
+    # back to anchor_pos=hi_pos for gap math, but its ON-DISK ident still
+    # names the ORIGINAL (now-unresolvable) anchor hash. Re-deriving the
+    # ident from that fallback anchor_pos would mint a DIFFERENT ident and
+    # create a second live entity for the same region. None for an interval
+    # created fresh during a run (anchor_pos there IS the creation position,
+    # in THIS linearization, always safely re-derivable).
+    ident: Optional[str] = None
 
 
 @dataclass
@@ -207,6 +220,10 @@ class FrontierAllocator:
         survive every merge it takes part in or that ident would have to be
         re-pointed at a different entity.
 
+        The keeper's `ident` (#325 review round 3, Finding 3) travels with it
+        the same way anchor_pos does -- both name the surviving entity's
+        identity, opaque to this allocator either way.
+
         Only same-tag intervals merge -- the authoritative/provisional
         boundary is the lineage frontier later phases read, and must survive
         the two sides becoming adjacent.
@@ -221,7 +238,7 @@ class FrontierAllocator:
                 absorbed.append(loser)
                 merged[-1] = Interval(
                     prev.lo_pos, max(prev.hi_pos, iv.hi_pos), tag,
-                    keeper.anchor_pos, prev.is_base or iv.is_base,
+                    keeper.anchor_pos, prev.is_base or iv.is_base, keeper.ident,
                 )
             else:
                 merged.append(iv)
@@ -234,9 +251,13 @@ class FrontierAllocator:
         if target is not None:
             idx = next(i for i, iv in enumerate(self._intervals) if iv is target)
             if from_low:
-                grown = Interval(target.lo_pos, pos, tag, target.anchor_pos, target.is_base)
+                grown = Interval(
+                    target.lo_pos, pos, tag, target.anchor_pos, target.is_base, target.ident,
+                )
             else:
-                grown = Interval(pos, target.hi_pos, tag, target.anchor_pos, target.is_base)
+                grown = Interval(
+                    pos, target.hi_pos, tag, target.anchor_pos, target.is_base, target.ident,
+                )
             self._intervals[idx] = grown
         else:
             # A brand-new interval. It is the base only if no same-tag

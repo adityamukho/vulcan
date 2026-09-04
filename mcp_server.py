@@ -6230,6 +6230,7 @@ def _frontier_load(
         intervals.append(frontier_registry.Interval(
             hash_to_pos[low_bounds[0]], hash_to_pos[low_bounds[1]],
             frontier_registry.TAG_AUTHORITATIVE, anchor_pos=0, is_base=True,
+            ident=_FRONTIER_LOW_IDENT,
         ))
     high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
     if high_bounds is not None:
@@ -6243,6 +6244,7 @@ def _frontier_load(
             db, ident, (lo_hash, hi_hash), count, hash_to_pos,
             linearization, run_ts_iso, intervals, is_base=False, index_con=index_con,
         )
+    _frontier_promote_base_if_missing(db, intervals, linearization, run_ts_iso, index_con=index_con)
     return frontier_registry.FrontierAllocator(len(linearization), intervals)
 
 
@@ -6327,7 +6329,7 @@ def _load_one_interval(
     a real, measured consequence of #325 (not a defect introduced by this
     docstring's fix): the fast path _skip_claim provides stays CORRECT for
     the case it still covers, but that case is narrower after #325 than
-    #326 assumed -- see TestSkipFastPathEndToEnd's docstring in
+    #326 assumed -- see TestDivergentRefEndToEnd's docstring in
     tests/test_mcp_server.py for the full accounting.
 
     Leaving a non-retained interval's facts in the graph -- what happened to
@@ -6351,15 +6353,20 @@ def _load_one_interval(
             # the anchor under normal claims, but recover it from the ident
             # rather than assuming that, in case a merge ever changes it.
             # Falls back to hi_pos only if the anchor hash itself has dropped
-            # out of this linearization (the ident survives as the entity's
-            # identity regardless -- it is never re-minted).
+            # out of this linearization -- and #325 review round 3 (Finding
+            # 3) is why the ORIGINAL `ident` string is still carried onto the
+            # Interval below in that case: anchor_pos=hi_pos is a stand-in
+            # for GAP MATH only, and re-deriving _interval_ident from it
+            # would mint a DIFFERENT ident than the one actually on disk,
+            # creating a second live entity for the same region the moment a
+            # later claim persists through the re-derived one instead.
             suffix = ident[len(_INTERVAL_PROVISIONAL_IDENT_PREFIX):]
             anchor_pos = next(
                 (pos for h, pos in hash_to_pos.items() if h.startswith(suffix)), hi_pos
             )
         intervals.append(frontier_registry.Interval(
             lo_pos, hi_pos, frontier_registry.TAG_PROVISIONAL,
-            anchor_pos=anchor_pos, is_base=is_base,
+            anchor_pos=anchor_pos, is_base=is_base, ident=ident,
         ))
         return
     if not resolved and pos_count is not None:
@@ -6403,6 +6410,89 @@ def _load_one_interval(
             )
     _frontier_discard_interval(
         db, ident, bounds, index_con=index_con, pos_count=pos_count, tag=tag,
+    )
+
+
+def _frontier_promote_base_if_missing(
+    db: Any,
+    intervals: List["frontier_registry.Interval"],
+    linearization: List[str],
+    run_ts_iso: str,
+    index_con: Optional[Any] = None,
+) -> None:
+    """#325 review round 3, Finding 1: restore the base invariant ON DISK
+    when a run ends with a fragmented provisional side that has no base at
+    all.
+
+    Reachable, reproduced against a real graph: a commit landing inside
+    frontier-high's span breaks its stored :pos-count, so it is discarded
+    (_load_one_interval), while an extra interval ABOVE it is unaffected and
+    stays retained. _load_one_interval only ever passes is_base=True for
+    :ingestion/frontier-high, so the provisional side then loads with every
+    interval is_base=False. frontier_registry._extend cannot self-heal this:
+    `is_base = not any(iv.tag == tag for iv in self._intervals)` is False
+    while ANY same-tag interval already exists, and _coalesce's survivor
+    rule only PRESERVES an existing base, it never MANUFACTURES one. Left
+    alone, :ingestion/frontier-high never comes back -- and
+    _correction_sweep_select_position returns None on `high_bounds is
+    None`, so Stage B never runs again, :ingestion/lineage-confirmed-through
+    never advances, and the forward stream is deliberately starved above a
+    retained provisional region (#325 review round 2, Ruling 1) -- so
+    nothing else ever upgrades that lineage. Provisional :introduced-by
+    stays provisional for the life of the graph, silently, on a run that
+    reports status: complete.
+
+    The fix lands ON DISK, not just on the returned allocator's in-memory
+    intervals: the write dispatch re-mints a claim's persist target from
+    interval.is_base/.anchor_pos (_reverse_claim_persist_target) every run,
+    so an in-memory-only promotion would still persist through the OLD
+    minted ident next time and :ingestion/frontier-high would still never
+    reappear on disk.
+
+    Picks the LOWEST retained extra (by lo_pos) -- the one that would have
+    become the base under ordinary claiming, had frontier-high not been
+    discarded out from under it. Retracts its facts at its OWN (minted)
+    ident and rewrites them at the fixed :ingestion/frontier-high ident,
+    copying its stored :pos-count VERBATIM -- never recomputed, since
+    recomputing would discard the claim-time origin the retain check itself
+    depends on (the same "count must come from the interval, never be
+    recomputed where it is read" rule _load_one_interval follows).
+    Retract-before-transact, the same order every other absorb-then-extend
+    write here uses: a crash in between leaves a DUPLICATE description (both
+    entities live, each still faithful to its own span) rather than a
+    window with neither -- re-walkable and safe, never silently lost.
+    """
+    provisional = [iv for iv in intervals if iv.tag == frontier_registry.TAG_PROVISIONAL]
+    if not provisional or any(iv.is_base for iv in provisional):
+        return
+    chosen = min(provisional, key=lambda iv: iv.lo_pos)
+    old_ident = chosen.ident
+    if old_ident is None:
+        # Never happens for a loaded extra -- _load_one_interval always sets
+        # ident. Defensive only: fail safe (no promotion, re-walked next
+        # time via the same missing-base path) rather than promote an
+        # interval this function cannot correctly retract.
+        return
+    lo_hash, hi_hash = linearization[chosen.lo_pos], linearization[chosen.hi_pos]
+    pos_count = _frontier_read_pos_count(db, old_ident)
+    _frontier_discard_interval(
+        db, old_ident, (lo_hash, hi_hash), index_con=index_con,
+        pos_count=pos_count, tag=":provisional",
+    )
+    facts = [
+        f"[{_FRONTIER_HIGH_IDENT} :entity-type :type/ingest-interval]",
+        f"[{_FRONTIER_HIGH_IDENT} :tag :provisional]",
+        f'[{_FRONTIER_HIGH_IDENT} :lo-hash "{_edn_escape(lo_hash)}"]',
+        f'[{_FRONTIER_HIGH_IDENT} :hi-hash "{_edn_escape(hi_hash)}"]',
+    ]
+    if pos_count is not None:
+        facts.append(f"[{_FRONTIER_HIGH_IDENT} :pos-count {int(pos_count)}]")
+    _transact(db, "[" + " ".join(facts) + "]", run_ts_iso, index_con=index_con)
+
+    idx = next(i for i, iv in enumerate(intervals) if iv is chosen)
+    intervals[idx] = frontier_registry.Interval(
+        chosen.lo_pos, chosen.hi_pos, frontier_registry.TAG_PROVISIONAL,
+        anchor_pos=chosen.hi_pos, is_base=True, ident=_FRONTIER_HIGH_IDENT,
     )
 
 
@@ -12187,27 +12277,82 @@ class _RoundRobinClaimer:
 
         claim_high() itself is unchanged and still returns None on exactly
         is_gap_empty(), so no symmetric fallback is needed on that side.
+
+        #325 review round 3 (Finding 5): the fallback used to keep
+        `_taken_in_phase` as accumulated under FORWARD's budget but then
+        compare it against REVERSE's limit for the very same call -- a
+        forward phase already `forward_per_round - 1` claims in would
+        immediately trip `_taken_in_phase >= reverse_per_round` on the
+        fallback claim (since `_taken_in_phase` was never reset), flip back
+        to "forward" one call later on a fresh reverse-phase entry, refuse
+        again, and repeat -- serving roughly `2 x reverse_per_round`
+        reverse claims per nominal cycle instead of `reverse_per_round`,
+        silently detaching `MINIGRAF_INGEST_STREAM_RATIO` from what it
+        configures the moment forward starves. Falling through now ENDS the
+        forward phase outright (resets `_taken_in_phase` to 0 and flips
+        `_forward_phase` to False) before charging the fallback claim
+        against reverse's own, fresh budget -- so a starved forward phase
+        costs nothing but the one free peek, and reverse gets exactly
+        `reverse_per_round` claims per cycle, same as an ordinary rotation.
         """
         if self._allocator.is_gap_empty():
             return None
         if self._forward_phase:
             pos = self._allocator.claim_low()
             if pos is not None:
-                tag, limit = "fwd", self._forward_per_round
-            else:
-                pos = self._allocator.claim_high()
-                tag, limit = "rev", self._reverse_per_round
-        else:
-            pos = self._allocator.claim_high()
-            tag, limit = "rev", self._reverse_per_round
+                self._taken_in_phase += 1
+                if self._taken_in_phase >= self._forward_per_round:
+                    self._taken_in_phase = 0
+                    self._forward_phase = False
+                return "fwd", pos
+            # Forward has nothing legitimate to do this turn. The phase
+            # ends HERE, not after forward_per_round more attempts that
+            # would all refuse identically -- so the reverse phase that
+            # follows starts its own count from zero, never inheriting
+            # whatever forward had already accumulated.
+            self._taken_in_phase = 0
+            self._forward_phase = False
+
+        pos = self._allocator.claim_high()
         if pos is None:
             return None
-
         self._taken_in_phase += 1
-        if self._taken_in_phase >= limit:
+        if self._taken_in_phase >= self._reverse_per_round:
             self._taken_in_phase = 0
-            self._forward_phase = not self._forward_phase
-        return tag, pos
+            self._forward_phase = True
+        return "rev", pos
+
+
+def _interval_persist_ident(
+    interval: "frontier_registry.Interval", linearization: List[str]
+) -> str:
+    """The graph ident `interval` actually persists to (or would, if newly
+    minted this run).
+
+    #325 review round 3 (Finding 3): prefers `interval.ident` -- the REAL
+    on-disk identity _load_one_interval carried onto a LOADED interval --
+    over re-deriving one from `anchor_pos`. Re-derivation is only safe for
+    an interval created FRESH during this run, whose anchor_pos is its own
+    creation position in THIS linearization and therefore always resolves;
+    for a loaded extra whose original anchor hash has since dropped out of
+    the linearization, anchor_pos falls back to hi_pos for gap math only
+    (_load_one_interval), and re-deriving _interval_ident from THAT
+    fallback would mint a DIFFERENT ident than the one on disk -- creating a
+    second live entity for the same region the moment a claim persists
+    through it instead of the original.
+
+    `interval.ident` is None for every interval this run creates itself
+    (frontier_registry never sets it, only carries a caller-set one through
+    _extend/_coalesce), so the fallback below is exactly the pre-existing
+    behaviour for that case: the fixed :ingestion/frontier-high ident for a
+    base, or a freshly minted ident from the interval's own (always
+    resolvable) anchor_pos otherwise.
+    """
+    if interval.ident is not None:
+        return interval.ident
+    if interval.is_base:
+        return _FRONTIER_HIGH_IDENT
+    return _interval_ident(linearization[interval.anchor_pos])
 
 
 def _reverse_claim_persist_target(
@@ -12223,15 +12368,11 @@ def _reverse_claim_persist_target(
     the per-interval reverse floor and end-of-walk flush generalization
     Task 5's brief also describes are untouched).
 
-    The base interval (exactly one per tag) is always the fixed
-    :ingestion/frontier-high entity; any other interval's ident is minted
-    from its own anchor hash (_interval_ident), the same resolution
-    _load_one_interval performs on the read side -- NEVER re-derived from
-    the interval's current bounds. Every absorbed interval gets the same
-    treatment so _frontier_persist_claim can retract its entity: the
-    coalesce survivor rule (frontier_registry._coalesce) never lets the
-    base be absorbed, so an absorbed interval here is always itself a
-    minted, non-base ident.
+    Every absorbed interval gets the same ident resolution
+    (_interval_persist_ident) so _frontier_persist_claim can retract its
+    entity: the coalesce survivor rule (frontier_registry._coalesce) never
+    lets the base be absorbed, so an absorbed interval here is always
+    itself a non-base ident.
 
     MUST be called immediately after the claim that produced `pos` -- a
     later claim overwrites `allocator.last_claim`, and reading it after the
@@ -12240,13 +12381,9 @@ def _reverse_claim_persist_target(
     claim = allocator.last_claim
     if claim is None:
         return None, []
-    interval = claim.interval
-    ident = (
-        _FRONTIER_HIGH_IDENT if interval.is_base
-        else _interval_ident(linearization[interval.anchor_pos])
-    )
+    ident = _interval_persist_ident(claim.interval, linearization)
     absorbed_idents = [
-        _interval_ident(linearization[iv.anchor_pos]) for iv in claim.absorbed
+        _interval_persist_ident(iv, linearization) for iv in claim.absorbed
     ]
     return ident, absorbed_idents
 
