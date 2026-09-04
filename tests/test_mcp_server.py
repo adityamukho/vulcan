@@ -8642,6 +8642,72 @@ class TestFrontierPersistSpan:
         assert json.loads(raw)["results"] == [[1]]
 
 
+class TestIntervalEntityPersistence:
+    """#325: provisional intervals above frontier-high persist as their own
+    ident-keyed entities. frontier-high and frontier-low keep their fixed
+    idents and carry no :ident fact, so an existing graph needs no migration."""
+
+    def test_ident_is_minted_from_the_anchor_hash(self):
+        import mcp_server
+        assert mcp_server._interval_ident("abcdef0123456789") == \
+            ":ingestion/interval-provisional-abcdef012345"
+
+    def test_extra_intervals_are_enumerable_and_frontier_high_is_not(self, real_db):
+        import mcp_server
+        ts = "2026-09-04T00:00:00Z"
+        mcp_server._frontier_persist_claim(real_db, ["h0", "h1", "h2"], 2, False, ts)
+        ident = mcp_server._interval_ident("h9")
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f'[{ident} :ident "{ident}"]',
+            f"[{ident} :tag :provisional]",
+            f'[{ident} :lo-hash "h8"]',
+            f'[{ident} :hi-hash "h9"]',
+            f"[{ident} :pos-count 2]",
+        ]) + "]", ts)
+
+        extras = mcp_server._intervals_read_extra(real_db)
+        assert extras == [(ident, "h8", "h9", 2)], (
+            "enumeration must return the minted-ident interval and must NOT "
+            "return frontier-high, which is read by fixed ident"
+        )
+
+    def test_an_extra_interval_with_no_pos_count_is_still_enumerable(self, real_db):
+        import mcp_server
+        ts = "2026-09-04T00:00:00Z"
+        ident = mcp_server._interval_ident("h9")
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f'[{ident} :ident "{ident}"]',
+            f"[{ident} :tag :provisional]",
+            f'[{ident} :lo-hash "h8"]',
+            f'[{ident} :hi-hash "h9"]',
+        ]) + "]", ts)
+        assert mcp_server._intervals_read_extra(real_db) == [(ident, "h8", "h9", None)], (
+            "a countless interval is untrustworthy but must stay enumerable, "
+            "or its facts leak forever -- the same rule "
+            "_completed_regions_read_full follows"
+        )
+
+    def test_discard_removes_every_fact_including_the_ident(self, real_db):
+        import mcp_server
+        ts = "2026-09-04T00:00:00Z"
+        ident = mcp_server._interval_ident("h9")
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f'[{ident} :ident "{ident}"]',
+            f"[{ident} :tag :provisional]",
+            f'[{ident} :lo-hash "h8"]',
+            f'[{ident} :hi-hash "h9"]',
+            f"[{ident} :pos-count 2]",
+        ]) + "]", ts)
+        mcp_server._frontier_discard_interval(
+            real_db, ident, ("h8", "h9"), pos_count=2, tag=":provisional",
+        )
+        assert mcp_server._intervals_read_extra(real_db) == []
+        assert mcp_server._frontier_read_bounds(real_db, ident) is None
+
+
 class TestSkipFastPathEndToEnd:
     """#326 acceptance test 1: a real re-walk of an ingested region, driven by
     #325's actual trigger (the branch tip growing past the persisted :hi-hash)

@@ -5984,6 +5984,64 @@ def _frontier_read_pos_count(db: Any, ident: str) -> Optional[int]:
         return None
 
 
+_INTERVAL_PROVISIONAL_IDENT_PREFIX = ":ingestion/interval-provisional-"
+
+
+def _interval_ident(anchor_hash: str) -> str:
+    """Deterministic ident for a provisional interval created at anchor_hash.
+
+    MINTED ONCE, at creation, and never re-derived from current bounds. A
+    provisional interval grows DOWNWARD, so keying on :lo-hash would recreate
+    the entity on every claim; keying on the CURRENT :hi-hash would rename it
+    on every merge. #326 paid for the bounds-keyed version once: two regions
+    collided onto one entity, :pos-count became nondeterministic through a
+    last-write-wins join, and a retract destroyed the surviving witness.
+    """
+    return f"{_INTERVAL_PROVISIONAL_IDENT_PREFIX}{anchor_hash[:12]}"
+
+
+def _intervals_read_extra(db: Any) -> List[Tuple[str, str, str, Optional[int]]]:
+    """Every provisional interval entity ABOVE frontier-high, as
+    (ident, lo_hash, hi_hash, pos_count), sorted by ident.
+
+    Binds ?ident rather than ?e: `[?e :entity-type :type/ingest-interval]`
+    answers in UUID space. frontier-high and frontier-low carry no :ident fact
+    and are therefore invisible here BY CONSTRUCTION -- they are read by their
+    fixed idents, which is what makes this change migration-free.
+
+    :pos-count is a SECOND query, not a join. An interval carrying no count is
+    untrustworthy but must still be enumerable -- it has to be retractable --
+    and a single wide join would make it invisible instead, leaking its facts
+    forever. Same rule as _completed_regions_read_full.
+    """
+    raw = _db_execute(
+        db,
+        "(query [:find ?ident ?lo ?hi :where"
+        " [?e :entity-type :type/ingest-interval]"
+        " [?e :ident ?ident] [?e :lo-hash ?lo] [?e :hi-hash ?hi]])",
+    )
+    raw_counts = _db_execute(
+        db,
+        "(query [:find ?ident ?c :where"
+        " [?e :entity-type :type/ingest-interval]"
+        " [?e :ident ?ident] [?e :pos-count ?c]])",
+    )
+    counts: Dict[str, Optional[int]] = {}
+    for ident, c in json.loads(raw_counts).get("results", []):
+        try:
+            counts[str(ident)] = int(c)
+        except (TypeError, ValueError):
+            counts[str(ident)] = None
+    seen = set()
+    out: List[Tuple[str, str, str, Optional[int]]] = []
+    for ident, lo, hi in json.loads(raw).get("results", []):
+        if str(ident) in seen:
+            continue
+        seen.add(str(ident))
+        out.append((str(ident), lo, hi, counts.get(str(ident))))
+    return sorted(out, key=lambda r: r[0])
+
+
 def _frontier_span_count(
     linearization: List[str], lo_hash: str, hi_hash: str
 ) -> Optional[int]:
@@ -6265,6 +6323,7 @@ def _frontier_discard_interval(
     bounds: Tuple[str, str],
     index_con: Optional[Any] = None,
     pos_count: Optional[int] = None,
+    tag: Optional[str] = None,
 ) -> None:
     """Retract an interval's persisted facts, mirroring the set
     _frontier_persist_claim creates. Used by _frontier_load when a persisted
@@ -6274,8 +6333,21 @@ def _frontier_discard_interval(
     read one. Left behind it would attach to whatever interval the next
     _frontier_persist_claim creates at this ident and license a comparison
     against a span it was never measured from.
+
+    `tag` defaults to None, meaning "derive it the way the two fixed idents
+    always have" -- frontier-low is :authoritative, everything else (including
+    frontier-high) is :provisional. #325's minted per-anchor idents need the
+    caller to say which tag was actually written, since neither fixed ident
+    equality holds for them.
+
+    A minted ident (the #325 _INTERVAL_PROVISIONAL_IDENT_PREFIX form) also
+    carries a string-valued :ident fact -- unlike frontier-high/-low, which are
+    read by fixed ident and never had one -- so its retract set includes it.
+    Leaving it live would leak the fact and keep the entity answering
+    _intervals_read_extra's enumeration after every other fact is gone.
     """
-    tag = ":authoritative" if ident == _FRONTIER_LOW_IDENT else ":provisional"
+    if tag is None:
+        tag = ":authoritative" if ident == _FRONTIER_LOW_IDENT else ":provisional"
     facts = [
         f"[{ident} :entity-type :type/ingest-interval]",
         f"[{ident} :tag {tag}]",
@@ -6284,6 +6356,8 @@ def _frontier_discard_interval(
     ]
     if pos_count is not None:
         facts.append(f"[{ident} :pos-count {int(pos_count)}]")
+    if ident.startswith(_INTERVAL_PROVISIONAL_IDENT_PREFIX):
+        facts.append(f'[{ident} :ident "{_edn_escape(ident)}"]')
     _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
 
 
