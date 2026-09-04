@@ -8665,11 +8665,25 @@ class TestIntervalEntityPersistence:
             f'[{ident} :hi-hash "h9"]',
             f"[{ident} :pos-count 2]",
         ]) + "]", ts)
+        # A second minted interval, deliberately given a LEXICALLY SMALLER
+        # ident than the first (h2 < h9 as strings after the shared prefix),
+        # so this also exercises _intervals_read_extra's sorted(...) rather
+        # than happening to match insertion order.
+        ident2 = mcp_server._interval_ident("h2")
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident2} :entity-type :type/ingest-interval]",
+            f'[{ident2} :ident "{ident2}"]',
+            f"[{ident2} :tag :provisional]",
+            f'[{ident2} :lo-hash "h0"]',
+            f'[{ident2} :hi-hash "h2"]',
+            f"[{ident2} :pos-count 3]",
+        ]) + "]", ts)
 
         extras = mcp_server._intervals_read_extra(real_db)
-        assert extras == [(ident, "h8", "h9", 2)], (
-            "enumeration must return the minted-ident interval and must NOT "
-            "return frontier-high, which is read by fixed ident"
+        assert extras == sorted([(ident, "h8", "h9", 2), (ident2, "h0", "h2", 3)]), (
+            "enumeration must return both minted-ident intervals, sorted by "
+            "ident, and must NOT return frontier-high, which is read by "
+            "fixed ident"
         )
 
     def test_an_extra_interval_with_no_pos_count_is_still_enumerable(self, real_db):
@@ -8706,6 +8720,62 @@ class TestIntervalEntityPersistence:
         )
         assert mcp_server._intervals_read_extra(real_db) == []
         assert mcp_server._frontier_read_bounds(real_db, ident) is None
+        # A residual :pos-count would attach to whatever interval the next
+        # _frontier_persist_claim mints at this same deterministic ident, and
+        # neither assertion above would catch it: _intervals_read_extra scans
+        # via :entity-type/:ident, which are gone, and _frontier_read_bounds
+        # only reads :lo-hash/:hi-hash.
+        assert mcp_server._frontier_read_pos_count(real_db, ident) is None
+
+
+class TestFrontierPersistClaimTargetsAnInterval:
+    """#325: a claim extends the interval entity it belongs to, and a merge
+    retracts the absorbed entity in the same call."""
+
+    def test_claim_extends_a_minted_ident_when_given_one(self, real_db):
+        import mcp_server
+        lin = [f"h{i}" for i in range(10)]
+        ident = mcp_server._interval_ident("h9")
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 9, False, "2026-09-04T00:00:00Z", ident=ident,
+        )
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 8, False, "2026-09-04T00:00:01Z", ident=ident,
+        )
+        assert mcp_server._frontier_read_bounds(real_db, ident) == ("h8", "h9")
+        assert mcp_server._frontier_read_pos_count(real_db, ident) == 2
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) is None, (
+            "the fixed high ident must be untouched when a claim names another"
+        )
+
+    def test_absorbed_idents_are_retracted_by_the_merging_claim(self, real_db):
+        import mcp_server
+        lin = [f"h{i}" for i in range(10)]
+        upper = mcp_server._interval_ident("h9")
+        for p, t in ((9, "00"), (8, "01")):
+            mcp_server._frontier_persist_claim(
+                real_db, lin, p, False, f"2026-09-04T00:00:{t}Z", ident=upper)
+        for p, t in ((5, "02"), (4, "03")):
+            mcp_server._frontier_persist_claim(
+                real_db, lin, p, False, f"2026-09-04T00:00:{t}Z")
+        # the claim at 6 makes [6,?] touch nothing yet; the claim at 7 merges.
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 7, False, "2026-09-04T00:00:04Z",
+            ident=mcp_server._FRONTIER_HIGH_IDENT, absorbed_idents=[upper],
+        )
+        assert mcp_server._intervals_read_extra(real_db) == [], (
+            "the absorbed entity's facts must be gone, not merely unreferenced"
+        )
+
+    def test_span_flush_targets_a_named_ident(self, real_db):
+        import mcp_server
+        lin = [f"h{i}" for i in range(10)]
+        ident = mcp_server._interval_ident("h9")
+        mcp_server._frontier_persist_span(
+            real_db, lin, 6, 9, False, "2026-09-04T00:00:00Z", ident=ident)
+        assert mcp_server._frontier_read_bounds(real_db, ident) == ("h6", "h9")
+        assert mcp_server._frontier_read_pos_count(real_db, ident) == 4
 
 
 class TestSkipFastPathEndToEnd:

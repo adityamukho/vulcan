@@ -6780,14 +6780,44 @@ def _frontier_persist_claim(
     from_low: bool,
     commit_ts_iso: str,
     index_con: Optional[Any] = None,
+    ident: Optional[str] = None,
+    absorbed_idents: Optional[List[str]] = None,
 ) -> None:
-    """Persist a single claimed position by extending the correct fixed-ident
-    interval fact -- retracts+reasserts only the moved bound, mirroring
+    """Persist a single claimed position by extending the correct interval
+    fact -- retracts+reasserts only the moved bound, mirroring
     _watermark_update's per-commit cost profile (see the design spec's
     "Persistence timing" and "Graph persistence schema" sections).
+
+    `ident` defaults to today's fixed low/high choice (_FRONTIER_LOW_IDENT /
+    _FRONTIER_HIGH_IDENT), so every pre-#325 call site and test keeps writing
+    exactly what it always has. #325's reverse walk instead names a specific
+    provisional interval entity (_interval_ident) when the claim belongs to
+    one already tracked separately from frontier-high.
+
+    `absorbed_idents` names entities this claim's merge swallows -- the
+    interval named by `ident` and one or more others have just become
+    contiguous, and the others stop existing as their own entities. They are
+    retracted BEFORE `ident`'s bound is extended: a crash between the two
+    then leaves a DUPLICATE description of the merged region (both entities
+    still describe their own span, so the next _frontier_load re-walks the
+    overlap and nothing is lost), where extending first would leave a WINDOW
+    in which `ident` already claims the full merged span but the absorbed
+    entity's now-redundant facts are still live -- and a crash there is
+    invisible right up until _frontier_discard_interval never runs, silently
+    leaking a phantom entity into _intervals_read_extra forever.
     """
-    ident = _FRONTIER_LOW_IDENT if from_low else _FRONTIER_HIGH_IDENT
+    if ident is None:
+        ident = _FRONTIER_LOW_IDENT if from_low else _FRONTIER_HIGH_IDENT
     tag = ":authoritative" if from_low else ":provisional"
+
+    for absorbed in absorbed_idents or []:
+        absorbed_bounds = _frontier_read_bounds(db, absorbed)
+        if absorbed_bounds is not None:
+            _frontier_discard_interval(
+                db, absorbed, absorbed_bounds, index_con=index_con,
+                pos_count=_frontier_read_pos_count(db, absorbed), tag=tag,
+            )
+
     moved_hash = linearization[pos]
     existing = _frontier_read_bounds(db, ident)
 
@@ -6798,6 +6828,14 @@ def _frontier_persist_claim(
         to_transact.append(f"[{ident} :tag {tag}]")
         to_transact.append(f'[{ident} :lo-hash "{_edn_escape(moved_hash)}"]')
         to_transact.append(f'[{ident} :hi-hash "{_edn_escape(moved_hash)}"]')
+        # #325: a minted ident (_INTERVAL_PROVISIONAL_IDENT_PREFIX's form)
+        # needs its own string-valued :ident fact so _intervals_read_extra
+        # can enumerate it -- frontier-low/-high are read by fixed ident and
+        # never carry one, and adding one to them would make them show up in
+        # that enumeration too, breaking its "frontier-high is not extra"
+        # contract.
+        if ident.startswith(_INTERVAL_PROVISIONAL_IDENT_PREFIX):
+            to_transact.append(f'[{ident} :ident "{_edn_escape(ident)}"]')
         new_count: Optional[int] = 1
     else:
         lo_hash, hi_hash = existing
@@ -6862,6 +6900,7 @@ def _frontier_persist_span(
     from_low: bool,
     commit_ts_iso: str,
     index_con: Optional[Any] = None,
+    ident: Optional[str] = None,
 ) -> None:
     """Persist a whole claimed SPAN in one write, for #326's end-of-walk flush.
 
@@ -6869,26 +6908,38 @@ def _frontier_persist_span(
     facts are gone, so its `existing is None` branch writes lo == hi ==
     moved_hash: the interval collapses to a point and the top bound is lost.
 
+    `ident` defaults to today's fixed low/high choice, same rationale as
+    _frontier_persist_claim's: every pre-#325 call site keeps flushing
+    frontier-low/-high unchanged, and #325's walk names a specific
+    provisional interval entity when the flush belongs to one.
+
     Advance-only in both directions -- the flush is bookkeeping catching up with
     the allocator, and must never retreat a bound a real per-commit claim
     already moved. A span that changes nothing writes nothing (#156: a
     re-transact at a new valid-from is not a graph-level no-op).
     """
-    ident = _FRONTIER_LOW_IDENT if from_low else _FRONTIER_HIGH_IDENT
+    if ident is None:
+        ident = _FRONTIER_LOW_IDENT if from_low else _FRONTIER_HIGH_IDENT
     tag = ":authoritative" if from_low else ":provisional"
     lo_hash, hi_hash = linearization[lo_pos], linearization[hi_pos]
     existing = _frontier_read_bounds(db, ident)
 
     if existing is None:
+        facts = [
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f"[{ident} :tag {tag}]",
+            f'[{ident} :lo-hash "{_edn_escape(lo_hash)}"]',
+            f'[{ident} :hi-hash "{_edn_escape(hi_hash)}"]',
+            f"[{ident} :pos-count {hi_pos - lo_pos + 1}]",
+        ]
+        # #325: same rule _frontier_persist_claim follows -- a minted ident
+        # needs its own :ident fact to be enumerable via _intervals_read_extra;
+        # frontier-low/-high never get one.
+        if ident.startswith(_INTERVAL_PROVISIONAL_IDENT_PREFIX):
+            facts.append(f'[{ident} :ident "{_edn_escape(ident)}"]')
         _transact(
             db,
-            "[" + " ".join([
-                f"[{ident} :entity-type :type/ingest-interval]",
-                f"[{ident} :tag {tag}]",
-                f'[{ident} :lo-hash "{_edn_escape(lo_hash)}"]',
-                f'[{ident} :hi-hash "{_edn_escape(hi_hash)}"]',
-                f"[{ident} :pos-count {hi_pos - lo_pos + 1}]",
-            ]) + "]",
+            "[" + " ".join(facts) + "]",
             commit_ts_iso,
             index_con=index_con,
         )
