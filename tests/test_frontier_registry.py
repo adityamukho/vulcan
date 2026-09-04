@@ -281,3 +281,55 @@ class TestFragmentedProvisionalSet:
         for _ in range(8):
             a.claim_high()
         assert a.is_gap_empty() is True
+
+
+class TestCoalesceSurvivorRuleHigherBase:
+    """The merge-survivor rule (#325 code review, finding 1) has two live
+    branches: base wins because it is the LOWER participant (every other
+    test in this file only exercises that one, since claim_high() always
+    opens a fresh fragment ABOVE an existing base), and base wins because it
+    is the HIGHER participant. Nothing reaches the second branch through
+    claim_low()/claim_high() -- a same-tag interval seeded above an existing
+    base is not a state normal claiming produces -- so it is seeded directly
+    here, the same way TestFragmentedProvisionalSet seeds a reload state.
+
+    If `keeper, loser = (prev, iv) if (...) else (iv, prev)` in _coalesce
+    ever regressed to always keeping `prev` (the lower participant), this
+    test's assertions would flip silently: the merged interval would carry
+    the NON-base interval's anchor_pos, and `absorbed` would name the actual
+    base interval. A later task retracts every entity in `absorbed` -- so
+    that inversion means retracting the live :ingestion/frontier-high entity
+    while the merged interval keeps pointing persistence at an ident nothing
+    still holds. `is_base` on the merged interval would stay True either way
+    (it is an OR of both participants, independent of which is kept), so
+    that field alone would not catch the regression -- only anchor_pos and
+    the identity of the absorbed interval do.
+    """
+
+    def test_higher_base_survives_a_merge_with_a_lower_non_base_fragment(self):
+        # provisional: a lower non-base fragment [2,4] (anchor_pos=99, as if
+        # left over from some earlier state) and a higher base [6,11]
+        # (anchor_pos=11, the persisted :ingestion/frontier-high interval).
+        # Position 5 is the only gap; claiming it makes the two touch.
+        a = frontier_registry.FrontierAllocator(12, [
+            frontier_registry.Interval(0, 1, frontier_registry.TAG_AUTHORITATIVE,
+                                       anchor_pos=0, is_base=True),
+            frontier_registry.Interval(2, 4, frontier_registry.TAG_PROVISIONAL,
+                                       anchor_pos=99, is_base=False),
+            frontier_registry.Interval(6, 11, frontier_registry.TAG_PROVISIONAL,
+                                       anchor_pos=11, is_base=True),
+        ])
+        assert a.claim_high() == 5
+        merged = a.last_claim
+        assert merged.interval.lo_pos == 2 and merged.interval.hi_pos == 11
+        assert merged.interval.is_base is True
+        assert merged.interval.anchor_pos == 11, (
+            "the HIGHER interval is the base and must keep its anchor_pos "
+            "even though the LOWER interval merged first in sort order"
+        )
+        assert len(merged.absorbed) == 1
+        assert merged.absorbed[0].anchor_pos == 99, (
+            "the lower non-base fragment is what gets absorbed/retracted, "
+            "never the base"
+        )
+        assert merged.absorbed[0].is_base is False

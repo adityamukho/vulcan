@@ -105,8 +105,16 @@ class FrontierAllocator:
     def intervals(self) -> List[Interval]:
         return list(self._intervals)
 
-    def _interval_covering(self, pos: int) -> Optional[Interval]:
+    def _interval_covering(self, pos: int, tag: Optional[str] = None) -> Optional[Interval]:
+        """The interval containing pos, optionally restricted to one tag.
+
+        `tag` exists for _extend's post-coalesce lookup: after a merge, more
+        than one tag's intervals can sit in self._intervals, and only the
+        same-tag one is the survivor a claim just landed in.
+        """
         for iv in self._intervals:
+            if tag is not None and iv.tag != tag:
+                continue
             if iv.lo_pos <= pos <= iv.hi_pos:
                 return iv
         return None
@@ -198,8 +206,5 @@ class FrontierAllocator:
             grown = Interval(pos, pos, tag, anchor_pos=pos, is_base=is_base)
             self._intervals.append(grown)
         absorbed = self._coalesce(tag)
-        surviving = next(
-            iv for iv in self._intervals
-            if iv.tag == tag and iv.lo_pos <= pos <= iv.hi_pos
-        )
+        surviving = self._interval_covering(pos, tag=tag)
         self.last_claim = ClaimResult(pos=pos, interval=surviving, absorbed=absorbed)
