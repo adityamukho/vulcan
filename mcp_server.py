@@ -171,9 +171,10 @@ _ingest_progress: Dict[str, Any] = {
     "phase": None,
     # #326. Deliberately NOT named "skipped": _ingest_progress["status"] already
     # takes the value "skipped" (the whole run declined because another process
-    # owns the graph) and commit_census already reports skipped_commits (commits
-    # dropped for extraction failure). A third bare "skipped" reads as one of
-    # those two on sight.
+    # owns the graph) and stderr_capture already reports skipped_commits (gated
+    # by run_ingestion_benchmark._exit_code; commits dropped for extraction OR
+    # write failure -- _SKIPPED_COMMIT_RE matches both log lines). A third bare
+    # "skipped" reads as one of those two on sight.
     "positions_skipped": 0,
 }
 _shutdown_requested = asyncio.Event()
@@ -6200,13 +6201,25 @@ def _frontier_load(
             # and spans all three streams -- that is 2d's, see the 2b1 design
             # spec's "Why re-ingest is made safe, not efficient".
             # #326: the bounds are the completion witness -- archive before
-            # retracting. _frontier_persist_claim is the LAST write of a
-            # position, so every position inside this interval provably
-            # completed; dropping the facts is what made that proof
+            # retracting. Dropping the facts is what made the proof
             # unavailable in exactly the case (#325 tip growth) that most
             # needs it. Only a REPRESENTABLE interval is archived: the
             # inverted case below reaches the same branch and describes no
             # completed region at all.
+            #
+            # "_frontier_persist_claim is the LAST write of a position, so
+            # membership in this interval proves that position completed" is
+            # FALSE as a standalone claim -- see _skip_claim's docstring.
+            # :lo-hash is a closed RANGE bound, so membership is implied by a
+            # NEIGHBOUR's claim, not necessarily by the position's own: a
+            # write that raises takes _run_ingestion's per-commit `except`,
+            # which continues the descent, and the next lower position that
+            # succeeds sweeps the failed one into the interval. What makes
+            # membership mean the position's OWN completion is
+            # _run_ingestion's `rev_claim_floor_pos` gate, which stops
+            # :lo-hash descending past a position this run failed to
+            # complete -- the interval archived here is only ever as precise
+            # as that floor made it.
             #
             # The archive is gated on the interval's OWN :pos-count, which was
             # written at claim time against the linearization the positions
@@ -12224,6 +12237,14 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # it claims frontier-low and its failure semantics are out of
                 # scope for #326.
                 #
+                # A third way a reverse position retires incomplete does NOT
+                # set this: the shutdown `break` below (`while pending: if
+                # _shutdown_requested.is_set(): ...`), which abandons whatever
+                # is still queued in `pending` unclaimed. It needs no floor --
+                # nothing lower ever claims after a shutdown, and
+                # `completed_all = False` already gates the end-of-walk flush
+                # off for this run -- so do not go looking for a third
+                # _note_incomplete_rev call to match it.
                 rev_claim_floor_pos: Optional[int] = None
 
                 def _note_incomplete_rev(claim_tag: str, claim_pos: int) -> None:

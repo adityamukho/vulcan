@@ -242,13 +242,30 @@ that raised -- because they are the same defect; the forward stream is
 untouched, since it claims frontier-low and its failure semantics are out of
 scope here.
 
+There is a third way a reverse position retires incomplete that does NOT raise
+the floor: the shutdown `break` in `_run_ingestion`'s pipeline loop, which
+abandons whatever is still queued in `pending` unclaimed. It needs no floor,
+because nothing lower ever claims after a shutdown, and `completed_all=False`
+already gates the end-of-walk flush off for that run -- so a reader auditing
+this invariant should not expect a third `_note_incomplete_rev` call site to
+match it.
+
 **It withholds BOOKKEEPING, never WORK.** Positions below the floor are still
 claimed, still parsed and still written in full. They simply do not assert
 completion, so the next run re-walks them. Cost is one run's re-walk below a
 transient failure -- what master effectively did anyway. A DETERMINISTIC failure
 at a fixed position blocks reverse-frontier progress below it for as long as it
 keeps failing; that is the accepted price of a precise interval, and it is loud
-rather than silent.
+rather than silent. It also starves Stage B (the correction sweep) for that
+entire reverse region, not just below the floor:
+`_correction_sweep_select_position` needs the PERSISTED gap closed before it
+selects anything, and a floored run never moves frontier-high's `:lo-hash`
+down to meet frontier-low, so the sweep runs zero times -- no lineage
+confirmation and none of `_forward_apply(..., lifecycle_only=True)`'s D/R
+closes, renames, dependency churn or gitlink changes for the span. It
+self-heals on the next clean run; `_should_fold_lineage_watermark` stays
+correct throughout, since it requires the sweep to have reached the high
+bound.
 
 **Why `fwd` never skips**, which does double duty:
 
@@ -345,9 +362,10 @@ matter). `positions_skipped_this_run` is derived in
 
 **The name is deliberately not `skipped`.** `_ingest_progress["status"]` already
 takes the value `"skipped"`, meaning the whole run declined because another
-process owns the graph, and `commit_census` already reports `skipped_commits`,
-meaning commits dropped for extraction failure. A third, unrelated `skipped`
-would be misread as one of those two on sight.
+process owns the graph, and `stderr_capture` already reports `skipped_commits`
+(gated by `run_ingestion_benchmark._exit_code`), meaning commits dropped for
+extraction OR write failure -- `_SKIPPED_COMMIT_RE` matches both log lines. A
+third, unrelated `skipped` would be misread as one of those two on sight.
 
 `processed` is ALSO incremented for a skipped position, at the new site in
 `submit_next`. This preserves its existing meaning -- positions retired by the

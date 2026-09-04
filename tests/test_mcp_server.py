@@ -7682,10 +7682,14 @@ class TestFrontierLoadNormalisesUnrepresentableIntervals:
 
 
 class TestCompletedRegionRecord:
-    """#326: the skip fast-path's completion witness. `_frontier_persist_claim`
-    is the LAST write of a position, so a position inside a persisted interval
-    provably completed. `_frontier_load` throws that interval away on tip
-    growth; these facts are the archive that keeps the proof.
+    """#326: the skip fast-path's completion witness. `_frontier_load` throws
+    a persisted frontier-high interval away on tip growth; these facts are the
+    archive that keeps the proof alive instead. The proof itself is not "a
+    position inside the interval provably completed" -- `:lo-hash` is a
+    closed RANGE bound, so membership is implied by a NEIGHBOUR's claim, not
+    necessarily by the position's own; what makes membership mean the
+    position's OWN completion is `_run_ingestion`'s `rev_claim_floor_pos` gate
+    (see `_skip_claim`'s docstring).
 
     Deliberately NOT in MINIGRAF_SCHEMA: handle_minigraf_audit iterates exactly
     the registered types and retracts any attribute outside a registered type's
@@ -8057,11 +8061,18 @@ class TestCompletedRegionRecord:
 
 
 class TestFrontierLoadArchivesDiscardedInterval:
-    """#326: the discard branch's bounds ARE the completion witness --
-    _frontier_persist_claim is the last write of a position, so every position
-    inside the persisted interval provably completed. Recording them before the
-    retract is what makes the witness survive the one case (#325's tip growth)
-    that ruled out reading the live interval directly."""
+    """#326: the discard branch's bounds ARE the completion witness. Recording
+    them before the retract is what makes the witness survive the one case
+    (#325's tip growth) that ruled out reading the live interval directly.
+
+    The witness is not "_frontier_persist_claim is the last write of a
+    position, so every position inside the interval provably completed" --
+    that is FALSE as a standalone claim: `:lo-hash` is a closed RANGE bound,
+    so membership is implied by a NEIGHBOUR's claim, not necessarily by the
+    position's own. What makes membership mean the position's OWN completion
+    is `_run_ingestion`'s `rev_claim_floor_pos` gate, which stops :lo-hash
+    descending past a position this run failed to complete (see
+    `_skip_claim`'s docstring)."""
 
     def _seed_high(self, db, lo_hash, hi_hash, pos_count=None):
         """Seeds the interval as a real run would leave it, :pos-count

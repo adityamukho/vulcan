@@ -504,7 +504,13 @@ complete is a floor `:lo-hash` may not cross for the rest of that run:
 `_reverse_apply` takes `persist_claim`, and the end-of-walk
 `_frontier_persist_span` flush clamps its lo bound to the same floor. Both
 incompleteness paths raise it — a write that raised and an extraction that
-raised — because they are the same defect. **This withholds BOOKKEEPING, never
+raised — because they are the same defect. There is a third way a reverse
+position retires incomplete that does NOT raise it: the shutdown `break` in
+`_run_ingestion`'s pipeline loop, which leaves whatever is still in `pending`
+unclaimed. That path is safe without raising the floor — nothing lower ever
+claims after a shutdown, and `completed_all=False` gates the end-of-walk flush
+off — so do not go looking for a third `_note_incomplete_rev` call to match it.
+**This withholds BOOKKEEPING, never
 WORK**: positions below the floor are still claimed, parsed and written in full,
 they simply do not assert completion, so the next run re-walks them. Do not
 "optimize" it into skipping the work. Cost is one run's re-walk below a
@@ -512,7 +518,20 @@ transient failure, which is what master effectively did anyway. A deterministic
 failure at a fixed position therefore blocks reverse-frontier progress below it
 for as long as it keeps failing — that is the accepted price of a precise
 interval, and it is loud (`stderr_capture` reads the per-commit skip line;
-`commit_census`'s `skipped_commits` clause fails on the extraction case).
+`stderr_capture`'s `skipped_commits`, gated by `run_ingestion_benchmark._exit_code`,
+fails on both the extraction case and the write-failure case — `_SKIPPED_COMMIT_RE`
+matches both log lines).
+
+**The floor also starves Stage B (the correction sweep), for the whole reverse
+region below it, not just below the floor.**
+`_correction_sweep_select_position` only selects once the PERSISTED gap reads
+closed, and a floored run never advances frontier-high's `:lo-hash` down to
+meet frontier-low — so the sweep runs zero times for that entire run, meaning
+no lineage confirmation and none of `_forward_apply(..., lifecycle_only=True)`'s
+D/R closes, renames, dependency churn or gitlink changes for the whole span.
+It self-heals the next time a run completes cleanly; `_should_fold_lineage_watermark`
+stays correct throughout, since it requires the sweep to have actually reached
+the high bound.
 
 `fwd` never skips, and one clause buys two properties. A forward claim inside a
 provisional region is the authority upgrade that must still happen; and
@@ -535,7 +554,8 @@ so excluding skips would silently redefine the number that gate compares against
 `git rev-list` and turn a clean skip-heavy resume into a reported lost commit.
 The counter is `positions_skipped`, never `skipped`: `status` already takes the
 value `"skipped"` (run declined, another process owns the graph) and
-`commit_census` already reports `skipped_commits` (extraction failures).
+`stderr_capture` already reports `skipped_commits` (extraction AND write
+failures — `_SKIPPED_COMMIT_RE` matches both log lines).
 
 **`walk_vs_graph` is NOT a backstop on the skip predicate, and an earlier draft
 of this section said it was.** `_ingest_progress["processed"]` is SEEDED with
