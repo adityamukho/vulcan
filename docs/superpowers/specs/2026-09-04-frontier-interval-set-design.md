@@ -107,6 +107,15 @@ One addition: `claim_low()`/`claim_high()` return the position AND the resulting
 interval AND any interval the coalesce swallowed. That lets the persist path
 mirror an in-memory merge without re-reading the interval set once per commit.
 
+**Merge survivor rule.** When a coalesce joins two provisional intervals, the
+LOWER one is the surviving entity: its `:hi-hash` extends upward and the upper
+entity's facts are retracted. When `frontier-high` is one of the two it is by
+definition the lower, so it always survives — which is what keeps "`frontier-high`
+is the lowest provisional interval" true by construction rather than by
+maintenance, and keeps the sweep-side readers pointed at a stable ident. The
+survivor's `:pos-count` is rewritten to the merged span in the same transact as
+the bound that moved.
+
 ## Persistence
 
 A provisional interval above `frontier-high` persists as its own entity:
