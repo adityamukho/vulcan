@@ -8941,12 +8941,13 @@ class TestSkipFlushNeverCoversFailedWrites:
         real_reverse_apply = mcp_server._reverse_apply
 
         def failing_reverse_apply(db, repo_path, linearization, commit_metadata,
-                                  pos, file_results, index_con=None):
+                                  pos, file_results, index_con=None,
+                                  persist_claim=True):
             if linearization[pos] in failing:
                 raise RuntimeError("simulated per-commit write failure")
             return real_reverse_apply(
                 db, repo_path, linearization, commit_metadata, pos, file_results,
-                index_con,
+                index_con, persist_claim,
             )
 
         monkeypatch.setattr(mcp_server, "_reverse_apply", failing_reverse_apply)
@@ -8991,6 +8992,116 @@ class TestSkipFlushNeverCoversFailedWrites:
             "interval reached the tip, stayed representable, and was retained "
             "rather than discarded -- nothing will ever re-walk them"
         )
+
+class TestSkipFastPathFailedWriteIsNotClaimed:
+    """#326 Finding A: an isolated per-commit WRITE FAILURE at a non-tip
+    reverse position must not become a permanent silent skip.
+
+    _frontier_persist_claim is _reverse_apply's LAST write, but a write that
+    RAISES takes _run_ingestion's per-commit `except`, which logs, counts, and
+    CONTINUES THE DESCENT. No claim is persisted for the failed position -- but
+    :lo-hash is a closed RANGE bound, so the next LOWER position that succeeds
+    moves it beneath the failed one and sweeps it into the interval. That
+    interval is archived on the next tip growth (pure tip growth preserves its
+    :pos-count exactly), and _skip_claim then skips that position forever.
+
+    So the witness statement -- "membership in a persisted interval proves the
+    position completed" -- was only ever implied by a NEIGHBOUR's claim. #313's
+    SIGKILL is safe because the process STOPS; the `except` path does not. On
+    master this was self-healing by accident (the discard forced a full
+    re-walk); the archive converts it into permanent loss that every at-scale
+    detector reads clean.
+
+    The fix makes the interval PRECISE: once a reverse write fails, :lo-hash
+    stops descending for the rest of the run. Positions below are still walked
+    and still written -- they simply do not claim -- so the next run re-walks
+    them.
+    """
+
+    def _repo(self, tmp_path, n, start=0):
+        repo = tmp_path / "repo"
+        if not repo.exists():
+            repo.mkdir()
+            _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(start, start + n):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @staticmethod
+    def _has_commit_entity(hash_):
+        import mcp_server
+        raw = mcp_server._db_execute(
+            mcp_server.get_db(),
+            f"(query [:find (count-distinct ?t) :where "
+            f"[:commit/{hash_[:12]} :entity-type ?t]])",
+        )
+        return json.loads(raw)["results"][0][0] > 0
+
+    @pytest.mark.asyncio
+    async def test_a_failed_non_tip_write_is_re_walked_by_a_later_run(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server
+        import frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = self._repo(tmp_path, 10)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+
+        victim = frontier_registry.build_linearization(str(repo))[5]
+
+        real_reverse_apply = mcp_server._reverse_apply
+
+        def failing_reverse_apply(db, repo_path, linearization, commit_metadata,
+                                  pos, file_results, index_con=None,
+                                  persist_claim=True):
+            if linearization[pos] == victim:
+                raise RuntimeError("simulated per-commit write failure")
+            return real_reverse_apply(
+                db, repo_path, linearization, commit_metadata, pos, file_results,
+                index_con, persist_claim,
+            )
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", failing_reverse_apply)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_reverse_apply)
+
+        assert not self._has_commit_entity(victim), (
+            "precondition: run 1's write for the victim position must actually "
+            "have failed, or the rest of this test proves nothing"
+        )
+
+        # Grow the tip, which is what drives _frontier_load down its
+        # discard-and-archive branch -- #325's real trigger, reproduced.
+        self._repo(tmp_path, 2, start=10)
+        grown = frontier_registry.build_linearization(str(repo))
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        skipped_run2 = mcp_server.handle_minigraf_ingest_status()[
+            "positions_skipped_this_run"
+        ]
+        assert skipped_run2 > 0, (
+            "run 2 skipped nothing, so the fast path was not exercised at all "
+            "and the assertion below could pass under a _skip_claim that "
+            "silently stopped matching"
+        )
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        missing = [h for h in grown if not self._has_commit_entity(h)]
+        assert not missing, (
+            f"commits {[h[:12] for h in missing]} still have no :commit/... "
+            "entity after two clean runs. The reverse write that failed in run "
+            "1 was swallowed by frontier-high's closed range when a LOWER "
+            "position claimed beneath it, the interval was archived as a "
+            "completed region, and _skip_claim now skips that position forever"
+        )
+
 
 class TestLineageProvisionalMarker:
     def test_unmarked_entity_reads_as_authoritative(self, real_db):

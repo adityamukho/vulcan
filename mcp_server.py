@@ -10190,6 +10190,7 @@ def _reverse_apply(
     pos: int,
     file_results: List[tuple],
     index_con: Optional[Any] = None,
+    persist_claim: bool = True,
 ) -> str:
     """#222 phase 2b: apply one already-claimed, already-extracted commit --
     structural facts, :modified-in edges, and provisional :introduced-by for
@@ -10275,6 +10276,11 @@ def _reverse_apply(
     records the claim -- mirrors _run_ingestion's one-checkpoint-per-commit
     cadence (see the design spec's "Resume-safety / atomicity boundary"
     section).
+
+    `persist_claim=False` does everything except record the claim (#326
+    Finding A). The caller uses it to keep frontier-high's :lo-hash from
+    descending past a position this run failed to complete; see the guard at
+    the persist site at the bottom of this function.
     """
     # commit_metadata is indexed POSITIONALLY against linearization below,
     # while _frontier_persist_claim persists linearization[pos] -- so a
@@ -10491,7 +10497,16 @@ def _reverse_apply(
     for superseded_ts, triples in retroactive_by_ts.items():
         _transact(db, "[" + " ".join(triples) + "]", superseded_ts, index_con=index_con)
 
-    _frontier_persist_claim(db, linearization, pos, from_low=False, commit_ts_iso=commit_ts_iso, index_con=index_con)
+    # #326 (Finding A): `persist_claim=False` withholds the BOOKKEEPING for this
+    # position, never the work -- every triple above has already been written.
+    # See _run_ingestion's `rev_claim_floor_pos` for why: :lo-hash is a RANGE
+    # bound, so claiming a position below one whose write FAILED silently
+    # swallows the failed position into the interval, and the archive then turns
+    # that into a permanent skip. Do NOT "optimize" this into skipping the
+    # writes as well: the run below the floor is still doing real, necessary
+    # ingestion, it is simply not entitled to assert that it completed.
+    if persist_claim:
+        _frontier_persist_claim(db, linearization, pos, from_low=False, commit_ts_iso=commit_ts_iso, index_con=index_con)
     _db_checkpoint_gated(db)
     return commit_hash
 
@@ -12084,6 +12099,62 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 lowest_skipped_pos: Optional[int] = None
                 highest_skipped_pos: Optional[int] = None
 
+                # #326 Finding A: the floor :lo-hash may not cross this run.
+                #
+                # The witness this whole feature rests on -- "
+                # _frontier_persist_claim is the LAST write of a position, so
+                # membership in a persisted frontier interval proves that
+                # position completed" -- was FALSE as written, and the archive
+                # is what promoted an always-imprecise interval into a trusted
+                # one. Membership was only ever implied by a NEIGHBOUR's claim:
+                # frontier-high is a closed RANGE, so when a position's write
+                # fails, the per-commit `except` below logs, counts it, and
+                # CONTINUES THE DESCENT -- and the next lower position that
+                # succeeds moves :lo-hash beneath the failed one, sweeping it
+                # into the interval nothing ever claimed for it. #313's SIGKILL
+                # is safe only because the process STOPS there; the `except`
+                # path does not.
+                #
+                # On master that was self-healing by accident: the interval was
+                # discarded on tip growth and everything got re-walked. #326
+                # archives the interval instead, so the same imprecision became
+                # a PERMANENT, SILENT skip of the failed position -- and every
+                # at-scale detector reads that graph clean (fact_audit's two
+                # witnesses agree about an absence, both :introduced-by checks
+                # only examine entities that EXIST, stderr carries only the one
+                # skip line from the run that failed, and commit_census runs on
+                # a fresh graph).
+                #
+                # So the fix is to make the interval PRECISE rather than to
+                # weaken the predicate: once a reverse position fails to
+                # complete, no lower reverse position claims. The reverse
+                # stream descends monotonically, so the highest such position
+                # is the floor for the rest of the run.
+                #
+                # This withholds BOOKKEEPING, never WORK. Positions below the
+                # floor are still claimed, still parsed and still written in
+                # full; they simply do not assert completion, so the next run
+                # re-walks them. Do not "optimize" this into skipping them.
+                # The cost is one run's re-walk below a transient failure,
+                # which is what master effectively did anyway.
+                #
+                # Both incompleteness paths set it, because they are the same
+                # defect: a write that raised (below), and an extraction that
+                # raised (which never even reaches _reverse_apply, so it is
+                # strictly the weaker case). The forward stream is untouched --
+                # it claims frontier-low and its failure semantics are out of
+                # scope for #326.
+                rev_claim_floor_pos: Optional[int] = None
+
+                def _note_incomplete_rev(claim_tag: str, claim_pos: int) -> None:
+                    nonlocal rev_claim_floor_pos
+                    if claim_tag != "rev":
+                        return
+                    rev_claim_floor_pos = (
+                        claim_pos if rev_claim_floor_pos is None
+                        else max(rev_claim_floor_pos, claim_pos)
+                    )
+
                 # #222 phase 2d: positions come from the shared-gap claimer,
                 # not a plain commit iterator, and each pipeline entry carries
                 # the tag of the stream that claimed it. Extraction is stream-
@@ -12174,6 +12245,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             f"({subject!r}): {e}",
                             file=sys.stderr,
                         )
+                        _note_incomplete_rev(tag, pos)
                         submit_next()
                         _ingest_progress["current_commit"] = commit_hash
                         _ingest_progress["processed"] += 1
@@ -12223,6 +12295,9 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 await loop.run_in_executor(
                                     write_executor, _reverse_apply, db, repo_path, linearization,
                                     commit_metadata, pos, extracted_files, index_con,
+                                    # #326 Finding A: below the floor we do the
+                                    # work but withhold the claim.
+                                    rev_claim_floor_pos is None or pos > rev_claim_floor_pos,
                                 )
 
                         except Exception as e:
@@ -12242,6 +12317,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 file=sys.stderr,
                             )
                             _trace_write_ok = False
+                            _note_incomplete_rev(tag, pos)
 
                     # #260: no record for a commit whose write failed -- same
                     # contamination class the brief excluded extraction
@@ -12293,15 +12369,27 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # commit_metadata[highest_skipped_pos] subscript below is
                 # guarded at the point of use rather than by an argument made
                 # thirty lines away.
+                #
+                # #326 Finding A: the flush obeys the same floor the per-commit
+                # claims do. _frontier_persist_span moves :lo-hash DOWN, so an
+                # unclamped flush would re-open the exact hole the floor closes
+                # -- a skipped position below a failed one would drag the
+                # persisted bound past it in one write. Clamping the lo bound
+                # (rather than dropping the flush) keeps the flush doing its
+                # job for the skipped span that IS above the floor.
+                flush_lo_pos = lowest_skipped_pos
+                if flush_lo_pos is not None and rev_claim_floor_pos is not None:
+                    flush_lo_pos = max(flush_lo_pos, rev_claim_floor_pos + 1)
                 if (
                     completed_all
-                    and lowest_skipped_pos is not None
+                    and flush_lo_pos is not None
                     and highest_skipped_pos is not None
+                    and flush_lo_pos <= highest_skipped_pos
                 ):
                     async with db_lease_async() as db:
                         await loop.run_in_executor(
                             write_executor, _frontier_persist_span, db, linearization,
-                            lowest_skipped_pos, highest_skipped_pos, False,
+                            flush_lo_pos, highest_skipped_pos, False,
                             commit_metadata[highest_skipped_pos][1], index_con,
                         )
 
