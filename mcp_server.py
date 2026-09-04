@@ -6313,10 +6313,22 @@ def _load_one_interval(
     would record a region whose freshly-computed count always matches its own
     (now-wrong) bounds -- the same discriminates-nothing failure the retain
     check exists to avoid. An unresolvable pair carries no position space to
-    recompute a count from at all, so recording it (well-formed: both bounds
-    are present in the FACTS, and pos_count is present) is the only witness
-    left, and _completed_region_record's own count is None for it -- the
-    denominator was never computable, not silently trusted.
+    recompute a count from at all -- routing it through
+    _completed_region_record's `order`-driven count would silently produce
+    None -- so the archive writes the interval's OWN stored pos_count
+    directly instead (#325 review round 2), preserving the CLAIM-time
+    denominator as the witness's checksum rather than discarding it.
+
+    That checksum only becomes USABLE again in a run whose linearization
+    regains these exact commit hashes -- ordinary history rewrites (rebase,
+    amend) never reproduce a prior hash, they only replace it, so in
+    practice an archived divergent-ref region is discovered once, discarded,
+    and never consulted by _skip_claim again in any two-run scenario. That is
+    a real, measured consequence of #325 (not a defect introduced by this
+    docstring's fix): the fast path _skip_claim provides stays CORRECT for
+    the case it still covers, but that case is narrower after #325 than
+    #326 assumed -- see TestSkipFastPathEndToEnd's docstring in
+    tests/test_mcp_server.py for the full accounting.
 
     Leaving a non-retained interval's facts in the graph -- what happened to
     an unresolvable pair before this fix -- was NEITHER a discard NOR an
@@ -6351,7 +6363,44 @@ def _load_one_interval(
         ))
         return
     if not resolved and pos_count is not None:
-        _completed_region_record(db, lo_hash, hi_hash, tag, run_ts_iso, index_con=index_con)
+        # #325 review round 2: carry the interval's OWN stored :pos-count
+        # through to the archive, rather than routing through
+        # _completed_region_record (whose count would be None here -- no
+        # order map exists, since at least one bound is absent from this
+        # linearization and there is no position space to compute a fresh
+        # count from). A None count is exactly what _completed_regions_load
+        # refuses to trust: "no denominator" and "a denominator that still
+        # checks out" must not be the same branch. This interval's
+        # pos_count was written at CLAIM time under whatever linearization
+        # these positions were claimed against, and stays a legitimate
+        # checksum even though it can no longer be recomputed here -- if
+        # the branch ever un-diverges back to these exact hashes, a later
+        # run's _completed_regions_load can then trust it (though bounds
+        # this specific are only ever resolvable again if the exact same
+        # commit hashes reappear, which no ordinary rebase produces).
+        #
+        # Bypasses _completed_region_record's coalescing machinery
+        # entirely, rather than calling it with an explicit count it has
+        # no parameter to accept: an unresolvable region has no position
+        # space to merge into by definition (verified against order=None
+        # per the original Task 4 ruling -- it records fine, just with a
+        # count of None). Query-before-write directly, matching the
+        # pattern every other write site here uses (#156): this ident is
+        # archived at most once in practice, since the discard below
+        # retracts the source facts and _load_one_interval is never
+        # called again for this ident once they are gone -- but a stray
+        # second call must still not duplicate a live datom.
+        region_ident = _completed_region_ident(lo_hash, tag)
+        existing_region = _db_execute(
+            db, f"(query [:find ?lo :where [{region_ident} :lo-hash ?lo]])"
+        )
+        if not json.loads(existing_region).get("results", []):
+            _transact(
+                db,
+                _completed_region_facts(lo_hash, hi_hash, tag, pos_count=pos_count),
+                run_ts_iso,
+                index_con=index_con,
+            )
     _frontier_discard_interval(
         db, ident, bounds, index_con=index_con, pos_count=pos_count, tag=tag,
     )
@@ -6895,7 +6944,24 @@ def _frontier_persist_claim(
 
     to_retract: List[str] = []
     to_transact: List[str] = []
-    if absorbed_bounds_list:
+    # #325 review round 2: branch on `absorbed_idents` (what the CALLER says
+    # merged), never on `absorbed_bounds_list` (what survived the phantom
+    # filter above). A merge whose absorbed interval was minted and coalesced
+    # away again within the SAME _extend() call -- degenerate from birth, so
+    # it never got an independent claim to persist -- leaves
+    # absorbed_bounds_list empty while absorbed_idents is not, and the two
+    # used to be treated as the same signal. They are not: falling through to
+    # the plain single-bound-move branch below then MOVES the wrong bound
+    # (assuming the claim is adjacent to the survivor's own lo, which is false
+    # whenever the claim actually landed on the far side of a gap and merged
+    # through a same-call phantom) and silently INVERTS the pair -- measured
+    # producing exactly `(hash-at-9, hash-at-8)` for a claim at position 9
+    # against a base spanning [6,8], from TestMultiStreamParityWithForwardOnly.
+    # A phantom absorbed interval's span is always exactly the claimed
+    # position itself (it was created AND absorbed by that one claim, with no
+    # independent history), so `moved_hash` already covers it in the union
+    # below -- no special contribution needed, only the branch choice matters.
+    if absorbed_idents:
         # #325: the merged span is the union of the claimed position, the
         # survivor's own current bounds (if it already existed), and every
         # absorbed interval's bounds -- see the docstring's Finding 1 note
@@ -10508,12 +10574,33 @@ def _reverse_apply(
     file_results: List[tuple],
     index_con: Optional[Any] = None,
     persist_claim: bool = True,
+    claim_ident: Optional[str] = None,
+    absorbed_idents: Optional[List[str]] = None,
 ) -> str:
     """#222 phase 2b: apply one already-claimed, already-extracted commit --
     structural facts, :modified-in edges, and provisional :introduced-by for
     every entity the commit's "A"/"M" files touch. "D"/"R" files are skipped
     entirely (deletions and renames are out of scope for this sub-phase --
     see the design spec).
+
+    `claim_ident`/`absorbed_idents` (#325 review round 2, the ident-wiring
+    slice of Task 5's scope): passed straight through to
+    _frontier_persist_claim's own `ident`/`absorbed_idents`. Both default to
+    None, which _frontier_persist_claim reads as "the fixed
+    :ingestion/frontier-high ident, nothing absorbed" -- correct for every
+    caller before #325's provisional side could hold more than one
+    interval. Once it can, the caller MUST supply the claim's own target:
+    _run_ingestion captures `allocator.last_claim` right after the claim
+    that produced this position (before any LATER claim overwrites it) and
+    resolves its ident from `.interval.is_base`/`.anchor_pos`, exactly as
+    _load_one_interval resolves an interval's ident on the READ side. Get
+    this wrong and every reverse claim persists to :ingestion/frontier-high
+    regardless of which in-memory interval it actually belongs to --
+    measured producing an INVERTED pair (`lo` from the new claim's hash,
+    `hi` still the old interval's) the moment a reverse claim lands above a
+    RETAINED interval it does not touch, which is silent since
+    `_frontier_read_bounds` returns the pair as-is and nothing checks
+    lo <= hi until the next _frontier_load.
 
     Split out of _reverse_fill_claim_and_process's single body (#222 phase
     2d): `pos` (from allocator.claim_high()) and `file_results` (from
@@ -10823,7 +10910,10 @@ def _reverse_apply(
     # writes as well: the run below the floor is still doing real, necessary
     # ingestion, it is simply not entitled to assert that it completed.
     if persist_claim:
-        _frontier_persist_claim(db, linearization, pos, from_low=False, commit_ts_iso=commit_ts_iso, index_con=index_con)
+        _frontier_persist_claim(
+            db, linearization, pos, from_low=False, commit_ts_iso=commit_ts_iso,
+            index_con=index_con, ident=claim_ident, absorbed_idents=absorbed_idents,
+        )
     _db_checkpoint_gated(db)
     return commit_hash
 
@@ -12077,21 +12167,39 @@ class _RoundRobinClaimer:
     def next_claim(self) -> Optional[Tuple[str, int]]:
         """('fwd', pos) or ('rev', pos), or None once the gap is empty.
 
-        There is deliberately no "the other side might still have work"
-        fallback: claim_low() and claim_high() both return None on exactly
-        the same condition, is_gap_empty(), so they can only ever return
-        None together. A fallthrough would be dead code reading as if the
-        two frontiers could exhaust independently -- they cannot; they share
-        one gap.
+        #325 review round 2: claim_low() and claim_high() no longer return
+        None on exactly the same condition -- that invariant held only
+        because claim_low() used to serve the lowest unclaimed position
+        unconditionally. It now refuses a hole that is not adjacent to the
+        authoritative interval's own edge (the forward stream's contiguous-
+        from-C0 contract; see claim_low()'s own docstring), which can be
+        true while claim_high() can still serve the topmost hole -- e.g. the
+        bulk gap between the two sides has already closed and only a fresh
+        tip gap remains, not touching the authoritative interval at all.
+
+        So a None from the CURRENT phase's own stream is no longer proof the
+        shared gap is empty; only is_gap_empty() is. When it is forward's
+        turn and claim_low() has nothing legitimate to do, this hands the
+        turn to reverse instead of reporting no claim at all -- the forward
+        stream stays starved (by design) until the provisional region folds
+        into the authoritative one, but the reverse stream must keep making
+        progress on whatever remains.
+
+        claim_high() itself is unchanged and still returns None on exactly
+        is_gap_empty(), so no symmetric fallback is needed on that side.
         """
+        if self._allocator.is_gap_empty():
+            return None
         if self._forward_phase:
             pos = self._allocator.claim_low()
-            tag = "fwd"
-            limit = self._forward_per_round
+            if pos is not None:
+                tag, limit = "fwd", self._forward_per_round
+            else:
+                pos = self._allocator.claim_high()
+                tag, limit = "rev", self._reverse_per_round
         else:
             pos = self._allocator.claim_high()
-            tag = "rev"
-            limit = self._reverse_per_round
+            tag, limit = "rev", self._reverse_per_round
         if pos is None:
             return None
 
@@ -12100,6 +12208,47 @@ class _RoundRobinClaimer:
             self._taken_in_phase = 0
             self._forward_phase = not self._forward_phase
         return tag, pos
+
+
+def _reverse_claim_persist_target(
+    allocator: "frontier_registry.FrontierAllocator", linearization: List[str]
+) -> Tuple[Optional[str], List[str]]:
+    """The (ident, absorbed_idents) a reverse claim's _frontier_persist_claim
+    call needs, read from `allocator.last_claim` -- the ClaimResult the
+    claim that produced this position just left behind.
+
+    #325 review round 2 (Task 5's ident-wiring, applied narrowly here: this
+    function and its one call site are the minimum needed to stop a reverse
+    claim above a RETAINED interval from corrupting :ingestion/frontier-high;
+    the per-interval reverse floor and end-of-walk flush generalization
+    Task 5's brief also describes are untouched).
+
+    The base interval (exactly one per tag) is always the fixed
+    :ingestion/frontier-high entity; any other interval's ident is minted
+    from its own anchor hash (_interval_ident), the same resolution
+    _load_one_interval performs on the read side -- NEVER re-derived from
+    the interval's current bounds. Every absorbed interval gets the same
+    treatment so _frontier_persist_claim can retract its entity: the
+    coalesce survivor rule (frontier_registry._coalesce) never lets the
+    base be absorbed, so an absorbed interval here is always itself a
+    minted, non-base ident.
+
+    MUST be called immediately after the claim that produced `pos` -- a
+    later claim overwrites `allocator.last_claim`, and reading it after the
+    fact would attribute the wrong interval's ident to this position.
+    """
+    claim = allocator.last_claim
+    if claim is None:
+        return None, []
+    interval = claim.interval
+    ident = (
+        _FRONTIER_HIGH_IDENT if interval.is_base
+        else _interval_ident(linearization[interval.anchor_pos])
+    )
+    absorbed_idents = [
+        _interval_ident(linearization[iv.anchor_pos]) for iv in claim.absorbed
+    ]
+    return ident, absorbed_idents
 
 
 @dataclass
@@ -12524,10 +12673,26 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         # git rev-list, turning a clean skip-heavy resume into
                         # a reported lost commit.
                         _ingest_progress["processed"] += 1
+                    # #325 review round 2: captured HERE, immediately after
+                    # the claim that produced `pos` -- allocator.last_claim
+                    # would be overwritten by any LATER claim, so this must
+                    # not be deferred to the write-dispatch loop below, which
+                    # runs claims out of order relative to when they were
+                    # made (pipelined: several positions can be claimed
+                    # before the first one's write happens). Only 'rev'
+                    # claims need it -- the authoritative side never
+                    # fragments (claim_low() only ever grows the one base
+                    # interval), so _frontier_persist_claim's own default
+                    # (:ingestion/frontier-low, nothing absorbed) is already
+                    # correct for 'fwd'.
+                    claim_ident, absorbed_idents = (
+                        _reverse_claim_persist_target(allocator, linearization)
+                        if tag == "rev" else (None, [])
+                    )
                     fut = loop.run_in_executor(
                         executor, _extract_commit, repo_path, linearization[pos], ignore_patterns
                     )
-                    pending.append((tag, pos, fut))
+                    pending.append((tag, pos, fut, claim_ident, absorbed_idents))
                     return True
 
                 for _ in range(pipeline_depth):
@@ -12539,7 +12704,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         completed_all = False
                         break
 
-                    tag, pos, fut = pending.popleft()
+                    tag, pos, fut, claim_ident, absorbed_idents = pending.popleft()
                     commit_hash, commit_ts_iso, author, subject = commit_metadata[pos]
                     # renamed_pairs (Task 9's 4th _extract_commit return element) is
                     # unpacked here but not yet consumed — Task 10 wires it into
@@ -12624,6 +12789,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     # #326 Finding A: below the floor we do the
                                     # work but withhold the claim.
                                     rev_claim_floor_pos is None or pos > rev_claim_floor_pos,
+                                    # #325 review round 2: the ident this
+                                    # claim's interval resolved to when it
+                                    # was MADE (captured in submit_next),
+                                    # never re-derived here -- see
+                                    # _reverse_claim_persist_target's
+                                    # docstring.
+                                    claim_ident, absorbed_idents,
                                 )
 
                         except Exception as e:

@@ -192,7 +192,15 @@ class TestFrontierAllocatorGrownLinearization:
         assert allocator.is_gap_empty()
 
     def test_claim_low_strictly_increases_and_terminates(self):
-        allocator = FrontierAllocator(5, [Interval(2, 3, TAG_AUTHORITATIVE)])
+        # #325 review: seeded at [0, 2], not [2, 3] -- claim_low() now only
+        # ever serves the hole adjacent to the authoritative interval's own
+        # edge (see its docstring), and an authoritative interval that does
+        # not start at position 0 is unreachable in the real system anyway
+        # (frontier-low is always seeded from linearization[0]). A seed
+        # starting mid-linearization would make claim_low() correctly
+        # refuse forever, which is a different property than this test
+        # exists to check.
+        allocator = FrontierAllocator(5, [Interval(0, 2, TAG_AUTHORITATIVE)])
         seen = []
         for _ in range(20):
             pos = allocator.claim_low()
@@ -271,9 +279,34 @@ class TestFragmentedProvisionalSet:
         assert merged.interval.anchor_pos == 11
         assert [iv.anchor_pos for iv in merged.absorbed] == [19]
 
-    def test_claim_low_still_ascends_across_a_fragmented_high_side(self):
+    def test_claim_low_returns_none_once_the_bulk_gap_closes(self):
+        """#325 review (post-Task-4 ruling): this replaces a test that
+        asserted [12, 13, 14] here, which encoded exactly the behaviour now
+        ruled wrong.
+
+        auth[0,3] + prov[4,11] means the bulk gap between the two sides has
+        ALREADY closed -- the only hole left is 12..19, above the
+        provisional region, not adjacent to the authoritative interval's
+        own edge (3+1=4). A claim_low() that served it anyway would jump
+        the forward stream over positions 4..11, which it has never
+        visited. `:ingestion/watermark`, `_preload_known_entities`'s
+        `watermark_pos` bound, and `:ingestion/lineage-confirmed-through`
+        all read the authoritative interval's reach as "the graph knows
+        everything up to here" -- a lie once the forward walk jumps over
+        unvisited territory. The costed failure mode is not abstract: a
+        later commit that merely re-touches an entity introduced inside the
+        skipped region reads as new to the forward walk's watermark-bounded
+        preload and mints a DUPLICATE `:introduced-by`, silently corrupting
+        lineage attribution. `TestMultiStreamParityWithForwardOnly` in
+        tests/test_mcp_server.py caught exactly this end-to-end; master
+        could never reach it because there was only ever one gap.
+
+        So claim_low() now returns None here: the forward stream has
+        nothing legitimate left to do until the provisional region folds
+        into the authoritative one.
+        """
         a = self._alloc()
-        assert [a.claim_low() for _ in range(3)] == [12, 13, 14]
+        assert a.claim_low() is None
 
     def test_is_gap_empty_requires_every_hole_closed(self):
         a = self._alloc()

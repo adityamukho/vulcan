@@ -120,9 +120,49 @@ class FrontierAllocator:
         return None
 
     def claim_low(self) -> Optional[int]:
+        """Serve ONLY the hole immediately adjacent to the authoritative
+        interval's own edge -- `gap_lo == authoritative.hi_pos + 1`, or
+        `gap_lo == 0` when no authoritative interval exists yet. Never the
+        lowest unclaimed position in general.
+
+        #325 review: "strictly ascending" was believed sufficient because
+        `_forward_apply`'s own precondition only needs an ascending
+        sequence. It is not sufficient -- the forward stream's real
+        contract is CONTIGUOUS FROM C0, and three things outside the
+        allocator read it that way: `:ingestion/watermark`,
+        `_preload_known_entities`'s `watermark_pos` bound, and
+        `:ingestion/lineage-confirmed-through`. Once the bulk gap between
+        the authoritative and provisional regions closes, any further hole
+        (a retained provisional interval's own tip growth, or a fresh gap
+        above it) is NOT adjacent to what the forward stream has actually
+        walked. Serving it would jump the forward walk over positions it
+        has never visited, and `:ingestion/watermark` would then assert a
+        contiguity it does not have: a later commit that merely re-touches
+        an entity introduced inside the skipped-over region reads as new to
+        the forward walk's watermark-bounded preload, minting a DUPLICATE
+        `:introduced-by` -- caught end-to-end by
+        TestMultiStreamParityWithForwardOnly, which master could never
+        reach because there was only ever one gap.
+
+        So once the bulk gap closes, the forward stream is simply finished
+        for the run: it has nothing legitimate to do above the provisional
+        region until that region folds into the authoritative one (a later
+        task's job, not the allocator's). `claim_high()` is unchanged --
+        serving the topmost hole and falling through to the bulk gap is the
+        whole point of #325, and the reverse stream carries no contiguity
+        contract.
+        """
         if self.is_gap_empty():
             return None
         pos = self.gap_lo
+        authoritative = next(
+            (iv for iv in self._intervals if iv.tag == TAG_AUTHORITATIVE), None
+        )
+        if authoritative is not None:
+            if pos != authoritative.hi_pos + 1:
+                return None
+        elif pos != 0:
+            return None
         self._extend(pos, tag=TAG_AUTHORITATIVE, from_low=True)
         return pos
 
