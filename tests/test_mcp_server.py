@@ -7568,8 +7568,12 @@ class TestFrontierLoad:
         allocator = mcp_server._frontier_load(db, linearization, "2026-01-02T00:00:00Z")
 
         assert allocator.total_positions == 4
+        # #325: the authoritative interval always carries anchor_pos=0,
+        # is_base=True -- it is the fixed base the low side is keyed on.
         assert allocator.intervals() == [
-            frontier_registry.Interval(0, 1, frontier_registry.TAG_AUTHORITATIVE)
+            frontier_registry.Interval(
+                0, 1, frontier_registry.TAG_AUTHORITATIVE, anchor_pos=0, is_base=True
+            )
         ]
         assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) == ("h0", "h1")
 
@@ -7583,7 +7587,9 @@ class TestFrontierLoad:
         second = mcp_server._frontier_load(db, linearization, "2026-01-03T00:00:00Z")
 
         assert second.intervals() == [
-            frontier_registry.Interval(0, 1, frontier_registry.TAG_AUTHORITATIVE)
+            frontier_registry.Interval(
+                0, 1, frontier_registry.TAG_AUTHORITATIVE, anchor_pos=0, is_base=True
+            )
         ]
         # Directly count raw facts -- _frontier_read_bounds's results[0]
         # shortcut would silently collapse a duplicate live datom and hide a
@@ -7644,15 +7650,22 @@ class TestFrontierLoadNormalisesUnrepresentableIntervals:
             facts.append(f"[{mcp_server._FRONTIER_HIGH_IDENT} :pos-count {pos_count}]")
         mcp_server._transact(db, "[" + " ".join(facts) + "]", "2026-01-01T00:00:00Z")
 
-    def test_discards_and_retracts_high_interval_that_no_longer_tops_out(self, real_db):
+    def test_discards_and_retracts_a_high_interval_whose_stored_count_no_longer_matches(
+        self, real_db
+    ):
+        """#325 superseded this class's original trigger ("doesn't reach the
+        tip") -- a span-matching interval is now RETAINED regardless of the
+        tip, see TestFrontierLoadRetainsAcrossTipGrowth. What still forces a
+        discard is the stored :pos-count no longer matching the span: here a
+        commit ("x") landed BETWEEN h1 and h2, growing the span from 2 to 3
+        while the interval's stored count still says 2."""
         import mcp_server
-        # Run 1 claimed h1..h2 of a 3-commit repo; h3 and h4 have since landed.
-        self._seed_high(real_db, "h1", "h2")
-        grown = ["h0", "h1", "h2", "h3", "h4"]
+        self._seed_high(real_db, "h1", "h2")  # pos-count 2, from the original 3-commit repo
+        interleaved = ["h0", "h1", "x", "h2", "h3", "h4"]
 
-        allocator = mcp_server._frontier_load(real_db, grown, "2026-01-02T00:00:00Z")
+        allocator = mcp_server._frontier_load(real_db, interleaved, "2026-01-02T00:00:00Z")
 
-        assert allocator.intervals() == [], "stale high interval must not be reconstructed"
+        assert allocator.intervals() == [], "stale-count high interval must not be reconstructed"
         assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) is None, (
             "discarding only in memory leaves the next persist call extending a pair "
             "the allocator no longer believes in, which re-creates the inverted state"
@@ -7675,8 +7688,13 @@ class TestFrontierLoadNormalisesUnrepresentableIntervals:
 
         allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-02T00:00:00Z")
 
+        # #325: a retained interval now carries anchor_pos/is_base -- for
+        # frontier-high, anchor_pos is its own hi_pos and it is always the
+        # base of the provisional side.
         assert allocator.intervals() == [
-            frontier_registry.Interval(2, 3, frontier_registry.TAG_PROVISIONAL)
+            frontier_registry.Interval(
+                2, 3, frontier_registry.TAG_PROVISIONAL, anchor_pos=3, is_base=True
+            )
         ]
         assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) == ("h2", "h3")
 
@@ -8095,15 +8113,25 @@ class TestFrontierLoadArchivesDiscardedInterval:
             facts.append(f"[{mcp_server._FRONTIER_HIGH_IDENT} :pos-count {pos_count}]")
         mcp_server._transact(db, "[" + " ".join(facts) + "]", "2026-01-01T00:00:00Z")
 
-    def test_discarded_interval_is_archived_as_a_provisional_region(self, real_db):
-        import mcp_server
+    def test_a_span_matching_interval_off_tip_is_retained_not_archived(self, real_db):
+        """#325 superseded this scenario: a span-matching interval that no
+        longer tops out (new commits landed on HEAD) used to be discarded and
+        archived here -- "reaches the tip" was the retain test. It is now
+        RETAINED instead (see TestFrontierLoadRetainsAcrossTipGrowth), because
+        the retain test became "stored :pos-count still matches the span",
+        which this fixture satisfies regardless of the tip. Kept as a
+        regression guard on this exact fixture shape, which this class's
+        other tests reuse for the cases that genuinely still discard."""
+        import mcp_server, frontier_registry
         self._seed_high(real_db, "h1", "h2")
         grown = ["h0", "h1", "h2", "h3", "h4"]
 
-        mcp_server._frontier_load(real_db, grown, "2026-01-02T00:00:00Z")
+        allocator = mcp_server._frontier_load(real_db, grown, "2026-01-02T00:00:00Z")
 
-        assert mcp_server._completed_regions_read(real_db) == [("h1", "h2", ":provisional")]
-        assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) is None
+        assert [iv.tag for iv in allocator.intervals()] == [frontier_registry.TAG_PROVISIONAL]
+        assert mcp_server._completed_regions_read(real_db) == []
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) == ("h1", "h2")
 
     def test_a_kept_interval_archives_nothing(self, real_db):
         """A live interval is already its own witness. Archiving one that was
@@ -8176,9 +8204,15 @@ class TestFrontierLoadArchivesDiscardedInterval:
     def test_the_discard_takes_the_pos_count_fact_with_it(self, real_db):
         """A count left behind attaches to whatever interval the next
         _frontier_persist_claim creates at this ident, licensing a comparison
-        against a span it was never measured from."""
+        against a span it was never measured from.
+
+        #325: h1..h3 is seeded with a count of 2 while its actual span under
+        the loaded linearization is 3 -- a deliberate mismatch, since a
+        matching count is now RETAINED rather than discarded (see
+        TestFrontierLoadRetainsAcrossTipGrowth), and this test needs a
+        genuine discard to exercise the pos-count cleanup."""
         import mcp_server
-        self._seed_high(real_db, "h1", "h2")
+        self._seed_high(real_db, "h1", "h3", pos_count=2)
 
         mcp_server._frontier_load(
             real_db, ["h0", "h1", "h2", "h3", "h4"], "2026-01-02T00:00:00Z"
@@ -8188,14 +8222,122 @@ class TestFrontierLoadArchivesDiscardedInterval:
             real_db, mcp_server._FRONTIER_HIGH_IDENT
         ) is None
 
-    def test_two_discards_across_runs_coalesce_into_one_region(self, real_db):
+    def test_two_unresolvable_discards_across_runs_coalesce_into_one_region(self, real_db):
+        """#325: a span-matching interval is retained now, not discarded, so
+        the only way _frontier_load still discards-and-archives a
+        REPRESENTABLE-looking pair is via unresolvable bounds (the
+        divergent-ref leak fix) -- this repoints the old coalescing regression
+        at that path instead of a since-retained one."""
         import mcp_server
-        self._seed_high(real_db, "h3", "h4")
-        mcp_server._frontier_load(real_db, ["h0", "h1", "h2", "h3", "h4", "h5"], "2026-01-02T00:00:00Z")
-        self._seed_high(real_db, "h1", "h4")
-        mcp_server._frontier_load(real_db, ["h0", "h1", "h2", "h3", "h4", "h5", "h6"], "2026-01-03T00:00:00Z")
+        self._seed_high(real_db, "gone-b", "gone-c", pos_count=2)
+        mcp_server._frontier_load(real_db, ["h0", "h1", "h2"], "2026-01-02T00:00:00Z")
+        self._seed_high(real_db, "gone-a", "gone-b", pos_count=2)
+        mcp_server._frontier_load(real_db, ["h0", "h1", "h2"], "2026-01-03T00:00:00Z")
 
-        assert mcp_server._completed_regions_read(real_db) == [("h1", "h4", ":provisional")]
+        assert mcp_server._completed_regions_read(real_db) == [
+            ("gone-a", "gone-c", ":provisional")
+        ]
+
+
+class TestFrontierLoadRetainsAcrossTipGrowth:
+    """#325: a high interval that no longer reaches the last position is
+    RETAINED, not discarded, provided its stored :pos-count still matches its
+    span in this linearization."""
+
+    def _seed_high(self, db, lin, lo, hi, count):
+        import mcp_server
+        ident = mcp_server._FRONTIER_HIGH_IDENT
+        facts = [
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f"[{ident} :tag :provisional]",
+            f'[{ident} :lo-hash "{lin[lo]}"]',
+            f'[{ident} :hi-hash "{lin[hi]}"]',
+        ]
+        if count is not None:
+            facts.append(f"[{ident} :pos-count {count}]")
+        mcp_server._transact(db, "[" + " ".join(facts) + "]", "2026-09-04T00:00:00Z")
+
+    def test_grown_tip_retains_the_interval_and_leaves_a_hole_above(self, real_db):
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(20)]
+        self._seed_high(real_db, lin, 4, 11, 8)
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-04T00:00:01Z")
+        prov = [iv for iv in alloc.intervals()
+                if iv.tag == frontier_registry.TAG_PROVISIONAL]
+        assert [(iv.lo_pos, iv.hi_pos) for iv in prov] == [(4, 11)]
+        assert prov[0].is_base is True
+        assert alloc.gap_hi == 19, "the new tip must be unclaimed"
+        assert mcp_server._completed_regions_read(real_db) == [], (
+            "a retained interval must not also be archived -- two descriptions "
+            "of one region is how #326's bounds-keyed dedup went wrong"
+        )
+
+    def test_a_countless_interval_is_still_discarded(self, real_db):
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(20)]
+        self._seed_high(real_db, lin, 4, 11, None)
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-04T00:00:01Z")
+        assert [iv for iv in alloc.intervals()
+                if iv.tag == frontier_registry.TAG_PROVISIONAL] == []
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) is None
+
+    def test_a_stale_count_is_discarded_not_retained(self, real_db):
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(20)]
+        self._seed_high(real_db, lin, 4, 11, 7)   # span is 8, count says 7
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-04T00:00:01Z")
+        assert [iv for iv in alloc.intervals()
+                if iv.tag == frontier_registry.TAG_PROVISIONAL] == []
+
+    def test_extra_intervals_load_alongside_the_base(self, real_db):
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(20)]
+        self._seed_high(real_db, lin, 4, 11, 8)
+        ident = mcp_server._interval_ident(lin[19])
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f'[{ident} :ident "{ident}"]',
+            f"[{ident} :tag :provisional]",
+            f'[{ident} :lo-hash "{lin[16]}"]',
+            f'[{ident} :hi-hash "{lin[19]}"]',
+            f"[{ident} :pos-count 4]",
+        ]) + "]", "2026-09-04T00:00:00Z")
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-04T00:00:01Z")
+        prov = sorted(
+            (iv for iv in alloc.intervals()
+             if iv.tag == frontier_registry.TAG_PROVISIONAL),
+            key=lambda iv: iv.lo_pos)
+        assert [(iv.lo_pos, iv.hi_pos, iv.is_base) for iv in prov] == \
+            [(4, 11, True), (16, 19, False)]
+        assert alloc.gap_hi == 15, "the hole between the two is what's unclaimed"
+
+
+class TestFrontierLoadRetractsUnresolvableBounds:
+    """#325: a bound hash absent from the linearization used to leave the facts
+    in the graph while loading no interval -- so the next _frontier_persist_claim
+    read a non-None `existing` and extended bounds the allocator did not
+    believe in."""
+
+    def test_unresolvable_bounds_are_retracted(self, real_db):
+        import mcp_server
+        ident = mcp_server._FRONTIER_HIGH_IDENT
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f"[{ident} :tag :provisional]",
+            f'[{ident} :lo-hash "gone-a"]',
+            f'[{ident} :hi-hash "gone-b"]',
+            f"[{ident} :pos-count 2]",
+        ]) + "]", "2026-09-04T00:00:00Z")
+        lin = [f"h{i}" for i in range(20)]
+        mcp_server._frontier_load(real_db, lin, "2026-09-04T00:00:01Z")
+        assert mcp_server._frontier_read_bounds(real_db, ident) is None, (
+            "left behind, these bounds are extended by the next claim"
+        )
+        assert mcp_server._completed_regions_read(real_db) == \
+            [("gone-a", "gone-b", ":provisional")], (
+            "archive before retracting -- the branch may straighten out"
+        )
 
 
 class TestCompletedRegionsLoad:
@@ -8537,8 +8679,12 @@ class TestFrontierPersistClaim:
         reopened_db = mcp_server.get_db()
         allocator = mcp_server._frontier_load(reopened_db, linearization, "2026-01-02T00:00:00Z")
 
+        # #325: the authoritative interval always carries anchor_pos=0,
+        # is_base=True on load.
         assert allocator.intervals() == [
-            frontier_registry.Interval(0, 0, frontier_registry.TAG_AUTHORITATIVE)
+            frontier_registry.Interval(
+                0, 0, frontier_registry.TAG_AUTHORITATIVE, anchor_pos=0, is_base=True
+            )
         ]
 
 

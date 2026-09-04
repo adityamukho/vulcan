@@ -6228,93 +6228,133 @@ def _frontier_load(
     low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
     if low_bounds is not None and low_bounds[0] in hash_to_pos and low_bounds[1] in hash_to_pos:
         intervals.append(frontier_registry.Interval(
-            hash_to_pos[low_bounds[0]], hash_to_pos[low_bounds[1]], frontier_registry.TAG_AUTHORITATIVE
+            hash_to_pos[low_bounds[0]], hash_to_pos[low_bounds[1]],
+            frontier_registry.TAG_AUTHORITATIVE, anchor_pos=0, is_base=True,
         ))
     high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
-    if high_bounds is not None and high_bounds[0] in hash_to_pos and high_bounds[1] in hash_to_pos:
-        hi_lo_pos, hi_hi_pos = hash_to_pos[high_bounds[0]], hash_to_pos[high_bounds[1]]
-        if hi_lo_pos <= hi_hi_pos and hi_hi_pos == len(linearization) - 1:
-            intervals.append(frontier_registry.Interval(
-                hi_lo_pos, hi_hi_pos, frontier_registry.TAG_PROVISIONAL
-            ))
-        else:
-            # Unrepresentable (#222 phase 2b1). Either the pair is inverted
-            # (what the pre-2b1 persist path produced once the linearization
-            # grew), or it no longer reaches the last position -- meaning new
-            # commits have landed above it, so the real state is three spans
-            # (authoritative low, filled high, new unclaimed above) and the
-            # gap now sits ABOVE this interval. One lo/hi pair per side
-            # cannot express that, so drop it and let the region be
-            # re-walked: re-processing an already-processed position is
-            # idempotent, so the graph converges and only work is wasted.
-            #
-            # Retract the facts too, not just the in-memory interval. Leaving
-            # them behind means the next _frontier_persist_claim sees a
-            # non-None `existing` and extends a pair the allocator no longer
-            # believes in, re-creating the inverted state on the first claim
-            # of the new run.
-            #
-            # Folding a 2c-confirmed high region into frontier-low instead
-            # (no re-walk at all) needs :ingestion/correction-sweep-through
-            # and spans all three streams -- that is 2d's, see the 2b1 design
-            # spec's "Why re-ingest is made safe, not efficient".
-            # #326: the bounds are the completion witness -- archive before
-            # retracting. Dropping the facts is what made the proof
-            # unavailable in exactly the case (#325 tip growth) that most
-            # needs it. Only a REPRESENTABLE interval is archived: the
-            # inverted case below reaches the same branch and describes no
-            # completed region at all.
-            #
-            # "_frontier_persist_claim is the LAST write of a position, so
-            # membership in this interval proves that position completed" is
-            # FALSE as a standalone claim -- see _skip_claim's docstring.
-            # :lo-hash is a closed RANGE bound, so membership is implied by a
-            # NEIGHBOUR's claim, not necessarily by the position's own: a
-            # write that raises takes _run_ingestion's per-commit `except`,
-            # which continues the descent, and the next lower position that
-            # succeeds sweeps the failed one into the interval. What makes
-            # membership mean the position's OWN completion is
-            # _run_ingestion's `rev_claim_floor_pos` gate, which stops
-            # :lo-hash descending past a position this run failed to
-            # complete -- the interval archived here is only ever as precise
-            # as that floor made it.
-            #
-            # The archive is gated on the interval's OWN :pos-count, which was
-            # written at claim time against the linearization the positions
-            # were claimed under. A region is stored as two hashes but consumed
-            # as a closed POSITION RANGE, and that is sound only if the
-            # linearization grew by APPENDING above it.
-            # `git log --topo-order --reverse` gives no such guarantee: it
-            # places a new commit immediately after its branch point whenever
-            # the old tip's line stalls behind it -- "branch off an old commit,
-            # merge the mainline in, fast-forward the mainline" is enough. Such
-            # a commit lands INSIDE the archived bounds, is covered by a proof
-            # that was never about it, is skipped, and is lost permanently and
-            # silently: it reaches neither the graph nor the index, so
-            # fact_audit's two witnesses agree, both :introduced-by checks only
-            # look at entities that exist, and stderr carries nothing.
-            #
-            # The count must come from the interval, NOT be computed here. A
-            # count computed at archive time is computed from the very span it
-            # is then compared against, so it always agrees and discriminates
-            # nothing. An interval with no stored count (written before this
-            # attribute existed) is not archived either -- "no denominator" and
-            # "a denominator that still checks out" must not be the same
-            # branch when the failure mode is silent permanent loss. The cost
-            # of not archiving is one full re-walk, which is exactly what
-            # master does here.
-            high_count = _frontier_read_pos_count(db, _FRONTIER_HIGH_IDENT)
-            if hi_lo_pos <= hi_hi_pos and high_count == hi_hi_pos - hi_lo_pos + 1:
-                _completed_region_record(
-                    db, high_bounds[0], high_bounds[1], ":provisional",
-                    run_ts_iso, index_con=index_con,
-                    order={h: i for i, h in enumerate(linearization)},
-                )
-            _frontier_discard_interval(
-                db, _FRONTIER_HIGH_IDENT, high_bounds, index_con=index_con,
-                pos_count=high_count,
-            )
+    if high_bounds is not None:
+        high_count = _frontier_read_pos_count(db, _FRONTIER_HIGH_IDENT)
+        _load_one_interval(
+            db, _FRONTIER_HIGH_IDENT, high_bounds, high_count, hash_to_pos,
+            linearization, run_ts_iso, intervals, is_base=True, index_con=index_con,
+        )
+    for ident, lo_hash, hi_hash, count in _intervals_read_extra(db):
+        _load_one_interval(
+            db, ident, (lo_hash, hi_hash), count, hash_to_pos,
+            linearization, run_ts_iso, intervals, is_base=False, index_con=index_con,
+        )
     return frontier_registry.FrontierAllocator(len(linearization), intervals)
+
+
+def _load_one_interval(
+    db: Any,
+    ident: str,
+    bounds: Tuple[str, str],
+    pos_count: Optional[int],
+    hash_to_pos: Dict[str, int],
+    linearization: List[str],
+    run_ts_iso: str,
+    intervals: List["frontier_registry.Interval"],
+    is_base: bool,
+    index_con: Optional[Any] = None,
+) -> None:
+    """Retain, or archive-and-retract, one persisted provisional interval.
+
+    RETAINED iff both bounds resolve in this linearization, lo <= hi, and the
+    STORED :pos-count still equals the current span. Dropping the old
+    `hi == last position` test is #325's whole point -- new commits landing
+    on HEAD no longer force a re-walk of the whole region, only a fresh hole
+    above it. Adding the count check is mandatory, not defensive: the old
+    retain path performed no count check at all and was safe only by
+    accident -- a genuinely new commit implies a new tip, so a commit landing
+    strictly INSIDE the old bounds forced `hi != last` and pushed the case
+    onto the discard path, where the count check already lived. Retaining
+    `hi < last` removes that accident, and an insertion inside a retained
+    interval is silent permanent loss: the commit reaches neither the graph
+    nor the index, so fact_audit's two witnesses agree, both :introduced-by
+    checks only examine entities that exist, and stderr carries nothing.
+
+    An interval carrying NO count is not retained. "No denominator" and "a
+    denominator that still checks out" must not be the same branch when the
+    failure mode is silent permanent loss -- the fail-safe direction is to
+    re-walk.
+
+    "_frontier_persist_claim is the LAST write of a position, so membership in
+    this interval proves that position completed" is FALSE as a standalone
+    claim -- see _skip_claim's docstring. :lo-hash is a closed RANGE bound, so
+    membership is implied by a NEIGHBOUR's claim, not necessarily by the
+    position's own: a write that raises takes _run_ingestion's per-commit
+    `except`, which continues the descent, and the next lower position that
+    succeeds sweeps the failed one into the interval. What makes membership
+    mean the position's OWN completion is _run_ingestion's
+    `rev_claim_floor_pos` gate, which stops :lo-hash descending past a
+    position this run failed to complete -- a retained (or later archived)
+    interval is only ever as precise as that floor made it.
+
+    A region is stored as two hashes but consumed as a closed POSITION RANGE,
+    which holds only if the linearization grew by APPENDING above it.
+    `git log --topo-order --reverse` gives no such guarantee: it places a new
+    commit immediately after its branch point whenever the old tip's line
+    stalls behind it -- "branch off an old commit, merge the mainline in,
+    fast-forward the mainline" is enough. Such a commit lands INSIDE the
+    bounds, is covered by a proof that was never about it, and is skipped.
+    That is exactly what the stored :pos-count checksum is for: the count
+    MUST come from the interval, never be recomputed here, because a count
+    computed from the very span it is then compared against always agrees and
+    discriminates nothing (equal count does not by itself prove the same
+    member set -- see the design spec's "checksum, not proof of set
+    identity" residual -- but it is what stands between this path and the
+    #325 tip-growth loss it exists to close).
+
+    Anything not retained is discarded (its facts retracted). Only the
+    UNRESOLVABLE-bounds case (the "divergent-ref leak", #325) is also
+    ARCHIVED as a :type/completed-region first: a REPRESENTABLE pair that
+    fails the retain check failed it on the count, so archiving it here too
+    would record a region whose freshly-computed count always matches its own
+    (now-wrong) bounds -- the same discriminates-nothing failure the retain
+    check exists to avoid. An unresolvable pair carries no position space to
+    recompute a count from at all, so recording it (well-formed: both bounds
+    are present in the FACTS, and pos_count is present) is the only witness
+    left, and _completed_region_record's own count is None for it -- the
+    denominator was never computable, not silently trusted.
+
+    Leaving a non-retained interval's facts in the graph -- what happened to
+    an unresolvable pair before this fix -- was NEITHER a discard NOR an
+    archive: the facts stayed while no interval loaded, so the next
+    _frontier_persist_claim read a non-None `existing` and extended bounds the
+    allocator no longer believed in.
+    """
+    lo_hash, hi_hash = bounds
+    lo_pos = hash_to_pos.get(lo_hash)
+    hi_pos = hash_to_pos.get(hi_hash)
+    tag = ":provisional"
+    resolved = lo_pos is not None and hi_pos is not None
+    if resolved and lo_pos <= hi_pos and pos_count == hi_pos - lo_pos + 1:
+        if is_base:
+            anchor_pos = hi_pos
+        else:
+            # #325: the ident's identity is the anchor hash it was minted
+            # from (_interval_ident), never the current bounds -- a
+            # provisional interval grows downward, so :hi-hash stays fixed at
+            # the anchor under normal claims, but recover it from the ident
+            # rather than assuming that, in case a merge ever changes it.
+            # Falls back to hi_pos only if the anchor hash itself has dropped
+            # out of this linearization (the ident survives as the entity's
+            # identity regardless -- it is never re-minted).
+            suffix = ident[len(_INTERVAL_PROVISIONAL_IDENT_PREFIX):]
+            anchor_pos = next(
+                (pos for h, pos in hash_to_pos.items() if h.startswith(suffix)), hi_pos
+            )
+        intervals.append(frontier_registry.Interval(
+            lo_pos, hi_pos, frontier_registry.TAG_PROVISIONAL,
+            anchor_pos=anchor_pos, is_base=is_base,
+        ))
+        return
+    if not resolved and pos_count is not None:
+        _completed_region_record(db, lo_hash, hi_hash, tag, run_ts_iso, index_con=index_con)
+    _frontier_discard_interval(
+        db, ident, bounds, index_con=index_con, pos_count=pos_count, tag=tag,
+    )
 
 
 def _frontier_discard_interval(
