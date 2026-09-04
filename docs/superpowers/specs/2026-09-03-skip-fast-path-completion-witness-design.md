@@ -56,10 +56,11 @@ or, on a graph predating that gate, not surfacing at all.
 
 ## Approaches considered
 
-**A. The persisted frontier interval, as it exists today.** Correct by
-construction and needs no new fact -- `_frontier_persist_claim` is the last
-write of a position, so membership in a persisted interval means the position
-completed. Rejected in #326's own text because in the #325 scenario the
+**A. The persisted frontier interval, as it exists today.** Needs no new fact.
+The argument made here was "`_frontier_persist_claim` is the last write of a
+position, so membership in a persisted interval means the position completed" --
+**which turned out to be false as written; see "The witness statement, corrected"
+below.** Rejected in #326's own text because in the #325 scenario the
 interval is the thing that was just discarded, so the witness is unavailable in
 the one case that motivated the fast path. It does cover #313 (whose claim
 genuinely never persisted).
@@ -207,6 +208,48 @@ the unsound witnesses; the region record is the sound one.
 interval that got archived, so it is in no region, so it is not skipped. The
 predicate does not need to know what a torn write looks like.
 
+### The witness statement, corrected
+
+The sentence this whole design rested on -- "`_frontier_persist_claim` is the
+LAST write of a position, so membership in a persisted interval proves that
+position completed" -- is **FALSE as written**, and was reproduced end to end
+during the final review.
+
+`:lo-hash` is a closed RANGE bound. Membership is therefore implied by a
+NEIGHBOUR's claim, never by the position's own. A reverse write that RAISES
+takes `_run_ingestion`'s per-commit `except`, which logs, does `processed += 1`,
+and **continues the descent**; the next lower position that succeeds moves
+`:lo-hash` beneath the failed one and sweeps it into the interval. Pure tip
+growth preserves the interval's `:pos-count` exactly, so it is archived, and
+`_skip_claim` then skips that position forever. #313 is safe only because a
+SIGKILL STOPS the process -- the `except` path does not.
+
+The interval was always this imprecise, master included. Master was
+self-healing by accident: the discard forced a full re-walk. **Archiving the
+interval is what converts the imprecision into permanent silent loss**, which
+every at-scale detector reads clean (`fact_audit`'s two witnesses agree about an
+absence, both `:introduced-by` checks only examine entities that EXIST,
+`stderr_capture` sees only the one skip line, and `commit_census` runs on a
+fresh graph).
+
+The fix makes the INTERVAL precise rather than weakening the predicate. The
+reverse stream descends monotonically, so the highest position a run failed to
+complete is a floor `:lo-hash` may not cross for the rest of that run:
+`_reverse_apply` gains `persist_claim`, and the end-of-walk
+`_frontier_persist_span` flush clamps its lo bound to the same floor. Both
+incompleteness paths raise the floor -- a write that raised and an extraction
+that raised -- because they are the same defect; the forward stream is
+untouched, since it claims frontier-low and its failure semantics are out of
+scope here.
+
+**It withholds BOOKKEEPING, never WORK.** Positions below the floor are still
+claimed, still parsed and still written in full. They simply do not assert
+completion, so the next run re-walks them. Cost is one run's re-walk below a
+transient failure -- what master effectively did anyway. A DETERMINISTIC failure
+at a fixed position blocks reverse-frontier progress below it for as long as it
+keeps failing; that is the accepted price of a precise interval, and it is loud
+rather than silent.
+
 **Why `fwd` never skips**, which does double duty:
 
 * A forward claim landing inside a provisional region is the authority upgrade
@@ -287,7 +330,9 @@ The flush exists so the live interval converges, not to protect correctness.
 
 A reverse position whose write FAILS (`_run_ingestion`'s per-commit `except`)
 never reaches `_frontier_persist_claim`, so a run of skips above it stays
-unpersisted. Same story: re-skipped next run.
+unpersisted. Same story: re-skipped next run. It ALSO raises the run's claim
+floor, so nothing below it persists a claim either and the flush's lo bound is
+clamped to sit above it -- see "The witness statement, corrected".
 
 ## Counters and status
 
@@ -346,6 +391,8 @@ Two guards, added after the first whole-branch review, both of the
 "ship the positive control with the number" kind #316 established.
 
 **1. A region is stored as HASHES but consumed as a closed POSITION RANGE.**
+(The denominator below is a CHECKSUM, not a proof of set identity -- see the
+residual at the end of this section.)
 Every position between the bounds is treated as proven-complete, which is sound
 only if the linearization grew by APPENDING above the region.
 `git log --topo-order --reverse` guarantees no such thing: it places a new
@@ -368,6 +415,21 @@ which covers an insertion arriving in a LATER run. An interval or region
 carrying no count is not trusted -- "no denominator" and "a denominator that
 still checks out" must not be the same branch here. A mismatch costs one full
 re-walk, which is exactly master's behaviour.
+
+**1b. RESIDUAL: an equal count is not the same member set.** The `:pos-count`
+guard catches a span that changed length, which is the reachable case. It cannot
+catch a rearrangement that preserves the length: an old commit inside the range
+that is neither ancestor nor descendant of `lo` could be reordered below `lo` by
+a later `git log --topo-order` while a new commit lands inside, leaving the count
+unchanged and the region trusted. A real repository realizing this was **NOT
+constructed** -- git's tie-breaking constrains which of the many valid
+topological orders it actually emits, and the attempt did not produce one. So
+this is an undemonstrated residual, not a measured loss, and it is recorded
+because the earlier wording ("the denominator makes the mapping SOUND")
+overstates what a checksum can do. Closing it takes a per-position completion
+marker (approach B above), at one fact per commit on the write path this issue
+exists to make cheaper -- which is exactly the trade B was rejected on, now with
+the residual it leaves stated on both sides.
 
 **2. The end-of-walk flush's hi bound is the highest SKIPPED position, never
 the highest reverse position CLAIMED.** `_frontier_persist_span` moves

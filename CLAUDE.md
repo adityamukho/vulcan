@@ -479,13 +479,40 @@ exactly the torn positions #313 needs re-walked. A fast path keyed on it would
 make that orphaned lineage permanent.
 
 The witness is membership in a `:type/completed-region` fact set, archived by
-`_frontier_load` from the high interval it is about to discard. Because
-`_frontier_persist_claim` is the last write of a position, every position inside
-a persisted interval provably completed, and the archive inherits that. A torn
-position's claim never persisted, so it was never inside the interval that got
-archived: it is in no region and is never skipped, by construction rather than
-by care. Only a REPRESENTABLE interval is archived — the inverted case reaches
-the same branch and describes no completed region at all.
+`_frontier_load` from the high interval it is about to discard. A torn position's
+claim never persisted, so it was never inside the interval that got archived: it
+is in no region and is never skipped, by construction rather than by care. Only
+a REPRESENTABLE interval is archived — the inverted case reaches the same branch
+and describes no completed region at all.
+
+**The obvious statement of why that interval is a witness — "`_frontier_persist_
+claim` is the LAST write of a position, so membership in a persisted interval
+proves that position completed" — is FALSE as written, and an earlier draft of
+this section said it.** `:lo-hash` is a closed RANGE bound, so membership was
+only ever implied by a NEIGHBOUR's claim, not by the position's own. A write
+that RAISES takes `_run_ingestion`'s per-commit `except`, which logs, does
+`processed += 1`, and CONTINUES THE DESCENT — the next lower position that
+succeeds moves `:lo-hash` beneath the failed one and sweeps it into the interval.
+#313's SIGKILL is safe only because the process STOPS there; the `except` path
+does not. The interval was always this imprecise, master included; the archive
+is what promotes it into a trusted witness, converting a case master healed by
+re-walking into permanent silent loss.
+
+So the interval is made PRECISE instead of the predicate being weakened. The
+reverse stream descends monotonically, so the highest position a run failed to
+complete is a floor `:lo-hash` may not cross for the rest of that run:
+`_reverse_apply` takes `persist_claim`, and the end-of-walk
+`_frontier_persist_span` flush clamps its lo bound to the same floor. Both
+incompleteness paths raise it — a write that raised and an extraction that
+raised — because they are the same defect. **This withholds BOOKKEEPING, never
+WORK**: positions below the floor are still claimed, parsed and written in full,
+they simply do not assert completion, so the next run re-walks them. Do not
+"optimize" it into skipping the work. Cost is one run's re-walk below a
+transient failure, which is what master effectively did anyway. A deterministic
+failure at a fixed position therefore blocks reverse-frontier progress below it
+for as long as it keeps failing — that is the accepted price of a precise
+interval, and it is loud (`stderr_capture` reads the per-commit skip line;
+`commit_census`'s `skipped_commits` clause fails on the extraction case).
 
 `fwd` never skips, and one clause buys two properties. A forward claim inside a
 provisional region is the authority upgrade that must still happen; and
@@ -530,7 +557,7 @@ control (the #313 torn-position test), plus the two stored denominators
 described next — not on anything downstream noticing afterwards.
 
 **A region is stored as two HASHES but consumed as a closed POSITION RANGE, and
-that needs a denominator to be sound.** Every position between the bounds is
+that needs a denominator.** Every position between the bounds is
 treated as proven-complete, which holds only if the linearization grew by
 APPENDING above the region. `git log --topo-order --reverse` guarantees no such
 thing: it places a new commit immediately after its branch point whenever the
@@ -551,6 +578,19 @@ denominator" and "a denominator that still checks out" must not be the same
 branch when the failure mode is silent permanent loss. Cost of a mismatch is one
 full re-walk, i.e. exactly master's behaviour. This is #316's
 `code_entities_scanned` idiom: every run re-proves its own positive control.
+
+**The denominator is a CHECKSUM, not a proof of set identity, and the residual
+is stated rather than papered over.** Equal count does not imply the same member
+set: an old commit inside the range that is neither ancestor nor descendant of
+`lo` could be reordered below `lo` by a later `git log --topo-order` while a new
+commit lands inside, leaving the count unchanged and the region trusted. A real
+repository realizing that was NOT constructed — git's tie-breaking constrains
+which of the valid topological orders it actually emits, and the attempt did not
+produce one — so this is an undemonstrated residual, not a measured loss. It is
+recorded here because "the count makes the mapping SOUND" is the claim an
+earlier draft made, and it overstates what a checksum can do. A per-position
+marker (approach B in the design spec) is what would close it, at the cost of
+one fact per commit on the write path this issue exists to make cheaper.
 
 **The end-of-walk flush's hi bound is the highest SKIPPED position, never the
 highest reverse position claimed.** `_frontier_persist_span` moves `:hi-hash`

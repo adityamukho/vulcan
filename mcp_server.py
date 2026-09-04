@@ -6553,9 +6553,9 @@ def _completed_regions_load(
         it is dropped from the returned list but its facts are KEPT. Dropping
         costs a re-walk; retracting would destroy the witness for good.
 
-    The stored :pos-count is the third way, and it is the one that makes the
-    hash-to-position mapping SOUND rather than merely well-defined. A region is
-    persisted as two hashes but consumed as a CLOSED POSITION RANGE: every
+    The stored :pos-count is the third way, and it is what makes the
+    hash-to-position mapping defensible rather than merely well-defined. A region
+    is persisted as two hashes but consumed as a CLOSED POSITION RANGE: every
     position between the bounds is treated as proven-complete. That is only
     true if the linearization grew by APPENDING above the region.
     `git log --topo-order --reverse` gives no such guarantee -- it places a new
@@ -6584,6 +6584,21 @@ def _completed_regions_load(
 
     Dropped-for-count regions are NOT retracted, for the same reason an
     unmappable one is not: the branch may straighten out on a later run.
+    _completed_region_record holds to the same rule (#326 Finding D) -- it drops
+    such a region from the MERGE but leaves its facts in the graph.
+
+    RESIDUAL, stated rather than papered over (#326 Finding B): the count is a
+    CHECKSUM, not a proof of set identity. Equal count does not imply the same
+    member set -- an old commit inside the range that is neither ancestor nor
+    descendant of `lo` could be reordered below `lo` by a later topo-order while
+    a new commit lands inside, leaving the count unchanged and this region
+    trusted. A real repository realizing that was NOT constructed; git's
+    tie-breaking constrains which of the valid topological orders it actually
+    emits. So it is an undemonstrated residual, not a measured loss -- but it is
+    a residual, and the word "sound" (which this docstring used) overstates what
+    a checksum can do. Closing it takes a per-position completion marker
+    (approach B in the design spec), at one fact per commit on the write path
+    this feature exists to make cheaper.
     """
     hash_to_pos = {h: i for i, h in enumerate(linearization)}
     out: List["frontier_registry.Interval"] = []
@@ -6620,10 +6635,26 @@ def _skip_claim(
 
     Sound because of what it does NOT read. The witness is membership in an
     archived completed region, whose bounds came from a persisted frontier
-    interval, whose last write per position is _frontier_persist_claim. A #313
-    torn position's claim never persisted, so that position was never inside the
-    interval that got archived, so it is in no region and is never skipped --
-    correct by construction rather than by care.
+    interval. A #313 torn position's claim never persisted, so that position was
+    never inside the interval that got archived, so it is in no region and is
+    never skipped -- correct by construction rather than by care.
+
+    An earlier version of this docstring justified that with "
+    _frontier_persist_claim is the LAST write of a position, so membership in a
+    persisted interval proves that position completed". **That is FALSE as
+    written** (#326 Finding A). :lo-hash is a closed RANGE bound, so membership
+    is implied by a NEIGHBOUR's claim, not by the position's own: a write that
+    RAISES takes _run_ingestion's per-commit `except`, which continues the
+    descent, and the next lower position that succeeds sweeps the failed one
+    into the interval. #313 is safe only because a SIGKILL stops the process.
+    What makes membership mean the position's own completion is the floor gate
+    in _run_ingestion (`rev_claim_floor_pos`), which stops :lo-hash descending
+    past a position this run failed to complete.
+
+    The other guard is a CHECKSUM, not a proof of set identity: the stored
+    :pos-count catches a linearization whose span changed, but equal count does
+    not imply the same member set. See _completed_regions_load for the residual
+    that leaves.
 
     'fwd' never skips: see TestSkipClaim's forward case for the two independent
     reasons. Restricting to same-tag skipping gets both from one clause.
