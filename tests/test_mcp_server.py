@@ -9157,6 +9157,52 @@ class TestFrontierPersistClaimTargetsAnInterval:
         assert mcp_server._frontier_read_pos_count(
             real_db, mcp_server._FRONTIER_HIGH_IDENT) == 6
 
+    def test_absorbed_interval_below_the_survivor_is_not_lost(self, real_db):
+        """#325 review Finding 1's own docstring names this exact geometry as
+        untested: every other merge test here has the absorbed interval
+        ABOVE the survivor. The union code is direction-agnostic by
+        construction (min/max over candidate positions, no `from_low`
+        branch), so this is a missing guard, not a bug -- but the FAILURE
+        mode it guards is real and was named at the time: '[100,120]
+        absorbing [50,98] via a claim at 99 would silently produce [99,120],
+        losing the proven [50,98] region with no inversion to trip the
+        _frontier_load lo<=hi guard'.
+        """
+        import mcp_server
+        lin = [f"h{i}" for i in range(130)]
+        survivor = mcp_server._interval_ident("h120")
+        below = mcp_server._interval_ident("h98")
+
+        for p, t in ((120, "00"), (100, "01")):
+            mcp_server._frontier_persist_claim(
+                real_db, lin, p, False, f"2026-09-04T00:00:{t}Z", ident=survivor)
+        for p, t in ((98, "02"), (50, "03")):
+            mcp_server._frontier_persist_claim(
+                real_db, lin, p, False, f"2026-09-04T00:00:{t}Z", ident=below)
+
+        assert mcp_server._frontier_read_bounds(real_db, survivor) == ("h100", "h120")
+        assert mcp_server._frontier_read_bounds(real_db, below) == ("h50", "h98")
+
+        # The claim at 99 merges `below` [h50,h98] UP into `survivor`
+        # [h100,h120] -- the mirror image of every other merge test's
+        # geometry, where the absorbed interval sits above the survivor.
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 99, False, "2026-09-04T00:00:04Z",
+            ident=survivor, absorbed_idents=[below],
+        )
+
+        assert mcp_server._frontier_read_bounds(real_db, below) is None, (
+            "the absorbed entity's facts must be gone, not merely unreferenced"
+        )
+        assert mcp_server._frontier_read_bounds(real_db, survivor) == ("h50", "h120"), (
+            "the survivor must describe the UNION of its own span [h100,h120], "
+            "the absorbed span [h50,h98], and the claimed position h99 -- "
+            "[h50,h120] -- never just the one bound a non-merging claim would "
+            "have moved (which would silently produce [h99,h120] and lose the "
+            "proven [h50,h98] region with no inversion to trip any guard)"
+        )
+        assert mcp_server._frontier_read_pos_count(real_db, survivor) == 71
+
     def test_absorb_retracts_before_the_survivor_transacts(self, real_db):
         """#325 review Finding 3: the crash-safety property this API exists
         for is about EMITTED ORDER, not end state -- retract-then-extend
@@ -10020,6 +10066,107 @@ class TestNonTipWriteFailureIsReWalked:
             "run 1 must remain a genuine hole (rev_claim_floor_pos keeps it "
             "out of the persisted interval), for run 2's forward stream to "
             "pick up naturally"
+        )
+
+
+class TestPerIntervalReverseFloor:
+    """#325: a write failure in the tip gap must not withhold bookkeeping for
+    a DISJOINT bulk gap below it. #326's `rev_claim_floor_pos` is a single
+    run-global scalar, correct only while the reverse stream makes one
+    contiguous descent. #325 lets it serve the topmost gap first and fall
+    through to a bulk gap entirely below (via claim_high() + a merge into a
+    retained interval), so a failure in the tip gap must floor only the
+    entity ident IT belongs to, never every ident the run touches.
+
+    The two gaps are constructed, not asserted-for: run 1 injects a failure
+    at position 5 of a 10-commit repo, leaving frontier-high's persisted lo
+    stuck at position 6 -- positions 4..1 still get their entity WRITE (the
+    floor only withholds the CLAIM, per #326), so the interval never
+    descends into {1..5} on disk. Growing the tip then opens a SECOND,
+    disjoint gap: {1..5} below the retained [6,9] interval, and the new tip
+    positions above it. A failure at the very top of the tip gap (so the
+    failed interval never has any on-disk bounds of its own to leak into the
+    merge -- see _frontier_persist_claim's "nothing on disk to retract or
+    fold into the union" case) isolates the two idents cleanly: T (the
+    minted tip ident) and :ingestion/frontier-high (the retained base,
+    survivor of the merge once a lower tip claim touches it).
+    """
+
+    def _repo(self, tmp_path, n, start=0):
+        repo = tmp_path / "repo"
+        if not repo.exists():
+            repo.mkdir()
+            _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(start, start + n):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_tip_gap_failure_does_not_floor_the_bulk_gap(self, tmp_path, monkeypatch):
+        import mcp_server, frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = self._repo(tmp_path, 10)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+
+        lin1 = frontier_registry.build_linearization(str(repo))
+        real_apply = mcp_server._reverse_apply
+
+        def fail_at_5(db, repo_path, linearization, commit_metadata, pos,
+                      files, *args, **kwargs):
+            # *args/**kwargs so this wrapper forwards whatever _run_ingestion's
+            # write dispatch passes positionally, unaffected by _reverse_apply
+            # growing more parameters later (matches the sibling wrappers in
+            # TestSkipFlushNeverCoversFailedWrites / TestNonTipWriteFailureIsReWalked).
+            if linearization[pos] == lin1[5]:
+                raise RuntimeError("injected run-1 bulk-gap write failure")
+            return real_apply(db, repo_path, linearization, commit_metadata,
+                               pos, files, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", fail_at_5)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_apply)
+
+        db = mcp_server.get_db()
+        base_after_run1 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run1 is not None
+        assert lin1.index(base_after_run1[0]) == 6, (
+            "precondition: run 1 must leave frontier-high's persisted lo at "
+            "position 6, i.e. never descend past the injected position-5 "
+            "write failure -- otherwise run 2 has no real bulk gap to test"
+        )
+
+        # Grow the tip: a second gap, disjoint from the bulk gap {1..5} left
+        # by run 1, and not touching it until a reverse claim descends all
+        # the way down to position 6's neighbour.
+        self._repo(tmp_path, 3, start=10)
+        lin2 = frontier_registry.build_linearization(str(repo))
+        tip_top = lin2[-1]
+
+        def fail_at_tip_top(db, repo_path, linearization, commit_metadata, pos,
+                             files, *args, **kwargs):
+            if linearization[pos] == tip_top:
+                raise RuntimeError("injected tip-gap write failure")
+            return real_apply(db, repo_path, linearization, commit_metadata,
+                               pos, files, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", fail_at_tip_top)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_apply)
+
+        base_after_run2 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run2 is not None
+        base_lo_pos = lin2.index(base_after_run2[0])
+        assert base_lo_pos <= 5, (
+            "bulk-gap claims below a tip-gap failure must still persist their "
+            "bookkeeping; a run-global floor withholds all of them, leaving "
+            f"frontier-high's lo stuck at position {base_lo_pos} instead of "
+            "descending into the bulk gap left by run 1"
         )
 
 

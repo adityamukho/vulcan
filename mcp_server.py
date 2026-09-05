@@ -6289,9 +6289,10 @@ def _load_one_interval(
     `except`, which continues the descent, and the next lower position that
     succeeds sweeps the failed one into the interval. What makes membership
     mean the position's OWN completion is _run_ingestion's
-    `rev_claim_floor_pos` gate, which stops :lo-hash descending past a
-    position this run failed to complete -- a retained (or later archived)
-    interval is only ever as precise as that floor made it.
+    `rev_claim_floor` gate (per target ident since #325), which stops
+    :lo-hash descending past a position this run failed to complete -- a
+    retained (or later archived) interval is only ever as precise as that
+    floor made it.
 
     A region is stored as two hashes but consumed as a closed POSITION RANGE,
     which holds only if the linearization grew by APPENDING above it.
@@ -6933,8 +6934,10 @@ def _skip_claim(
     descent, and the next lower position that succeeds sweeps the failed one
     into the interval. #313 is safe only because a SIGKILL stops the process.
     What makes membership mean the position's own completion is the floor gate
-    in _run_ingestion (`rev_claim_floor_pos`), which stops :lo-hash descending
-    past a position this run failed to complete.
+    in _run_ingestion (`rev_claim_floor`, keyed per target ident since #325 --
+    a single run-global scalar stopped discriminating once one run could serve
+    more than one gap), which stops :lo-hash descending past a position this
+    run failed to complete.
 
     The other guard is a CHECKSUM, not a proof of set identity: the stored
     :pos-count catches a linearization whose span changed, but equal count does
@@ -10682,10 +10685,13 @@ def _reverse_apply(
     interval. Once it can, the caller MUST supply the claim's own target:
     _run_ingestion captures `allocator.last_claim` right after the claim
     that produced this position (before any LATER claim overwrites it) and
-    resolves its ident from `.interval.is_base`/`.anchor_pos`, exactly as
-    _load_one_interval resolves an interval's ident on the READ side. Get
-    this wrong and every reverse claim persists to :ingestion/frontier-high
-    regardless of which in-memory interval it actually belongs to --
+    resolves its ident via `_interval_persist_ident`, which prefers the
+    interval's own carried `.ident` over re-deriving one from
+    `.is_base`/`.anchor_pos` -- `_load_one_interval` no longer resolves an
+    ident on the read side either, it carries the one it was handed (#325
+    review round 3, Finding 3). Get this wrong and every reverse claim
+    persists to :ingestion/frontier-high regardless of which in-memory
+    interval it actually belongs to --
     measured producing an INVERTED pair (`lo` from the new claim's hash,
     `hi` still the old interval's) the moment a reverse claim lands above a
     RETAINED interval it does not touch, which is silent since
@@ -10993,10 +10999,11 @@ def _reverse_apply(
 
     # #326 (Finding A): `persist_claim=False` withholds the BOOKKEEPING for this
     # position, never the work -- every triple above has already been written.
-    # See _run_ingestion's `rev_claim_floor_pos` for why: :lo-hash is a RANGE
-    # bound, so claiming a position below one whose write FAILED silently
-    # swallows the failed position into the interval, and the archive then turns
-    # that into a permanent skip. Do NOT "optimize" this into skipping the
+    # See _run_ingestion's `rev_claim_floor` (per target ident since #325) for
+    # why: :lo-hash is a RANGE bound, so claiming a position below one whose
+    # write FAILED silently swallows the failed position into the interval,
+    # and the archive then turns that into a permanent skip. Do NOT
+    # "optimize" this into skipping the
     # writes as well: the run below the floor is still doing real, necessary
     # ingestion, it is simply not entitled to assert that it completed.
     if persist_claim:
@@ -12699,8 +12706,17 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # The skipped span is the only thing this flush is entitled to
                 # assert; positions above it either persisted their own claim
                 # or legitimately did not.
-                lowest_skipped_pos: Optional[int] = None
-                highest_skipped_pos: Optional[int] = None
+                #
+                # #325: keyed by target ident, not a run-global pair. A skipped
+                # claim still came out of the allocator, so it still extended
+                # (and possibly merged) an in-memory interval, and the flush
+                # has to persist that skipped span to the SAME entity the
+                # claim belonged to -- a run that skips into more than one
+                # provisional interval (a retained one below a fresh tip gap,
+                # say) would otherwise fold an unrelated interval's skip span
+                # into whichever ident happened to be current when the two
+                # scalars were last written.
+                skipped_span: Dict[str, Tuple[int, int]] = {}
 
                 # #326 Finding A: the floor :lo-hash may not cross this run.
                 #
@@ -12756,15 +12772,27 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # `completed_all = False` already gates the end-of-walk flush
                 # off for this run -- so do not go looking for a third
                 # _note_incomplete_rev call to match it.
-                rev_claim_floor_pos: Optional[int] = None
+                #
+                # #325: ONE FLOOR PER INTERVAL, not per run. #326 shipped this
+                # as a single scalar because a run's reverse stream made one
+                # contiguous descent -- correct then. #325's allocator now
+                # serves the topmost gap first and falls through to a bulk gap
+                # entirely below it (claim_high() + a merge into a retained
+                # interval), so a failure in the tip gap's ident must not sit
+                # above every position in a disjoint bulk gap's ident: that
+                # would withhold the bookkeeping for work the bulk gap's claims
+                # actually completed, silently, and the next run would re-walk
+                # all of it for no reason. Same guarantee as #326 Finding A,
+                # stated over the unit it was always really about -- the
+                # interval a claim targets, not the run.
+                rev_claim_floor: Dict[str, int] = {}
 
-                def _note_incomplete_rev(claim_tag: str, claim_pos: int) -> None:
-                    nonlocal rev_claim_floor_pos
+                def _note_incomplete_rev(claim_tag: str, claim_pos: int, ident: Optional[str]) -> None:
                     if claim_tag != "rev":
                         return
-                    rev_claim_floor_pos = (
-                        claim_pos if rev_claim_floor_pos is None
-                        else max(rev_claim_floor_pos, claim_pos)
+                    prev = rev_claim_floor.get(ident)
+                    rev_claim_floor[ident] = (
+                        claim_pos if prev is None else max(prev, claim_pos)
                     )
 
                 # #222 phase 2d: positions come from the shared-gap claimer,
@@ -12787,21 +12815,34 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # interval scan, so a long run of skips costs microseconds per
                 # position and never stalls the event loop.
                 def submit_next() -> bool:
-                    nonlocal lowest_skipped_pos, highest_skipped_pos
                     while True:
                         claim = claimer.next_claim()
                         if claim is None:
                             return False
                         tag, pos = claim
+                        # #325 review round 2's placement rule applies to a
+                        # SKIPPED claim too, not only the one that breaks out
+                        # of this loop below: allocator.last_claim is
+                        # overwritten by the very next claim, so the ident a
+                        # skipped position belongs to must be resolved here,
+                        # immediately, or it is lost. A skipped position still
+                        # came out of the allocator and still extended (and
+                        # possibly merged) an in-memory interval -- the
+                        # end-of-walk flush has to persist that skipped span
+                        # to the SAME entity the claim belonged to. Only
+                        # 'rev' claims need it -- 'fwd' never skips
+                        # (_skip_claim), and the authoritative side never
+                        # fragments, so _frontier_persist_claim's own default
+                        # (:ingestion/frontier-low, nothing absorbed) is
+                        # already correct for 'fwd'.
+                        target_ident, absorbed = (
+                            _reverse_claim_persist_target(allocator, linearization)
+                            if tag == "rev" else (None, [])
+                        )
                         if not _skip_claim(tag, pos, completed_regions):
                             break
-                        lowest_skipped_pos = (
-                            pos if lowest_skipped_pos is None else min(lowest_skipped_pos, pos)
-                        )
-                        highest_skipped_pos = (
-                            pos if highest_skipped_pos is None
-                            else max(highest_skipped_pos, pos)
-                        )
+                        lo, hi = skipped_span.get(target_ident, (pos, pos))
+                        skipped_span[target_ident] = (min(lo, pos), max(hi, pos))
                         _ingest_progress["positions_skipped"] += 1
                         # `processed` keeps its meaning -- positions retired by
                         # the walk -- which is what #317's commit_census reads
@@ -12810,22 +12851,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         # git rev-list, turning a clean skip-heavy resume into
                         # a reported lost commit.
                         _ingest_progress["processed"] += 1
-                    # #325 review round 2: captured HERE, immediately after
-                    # the claim that produced `pos` -- allocator.last_claim
-                    # would be overwritten by any LATER claim, so this must
-                    # not be deferred to the write-dispatch loop below, which
-                    # runs claims out of order relative to when they were
-                    # made (pipelined: several positions can be claimed
-                    # before the first one's write happens). Only 'rev'
-                    # claims need it -- the authoritative side never
-                    # fragments (claim_low() only ever grows the one base
-                    # interval), so _frontier_persist_claim's own default
-                    # (:ingestion/frontier-low, nothing absorbed) is already
-                    # correct for 'fwd'.
-                    claim_ident, absorbed_idents = (
-                        _reverse_claim_persist_target(allocator, linearization)
-                        if tag == "rev" else (None, [])
-                    )
+                    claim_ident, absorbed_idents = target_ident, absorbed
                     fut = loop.run_in_executor(
                         executor, _extract_commit, repo_path, linearization[pos], ignore_patterns
                     )
@@ -12873,7 +12899,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             f"({subject!r}): {e}",
                             file=sys.stderr,
                         )
-                        _note_incomplete_rev(tag, pos)
+                        _note_incomplete_rev(tag, pos, claim_ident)
                         submit_next()
                         _ingest_progress["current_commit"] = commit_hash
                         _ingest_progress["processed"] += 1
@@ -12923,9 +12949,15 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 await loop.run_in_executor(
                                     write_executor, _reverse_apply, db, repo_path, linearization,
                                     commit_metadata, pos, extracted_files, index_con,
-                                    # #326 Finding A: below the floor we do the
-                                    # work but withhold the claim.
-                                    rev_claim_floor_pos is None or pos > rev_claim_floor_pos,
+                                    # #326 Finding A / #325: below THIS
+                                    # ident's floor we do the work but
+                                    # withhold the claim. Keyed by
+                                    # claim_ident, not a run-global scalar --
+                                    # a floor set by a failure in one
+                                    # interval must not block a claim
+                                    # targeting a different, disjoint one.
+                                    claim_ident not in rev_claim_floor
+                                    or pos > rev_claim_floor[claim_ident],
                                     # #325 review round 2: the ident this
                                     # claim's interval resolved to when it
                                     # was MADE (captured in submit_next),
@@ -12952,7 +12984,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 file=sys.stderr,
                             )
                             _trace_write_ok = False
-                            _note_incomplete_rev(tag, pos)
+                            _note_incomplete_rev(tag, pos, claim_ident)
 
                     # #260: no record for a commit whose write failed -- same
                     # contamination class the brief excluded extraction
@@ -12982,13 +13014,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # is still non-empty, and those entries are positions claimed
                 # and queued for extraction but never applied -- nothing
                 # persisted a claim for them. :lo-hash is a RANGE bound, so an
-                # ungated flush down to lowest_skipped_pos would swallow them
+                # ungated flush down to a skipped span's lo would swallow them
                 # and declare them complete: the next run's _frontier_load
                 # would read the gap as closed and never re-walk commits that
                 # have no entity in the graph at all. #326's own shape makes
                 # that the LIKELY case rather than an exotic one -- skips are
                 # retired inline in submit_next and never occupy `pending`, so
-                # the genuine tip claims sit there while lowest_skipped_pos is
+                # the genuine tip claims sit there while the skipped span is
                 # driven far below them. And _shutdown_requested is set by
                 # plain stdin EOF at session end, not just by a signal.
                 #
@@ -12998,35 +13030,34 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # covers it), so the next run re-skips the same region at
                 # microsecond cost -- exactly what this feature makes cheap.
                 #
-                # `highest_skipped_pos is not None` is belt-and-braces, not a
-                # reachable case: the two are set in the same branch, so
-                # either both are None or neither is. It is kept so the
-                # commit_metadata[highest_skipped_pos] subscript below is
-                # guarded at the point of use rather than by an argument made
-                # thirty lines away.
+                # #325: one flush per ident, not one flush for the whole run.
+                # A run that skips into more than one provisional interval
+                # (a retained one below a fresh tip gap, say) has to persist
+                # each interval's own skipped span to ITS OWN entity -- a
+                # single flush written unconditionally to
+                # :ingestion/frontier-high would either miss a minted
+                # interval's span entirely or, worse, misattribute it.
                 #
-                # #326 Finding A: the flush obeys the same floor the per-commit
-                # claims do. _frontier_persist_span moves :lo-hash DOWN, so an
-                # unclamped flush would re-open the exact hole the floor closes
-                # -- a skipped position below a failed one would drag the
-                # persisted bound past it in one write. Clamping the lo bound
-                # (rather than dropping the flush) keeps the flush doing its
-                # job for the skipped span that IS above the floor.
-                flush_lo_pos = lowest_skipped_pos
-                if flush_lo_pos is not None and rev_claim_floor_pos is not None:
-                    flush_lo_pos = max(flush_lo_pos, rev_claim_floor_pos + 1)
-                if (
-                    completed_all
-                    and flush_lo_pos is not None
-                    and highest_skipped_pos is not None
-                    and flush_lo_pos <= highest_skipped_pos
-                ):
-                    async with db_lease_async() as db:
-                        await loop.run_in_executor(
-                            write_executor, _frontier_persist_span, db, linearization,
-                            flush_lo_pos, highest_skipped_pos, False,
-                            commit_metadata[highest_skipped_pos][1], index_con,
-                        )
+                # #326 Finding A: each entry obeys the SAME ident's floor the
+                # per-commit claims do. _frontier_persist_span moves :lo-hash
+                # DOWN, so an unclamped flush would re-open the exact hole the
+                # floor closes -- a skipped position below a failed one would
+                # drag the persisted bound past it in one write. Clamping the
+                # lo bound (rather than dropping the flush) keeps it doing its
+                # job for the skipped span that IS above that ident's floor.
+                if completed_all:
+                    for ident, (lo_pos, hi_pos) in sorted(skipped_span.items()):
+                        floor = rev_claim_floor.get(ident)
+                        if floor is not None:
+                            lo_pos = max(lo_pos, floor + 1)
+                        if lo_pos > hi_pos:
+                            continue
+                        async with db_lease_async() as db:
+                            await loop.run_in_executor(
+                                write_executor, _frontier_persist_span, db, linearization,
+                                lo_pos, hi_pos, False,
+                                commit_metadata[hi_pos][1], index_con, ident,
+                            )
 
                 # Stage B: the correction sweep. A third, strictly
                 # SEQUENTIAL pass, not a third concurrent task -- claim_low()
