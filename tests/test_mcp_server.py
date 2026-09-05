@@ -10474,6 +10474,105 @@ class TestFoldedSkipSpanFlushDoesNotLaunderAFloor:
             "merge, silently declaring the floored position complete"
         )
 
+    @pytest.mark.asyncio
+    async def test_flush_refuses_when_folded_span_straddles_the_floor(
+        self, tmp_path, monkeypatch
+    ):
+        """#325 review round 3 (CRITICAL, Finding 1): the sibling test above
+        seeds its completed region entirely ABOVE the injected failure, so
+        the folded span's own `lo_pos` already exceeds the floor and the
+        `lo_pos > floor` half of the disjunction alone refuses it. Seeding a
+        SECOND completed region BELOW the failure instead makes the folded
+        span STRADDLE the floor (`lo_pos <= floor < hi_pos`) -- the shape
+        `lo_pos > floor` cannot see at all, because clamping `lo_pos` up to
+        `floor + 1` looks like it worked (the result is still inside
+        [lo_pos, hi_pos]). Only `len(sources) > 1` catches this: it is a
+        fold, and the fold is what let the flush target's existing on-disk
+        hi sit below the floor in the first place. Without that half of the
+        disjunction, `_frontier_persist_span`'s advance-only union bridges
+        straight across the floored position.
+
+        Descent (claim_high, 1:20 stream ratio): 12 (mint T), 11 (in the
+        first region -- skip, attributed to T), 10 (injected failure --
+        floors T at 10), 9 (genuine claim, withheld by the floor), 8 (in the
+        NEW region -- skip, attributed to T), 7 (adjacent to both T's lo and
+        frontier-high's hi -- merges T into frontier-high; T's floor also
+        blocks this claim's own persist, per Finding 1). The merge yields
+        skipped_span[frontier-high] = (8, 11), sources = {frontier-high, T},
+        floor = 10 -- `lo_pos` (8) does not exceed `floor` (10), so only the
+        fold half of the disjunction refuses the flush.
+        """
+        import mcp_server, frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = self._repo(tmp_path, 7)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        db = mcp_server.get_db()
+        lin1 = frontier_registry.build_linearization(str(repo))
+        base_after_run1 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run1 is not None
+        assert lin1.index(base_after_run1[0]) == 1 and lin1.index(base_after_run1[1]) == 6, (
+            "precondition: run 1 must close the whole 7-commit repo with "
+            "frontier-high spanning [1,6]"
+        )
+
+        self._repo(tmp_path, 6, start=7)
+        lin2 = frontier_registry.build_linearization(str(repo))
+        victim = lin2[10]
+        victim_pos = lin2.index(victim)
+        # Region 1, above the failure (as the sibling test) -- keeps 11
+        # skipped and attributed to T. Region 2, BELOW the failure, is the
+        # one added ingredient: it puts a second skip at position 8 onto
+        # the same ident T, so the folded span's lo (8) sits under the
+        # floor (10) instead of over it.
+        for region_lo, region_hi in ((11, 11), (8, 8)):
+            mcp_server._transact(
+                db,
+                mcp_server._completed_region_facts(
+                    lin2[region_lo], lin2[region_hi], ":provisional",
+                    pos_count=region_hi - region_lo + 1,
+                ),
+                "2026-09-05T00:00:00Z",
+            )
+
+        real_apply = mcp_server._reverse_apply
+
+        def fail_at_victim(db, repo_path, linearization, commit_metadata, pos,
+                            files, *args, **kwargs):
+            if linearization[pos] == victim:
+                raise RuntimeError("injected failure below the archived regions")
+            return real_apply(db, repo_path, linearization, commit_metadata,
+                               pos, files, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", fail_at_victim)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_apply)
+
+        raw = mcp_server._db_execute(
+            db,
+            f"(query [:find (count-distinct ?t) :where "
+            f"[:commit/{victim[:12]} :entity-type ?t]])",
+        )
+        assert json.loads(raw)["results"][0][0] == 0, (
+            "precondition: the injected write must actually have failed, or "
+            "this test proves nothing"
+        )
+
+        base_after_run2 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run2 is not None
+        lo_pos = lin2.index(base_after_run2[0])
+        hi_pos = lin2.index(base_after_run2[1])
+        assert not (lo_pos <= victim_pos <= hi_pos), (
+            f"frontier-high's persisted range [{lo_pos},{hi_pos}] must "
+            f"EXCLUDE position {victim_pos}, whose write genuinely failed -- "
+            "a folded span straddling the floor (lo_pos <= floor < hi_pos) "
+            "must refuse via len(sources) > 1, since lo_pos > floor alone "
+            "cannot see this shape and lets the clamp through"
+        )
+
 
 class TestLineageProvisionalMarker:
     def test_unmarked_entity_reads_as_authoritative(self, real_db):

@@ -11772,6 +11772,7 @@ def _correction_sweep_select_position(
     linearization: List[str],
     commit_metadata: List[Tuple[str, str, str, str]],
     hash_to_pos: Optional[Dict[str, int]] = None,
+    fragmented: Optional[bool] = None,
 ) -> Optional[Tuple[str, str]]:
     """Returns (commit_hash, commit_ts_iso) for the next commit this sweep
     should process, upward through frontier-high's own claimed territory,
@@ -11779,8 +11780,10 @@ def _correction_sweep_select_position(
     (Stream 2 could still descend past a position this call would confirm
     -- see the design spec's "Why confirming requires the gap to already
     be closed"), frontier-high hasn't claimed anything yet, a required
-    boundary hash is stale, commit_metadata doesn't match linearization, or
-    the sweep has already reached frontier-high's own :hi-hash.
+    boundary hash is stale, the provisional side is still fragmented (a
+    hole above frontier-high, #325), commit_metadata doesn't match
+    linearization, or the sweep has already reached frontier-high's own
+    :hi-hash.
 
     DB-bound, parse-free -- must run off the event-loop thread (per the
     design spec's Execution context) but never on the same executor as
@@ -11789,6 +11792,19 @@ def _correction_sweep_select_position(
     hash_to_pos, if omitted, is built fresh from linearization -- callers
     doing a full sweep should build it once and pass it in instead to
     avoid rebuilding an N-entry map on every one of a full sweep's N calls.
+
+    fragmented, if omitted, is computed fresh via _intervals_read_extra(db)
+    -- two datalog queries. #325 review Finding 3: the Stage B driving loop
+    in _run_ingestion calls this function once per swept position, and
+    fragmentation cannot change within that loop (Stage B only starts once
+    completed_all is True, meaning the whole gap is claimed and the walk
+    that mints/merges interval entities has already finished for this run;
+    nothing in the Stage B loop body writes an interval fact), so that
+    driver computes it ONCE before the loop and passes it in on every call,
+    the same hash_to_pos idiom -- turning O(N) extra queries per sweep into
+    O(1). A caller that omits it (every direct test call, and any future
+    caller that cannot prove the no-mid-loop-mutation invariant for its own
+    situation) gets the always-correct, always-fresh read.
     """
     low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
     high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
@@ -11821,7 +11837,7 @@ def _correction_sweep_select_position(
         return None  # gap still open -- Stream 2 may still descend past a position
                      # this sweep would otherwise confirm
 
-    if _intervals_read_extra(db):
+    if fragmented if fragmented is not None else _intervals_read_extra(db):
         return None  # #325: a hole remains above frontier-high, so Stream 2 can
                      # still descend past a position this sweep would confirm.
                      # Once everything coalesces there is exactly one provisional
@@ -12195,13 +12211,14 @@ def _should_fold_lineage_watermark(db: Any, linearization: List[str]) -> bool:
     to it.
 
     Stage B's loop exit alone must NOT trigger the fold.
-    _correction_sweep_select_position returns None for six different
+    _correction_sweep_select_position returns None for seven different
     reasons, only one of which is "reached the ceiling": it also returns
     None when frontier-high is absent, when either boundary hash is stale
-    (rewritten history), when the gap is still open, and when
-    commit_metadata violates its contract. Folding on any None would report
-    lineage as confirmed through HEAD in exactly the situations where the
-    sweep did no work at all.
+    (rewritten history), when the gap is still open, when the provisional
+    side is still fragmented -- a hole above frontier-high (#325) -- and
+    when commit_metadata violates its contract. Folding on any None would
+    report lineage as confirmed through HEAD in exactly the situations
+    where the sweep did no work at all.
     """
     high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
     if high_bounds is None:
@@ -13172,38 +13189,57 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # `base`. Reproduced empirically pre-fix: frontier-high ends
                 # [1,11], with zero :commit/... entities at position 10.
                 #
-                # So the flush additionally REFUSES this ident outright
-                # whenever `lo_pos > floor`, rather than clamping -- the
-                # exact condition under which clamping degenerates to a
-                # no-op and lets _frontier_persist_span's advance-only union
-                # bridge the untested gap above.
+                # So the flush additionally REFUSES this ident outright on
+                # the DISJUNCTION `lo_pos > floor or len(sources) > 1`,
+                # rather than clamping -- and BOTH halves are required,
+                # because they guard two DIFFERENT ways the clamp can fail,
+                # not one restated twice.
                 #
-                # #325 review round 2 (belt-and-braces): an earlier version
-                # of this rule gated the refusal on `len(sources) > 1`
-                # (fold happened) instead, and clamped otherwise. That
-                # un-folded clamp path IS safe -- but only because of an
-                # invariant nothing here documents or enforces: a skip
-                # attributed to an ident never sits above that ident's own
-                # existing hi + 1 unless a fold moved it there. It follows
-                # from _coalesce's adjacency rule plus the reverse stream's
-                # monotone descent, so under today's allocator `lo_pos > floor`
-                # and `len(sources) > 1` happen to coincide. But nothing
-                # ties the flush's own gate to that fact: if the allocator
-                # ever served reverse positions non-monotonically across a
-                # gap, or a survivor became the flush target for positions
-                # above its own merge point, `len(sources) > 1` would stay
-                # False while `lo_pos > floor` went True, and the clamp path
-                # would silently regain the exact gap-blindness this refusal
-                # exists to prevent -- a floored position swept into a
-                # persisted interval, never re-walked, the commit reaching
-                # neither the graph nor the fact index, invisible to every
-                # at-scale detector (#302's two witnesses agree about an
-                # absence; stderr carries nothing). Testing `lo_pos > floor`
-                # directly needs none of that side reasoning: whatever moved
-                # `lo_pos` above the floor, fold or not, the clamp below
-                # would be a no-op and the flush is refused instead. Cost is
-                # unchanged -- a re-walk of a region the next run re-skips at
-                # microsecond cost, same as the fold case always paid.
+                # `lo_pos > floor` guards the case demonstrated just above:
+                # whatever moved the flushed span's own lo above the floor,
+                # the clamp `max(lo_pos, floor + 1)` degenerates to a no-op
+                # there, so refusing is the only thing that still does
+                # anything.
+                #
+                # `len(sources) > 1` guards a SEPARATE case that
+                # `lo_pos > floor` cannot see at all: a fold whose merged
+                # span STRADDLES the floor, i.e. `lo_pos <= floor < hi_pos`.
+                # There `lo_pos > floor` is False, so the clamp fires and
+                # looks fine in isolation -- lo_pos becomes floor + 1, still
+                # inside [lo_pos, hi_pos]. But _frontier_persist_span's own
+                # union (see its docstring) is against the FOLD TARGET's
+                # EXISTING on-disk hi, not against lo_pos, and a fold is
+                # exactly what can put that existing hi far BELOW the floor
+                # (the absorbed interval's span reaches down to lo_pos while
+                # the target's own claimed territory stops well short of
+                # it). The union then bridges existing_hi -> hi_pos in one
+                # shot, crossing the floored position regardless of what
+                # lo_pos was clamped to. #325 review round 3 reproduced this
+                # exact shape by seeding an extra completed region BELOW the
+                # injected write failure so the fold's merged span straddled
+                # rather than sat entirely above it: `lo_pos > floor` alone
+                # let the clamp+flush through and left frontier-high at
+                # [1,11] with zero :commit/... entities at position 10 --
+                # the identical corruption the fold-only trigger existed to
+                # prevent, just reached through the other half of the
+                # disjunction. `len(sources) > 1` is exactly "a merge folded
+                # something else into this span this run", the one
+                # condition under which the flush target's on-disk bounds
+                # and the flushed span's own claim history can have
+                # diverged this far -- so it is the correct, and only,
+                # guard for that shape.
+                #
+                # An earlier version of this comment claimed testing
+                # `lo_pos > floor` alone "needs none of th[e] side
+                # reasoning" `len(sources) > 1` rested on. That claim was
+                # the bug: it swapped one case for the other instead of
+                # widening the refusal, and the straddling scenario above is
+                # the reachable counter-example. Refusing on either
+                # condition costs nothing but a re-walk next run (the
+                # completed-region fact that produced the skip is untouched,
+                # independent of skipped_span entirely), which is the
+                # accepted price #326 established throughout for "unproven
+                # -> don't assert, re-walk instead".
                 if completed_all:
                     for ident, (lo_pos, hi_pos) in sorted(skipped_span.items()):
                         sources = skipped_span_sources.get(ident, {ident})
@@ -13212,7 +13248,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             default=None,
                         )
                         if floor is not None:
-                            if lo_pos > floor:
+                            if lo_pos > floor or len(sources) > 1:
                                 continue
                             lo_pos = max(lo_pos, floor + 1)
                         if lo_pos > hi_pos:
@@ -13248,10 +13284,26 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     }
                     skipped = 0
                     async with db_lease_async() as db:
+                        # #325 review Finding 3: computed ONCE, not inside
+                        # the loop below. Stage B only starts once
+                        # completed_all is True -- the whole gap is
+                        # claimed and the walk that mints/merges interval
+                        # entities has already finished for this run -- and
+                        # nothing in this loop's body (select/extract/apply/
+                        # lifecycle-apply/watermark-update/checkpoint)
+                        # writes an interval fact, so fragmentation cannot
+                        # change between iterations. Passing it in turns
+                        # 2 extra datalog queries per swept commit into 2
+                        # for the whole sweep, mirroring the hash_to_pos
+                        # idiom just above.
+                        sweep_fragmented = bool(await loop.run_in_executor(
+                            write_executor, _intervals_read_extra, db,
+                        ))
                         while not _shutdown_requested.is_set():
                             selected = await loop.run_in_executor(
                                 write_executor, _correction_sweep_select_position,
                                 db, linearization, commit_metadata, hash_to_pos,
+                                sweep_fragmented,
                             )
                             if selected is None:
                                 break
