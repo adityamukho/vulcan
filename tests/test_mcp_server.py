@@ -9938,6 +9938,158 @@ class TestSkipFlushNeverCoversFailedWrites:
             "rather than discarded -- nothing will ever re-walk them"
         )
 
+
+class TestTipGrowthRetainsTheReverseFrontier:
+    """#325 acceptance 1: after the tip grows, the reverse stream walks only
+    the new commits, and frontier-high is retained and extended rather than
+    discarded. On master's _frontier_load, a high interval that no longer
+    reaches the tip is unconditionally discarded, so every position -- not
+    just the new ones -- gets re-claimed and re-walked; this is the issue's
+    headline property (#325: ~18h re-walk measured on a real 53k-commit
+    repo) and the most important test on this branch.
+
+    MINIGRAF_INGEST_TRACE_PATH is the independent witness of which commits
+    were actually APPLIED by the reverse stream: it emits one JSONL record
+    per applied commit (fields confirmed against _IngestTrace.emit), so a
+    position that was skipped-via-retention appears in no record at all --
+    this cannot be satisfied vacuously by a fast "skip" path either, since
+    the trace only records applied positions, not skipped ones.
+    """
+
+    @pytest.mark.asyncio
+    async def test_second_run_applies_only_the_new_commits(self, tmp_path, monkeypatch):
+        import mcp_server, frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = TestDivergentRefEndToEnd()._repo(tmp_path, 12)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        first_high = mcp_server._frontier_read_bounds(
+            mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT)
+        assert first_high is not None, (
+            "run 1 must leave a persisted frontier-high, or there is nothing "
+            "to retain and this test proves nothing"
+        )
+
+        TestDivergentRefEndToEnd()._repo(tmp_path, 3, start=12)
+        trace = tmp_path / "trace.jsonl"
+        monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(trace))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        lin = frontier_registry.build_linearization(str(repo))
+        records = [
+            json.loads(line) for line in trace.read_text().splitlines()
+            if line.strip()
+        ]
+        applied_rev = {r["pos"] for r in records if r.get("tag") == "rev"}
+        assert applied_rev, (
+            "run 2 must have applied at least one reverse position -- the "
+            "new tip -- or this test proves nothing"
+        )
+        new_positions = set(range(len(lin) - 3, len(lin)))
+        assert applied_rev <= new_positions, (
+            "reverse stream re-applied already-ingested positions: "
+            f"{sorted(applied_rev - new_positions)}"
+        )
+        assert mcp_server._intervals_read_extra(mcp_server.get_db()) == [], (
+            "the tip interval must have merged into frontier-high, not "
+            "persisted as a separate extra interval"
+        )
+        merged = mcp_server._frontier_read_bounds(
+            mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT)
+        assert merged is not None
+        assert merged[0] == first_high[0] and merged[1] == lin[-1], (
+            f"frontier-high must retain its original lo ({first_high[0][:12]}) "
+            f"and extend its hi to the new tip ({lin[-1][:12]}); got {merged}"
+        )
+
+
+class TestSecondTipGrowthBeforeMerge:
+    """#325: two disjoint provisional intervals must persist and reload, and
+    Stage B (the correction sweep) must decline while a hole remains between
+    them. This is the case a single extra fixed ident cannot express -- prior
+    to #325's ident-keyed provisional interval entities (70dd757), there was
+    nowhere to persist a SECOND, independent provisional region while the
+    first one was still unmerged with frontier-high.
+
+    Empirically confirmed (see this file's own exploration, not merely
+    reasoned): a 10-commit run 1 closes fully, frontier-high = [1,9]. Growing
+    the tip by 4 (positions 10-13) and interrupting the reverse stream after
+    two applies leaves a genuinely disjoint extra interval [11,13] -- one
+    position (10) short of merging with frontier-high's hi (9). Growing the
+    tip again by 3 more (positions 14-16) and reloading shows the base and
+    the extra both survive as separate provisional intervals with a hole at
+    position 10, and the correction sweep declines to select a position
+    while that fragmentation persists.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_intervals_persist_and_the_sweep_declines(self, tmp_path, monkeypatch):
+        import mcp_server, frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = TestDivergentRefEndToEnd()._repo(tmp_path, 10)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        base_after_run1 = mcp_server._frontier_read_bounds(
+            mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run1 is not None, (
+            "run 1 must leave a persisted frontier-high, or there is nothing "
+            "for the extra interval to stay disjoint from"
+        )
+
+        # Grow, then interrupt inside the tip gap so it never merges into
+        # frontier-high.
+        TestDivergentRefEndToEnd()._repo(tmp_path, 4, start=10)
+        original = mcp_server._reverse_apply
+        seen = {"n": 0}
+
+        def stop_after_two(*a, **kw):
+            seen["n"] += 1
+            if seen["n"] > 2:
+                mcp_server._shutdown_requested.set()
+            return original(*a, **kw)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", stop_after_two)
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+        finally:
+            mcp_server._shutdown_requested.clear()
+            monkeypatch.setattr(mcp_server, "_reverse_apply", original)
+
+        db = mcp_server.get_db()
+        extras_after_run2 = mcp_server._intervals_read_extra(db)
+        assert extras_after_run2 != [], (
+            "the interrupted run must leave a genuinely disjoint extra "
+            "provisional interval, separate from frontier-high, or this "
+            "test is not exercising the two-interval case at all"
+        )
+
+        # Grow the tip again, before the two provisional pieces ever merge.
+        TestDivergentRefEndToEnd()._repo(tmp_path, 3, start=14)
+        lin = frontier_registry.build_linearization(str(repo))
+        alloc = mcp_server._frontier_load(db, lin, "2026-09-04T00:00:00Z")
+        prov = [iv for iv in alloc.intervals()
+                if iv.tag == frontier_registry.TAG_PROVISIONAL]
+        assert len(prov) >= 2, (
+            f"expected frontier-high plus at least one disjoint extra "
+            f"interval to reload after the second growth, got {len(prov)}: "
+            f"{[(iv.lo_pos, iv.hi_pos, iv.is_base) for iv in prov]}"
+        )
+        assert mcp_server._intervals_read_extra(db) != [], (
+            "the extra interval must still be persisted and reloadable "
+            "after the second tip growth, not merged or dropped"
+        )
+
+        meta = [(h, "2026-09-04T00:00:00Z", "a", "s") for h in lin]
+        assert mcp_server._correction_sweep_select_position(db, lin, meta) is None, (
+            "Stage B must decline to select a position while the "
+            "provisional side is still fragmented into disjoint intervals"
+        )
+
+
 class TestNonTipWriteFailureIsReWalked:
     """Renamed from TestSkipFastPathFailedWriteIsNotClaimed in #325 review
     round 3 (Finding 6): the recovery this class tests no longer goes
