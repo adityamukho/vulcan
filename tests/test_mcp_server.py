@@ -9941,19 +9941,45 @@ class TestSkipFlushNeverCoversFailedWrites:
 
 class TestTipGrowthRetainsTheReverseFrontier:
     """#325 acceptance 1: after the tip grows, the reverse stream walks only
-    the new commits, and frontier-high is retained and extended rather than
-    discarded. On master's _frontier_load, a high interval that no longer
-    reaches the tip is unconditionally discarded, so every position -- not
-    just the new ones -- gets re-claimed and re-walked; this is the issue's
-    headline property (#325: ~18h re-walk measured on a real 53k-commit
-    repo) and the most important test on this branch.
+    the new commits, and frontier-high is retained -- keeping its original
+    lo -- and extended to the new tip, rather than being discarded and
+    re-derived. This is the issue's headline property (#325: ~18h re-walk
+    measured on a real 53k-commit repo) and the most important test on this
+    branch.
+
+    Corrected after review: an earlier version of this docstring, and this
+    class's introducing commit (42167df), claimed master re-walks "every
+    position -- not just the new ones" for plain tip growth, and that the
+    trace assertion below "cannot be satisfied vacuously by a fast skip
+    path either". Both are false, reproduced by ablation both ways -- see
+    the correcting commit that follows 42167df, and
+    .superpowers/sdd/2026-09-04-frontier-interval-set/task-7-report.md's
+    Finding 2 addendum, for the full account. The true picture:
+
+    - Against MASTER, only the retained-lo assertion below discriminates.
+      Master's _frontier_load discards an off-tip interval but ARCHIVES it
+      first (#326), and a plain tip-growth run never rewrites history, so
+      the archived region's hashes still resolve in that SAME run's
+      linearization -- #326's _skip_claim fast path intercepts it there,
+      same run, reassigning the old span to a freshly-derived interval
+      instead of re-walking it. Master's trace therefore also shows only
+      the 3 new positions applied; what it gets wrong is frontier-high's
+      lo, which moves to a later position than the one this run started
+      with, rather than being retained.
+    - On THIS BRANCH the trace assertion has real teeth: #325 removed the
+      "reaches the tip" requirement from _load_one_interval's retain check
+      (mcp_server.py, the `if resolved and lo_pos <= hi_pos and pos_count
+      == hi_pos - lo_pos + 1:` line), which is exactly what makes
+      off-tip retention possible at all. Re-adding master's `and hi_pos ==
+      len(linearization) - 1` to that line, on this branch, made positions
+      2-11 re-apply via the reverse stream (verified by ablation, not
+      merely reasoned) -- so on this branch, unlike on master, the fast
+      path is genuinely gone and a regression here would show up as a full
+      re-walk, which the trace assertion catches directly.
 
     MINIGRAF_INGEST_TRACE_PATH is the independent witness of which commits
     were actually APPLIED by the reverse stream: it emits one JSONL record
-    per applied commit (fields confirmed against _IngestTrace.emit), so a
-    position that was skipped-via-retention appears in no record at all --
-    this cannot be satisfied vacuously by a fast "skip" path either, since
-    the trace only records applied positions, not skipped ones.
+    per applied commit (fields confirmed against _IngestTrace.emit).
     """
 
     @pytest.mark.asyncio
@@ -10006,26 +10032,40 @@ class TestTipGrowthRetainsTheReverseFrontier:
 
 
 class TestSecondTipGrowthBeforeMerge:
-    """#325: two disjoint provisional intervals must persist and reload, and
-    Stage B (the correction sweep) must decline while a hole remains between
-    them. This is the case a single extra fixed ident cannot express -- prior
-    to #325's ident-keyed provisional interval entities (70dd757), there was
+    """#325: two disjoint provisional intervals must persist and reload.
+    This is the case a single extra fixed ident cannot express -- prior to
+    #325's ident-keyed provisional interval entities (70dd757), there was
     nowhere to persist a SECOND, independent provisional region while the
     first one was still unmerged with frontier-high.
 
-    Empirically confirmed (see this file's own exploration, not merely
-    reasoned): a 10-commit run 1 closes fully, frontier-high = [1,9]. Growing
-    the tip by 4 (positions 10-13) and interrupting the reverse stream after
-    two applies leaves a genuinely disjoint extra interval [11,13] -- one
-    position (10) short of merging with frontier-high's hi (9). Growing the
-    tip again by 3 more (positions 14-16) and reloading shows the base and
-    the extra both survive as separate provisional intervals with a hole at
-    position 10, and the correction sweep declines to select a position
-    while that fragmentation persists.
+    Observed directly in this scenario (via a debug run against this
+    branch, not merely reasoned): a 10-commit run 1 closes fully,
+    frontier-high = [1,9]. Growing the tip by 4 (positions 10-13) and
+    interrupting the reverse stream after two applies leaves a genuinely
+    disjoint extra interval [11,13] -- one position (10) short of merging
+    with frontier-high's hi (9). Growing the tip again by 3 more (positions
+    14-16) and reloading shows both survive as separate provisional
+    intervals: prov == [(1,9,is_base=True), (11,13,is_base=False)], with the
+    hole at position 10 still open between them.
+
+    Review round 4 removed this class's original third assertion, "the
+    correction sweep declines while fragmented while a hole remains
+    between them" -- it was VACUOUS in this exact scenario: run 1's
+    correction sweep already parks :ingestion/correction-sweep-through at
+    frontier-high's own ceiling (position 9) when it closes cleanly, so
+    _correction_sweep_select_position's `pos > ceiling_pos` guard returns
+    None on its own, before the fragmentation clause is ever reached --
+    reproduced by calling it with fragmented=False forced and observing it
+    still return None. That property IS covered, and non-vacuously (with a
+    real positive control that DOES select when unfragmented), by
+    TestCorrectionSweepDeclinesWhileFragmented
+    (test_declines_while_a_hole_remains_above /
+    test_selects_once_the_provisional_side_is_one_interval, both unit-level
+    against a seeded fixture) -- not duplicated here.
     """
 
     @pytest.mark.asyncio
-    async def test_two_intervals_persist_and_the_sweep_declines(self, tmp_path, monkeypatch):
+    async def test_two_intervals_persist_and_reload(self, tmp_path, monkeypatch):
         import mcp_server, frontier_registry
 
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
@@ -10056,8 +10096,10 @@ class TestSecondTipGrowthBeforeMerge:
         try:
             await mcp_server._run_ingestion(str(repo), "HEAD")
         finally:
+            # monkeypatch itself restores _reverse_apply at teardown; no
+            # need to set it back here too (#325 review round 4, Finding 4
+            # -- a second undo entry was redundant).
             mcp_server._shutdown_requested.clear()
-            monkeypatch.setattr(mcp_server, "_reverse_apply", original)
 
         db = mcp_server.get_db()
         extras_after_run2 = mcp_server._intervals_read_extra(db)
@@ -10082,12 +10124,12 @@ class TestSecondTipGrowthBeforeMerge:
             "the extra interval must still be persisted and reloadable "
             "after the second tip growth, not merged or dropped"
         )
-
-        meta = [(h, "2026-09-04T00:00:00Z", "a", "s") for h in lin]
-        assert mcp_server._correction_sweep_select_position(db, lin, meta) is None, (
-            "Stage B must decline to select a position while the "
-            "provisional side is still fragmented into disjoint intervals"
-        )
+        # No assertion on _correction_sweep_select_position here: in this
+        # scenario the sweep's own :ingestion/correction-sweep-through
+        # watermark is already parked at frontier-high's ceiling from run
+        # 1's clean close, so it declines via the ceiling check regardless
+        # of fragmentation -- asserting None here would not discriminate
+        # the fragmentation-declines property (see class docstring).
 
 
 class TestNonTipWriteFailureIsReWalked:
