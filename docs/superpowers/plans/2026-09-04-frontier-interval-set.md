@@ -1178,7 +1178,7 @@ nothing ever re-walks those positions.
 .venv/bin/python -m pytest tests/test_mcp_server.py -k "SkipFlush or SkipFastPath or RunIngestion" -v
 ```
 
-Expected: PASS, including `TestSkipFlushNeverCoversFailedWrites`, `TestSkipFastPathFailedWriteIsNotClaimed` and `TestSkipFastPathDoesNotSkipTornWrites`.
+Expected: PASS, including `TestSkipFlushNeverCoversFailedWrites`, `TestNonTipWriteFailureIsReWalked` (renamed from `TestSkipFastPathFailedWriteIsNotClaimed` in Task 4) and `TestSkipFastPathDoesNotSkipTornWrites`.
 
 - [ ] **Step 5: Ablate the floor to prove the test bites**
 
@@ -1337,7 +1337,7 @@ Claude-Session: https://claude.ai/code/session_01RPXCQaaXmkrULRy3Vcvag1"
 
 **Interfaces:** consumes everything from Tasks 1-6. Produces no production code.
 
-**Design notes:** Model these on `TestSkipFastPathEndToEnd` (`tests/test_mcp_server.py:8645`), which already builds a real git repo, runs `_run_ingestion` twice against a real file-backed graph, and grows the tip between runs. Reuse its `_repo` helper shape and its `MINIGRAF_INGEST_STREAM_RATIO=1:20` setting — at the 1:1 default the forward stream claims the region before the reverse stream reaches it and the assertions pass vacuously, which is the exact failure these tests exist to rule out.
+**Design notes:** Model these on `TestDivergentRefEndToEnd` (`tests/test_mcp_server.py:9300`, renamed from `TestSkipFastPathEndToEnd` during Task 4 — the class no longer tests the skip fast path), which already builds a real git repo, runs `_run_ingestion` twice against a real file-backed graph, and grows the tip between runs. Reuse its `_repo` helper shape and its `MINIGRAF_INGEST_STREAM_RATIO=1:20` setting — at the 1:1 default the forward stream claims the region before the reverse stream reaches it and the assertions pass vacuously, which is the exact failure these tests exist to rule out.
 
 Use `MINIGRAF_INGEST_TRACE_PATH` as the independent witness of which commits were actually applied: it emits one record per APPLIED commit, so a position that was never claimed appears in no record. It is an existing mechanism, not one built for these tests.
 
@@ -1354,7 +1354,7 @@ class TestTipGrowthRetainsTheReverseFrontier:
         import mcp_server, frontier_registry, json as _json
 
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
-        repo = TestSkipFastPathEndToEnd()._repo(tmp_path, 12)
+        repo = TestDivergentRefEndToEnd()._repo(tmp_path, 12)
         mcp_server._reset_db_state()
         mcp_server.open_db(str(repo / "memory.graph"))
         await mcp_server._run_ingestion(str(repo), "HEAD")
@@ -1362,7 +1362,7 @@ class TestTipGrowthRetainsTheReverseFrontier:
             mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT)
         assert first_high is not None
 
-        TestSkipFastPathEndToEnd()._repo(tmp_path, 3, start=12)
+        TestDivergentRefEndToEnd()._repo(tmp_path, 3, start=12)
         trace = tmp_path / "trace.jsonl"
         monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(trace))
         await mcp_server._run_ingestion(str(repo), "HEAD")
@@ -1408,13 +1408,13 @@ class TestSecondTipGrowthBeforeMerge:
         import mcp_server, frontier_registry
 
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
-        repo = TestSkipFastPathEndToEnd()._repo(tmp_path, 10)
+        repo = TestDivergentRefEndToEnd()._repo(tmp_path, 10)
         mcp_server._reset_db_state()
         mcp_server.open_db(str(repo / "memory.graph"))
         await mcp_server._run_ingestion(str(repo), "HEAD")
 
         # Grow, then interrupt inside the tip gap so it never merges.
-        TestSkipFastPathEndToEnd()._repo(tmp_path, 4, start=10)
+        TestDivergentRefEndToEnd()._repo(tmp_path, 4, start=10)
         original = mcp_server._reverse_apply
         seen = {"n": 0}
 
@@ -1429,7 +1429,7 @@ class TestSecondTipGrowthBeforeMerge:
         mcp_server._shutdown_requested.clear()
         monkeypatch.setattr(mcp_server, "_reverse_apply", original)
 
-        TestSkipFastPathEndToEnd()._repo(tmp_path, 3, start=14)
+        TestDivergentRefEndToEnd()._repo(tmp_path, 3, start=14)
         db = mcp_server.get_db()
         lin = frontier_registry.build_linearization(str(repo))
         alloc = mcp_server._frontier_load(db, lin, "2026-09-04T00:00:00Z")
@@ -1456,7 +1456,7 @@ class TestInsertionInsideRetainedIntervalIsRefused:
         import mcp_server, frontier_registry
 
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
-        repo = TestSkipFastPathEndToEnd()._repo(tmp_path, 8)
+        repo = TestDivergentRefEndToEnd()._repo(tmp_path, 8)
         mcp_server._reset_db_state()
         mcp_server.open_db(str(repo / "memory.graph"))
         await mcp_server._run_ingestion(str(repo), "HEAD")
