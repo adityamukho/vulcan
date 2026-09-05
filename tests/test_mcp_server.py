@@ -10358,6 +10358,123 @@ class TestSkippedSpanTransferredOnMerge:
         )
 
 
+class TestFoldedSkipSpanFlushDoesNotLaunderAFloor:
+    """#325 review Finding 4 (CRITICAL): the Finding-2 fold moves an
+    absorbed interval's skipped span onto the survivor, but the survivor's
+    OWN on-disk bounds can sit far below where that span begins, with the
+    floored position in between. _frontier_persist_span is advance-only and
+    gap-blind -- its union with the survivor's existing bounds bridges the
+    ENTIRE distance in one shot, including a position that this run failed
+    to complete and that no witness anywhere else ever proved complete for
+    the survivor.
+
+    Combines both ingredients Finding 1 and Finding 2's own tests each
+    lacked alone: an archived completed region (drives the fold) AND an
+    injected write failure strictly BELOW that region but ABOVE the
+    survivor's own existing hi bound (creates a floor the flushed span's own
+    lo does not need clamping against, since it sits entirely above it --
+    the bug is in the union with the survivor's existing bounds, not in the
+    flushed span's own extent).
+    """
+
+    def _repo(self, tmp_path, n, start=0):
+        repo = tmp_path / "repo"
+        if not repo.exists():
+            repo.mkdir()
+            _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(start, start + n):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_flush_does_not_bridge_a_floored_position_via_a_folded_span(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server, frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        # Run 1: a clean 7-commit repo closes fully -- authoritative=[0,0],
+        # frontier-high (base, is_base=True) = [1,6].
+        repo = self._repo(tmp_path, 7)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        db = mcp_server.get_db()
+        lin1 = frontier_registry.build_linearization(str(repo))
+        base_after_run1 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run1 is not None
+        assert lin1.index(base_after_run1[0]) == 1 and lin1.index(base_after_run1[1]) == 6, (
+            "precondition: run 1 must close the whole 7-commit repo with "
+            "frontier-high spanning [1,6]"
+        )
+
+        # Grow the tip by 6 (positions 7..12) and seed a completed region at
+        # the single position 11 -- resolvable in the grown linearization.
+        # claim_high() descends 12 (genuine claim, persists to a freshly
+        # minted ident T), 11 (in the region -- skipped, recorded under T's
+        # skipped_span), then 10 (genuine claim -- injected write failure,
+        # floors T at position 10), 9, 8 (genuine claims below T's own
+        # floor, work done but claim withheld), then 7 (adjacent to both
+        # T's lo and frontier-high's hi -- MERGES T into frontier-high;
+        # T's floor(10) also blocks THIS claim from persisting, per Finding
+        # 1's fix, so frontier-high's on-disk state never moves from [1,6]
+        # via the per-claim path at all -- only the end-of-walk flush can
+        # still touch it).
+        self._repo(tmp_path, 6, start=7)
+        lin2 = frontier_registry.build_linearization(str(repo))
+        victim = lin2[10]
+        victim_pos = lin2.index(victim)
+        region_lo = region_hi = 11
+        mcp_server._transact(
+            db,
+            mcp_server._completed_region_facts(
+                lin2[region_lo], lin2[region_hi], ":provisional",
+                pos_count=region_hi - region_lo + 1,
+            ),
+            "2026-09-05T00:00:00Z",
+        )
+
+        real_apply = mcp_server._reverse_apply
+
+        def fail_at_victim(db, repo_path, linearization, commit_metadata, pos,
+                            files, *args, **kwargs):
+            if linearization[pos] == victim:
+                raise RuntimeError("injected failure below the archived region")
+            return real_apply(db, repo_path, linearization, commit_metadata,
+                               pos, files, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", fail_at_victim)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_apply)
+
+        raw = mcp_server._db_execute(
+            db,
+            f"(query [:find (count-distinct ?t) :where "
+            f"[:commit/{victim[:12]} :entity-type ?t]])",
+        )
+        assert json.loads(raw)["results"][0][0] == 0, (
+            "precondition: the injected write must actually have failed, or "
+            "this test proves nothing"
+        )
+
+        base_after_run2 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run2 is not None
+        lo_pos = lin2.index(base_after_run2[0])
+        hi_pos = lin2.index(base_after_run2[1])
+        assert not (lo_pos <= victim_pos <= hi_pos), (
+            f"frontier-high's persisted range [{lo_pos},{hi_pos}] must "
+            f"EXCLUDE position {victim_pos}, whose write genuinely failed -- "
+            "the end-of-walk flush bridged the gap between frontier-high's "
+            "own existing bounds and a skipped span folded onto it from a "
+            "merge, silently declaring the floored position complete"
+        )
+
+
 class TestLineageProvisionalMarker:
     def test_unmarked_entity_reads_as_authoritative(self, real_db):
         import mcp_server

@@ -12718,6 +12718,20 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # scalars were last written.
                 skipped_span: Dict[str, Tuple[int, int]] = {}
 
+                # #325 review Finding 4: which idents CONTRIBUTED to
+                # skipped_span[ident] -- always at least {ident} itself. A
+                # merge fold (below) moves the SPAN onto the survivor but
+                # cannot move the FLOOR with it: floors are set at DISPATCH,
+                # which runs strictly AFTER every claim (including the
+                # merging one) has already happened, so `rev_claim_floor`
+                # may not even hold the absorbed ident's entry yet at fold
+                # time. The flush (at true end-of-walk, after every floor
+                # exists) reads this to find every floor relevant to a
+                # (possibly folded) skipped span, not just the survivor's
+                # own -- see the flush loop below for why a floor found this
+                # way still is not enough on its own.
+                skipped_span_sources: Dict[str, Set[str]] = {}
+
                 # #326 Finding A: the floor :lo-hash may not cross this run.
                 #
                 # The witness this whole feature rests on -- "
@@ -12879,6 +12893,18 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 skipped_span[target_ident] = (
                                     min(lo_t, lo_a), max(hi_t, hi_a)
                                 )
+                                # #325 review Finding 4: carry provenance
+                                # along with the span, so the flush can find
+                                # a floor that was never the survivor's own.
+                                # Union rather than overwrite -- transitive
+                                # folds (T1 into T2, T2 later into T3) must
+                                # accumulate every original source, not just
+                                # the most recent one.
+                                sources_a = skipped_span_sources.pop(a, {a})
+                                sources_t = skipped_span_sources.get(
+                                    target_ident, {target_ident}
+                                )
+                                skipped_span_sources[target_ident] = sources_t | sources_a
                         if not _skip_claim(tag, pos, completed_regions):
                             break
                         lo, hi = skipped_span.get(target_ident, (pos, pos))
@@ -13114,10 +13140,47 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # drag the persisted bound past it in one write. Clamping the
                 # lo bound (rather than dropping the flush) keeps it doing its
                 # job for the skipped span that IS above that ident's floor.
+                #
+                # #325 review Finding 4 (CRITICAL): clamping `lo_pos` against
+                # the widened (provenance-aware) floor is NECESSARY but not
+                # SUFFICIENT once a fold has moved another interval's span
+                # onto this ident. Demonstrated case: T is floored at
+                # position 10 by a failed write; T's own skipped span (from
+                # an archived region at position 11) folds onto a retained
+                # base whose own on-disk range is [1,6] -- far below either
+                # number. The span being flushed, (11,11), is already ABOVE
+                # the floor (10), so clamping `lo_pos` by `floor + 1 = 11`
+                # is a no-op -- lo_pos was already 11. The danger is not in
+                # the flushed span's OWN bounds; it is that
+                # _frontier_persist_span's advance-only union takes base's
+                # existing hi (6) and the flushed hi (11) and silently
+                # bridges the entire gap between them, INCLUDING position 10
+                # -- which no witness anywhere ever proved complete for
+                # `base`. Reproduced empirically pre-fix: frontier-high ends
+                # [1,11], with zero :commit/... entities at position 10.
+                #
+                # So a fold additionally REFUSES this ident's flush outright
+                # for the run whenever any source's floor applies -- not
+                # merely clamps it. `sources` always contains at least
+                # `ident` itself; `len(sources) > 1` is exactly "a merge
+                # folded something else into this span this run", the one
+                # condition under which the flush's target and the flushed
+                # span's own claim history can have diverged this far.
+                # Refusing costs nothing but a re-walk next run (the
+                # completed-region fact that produced the skip is untouched,
+                # independent of skipped_span entirely), which is the
+                # accepted price #326 established throughout for "unproven
+                # -> don't assert, re-walk instead".
                 if completed_all:
                     for ident, (lo_pos, hi_pos) in sorted(skipped_span.items()):
-                        floor = rev_claim_floor.get(ident)
+                        sources = skipped_span_sources.get(ident, {ident})
+                        floor = max(
+                            (rev_claim_floor[s] for s in sources if s in rev_claim_floor),
+                            default=None,
+                        )
                         if floor is not None:
+                            if len(sources) > 1:
+                                continue
                             lo_pos = max(lo_pos, floor + 1)
                         if lo_pos > hi_pos:
                             continue
