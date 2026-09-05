@@ -22470,6 +22470,63 @@ class TestCorrectionSweepSelectPosition:
         assert result is not None
 
 
+class TestCorrectionSweepDeclinesWhileFragmented:
+    """#325: with a hole above frontier-high, Stream 2 can still descend past a
+    position the sweep would confirm, so the sweep must decline."""
+
+    def _seed(self, db, lin, extra=None):
+        import mcp_server
+        hi = mcp_server._FRONTIER_HIGH_IDENT
+        lo = mcp_server._FRONTIER_LOW_IDENT
+        mcp_server._transact(db, "[" + " ".join([
+            f"[{lo} :entity-type :type/ingest-interval]",
+            f"[{lo} :tag :authoritative]",
+            f'[{lo} :lo-hash "{lin[0]}"]', f'[{lo} :hi-hash "{lin[3]}"]',
+            f"[{lo} :pos-count 4]",
+            f"[{hi} :entity-type :type/ingest-interval]",
+            f"[{hi} :tag :provisional]",
+            f'[{hi} :lo-hash "{lin[4]}"]', f'[{hi} :hi-hash "{lin[11]}"]',
+            f"[{hi} :pos-count 8]",
+        ]) + "]", "2026-09-04T00:00:00Z")
+        if extra is not None:
+            ident = mcp_server._interval_ident(lin[extra[1]])
+            mcp_server._transact(db, "[" + " ".join([
+                f"[{ident} :entity-type :type/ingest-interval]",
+                f'[{ident} :ident "{ident}"]',
+                f"[{ident} :tag :provisional]",
+                f'[{ident} :lo-hash "{lin[extra[0]]}"]',
+                f'[{ident} :hi-hash "{lin[extra[1]]}"]',
+                f"[{ident} :pos-count {extra[1] - extra[0] + 1}]",
+            ]) + "]", "2026-09-04T00:00:00Z")
+
+    def _meta(self, lin):
+        return [(h, "2026-09-04T00:00:00Z", "a", f"s{i}") for i, h in enumerate(lin)]
+
+    def test_declines_while_a_hole_remains_above(self, real_db):
+        import mcp_server
+        lin = [f"h{i}" for i in range(12)]
+        self._seed(real_db, lin, extra=(9, 11))
+        assert mcp_server._correction_sweep_select_position(
+            real_db, lin, self._meta(lin)) is None
+
+    def test_selects_once_the_provisional_side_is_one_interval(self, real_db):
+        import mcp_server
+        lin = [f"h{i}" for i in range(12)]
+        self._seed(real_db, lin)
+        assert mcp_server._correction_sweep_select_position(
+            real_db, lin, self._meta(lin)) == (lin[4], "2026-09-04T00:00:00Z")
+
+    def test_fold_gate_declines_while_fragmented(self, real_db):
+        import mcp_server
+        lin = [f"h{i}" for i in range(12)]
+        self._seed(real_db, lin, extra=(9, 11))
+        mcp_server._transact(
+            real_db,
+            f'[[:ingestion/correction-sweep-through :hash "{lin[11]}"]]',
+            "2026-09-04T00:00:00Z")
+        assert mcp_server._should_fold_lineage_watermark(real_db, lin) is False
+
+
 class TestCorrectionSweepApply:
     def _init_repo(self, repo):
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)

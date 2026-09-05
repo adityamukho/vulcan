@@ -11821,6 +11821,12 @@ def _correction_sweep_select_position(
         return None  # gap still open -- Stream 2 may still descend past a position
                      # this sweep would otherwise confirm
 
+    if _intervals_read_extra(db):
+        return None  # #325: a hole remains above frontier-high, so Stream 2 can
+                     # still descend past a position this sweep would confirm.
+                     # Once everything coalesces there is exactly one provisional
+                     # interval and the gap-closed test above is exact again.
+
     if high_bounds[1] not in hash_to_pos:
         return None  # frontier-high's :hi-hash is stale; nothing safe to do
     ceiling_pos = hash_to_pos[high_bounds[1]]
@@ -12199,6 +12205,13 @@ def _should_fold_lineage_watermark(db: Any, linearization: List[str]) -> bool:
     """
     high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
     if high_bounds is None:
+        return False
+    if _intervals_read_extra(db):
+        # #325: a hole remains above frontier-high, so the sweep itself
+        # would have declined (see _correction_sweep_select_position) even
+        # if through_hash already equals high_bounds[1] from before the
+        # hole opened up -- folding here would still misreport lineage as
+        # confirmed through a ceiling Stream 2 can still descend past.
         return False
     through_hash = _correction_sweep_through_query(db)
     if through_hash is None:
@@ -13159,18 +13172,38 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # `base`. Reproduced empirically pre-fix: frontier-high ends
                 # [1,11], with zero :commit/... entities at position 10.
                 #
-                # So a fold additionally REFUSES this ident's flush outright
-                # for the run whenever any source's floor applies -- not
-                # merely clamps it. `sources` always contains at least
-                # `ident` itself; `len(sources) > 1` is exactly "a merge
-                # folded something else into this span this run", the one
-                # condition under which the flush's target and the flushed
-                # span's own claim history can have diverged this far.
-                # Refusing costs nothing but a re-walk next run (the
-                # completed-region fact that produced the skip is untouched,
-                # independent of skipped_span entirely), which is the
-                # accepted price #326 established throughout for "unproven
-                # -> don't assert, re-walk instead".
+                # So the flush additionally REFUSES this ident outright
+                # whenever `lo_pos > floor`, rather than clamping -- the
+                # exact condition under which clamping degenerates to a
+                # no-op and lets _frontier_persist_span's advance-only union
+                # bridge the untested gap above.
+                #
+                # #325 review round 2 (belt-and-braces): an earlier version
+                # of this rule gated the refusal on `len(sources) > 1`
+                # (fold happened) instead, and clamped otherwise. That
+                # un-folded clamp path IS safe -- but only because of an
+                # invariant nothing here documents or enforces: a skip
+                # attributed to an ident never sits above that ident's own
+                # existing hi + 1 unless a fold moved it there. It follows
+                # from _coalesce's adjacency rule plus the reverse stream's
+                # monotone descent, so under today's allocator `lo_pos > floor`
+                # and `len(sources) > 1` happen to coincide. But nothing
+                # ties the flush's own gate to that fact: if the allocator
+                # ever served reverse positions non-monotonically across a
+                # gap, or a survivor became the flush target for positions
+                # above its own merge point, `len(sources) > 1` would stay
+                # False while `lo_pos > floor` went True, and the clamp path
+                # would silently regain the exact gap-blindness this refusal
+                # exists to prevent -- a floored position swept into a
+                # persisted interval, never re-walked, the commit reaching
+                # neither the graph nor the fact index, invisible to every
+                # at-scale detector (#302's two witnesses agree about an
+                # absence; stderr carries nothing). Testing `lo_pos > floor`
+                # directly needs none of that side reasoning: whatever moved
+                # `lo_pos` above the floor, fold or not, the clamp below
+                # would be a no-op and the flush is refused instead. Cost is
+                # unchanged -- a re-walk of a region the next run re-skips at
+                # microsecond cost, same as the fold case always paid.
                 if completed_all:
                     for ident, (lo_pos, hi_pos) in sorted(skipped_span.items()):
                         sources = skipped_span_sources.get(ident, {ident})
@@ -13179,7 +13212,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             default=None,
                         )
                         if floor is not None:
-                            if len(sources) > 1:
+                            if lo_pos > floor:
                                 continue
                             lo_pos = max(lo_pos, floor + 1)
                         if lo_pos > hi_pos:
