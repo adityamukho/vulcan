@@ -2168,9 +2168,24 @@ nightly, per CLAUDE.md's rule against gating on a prediction:**
 | `prior_ingested` | 262 |
 | `processed_this_run` | 38 |
 | `positions_skipped_this_run` | 0 |
+| `retention_engaged` | **true** |
 | `proved_nothing` | false (nonzero denominator — the positive control) |
 | `ok` | true |
 | Wall clock (both ingestions + census) | 89–91s (two runs, both under 92s) |
+
+`retention_engaged` was added, and this baseline re-measured, after review
+flagged that `ok` alone has no positive control: a future regression to
+pre-#325 discard-on-tip-growth behaviour would re-walk all 300 positions on
+the "resume" and still report `repo_vs_graph == 0` (minigraf collapses a
+re-transacted commit triple at an identical `commit_ts_iso` rather than
+duplicating it), so `ok` would stay green while silently no longer exercising
+the mechanism this probe exists to guard. `retention_engaged` is `prior_ingested
+> 0 and processed_this_run < repo_commits` (`evals/at_scale/probe_resume_census.py`'s
+`retention_engaged`) — RENDERED, never gated, so every run re-proves its own
+positive control rather than it being a fact about the day this baseline was
+measured. `262 > 0` and `38 < 300` both hold, so this run's `true` is direct
+evidence the resume actually skipped the already-ingested region rather than
+re-walking everything and coincidentally landing on a clean total.
 
 **`positions_skipped_this_run == 0` is the EXPECTED reading for a clean
 append-only resume, not evidence retention failed to engage.** #326's skip
@@ -2208,6 +2223,37 @@ test_walk_vs_graph_alone_does_not_decide_it` pins with constructed numbers.
 `repo_vs_graph` answers the only question this probe exists to ask — does the
 graph hold every commit the repo has, after a resume — without routing through
 `walk_claimed` at all.
+
+**`resume_ok` checks `census_error is None` explicitly, not only
+`repo_vs_graph`.** An earlier draft checked `repo_vs_graph == 0` alone, which
+also reads 0 on a run whose OWN collection failed outright — `collect_commit_census`
+routes both `repo_commits` and `graph_commit_entities` to the same zero
+default on a `census_error`, so a persisted result would have read `"ok":
+true` beside a non-null `census_error`, the exact "unverified reads as
+verified-clean" shape `commit_census`'s own `ok` refuses. Fixed to
+`census_error is None and repo_vs_graph == 0`; pinned by
+`TestResumeOk::test_a_census_error_fails_even_with_repo_vs_graph_zero`, with
+its own counterfactual test proving `repo_vs_graph` alone WOULD have read
+clean on the same input.
+
+**Coverage residual of the frozen slice — read before treating a green run as
+full coverage.** `--branch`/`--truncate-by` are pinned to the same 300th-commit
+target and 30 every night, so this step replays an IDENTICAL scenario each
+run. That is enough to catch a REGRESSION in the retention predicate itself
+(pre-#325 discard-on-tip-growth reappearing) — which is what
+`retention_engaged` above additionally confirms this baseline actually
+exercises — but it can NEVER observe a newly landed commit arriving INSIDE an
+already-retained interval's bounds, the exact scenario the interval's
+`:pos-count` checksum was written to catch (see CLAUDE.md's "A region is
+stored as two HASHES but consumed as a closed POSITION RANGE" section). The
+ident-collision census immediately above this one in the nightly deliberately
+carries no `--since`
+bound for the matching reason — its own comment: the pair to worry about is
+new-vs-old, and a bounded collection would see only new-vs-new. This probe's
+fixed slice takes the opposite trade, accepted here for the ingestion-cost
+reasons measured above, and is named as a residual rather than left implicit.
+`probe_resume_census.py`'s own module docstring qualifies its "only at-scale
+check that can observe" claim against exactly this bound.
 
 **Where it runs, and what a red run means.** The at-scale nightly runs it with
 `--fail-on-mismatch` (`if: always()`, beside the ident-collision census, so a

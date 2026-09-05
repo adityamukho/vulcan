@@ -15,7 +15,7 @@ import subprocess as _subprocess
 import pytest
 
 from evals.at_scale import probe_resume_census
-from evals.at_scale.probe_resume_census import resume_ok
+from evals.at_scale.probe_resume_census import resume_ok, retention_engaged
 
 
 @pytest.fixture(autouse=True)
@@ -52,8 +52,13 @@ def _repo(tmp_path, n, start=0):
 
 
 def _census(**overrides):
-    """A clean 15-commit census, before overrides -- mirrors
-    test_at_scale_commit_census.py's own `_clean` helper."""
+    """A clean 15-commit resume census, before overrides -- mirrors
+    test_at_scale_commit_census.py's own `_clean` helper, extended with the
+    resume-specific fields (prior_ingested/processed_this_run) this probe
+    adds on top of collect_commit_census's own dict. prior_ingested=12,
+    processed_this_run=3 is the split
+    test_prior_ingested_and_processed_this_run_attribute_correctly measures
+    for a real 12-then-3 resume."""
     kwargs = dict(
         ref="main", repo_commits=15, walk_claimed=15, graph_commit_entities=15,
         repo_vs_walk=0, walk_vs_graph=0, repo_vs_graph=0,
@@ -61,6 +66,8 @@ def _census(**overrides):
         proved_nothing=False, ok=True,
         interpretation="repo, walk and graph agree at 15 commits.",
         census_error=None,
+        prior_ingested=12, processed_this_run=3, truncate_by=3,
+        positions_skipped_this_run=0, retention_engaged=True,
     )
     kwargs.update(overrides)
     return kwargs
@@ -90,17 +97,75 @@ class TestResumeOk:
     def test_repo_vs_walk_alone_does_not_decide_it(self):
         assert resume_ok(_census(repo_vs_walk=5, ok=False)) is True
 
-    def test_a_census_error_reads_true_here_deliberately(self):
-        """Not a gap in this function -- collect_commit_census routes both
-        repo_commits and graph_commit_entities to 0 on a failed collection, so
-        repo_vs_graph reads 0 regardless. The CLI's unconditional
-        census_error check is what keeps this from reaching a green log
-        unnoticed; see main()."""
+    def test_a_census_error_fails_even_with_repo_vs_graph_zero(self):
+        """The exact "unverified reads as verified-clean" shape flagged in
+        review: collect_commit_census routes both repo_commits and
+        graph_commit_entities to 0 on a failed collection, so repo_vs_graph
+        reads 0 regardless of whether anything was actually measured. An
+        earlier draft of this function checked only repo_vs_graph and read
+        True here -- a persisted result would then show "ok": true beside a
+        non-null census_error. `census_error is None` is checked first and
+        explicitly so this can never happen; the CLI's unconditional
+        census_error check in main() is now belt-and-suspenders, not the
+        only thing standing between this and a green log."""
         census = _census(
             repo_commits=0, graph_commit_entities=0, repo_vs_graph=0,
+            prior_ingested=0, processed_this_run=0,
             census_error="CalledProcessError: ...", proved_nothing=False, ok=False,
         )
-        assert resume_ok(census) is True
+        assert resume_ok(census) is False
+
+    def test_the_counterfactual_repo_vs_graph_alone_would_have_passed(self):
+        """Positive control for the test above: without the explicit
+        census_error check, `repo_vs_graph == 0` alone reads True on this
+        exact census. Pinned so a future edit that drops the check silently
+        cannot pass test_a_census_error_fails_even_with_repo_vs_graph_zero by
+        accident-proofing repo_vs_graph instead."""
+        census = _census(
+            repo_commits=0, graph_commit_entities=0, repo_vs_graph=0,
+            census_error="CalledProcessError: ...",
+        )
+        assert census["repo_vs_graph"] == 0
+
+
+class TestRetentionEngaged:
+    """The positive control this probe's own review flagged as missing: a
+    future change that made `_frontier_load` always discard (reverting #325)
+    would re-walk everything on a "resume" and still land on repo_vs_graph ==
+    0, since minigraf collapses a re-transacted commit triple at an identical
+    commit_ts_iso rather than duplicating it. `ok` cannot see that
+    regression; this field is rendered specifically so a reader (or a future
+    stricter gate) can."""
+
+    def test_a_healthy_partial_resume_engaged_retention(self):
+        assert retention_engaged(_census()) is True
+
+    def test_zero_prior_ingested_is_not_a_resume_at_all(self):
+        """truncate_by covering all of history (or 0 with an already-empty
+        graph) leaves nothing for a resume to have resumed FROM. Isolated
+        from the other clause: processed_this_run stays well below
+        repo_commits (3 < 15), so only `prior_ingested > 0` being False can
+        be responsible for the result -- must read False rather than True by
+        coincidence of the arithmetic."""
+        census = _census(prior_ingested=0, processed_this_run=3)
+        assert retention_engaged(census) is False
+
+    def test_a_full_rewalk_that_still_lands_clean_reads_false(self):
+        """The exact regression this field exists to catch: pre-#325
+        discard-on-tip-growth behaviour re-walks every position on the
+        "resume", so processed_this_run climbs to meet repo_commits even
+        though the graph ends up complete either way. ok alone cannot tell
+        this apart from the healthy case above -- both have repo_vs_graph ==
+        0 -- which is exactly why this is a separate, rendered field."""
+        census = _census(processed_this_run=15)  # prior_ingested stays 12
+        assert retention_engaged(census) is False
+
+    def test_processed_this_run_exactly_matching_repo_commits_is_not_engaged(self):
+        """Boundary case for the strict '<': a resume that reprocessed
+        EXACTLY repo_commits positions re-walked everything, even if
+        prior_ingested was nonzero (e.g. a duplicate-tolerant re-walk)."""
+        census = _census(prior_ingested=1, processed_this_run=15)
+        assert retention_engaged(census) is False
 
 
 class TestResumeCensus:
@@ -128,6 +193,12 @@ class TestResumeCensus:
             "a run whose denominator is zero proves nothing and must say so "
             "rather than reading as a pass"
         )
+        assert result["retention_engaged"] is True, (
+            "prior_ingested=12 > 0 and processed_this_run=3 < repo_commits=15 "
+            "-- the resume genuinely skipped the already-ingested region "
+            "rather than re-walking everything and coincidentally landing "
+            "clean"
+        )
 
     @pytest.mark.asyncio
     async def test_prior_ingested_and_processed_this_run_attribute_correctly(
@@ -151,15 +222,27 @@ class TestResumeCensus:
         assert result["walk_claimed"] == 15
 
     @pytest.mark.asyncio
-    async def test_an_empty_repo_proves_nothing_and_does_not_fail(self, tmp_path):
+    async def test_an_empty_repo_is_unverified_not_a_pass(self, tmp_path):
+        """An empty repo has no resolvable `<branch>` ref at all (`git
+        rev-list --count` on an unborn branch exits 128), so
+        collect_commit_census's own collection fails and sets census_error --
+        this is `census_error`'s path into the empty-repo case, not
+        `proved_nothing`'s (which requires the collection to have SUCCEEDED
+        and counted 0). Per review: `ok` must agree with a non-null
+        census_error, not read around it via repo_vs_graph's coincidental
+        0-vs-0 -- so this reads False, not True. retention_engaged is False
+        too: nothing was ever ingested (prior_ingested stays 0, the
+        _CLEAN_INGEST_PROGRESS default), so there was nothing to resume
+        FROM."""
         repo = tmp_path / "empty"
         repo.mkdir()
         _subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
         result = await probe_resume_census.run_resume_census(
             str(repo), "main", str(tmp_path / "memory.graph"), truncate_by=0,
         )
-        assert result["ok"] is True
-        assert result["census_error"] is not None or result["proved_nothing"] is True
+        assert result["census_error"] is not None
+        assert result["ok"] is False
+        assert result["retention_engaged"] is False
 
     @pytest.mark.asyncio
     async def test_ingest_progress_does_not_leak_across_calls(self, tmp_path, monkeypatch):
@@ -191,7 +274,11 @@ class TestCli:
         """The unconditional half of main()'s two-axis exit code, mirroring
         probe_ident_collision_new_history.py's measurement_invalid: a failed
         collection must not be indistinguishable from a clean run just
-        because nobody passed --fail-on-mismatch."""
+        because nobody passed --fail-on-mismatch. `ok=True` here is
+        deliberately adversarial -- a real run_resume_census now always sets
+        `ok=False` on a census_error (see resume_ok) -- so this pins that
+        main()'s exit code does not rely SOLELY on trusting `result["ok"]`;
+        it checks census_error itself too."""
         async def fake_run(*args, **kwargs):
             return _census(
                 repo_commits=0, graph_commit_entities=0, repo_vs_graph=0,

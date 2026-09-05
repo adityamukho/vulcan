@@ -22,6 +22,24 @@ reimplementing the comparison is deliberate: a second copy of "count three
 things and diff them" is exactly how this probe and the nightly gate could
 drift into silently counting different things.
 
+WHAT "CAN OBSERVE THAT FAILURE" DOES NOT MEAN, AGAINST THE BOUND THIS SAME
+CHANGE SHIPS WITH. The nightly step pins `--branch` to the commit at a FIXED
+position from repo root and a fixed `--truncate-by` (see
+evals/at_scale/benchmark.md and the workflow comment beside the step) rather
+than the branch's growing tip, for cost -- so every nightly run re-plays an
+IDENTICAL frozen scenario. That is enough to catch a REGRESSION in the
+retention predicate itself (the pre-#325 discard-on-tip-growth behaviour
+reappearing), which is this probe's actual job. It can NEVER observe a newly
+landed commit arriving INSIDE an already-retained interval's bounds -- the
+exact scenario `:pos-count`'s checksum was written to catch (see
+frontier_registry / mcp_server.py's `:pos-count` discussion) -- because the
+frozen slice never grows and the checksum question only arises on a range
+that is still being appended to. The ident-collision census immediately above
+this one in the nightly deliberately carries no `--since` bound for the
+matching reason (its own comment: the pair to worry about is new-vs-old, and
+a bounded collection would see only new-vs-new); this probe's bound is the
+opposite trade, accepted for cost, and named here rather than left implicit.
+
 WALK_CLAIMED IS NOT A MANUAL RESET, AND ITS OWN FORMULA IS ALREADY
 ESTABLISHED. `_run_ingestion` seeds `_ingest_progress["processed"]` with its
 own freshly recomputed `prior_ingested` (`_count_commit_entities(db)`, run
@@ -92,19 +110,22 @@ import mcp_server  # noqa: E402
 
 from evals.at_scale.commit_census import collect_commit_census  # noqa: E402
 
-__all__ = ["run_resume_census", "resume_ok", "main"]
+__all__ = ["run_resume_census", "resume_ok", "retention_engaged", "main"]
 
-# The clean, un-contaminated baseline `handle_minigraf_ingest_git` writes
-# before starting a run (mcp_server.py). Mirrored here rather than imported
-# because it is a dict LITERAL there, not a named constant -- and because this
-# probe calls `_run_ingestion` directly, bypassing the handler that normally
-# writes it. Without this reset, `_ingest_progress` is a bare module global
-# that outlives one `run_resume_census` call: a second call in the same
-# process (this file's own two-test suite runs both in one pytest session)
-# would start from whatever the FIRST call's run left behind -- e.g. an empty
-# second repo's failed `_run_ingestion` calls touch `processed` and
-# `prior_ingested` not at all, so a prior test's real counts would leak
-# straight through as this run's numbers.
+# mcp_server.py's own module-level `_ingest_progress` initializer (the value
+# it holds before any run has ever started) -- NOT `handle_minigraf_ingest_git`'s
+# dict literal, which writes `"status": "starting"` rather than `"idle"` and is
+# otherwise identical; this mirrors the module-level one specifically. Neither
+# is a named constant in mcp_server.py, so this is copied rather than imported.
+# This probe calls `_run_ingestion` directly, bypassing the handler that
+# normally performs this reset, so without it `_ingest_progress` is a bare
+# module global that outlives one `run_resume_census` call: a second call in
+# the same process (this file's own multi-test suite runs several in one
+# pytest session) would start from whatever the FIRST call's run left behind
+# -- e.g. an empty second repo's failed `_run_ingestion` calls touch
+# `processed` and `prior_ingested` not at all, so a prior test's real counts
+# would leak straight through as this run's numbers. See
+# test_ingest_progress_does_not_leak_across_calls.
 _CLEAN_INGEST_PROGRESS: Dict[str, Any] = {
     "status": "idle", "processed": 0, "total": 0, "prior_ingested": 0,
     "current_commit": "", "error": None, "owner_pid": None, "error_at": None,
@@ -123,21 +144,66 @@ def resume_ok(census: Dict[str, Any]) -> bool:
     skipped every already-ingested position or re-walked all of them --
     exactly the property a check of #325's retention predicate needs.
 
-    A census_error routes BOTH `repo_commits` and `graph_commit_entities` to
-    the same zero default inside `collect_commit_census` (see its own
-    docstring: "the collection fails into `census_error`, never into a
-    zero" -- meaning the *comparison* never mistakes it for an empty repo,
-    not that the raw counts stay non-zero). So `repo_vs_graph` reads 0 -- and
-    this reads `True` -- on a run whose collection failed outright, same as
-    on a genuinely empty repo. That is intentional here, not accidental: it
-    mirrors `commit_census`'s own accepted empty-repo exemption, the raw
-    `census_error` string ships in the result for a human to see either way,
-    and `main()` fails the run unconditionally on `census_error` regardless
-    of `--fail-on-mismatch` -- the same two-axis split
-    `probe_ident_collision_new_history.py` uses between `measurement_invalid`
-    (always fails) and `--fail-on-collision` (gates the finding).
+    `census_error is None` is checked FIRST and explicitly, not folded into
+    `repo_vs_graph` implicitly. A census_error routes BOTH `repo_commits` and
+    `graph_commit_entities` to the same zero default inside
+    `collect_commit_census`, so `repo_vs_graph` alone reads 0 on a run whose
+    collection failed outright -- the exact "unverified reads as
+    verified-clean" shape `commit_census`'s own `ok` (`census_error is not
+    None` -> `ok = False`, checked before its own `proved_nothing` branch)
+    exists to refuse. A persisted result reading `"ok": true` beside a
+    non-null `census_error` is a defect, not a design choice: `census_error`
+    ships in the result for a human to see regardless, but `ok` must agree
+    with it, not read around it. `main()` additionally fails the CLI's exit
+    code unconditionally on `census_error` (belt-and-suspenders, matching
+    `probe_ident_collision_new_history.py`'s `measurement_invalid` always
+    failing regardless of `--fail-on-collision`) -- but that no longer papers
+    over this field disagreeing with it.
     """
-    return census["repo_vs_graph"] == 0
+    return census["census_error"] is None and census["repo_vs_graph"] == 0
+
+
+def retention_engaged(census: Dict[str, Any]) -> bool:
+    """Did this run's resume actually exercise the retention branch it exists
+    to watch, or did it just re-walk everything and still land on a clean
+    total?
+
+    RENDERED, NEVER GATED -- the positive control, not a second verdict.
+    Without it, a future change that made `_frontier_load` always discard
+    (i.e. reverted #325 entirely) would make this probe re-walk all
+    `repo_commits` positions from scratch on the "resume" and still report
+    `repo_vs_graph == 0` -- the graph ends up complete either way, since
+    minigraf collapses a re-transacted commit triple at an identical
+    `commit_ts_iso` rather than duplicating it. `ok` alone cannot tell a
+    correct skip apart from a wasteful full re-walk that happens to land on
+    the same total, so a regression in the mechanism this probe exists to
+    guard would read green forever -- the same "a check that matched nothing
+    also reports 0" trap #316's `code_entities_scanned` and #317's
+    `repo_commits` both guard against, applied to THIS probe's own positive
+    control rather than to a downstream count.
+
+    `prior_ingested > 0`: there has to have been something already in the
+    graph for a resume to be resuming AT ALL -- a truncate_by of 0, or a
+    truncated ref with no history below it, makes this vacuously
+    unfalsifiable and this reads False rather than True by coincidence.
+
+    `processed_this_run < repo_commits`: the run did NOT re-walk (or
+    re-claim) every position the repo has. On a healthy resume this is
+    `processed_this_run == repo_commits - prior_ingested` (only the newly
+    appended commits were freshly processed); a wrongly-discarding
+    `_frontier_load` would instead push `processed_this_run` up toward
+    `repo_commits` as it re-walks the whole already-ingested region. This is
+    a WEAKER check than counting skipped positions directly
+    (`positions_skipped_this_run` reads 0 on a perfectly healthy resume too
+    -- see its own comment -- because a retained region is excluded from the
+    walkable gap before the loop begins, never iterated-then-skipped), which
+    is why it is phrased as "did the run avoid re-walking everything",
+    not "did the skip counter fire".
+    """
+    return (
+        census["prior_ingested"] > 0
+        and census["processed_this_run"] < census["repo_commits"]
+    )
 
 
 async def run_resume_census(
@@ -157,23 +223,19 @@ async def run_resume_census(
     mcp_server.open_db(graph_path)
     mcp_server._ingest_progress = dict(_CLEAN_INGEST_PROGRESS)
 
+    # No try/except around either call: `_run_ingestion`'s own top-level
+    # `except Exception as e:` already swallows every Exception-rooted
+    # failure internally (bad ref, unreadable blob, an empty repo's `~N`
+    # failing to resolve) and reports it through `_ingest_progress["status"]`
+    # / `["error"]` rather than raising -- confirmed by reading
+    # `_run_ingestion` directly. A wrapper here would only catch
+    # BaseException-rooted control flow (asyncio.CancelledError,
+    # KeyboardInterrupt), which `except Exception` cannot do either, so it
+    # would add no protection -- see the review that flagged an earlier
+    # draft's guard here as claiming otherwise.
     truncated_ref = f"{branch}~{truncate_by}" if truncate_by else branch
-    try:
-        await mcp_server._run_ingestion(repo_path, truncated_ref)
-    except Exception:  # noqa: BLE001 -- _run_ingestion itself swallows
-        # Exception internally and reports failure through
-        # _ingest_progress["status"] / ["error"]; this only guards the
-        # BaseException-rooted control-flow paths (asyncio.CancelledError)
-        # its own `except Exception` does not cover, so a truncated ref that
-        # cannot resolve (e.g. an empty repo has no `~N`) still lets the
-        # resume attempt run and collect_commit_census report the failure
-        # rather than this coroutine crashing outright.
-        pass
-
-    try:
-        await mcp_server._run_ingestion(repo_path, branch)
-    except Exception:  # noqa: BLE001 -- see above
-        pass
+    await mcp_server._run_ingestion(repo_path, truncated_ref)
+    await mcp_server._run_ingestion(repo_path, branch)
 
     walk_claimed = mcp_server._ingest_progress["processed"]
     prior_ingested = mcp_server._ingest_progress.get("prior_ingested", 0)
@@ -199,6 +261,13 @@ async def run_resume_census(
     census["positions_skipped_this_run"] = mcp_server._ingest_progress.get(
         "positions_skipped", 0
     )
+    # Rendered, never gated -- see retention_engaged's own docstring. A run
+    # where this reads False is not a failure by itself (the census could
+    # still be perfectly clean); it means THIS run proved nothing about
+    # whether retention engaged, which is exactly the distinction #316's
+    # `code_entities_scanned` and #317's `repo_commits` denominators exist to
+    # preserve for their own checks.
+    census["retention_engaged"] = retention_engaged(census)
     # Overrides collect_commit_census's own `ok` -- see resume_ok's docstring
     # for why that field is unsound on a resumed graph. `census["ok"]` (that
     # verdict) is kept alongside it under a distinct key rather than
@@ -214,9 +283,11 @@ def main() -> int:
         description=(
             "Census a RESUMED graph: ingest <branch>~<truncate-by>, then "
             "resume to <branch> in the same graph, then compare repo/walk/"
-            "graph commit counts. The only at-scale check that can observe "
-            "a wrongly-RETAINED frontier interval (#325) -- see the module "
-            "docstring."
+            "graph commit counts. The only at-scale check that can observe a "
+            "wrongly-RETAINED frontier interval (#325) at all -- but see the "
+            "module docstring for what a FIXED (--branch, --truncate-by) "
+            "pair, as the nightly runs this, cannot observe: a newly landed "
+            "commit inside an already-retained interval's bounds."
         )
     )
     ap.add_argument("--repo", required=True, help="Path to the repo to ingest.")
@@ -259,11 +330,14 @@ def main() -> int:
 
     # UNCONDITIONAL, like probe_ident_collision_new_history.py's
     # measurement_invalid: a census whose own collection failed must never
-    # exit 0 just because nobody passed --fail-on-mismatch. This is the
-    # counterpart to resume_ok's documented swallow -- the dict-level `ok`
-    # reads True on a census_error (mirroring the empty-repo exemption), but
-    # the CLI's exit code does not let that failure sit silently in a green
-    # log.
+    # exit 0 just because nobody passed --fail-on-mismatch. `resume_ok`
+    # already makes `result["ok"]` False on a census_error too (see its
+    # docstring), so `args.fail_on_mismatch and result["ok"] is False` below
+    # WOULD also catch this -- but only when the flag is passed. This check
+    # is unconditional so a caller that omits --fail-on-mismatch (the
+    # nightly's ident-collision census's own --fail-on-collision precedent:
+    # a finding is gated, an invalid measurement never is) still cannot get a
+    # green exit code out of a run that never measured anything.
     census_error: Optional[str] = result.get("census_error")
     if census_error is not None:
         print(f"\nCENSUS COLLECTION FAILED: {census_error}", file=sys.stderr)

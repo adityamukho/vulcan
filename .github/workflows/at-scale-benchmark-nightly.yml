@@ -192,6 +192,20 @@ jobs:
       # added, per CLAUDE.md's rule against gating on a prediction. A
       # census_error fails the step regardless of the flag (see
       # probe_resume_census.py's main()).
+      #
+      # COVERAGE RESIDUAL OF THE FROZEN SLICE -- read before treating a green
+      # run here as full coverage. --branch/--truncate-by are pinned, so every
+      # night replays an IDENTICAL scenario: enough to catch a REGRESSION in
+      # the retention predicate itself (pre-#325 discard-on-tip-growth
+      # reappearing), but this step can NEVER observe a newly landed commit
+      # arriving INSIDE an already-retained interval's bounds -- the exact
+      # case the interval's `:pos-count` checksum exists to catch. The
+      # ident-collision census immediately above this one deliberately
+      # carries no --since bound for the matching reason (its own comment:
+      # the pair to worry about is new-vs-old, and a bounded collection would
+      # see only new-vs-new); this step's fixed slice is the opposite trade,
+      # accepted here for the ingestion-cost reasons above, not free of a
+      # residual the way that unbounded census is.
       - name: Census a resumed graph for a wrongly-retained frontier interval
         id: resume_census
         if: always()
