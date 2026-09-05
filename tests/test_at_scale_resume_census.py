@@ -118,14 +118,22 @@ class TestResumeOk:
     def test_the_counterfactual_repo_vs_graph_alone_would_have_passed(self):
         """Positive control for the test above: without the explicit
         census_error check, `repo_vs_graph == 0` alone reads True on this
-        exact census. Pinned so a future edit that drops the check silently
-        cannot pass test_a_census_error_fails_even_with_repo_vs_graph_zero by
+        exact census, while the REAL `resume_ok` still reads False on it.
+        Both halves are asserted through the production function, not just
+        the constructed dict, so this actually exercises `resume_ok` rather
+        than restating a literal already baked into `_census`'s kwargs (an
+        earlier version of this test built the dict and asserted on the
+        dict's own `repo_vs_graph` key, calling no production code at all --
+        the #270 tautological-assertion shape). Pinned so a future edit that
+        drops the census_error check silently cannot pass
+        test_a_census_error_fails_even_with_repo_vs_graph_zero by
         accident-proofing repo_vs_graph instead."""
         census = _census(
             repo_commits=0, graph_commit_entities=0, repo_vs_graph=0,
             census_error="CalledProcessError: ...",
         )
         assert census["repo_vs_graph"] == 0
+        assert resume_ok(census) is False
 
 
 class TestRetentionEngaged:
@@ -141,12 +149,19 @@ class TestRetentionEngaged:
         assert retention_engaged(_census()) is True
 
     def test_zero_prior_ingested_is_not_a_resume_at_all(self):
-        """truncate_by covering all of history (or 0 with an already-empty
-        graph) leaves nothing for a resume to have resumed FROM. Isolated
-        from the other clause: processed_this_run stays well below
-        repo_commits (3 < 15), so only `prior_ingested > 0` being False can
-        be responsible for the result -- must read False rather than True by
-        coincidence of the arithmetic."""
+        """An UNRESOLVABLE truncated ref (`<branch>~N` at or beyond the
+        branch's own commit count) leaves nothing for a resume to have
+        resumed FROM -- the first ingestion fails outright and
+        `prior_ingested` stays at its `_CLEAN_INGEST_PROGRESS` seed of 0.
+        NOT `truncate_by=0` on an ordinary non-empty repo: `truncated_ref =
+        branch if not truncate_by`, so that case ingests the FULL branch on
+        the first pass and `prior_ingested` comes back as the full count,
+        still > 0 -- see probe_resume_census.py's own retention_engaged
+        docstring, corrected alongside this one. Isolated from the other
+        clause: processed_this_run stays well below repo_commits (3 < 15),
+        so only `prior_ingested > 0` being False can be responsible for the
+        result -- must read False rather than True by coincidence of the
+        arithmetic."""
         census = _census(prior_ingested=0, processed_this_run=3)
         assert retention_engaged(census) is False
 

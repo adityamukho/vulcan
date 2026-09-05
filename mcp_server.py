@@ -13195,11 +13195,25 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # because they guard two DIFFERENT ways the clamp can fail,
                 # not one restated twice.
                 #
-                # `lo_pos > floor` guards the case demonstrated just above:
-                # whatever moved the flushed span's own lo above the floor,
-                # the clamp `max(lo_pos, floor + 1)` degenerates to a no-op
-                # there, so refusing is the only thing that still does
-                # anything.
+                # `lo_pos > floor` guards case C: a flush whose own lo_pos
+                # already sits above the floor, with NO fold involved
+                # (len(sources) == 1) -- there the clamp `max(lo_pos,
+                # floor + 1)` degenerates to a no-op and refusing is the
+                # only thing that still does anything. Stated precisely,
+                # because the case demonstrated just above (Finding 4) is
+                # NOT case C: T's own skipped span there folds onto the
+                # retained base to produce the flush, so len(sources) == 2
+                # and `len(sources) > 1` alone already refuses it -- the
+                # same-numbered test asserts on frontier-high's persisted
+                # range, not on which half of the disjunction fired, so it
+                # does not distinguish the two. Case C is not constructible
+                # under today's allocator (every source of "lo_pos above the
+                # floor" this codebase produces is itself a fold -- the
+                # floor is set by a write failure on some ident, and only a
+                # merge moves a flush's span onto an ident other than the
+                # one that failed), so this half is belt-and-braces against
+                # a future non-monotonic allocator, not a demonstrated
+                # requirement. No test isolates it from `len(sources) > 1`.
                 #
                 # `len(sources) > 1` guards a SEPARATE case that
                 # `lo_pos > floor` cannot see at all: a fold whose merged

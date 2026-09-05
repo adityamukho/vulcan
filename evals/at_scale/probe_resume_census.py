@@ -33,8 +33,35 @@ reappearing), which is this probe's actual job. It can NEVER observe a newly
 landed commit arriving INSIDE an already-retained interval's bounds -- the
 exact scenario `:pos-count`'s checksum was written to catch (see
 frontier_registry / mcp_server.py's `:pos-count` discussion) -- because the
-frozen slice never grows and the checksum question only arises on a range
-that is still being appended to. The ident-collision census immediately above
+frozen slice never grows THAT particular retained interval's span again
+after this probe's own run claims it.
+
+That is a narrower gap than "the checksum path is untouched": the probe DOES
+put `:pos-count` in play once per run, on its OWN resume. The first ingestion
+builds a linearization for `<branch>~<truncate_by>`; the second re-derives a
+linearization for the full `<branch>`, which has grown by exactly
+`truncate_by` commits since the first was recomputed -- a range genuinely
+still being appended to -- and `_frontier_load`'s retain check compares the
+interval's stored count against ITS span under that grown linearization. A
+run reporting `retention_engaged: true` (see `results/325-resume-census.json`,
+truncate_by=30, prior_ingested=262) is evidence the count check ran and
+passed, not evidence it was never reached: a mismatch there would discard the
+interval and push `processed_this_run` up toward `repo_commits`, reading
+`retention_engaged` False. What genuinely never happens in one run of this
+probe is a SECOND append landing inside the interval this run's own resume
+just retained -- that would need a third ingestion pass this probe does not
+make. The error in an earlier draft of this note was conservative (it
+understated the probe's own coverage), but a reader could still conclude the
+checksum path itself is never touched here, which is wrong.
+
+Also worth stating plainly: `retention_engaged` has ZERO MARGIN at the
+truncate_by boundary. `processed_this_run < repo_commits` is a strict
+inequality with no threshold, so a partial regression that re-walks 299 of a
+300-position resume still reads `retention_engaged: True` -- it discriminates
+a TOTAL regression in the retention predicate (a full re-walk), never a
+partial one.
+
+The ident-collision census immediately above
 this one in the nightly deliberately carries no `--since` bound for the
 matching reason (its own comment: the pair to worry about is new-vs-old, and
 a bounded collection would see only new-vs-new); this probe's bound is the
@@ -183,9 +210,18 @@ def retention_engaged(census: Dict[str, Any]) -> bool:
     control rather than to a downstream count.
 
     `prior_ingested > 0`: there has to have been something already in the
-    graph for a resume to be resuming AT ALL -- a truncate_by of 0, or a
-    truncated ref with no history below it, makes this vacuously
-    unfalsifiable and this reads False rather than True by coincidence.
+    graph for a resume to be resuming AT ALL. A truncate_by of 0 does NOT
+    produce that case: `truncated_ref = f"{branch}~{truncate_by}" if
+    truncate_by else branch` treats 0 as falsy, so the FIRST ingestion walks
+    the full branch and `prior_ingested` comes back as the full count --
+    still > 0 (a resume onto an already-complete graph, which the second
+    ingestion then does nothing further with). What actually produces
+    `prior_ingested == 0` is a truncated ref with no history below it at
+    all -- an UNRESOLVABLE `<branch>~N` (`N` at or beyond the branch's own
+    commit count), which fails ingestion outright and leaves the seeded
+    `prior_ingested` at its `_CLEAN_INGEST_PROGRESS` default of 0. That is
+    the case this clause reads False rather than True by coincidence, not a
+    `truncate_by=0` run.
 
     `processed_this_run < repo_commits`: the run did NOT re-walk (or
     re-claim) every position the repo has. On a healthy resume this is
@@ -224,15 +260,24 @@ async def run_resume_census(
     mcp_server._ingest_progress = dict(_CLEAN_INGEST_PROGRESS)
 
     # No try/except around either call: `_run_ingestion`'s own top-level
-    # `except Exception as e:` already swallows every Exception-rooted
-    # failure internally (bad ref, unreadable blob, an empty repo's `~N`
-    # failing to resolve) and reports it through `_ingest_progress["status"]`
-    # / `["error"]` rather than raising -- confirmed by reading
-    # `_run_ingestion` directly. A wrapper here would only catch
+    # `except Exception as e:` (inside its `try`, guarding the bulk of the
+    # function body -- bad ref, unreadable blob, an empty repo's `~N` failing
+    # to resolve) reports the failure through `_ingest_progress["status"]` /
+    # `["error"]` rather than raising -- confirmed by reading `_run_ingestion`
+    # directly. NOT "every Exception-rooted failure" without qualification,
+    # though: three statements run above that try
+    # (`_shutdown_requested.clear()`, `_reset_introduced_by_ambiguity_log_
+    # budget()`, `await owner_hint.__aenter__()`), and an exception raised by
+    # any of those would propagate past this call uncaught. None of them do
+    # in practice (a clear/reset touch no I/O, and `owner_hint.__aenter__()`
+    # is a best-effort hint write), which is why removing the guards here is
+    # safe -- but the safety is "these three calls do not fail today", not
+    # "the try covers everything". A wrapper here would also only catch
     # BaseException-rooted control flow (asyncio.CancelledError,
     # KeyboardInterrupt), which `except Exception` cannot do either, so it
-    # would add no protection -- see the review that flagged an earlier
-    # draft's guard here as claiming otherwise.
+    # would add no protection against what the inner try already covers --
+    # see the review that flagged an earlier draft's guard here as claiming
+    # otherwise.
     truncated_ref = f"{branch}~{truncate_by}" if truncate_by else branch
     await mcp_server._run_ingestion(repo_path, truncated_ref)
     await mcp_server._run_ingestion(repo_path, branch)
