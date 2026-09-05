@@ -1,0 +1,21 @@
+{
+  "ref": "87cbcc1a3f9c57a44c7ba9c21533398c81f5bc78",
+  "repo_commits": 300,
+  "walk_claimed": 300,
+  "graph_commit_entities": 300,
+  "distinct_commit_idents": 300,
+  "repo_vs_walk": 0,
+  "walk_vs_graph": 0,
+  "repo_vs_graph": 0,
+  "ident_collisions": 0,
+  "final_status": "complete",
+  "proved_nothing": false,
+  "ok": true,
+  "interpretation": "repo, walk and graph agree at 300 commits.",
+  "census_error": null,
+  "prior_ingested": 262,
+  "processed_this_run": 38,
+  "truncate_by": 30,
+  "positions_skipped_this_run": 0,
+  "commit_census_ok": true
+}
