@@ -10169,6 +10169,194 @@ class TestPerIntervalReverseFloor:
             "descending into the bulk gap left by run 1"
         )
 
+    @pytest.mark.asyncio
+    async def test_merge_does_not_launder_a_floored_positions_failure_through_the_survivor(
+        self, tmp_path, monkeypatch
+    ):
+        """#325 review Finding 1 (CRITICAL): a merging claim's target is the
+        SURVIVOR, never the interval the floor actually belongs to. A minted
+        tip interval T floored by a failed write descends until it touches a
+        retained base -- _coalesce makes the base the survivor and T
+        absorbed, so the claim that performs the merge resolves its ident to
+        the base, which carries no floor entry of its own. Checking only
+        that ident (the pre-fix behaviour) reads the merge as unrestricted
+        and persists a union spanning the gap the failure sits in --
+        permanently sweeping a position whose write genuinely failed into
+        the graph's own completion witness.
+
+        Same fixture as test_tip_gap_failure_does_not_floor_the_bulk_gap, one
+        position down: the injected tip-gap failure lands at lin2[-2]
+        (position 11, not the topmost) rather than lin2[-1] (position 12).
+        Position 12 succeeds and persists to a minted ident T = [h12,h12]
+        BEFORE position 11 fails and floors T at 11. The claim at position
+        10 then merges T into the retained base -- exactly the shape the
+        fix must catch.
+        """
+        import mcp_server, frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = self._repo(tmp_path, 10)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+
+        lin1 = frontier_registry.build_linearization(str(repo))
+        real_apply = mcp_server._reverse_apply
+
+        def fail_at_5(db, repo_path, linearization, commit_metadata, pos,
+                      files, *args, **kwargs):
+            if linearization[pos] == lin1[5]:
+                raise RuntimeError("injected run-1 bulk-gap write failure")
+            return real_apply(db, repo_path, linearization, commit_metadata,
+                               pos, files, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", fail_at_5)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_apply)
+
+        db = mcp_server.get_db()
+        base_after_run1 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run1 is not None
+        assert lin1.index(base_after_run1[0]) == 6, (
+            "precondition: run 1 must leave frontier-high's persisted lo at "
+            "position 6"
+        )
+
+        self._repo(tmp_path, 3, start=10)
+        lin2 = frontier_registry.build_linearization(str(repo))
+        victim = lin2[-2]  # position 11 -- one below the topmost tip claim
+        victim_pos = lin2.index(victim)
+
+        def fail_at_victim(db, repo_path, linearization, commit_metadata, pos,
+                            files, *args, **kwargs):
+            if linearization[pos] == victim:
+                raise RuntimeError("injected mid-gap write failure")
+            return real_apply(db, repo_path, linearization, commit_metadata,
+                               pos, files, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", fail_at_victim)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_apply)
+
+        raw = mcp_server._db_execute(
+            db,
+            f"(query [:find (count-distinct ?t) :where "
+            f"[:commit/{victim[:12]} :entity-type ?t]])",
+        )
+        assert json.loads(raw)["results"][0][0] == 0, (
+            "precondition: the injected mid-gap write must actually have "
+            "failed, or this test proves nothing"
+        )
+
+        base_after_run2 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run2 is not None
+        lo_pos = lin2.index(base_after_run2[0])
+        hi_pos = lin2.index(base_after_run2[1])
+        assert not (lo_pos <= victim_pos <= hi_pos), (
+            f"frontier-high's persisted range [{lo_pos},{hi_pos}] must "
+            f"EXCLUDE position {victim_pos}, whose write genuinely failed -- "
+            "a merge into the survivor swept the floored interval's failure "
+            "into the persisted interval as if it had completed, and the "
+            "next run will never re-walk it"
+        )
+
+
+class TestSkippedSpanTransferredOnMerge:
+    """#325 review Finding 2 (Important): skipped_span is keyed by target
+    ident, exactly like rev_claim_floor, and suffers the same hazard a merge
+    creates -- an interval's OWN skipped_span entry does not automatically
+    follow it when a later claim absorbs it into a survivor.
+
+    Unlike Finding 1, this one is wrong in the OPPOSITE direction: it is not
+    that the merge silently claims too much, it is that the end-of-walk
+    flush, still keyed to the absorbed (now-retracted) ident, RESURRECTS a
+    phantom entity. _frontier_persist_claim's merge retracts the absorbed
+    interval's facts outright; _frontier_persist_span's `existing is None`
+    branch then mints a brand new entity, :ident fact and all, the moment
+    anything later flushes to that same ident -- so a stale skipped_span
+    entry left behind by the merge brings the absorbed interval back from
+    the dead, overlapping the survivor it was just folded into.
+    """
+
+    def _repo(self, tmp_path, n, start=0):
+        repo = tmp_path / "repo"
+        if not repo.exists():
+            repo.mkdir()
+            _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(start, start + n):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_absorbed_intervals_skip_span_does_not_resurrect_it(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server, frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        # Run 1: a clean 7-commit repo closes fully -- authoritative=[0,0],
+        # frontier-high (base, is_base=True) = [1,6].
+        repo = self._repo(tmp_path, 7)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        db = mcp_server.get_db()
+        base_after_run1 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        lin1 = frontier_registry.build_linearization(str(repo))
+        assert base_after_run1 is not None
+        assert lin1.index(base_after_run1[0]) == 1 and lin1.index(base_after_run1[1]) == 6, (
+            "precondition: run 1 must close the whole 7-commit repo with "
+            "frontier-high spanning [1,6]"
+        )
+
+        # Grow the tip by 6 (positions 7..12) and seed a completed region at
+        # [8,10] -- resolvable in the grown linearization, mirroring
+        # TestSkipClaimFastPathStillFiresForAResolvableRegion's seeding.
+        # claim_high() descends 12, 11 (genuine claims, persisted to a
+        # freshly minted ident T), then 10, 9, 8 (all inside the seeded
+        # region -- skipped, recorded under T's skipped_span), then 7
+        # (adjacent to both T's lo and frontier-high's hi -- MERGES T into
+        # frontier-high).
+        self._repo(tmp_path, 6, start=7)
+        lin2 = frontier_registry.build_linearization(str(repo))
+        region_lo, region_hi = 8, 10
+        mcp_server._transact(
+            db,
+            mcp_server._completed_region_facts(
+                lin2[region_lo], lin2[region_hi], ":provisional",
+                pos_count=region_hi - region_lo + 1,
+            ),
+            "2026-09-05T00:00:00Z",
+        )
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        status = mcp_server.handle_minigraf_ingest_status()
+        assert status["positions_skipped_this_run"] > 0, (
+            "precondition: the seeded region must actually have driven the "
+            "skip branch, or this test proves nothing about the transfer"
+        )
+
+        extras = mcp_server._intervals_read_extra(db)
+        assert extras == [], (
+            f"a minted interval entity survived or was resurrected after "
+            f"being absorbed into frontier-high: {extras}. The end-of-walk "
+            "flush must have written to the ABSORBED ident's stale "
+            "skipped_span entry instead of folding it into the survivor "
+            "frontier-high absorbed it into"
+        )
+
+        base_after_run2 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run2 is not None
+        assert lin2.index(base_after_run2[0]) == 1 and lin2.index(base_after_run2[1]) == 12, (
+            "frontier-high must end up spanning the whole run, [1,12] -- "
+            f"got {[lin2.index(h) for h in base_after_run2]}"
+        )
+
 
 class TestLineageProvisionalMarker:
     def test_unmarked_entity_reads_as_authoritative(self, real_db):

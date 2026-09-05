@@ -12785,11 +12785,32 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # all of it for no reason. Same guarantee as #326 Finding A,
                 # stated over the unit it was always really about -- the
                 # interval a claim targets, not the run.
+                #
+                # #325 review Finding 1 (CRITICAL): a floor keyed on an ident
+                # an absorbed interval no longer HAS is no floor at all -- a
+                # merge reassigns the floored interval's own claims to the
+                # SURVIVOR's ident, so the write-dispatch floor check below
+                # must consult every ident a merging claim's `absorbed_idents`
+                # names, not only `claim_ident`, or the survivor reads as
+                # unrestricted and a mid-gap write failure gets swept into the
+                # persisted interval permanently.
                 rev_claim_floor: Dict[str, int] = {}
 
-                def _note_incomplete_rev(claim_tag: str, claim_pos: int, ident: Optional[str]) -> None:
+                def _note_incomplete_rev(claim_tag: str, claim_pos: int, ident: str) -> None:
+                    # #325 review Finding 3 (Minor): `ident` is typed `str`,
+                    # never `Optional[str]` -- this is only ever called with
+                    # `claim_tag == "rev"` carrying a real claim_ident, since
+                    # 'fwd' claims resolve (None, []) in submit_next and this
+                    # function returns before touching `ident` for them, and
+                    # a 'rev' claim's ident is always set immediately after
+                    # claim_high() by _reverse_claim_persist_target. A None
+                    # key here would silently poison rev_claim_floor with a
+                    # non-str key, which sorted(skipped_span.items()) below
+                    # raises TypeError on the moment a real str key also
+                    # exists.
                     if claim_tag != "rev":
                         return
+                    assert ident is not None, "a 'rev' claim must always resolve a real ident"
                     prev = rev_claim_floor.get(ident)
                     rev_claim_floor[ident] = (
                         claim_pos if prev is None else max(prev, claim_pos)
@@ -12839,6 +12860,25 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             _reverse_claim_persist_target(allocator, linearization)
                             if tag == "rev" else (None, [])
                         )
+                        # #325 review Finding 2: a merge can absorb an
+                        # interval that already holds its OWN skipped_span
+                        # entry from an earlier claim. This claim's merge (if
+                        # it persists) makes _frontier_persist_claim retract
+                        # the absorbed entity outright -- a flush that still
+                        # named it afterwards would resurrect it, because
+                        # _frontier_persist_span's `existing is None` branch
+                        # mints a fresh entity unconditionally. Fold at CLAIM
+                        # time, here, not at dispatch: the merge itself
+                        # happens here (allocator.last_claim), and dispatch
+                        # never sees which idents a skipped claim's own merge
+                        # touched.
+                        for a in absorbed:
+                            if a in skipped_span:
+                                lo_a, hi_a = skipped_span.pop(a)
+                                lo_t, hi_t = skipped_span.get(target_ident, (lo_a, hi_a))
+                                skipped_span[target_ident] = (
+                                    min(lo_t, lo_a), max(hi_t, hi_a)
+                                )
                         if not _skip_claim(tag, pos, completed_regions):
                             break
                         lo, hi = skipped_span.get(target_ident, (pos, pos))
@@ -12956,8 +12996,37 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                     # a floor set by a failure in one
                                     # interval must not block a claim
                                     # targeting a different, disjoint one.
-                                    claim_ident not in rev_claim_floor
-                                    or pos > rev_claim_floor[claim_ident],
+                                    #
+                                    # #325 review (Finding 1, CRITICAL): a
+                                    # merging claim's target is the SURVIVOR,
+                                    # never the interval that was actually
+                                    # floored. A minted tip interval T
+                                    # floored at position X by a failed write
+                                    # descends and eventually touches a
+                                    # retained base -- _coalesce makes the
+                                    # base the survivor and T absorbed, so
+                                    # claim_ident becomes :ingestion/frontier-
+                                    # high, which carries no floor entry of
+                                    # its own. Checking claim_ident alone
+                                    # reads that as unrestricted and persists
+                                    # a union spanning the gap X sits in --
+                                    # sweeping the failed position into the
+                                    # graph permanently, the exact
+                                    # closed-range defect #326 exists to
+                                    # prevent, reintroduced across a merge.
+                                    # This MUST be evaluated at dispatch
+                                    # time, not claim time (as it already is,
+                                    # here): claims run ahead of writes by
+                                    # pipeline_depth, so the ident that fails
+                                    # may not have a floor entry yet when the
+                                    # merging claim is first ALLOCATED in
+                                    # submit_next, only by the time its write
+                                    # is actually dispatched.
+                                    pos > max(
+                                        [rev_claim_floor[i] for i in
+                                         [claim_ident, *(absorbed_idents or [])]
+                                         if i in rev_claim_floor] or [-1]
+                                    ),
                                     # #325 review round 2: the ident this
                                     # claim's interval resolved to when it
                                     # was MADE (captured in submit_next),
