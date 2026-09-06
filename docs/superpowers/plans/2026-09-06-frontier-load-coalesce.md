@@ -823,7 +823,7 @@ Expected: tests PASS and the diff is EMPTY. No new module was added, so `[tool.s
 
 - [ ] **Step 2: Add the CLAUDE.md section**
 
-Append immediately after the `#325` section (the paragraph ending `...is read correctly by the new code with no seeding step.`):
+Insert as the LAST paragraphs of the `## Graph Storage` section — that is, immediately BEFORE the `## Claude Code Plugin Publishing` heading (`CLAUDE.md:942` at the time of writing; locate it by heading text, not line number). The `#325` block does not end where its "No `GRAPH_FORMAT_VERSION` bump, no migration" paragraph does — the resume-census-probe paragraph follows it and is still #325 — so appending after that paragraph would bury this section mid-#325.
 
 ```markdown
 **A LOADED provisional set is now coalesced too, and #329 is why that is
