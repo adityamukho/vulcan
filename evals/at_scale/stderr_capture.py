@@ -136,6 +136,30 @@ _ERROR_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     # module exists to close, and it stayed open until _run_ingestion started
     # printing this line.
     ("ingestion_failed", re.compile(r"\[_run_ingestion\] ingestion failed:")),
+    # #329. mcp_server._frontier_check_load_invariants prints
+    # "[_frontier_load] provisional base is not the lowest provisional
+    # interval: ..." and mcp_server._frontier_coalesce_loaded prints
+    # "[_frontier_load] a loaded provisional interval carries no ident;
+    # skipping the load-time coalesce (#329)" -- both via
+    # print(..., file=sys.stderr), never a raise, because #329's own scope
+    # decision was to make a fragmented provisional side LOUD rather than
+    # repair it. That trade was not honored until this entry existed:
+    # neither message matched any pattern above, so a nightly emitting one
+    # still reported error_signals: [] and passed
+    # run_ingestion_benchmark._exit_code clean.
+    #
+    # SOURCE-VERIFIED, not runtime-observed: read at the two print call
+    # sites themselves (mcp_server.py), each a literal f-string carrying
+    # this exact prefix, not exercised end-to-end. A third print in the
+    # same function, _frontier_check_load_invariants' "provisional
+    # intervals still adjacent or overlapping after coalescing" message,
+    # shares this same "[_frontier_load] " prefix and is also caught by
+    # this pattern when it takes its strict=False branch (its strict=True
+    # branch raises instead of printing, and is caught upstream by
+    # `ingestion_failed` once _run_ingestion's run-level except reports
+    # it). That is not a false positive -- it is the same defect class,
+    # a load-time invariant violation on this same code path.
+    ("frontier_load_invariant_warning", re.compile(r"\[_frontier_load\] ")),
 )
 
 

@@ -945,9 +945,9 @@ not merely tidiness.** `frontier_registry._coalesce` runs only from
 stores what it is handed verbatim. So a load producing two contiguous or
 overlapping provisional entities **with an already-empty gap** never merged:
 no claim ever happens. `_intervals_read_extra` was then permanently
-non-empty, and Task 6's gate makes both
+non-empty, and that condition makes both
 `_correction_sweep_select_position` and `_should_fold_lineage_watermark`
-return early on that condition — so Stage B never ran again,
+return early — so Stage B never ran again,
 `:ingestion/lineage-confirmed-through` never advanced, and provisional
 `:introduced-by` stayed provisional for the life of the graph, on runs
 reporting `status: complete` with a clean `divergence` and zero bytes on

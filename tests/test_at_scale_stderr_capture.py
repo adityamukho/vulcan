@@ -92,6 +92,40 @@ class TestErrorSignals:
         signals = scan_ingestion_stderr(text)["error_signals"]
         assert [s["pattern"] for s in signals] == ["ingestion_failed"]
 
+    def test_detects_a_frontier_load_base_not_lowest_warning(self):
+        """#329. _frontier_check_load_invariants (mcp_server.py) prints this
+        on its own -- never a raise -- because #329's own scope decision was
+        to make a fragmented provisional side LOUD rather than repair it.
+        That trade was not honored until this pattern existed: the message
+        matched nothing in _ERROR_PATTERNS before, so a nightly emitting it
+        still reported error_signals: [] and passed
+        run_ingestion_benchmark._exit_code clean.
+
+        test_clean_log_yields_no_signals below is this pattern's negative
+        control too -- CLEAN carries no "[_frontier_load] " line, so it
+        already proves this entry does not fire on an ordinary run.
+        """
+        text = (
+            "[_frontier_load] provisional base is not the lowest "
+            "provisional interval: base at [10,20], lowest at [0,5] (#329)\n"
+        )
+        signals = scan_ingestion_stderr(text)["error_signals"]
+        assert [s["pattern"] for s in signals] == ["frontier_load_invariant_warning"]
+
+    def test_detects_a_frontier_load_no_ident_warning(self):
+        """The second of the two print call sites #329's pattern covers --
+        _frontier_coalesce_loaded's message, not
+        _frontier_check_load_invariants'. Both share the same
+        "[_frontier_load] " prefix and are meant to be caught by one entry;
+        this pins the second one specifically rather than trusting the first
+        test to stand in for both."""
+        text = (
+            "[_frontier_load] a loaded provisional interval carries no "
+            "ident; skipping the load-time coalesce (#329)\n"
+        )
+        signals = scan_ingestion_stderr(text)["error_signals"]
+        assert [s["pattern"] for s in signals] == ["frontier_load_invariant_warning"]
+
     def test_clean_log_yields_no_signals(self):
         assert scan_ingestion_stderr(CLEAN)["error_signals"] == []
 

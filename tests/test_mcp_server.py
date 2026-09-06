@@ -28457,3 +28457,138 @@ class TestFrontierLoadCoalescesProvisionalIntervals:
         ]
         assert mcp_server._frontier_read_bounds(
             real_db, mcp_server._FRONTIER_LOW_IDENT) == ("h0", "h10")
+
+    def test_promote_then_merge_in_a_single_load_does_not_lose_the_second_write(
+        self, real_db
+    ):
+        """#329 review, Finding 1: _frontier_promote_base_if_missing
+        transacts [:ingestion/frontier-high :hi-hash "hX"] at run_ts_iso,
+        and _frontier_coalesce_loaded's merge can then retract that exact
+        datom and transact a DIFFERENT value for the same (entity,
+        attribute, valid_from) -- the first place in this whole arc where
+        an attribute is rewritten at the valid_from it was just written at,
+        inside one call. The reviewer measured this against a real graph
+        and found it clean; this pins that it stays clean.
+
+        The reachable state, per _frontier_promote_base_if_missing's own
+        docstring: frontier-high is discarded on a :pos-count break while a
+        retained extra sits above it. The simplest fixture that reaches it
+        is two ADJACENT extras and NO frontier-high at all -- promotion
+        always fires first (picking the lower extra), and the coalesce
+        that follows in the same _frontier_load call then immediately
+        widens what promotion just wrote. Neither #329's spec nor its
+        implementation plan anticipated this interaction.
+        """
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(26)]
+        extra_lo = mcp_server._interval_ident(lin[10])
+        self._seed_interval(real_db, extra_lo, lin, 0, 10, 11)
+        extra_hi = mcp_server._interval_ident(lin[25])
+        self._seed_interval(real_db, extra_hi, lin, 11, 25, 15)
+
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-06T00:00:01Z")
+
+        prov = [iv for iv in alloc.intervals()
+                if iv.tag == frontier_registry.TAG_PROVISIONAL]
+        assert [(iv.lo_pos, iv.hi_pos) for iv in prov] == [(0, 25)], (
+            "promotion picks the lower extra as the new base, then the "
+            "same-call coalesce must still widen it to absorb the other"
+        )
+        assert prov[0].is_base is True
+        assert prov[0].ident == mcp_server._FRONTIER_HIGH_IDENT
+
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) == ("h0", "h25"), (
+            "the merge's :hi-hash write must win, not be silently dropped "
+            "or ignored because promotion already wrote :hi-hash once at "
+            "this same run_ts_iso"
+        )
+        assert mcp_server._frontier_read_pos_count(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) == 26, (
+            ":pos-count is rewritten at the same valid_from too -- "
+            "promotion writes 11 (the lower extra's own count), the merge "
+            "must overwrite it with the union's 26"
+        )
+        assert mcp_server._intervals_read_extra(real_db) == []
+
+        alloc2 = mcp_server._frontier_load(real_db, lin, "2026-09-06T00:00:02Z")
+        prov2 = [iv for iv in alloc2.intervals()
+                 if iv.tag == frontier_registry.TAG_PROVISIONAL]
+        assert [(iv.lo_pos, iv.hi_pos) for iv in prov2] == [(0, 25)], (
+            "the promoted-then-merged interval must itself be RETAINED on "
+            "reload -- its on-disk :pos-count has to equal its span or "
+            "this whole union is re-walked on every run"
+        )
+
+    def test_two_non_base_extras_merge_to_a_minted_survivor_ident(self, real_db):
+        """#329 review, Finding 2: every merge test above pairs one extra
+        against the BASE, so _interval_persist_ident always resolves to
+        the fixed :ingestion/frontier-high ident for the survivor.
+        coalesce_intervals' OTHER survivor branch -- "otherwise the LOWER
+        one wins" -- fires only when two NON-base extras merge, and the
+        survivor's ident is then a MINTED one
+        (:ingestion/interval-provisional-...). That branch is live
+        production code in _frontier_persist_merge's widen loop and no
+        existing test reaches it.
+
+        If the branch were wrong, absorbed's discard would name one entity
+        while the widen loop names another: the loser's facts would be
+        retracted correctly, but the survivor's new bounds would land on
+        an ident nothing reads back -- leaving a phantom in
+        _intervals_read_extra forever, which is exactly the state that
+        declines Stage B (_correction_sweep_select_position and
+        _should_fold_lineage_watermark both return early on a non-empty
+        extra set). That is #329 reintroduced by its own fix.
+
+        frontier-high [0,5] and extra A [10,15] are deliberately NOT
+        adjacent (gap at 6..9) -- asserted below as this test's own
+        positive control, so a coalesce bug that merged everything
+        indiscriminately would not pass by accident.
+        """
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(21)]
+        self._seed_interval(real_db, mcp_server._FRONTIER_HIGH_IDENT, lin, 0, 5, 6)
+        ident_a = mcp_server._interval_ident(lin[15])
+        self._seed_interval(real_db, ident_a, lin, 10, 15, 6)
+        ident_b = mcp_server._interval_ident(lin[20])
+        self._seed_interval(real_db, ident_b, lin, 16, 20, 5)
+
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-06T00:00:01Z")
+
+        prov = sorted(
+            (iv for iv in alloc.intervals()
+             if iv.tag == frontier_registry.TAG_PROVISIONAL),
+            key=lambda iv: iv.lo_pos,
+        )
+        assert [(iv.lo_pos, iv.hi_pos) for iv in prov] == [(0, 5), (10, 20)]
+        assert (6, 9) in alloc._unclaimed(), (
+            "positive control: frontier-high and extra A must stay "
+            "disjoint, or this test proves nothing about the minted-ident "
+            "branch specifically"
+        )
+
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) == ("h0", "h5"), (
+            "frontier-high took no part in this merge and must be untouched"
+        )
+        assert mcp_server._frontier_read_bounds(
+            real_db, ident_a) == ("h10", "h20")
+        assert mcp_server._frontier_read_pos_count(real_db, ident_a) == 11
+        assert mcp_server._frontier_read_bounds(real_db, ident_b) is None, (
+            "B's facts must be entirely gone, not merely superseded"
+        )
+        extras = mcp_server._intervals_read_extra(real_db)
+        assert [row[0] for row in extras] == [ident_a], (
+            "exactly one extra survives, at A's minted ident -- a phantom "
+            "here is the #329 failure mode this test guards"
+        )
+
+        alloc2 = mcp_server._frontier_load(real_db, lin, "2026-09-06T00:00:02Z")
+        prov2 = sorted(
+            (iv for iv in alloc2.intervals()
+             if iv.tag == frontier_registry.TAG_PROVISIONAL),
+            key=lambda iv: iv.lo_pos,
+        )
+        assert [(iv.lo_pos, iv.hi_pos) for iv in prov2] == [(0, 5), (10, 20)], (
+            "the merged extra must be RETAINED on reload"
+        )
