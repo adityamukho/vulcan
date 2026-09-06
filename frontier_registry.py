@@ -52,6 +52,50 @@ class ClaimResult:
     absorbed: List["Interval"]
 
 
+def coalesce_intervals(
+    intervals: List[Interval], tag: str
+) -> Tuple[List[Interval], List[Interval]]:
+    """Merge same-tag intervals that overlap or touch. Returns
+    (every interval sorted by lo_pos with `tag`'s merged, the intervals
+    merged AWAY so the persistence layer can retract their entities).
+
+    Module-level rather than a method (#329) because _frontier_load needs
+    the merge on a set it has just built from graph facts, with no claim in
+    sight: _coalesce ran only from _extend, and _extend only from a claim,
+    so two contiguous LOADED intervals with an already-empty gap never
+    merged. Both callers share this one function so the load-time merge
+    cannot drift from the claim-time merge -- it IS the claim-time merge.
+
+    Survivor rule: the base wins if either participant is base; otherwise
+    the LOWER one wins and keeps its anchor_pos. The base is what persists
+    at the fixed :ingestion/frontier-high ident, so it must survive every
+    merge it takes part in or that ident would have to be re-pointed at a
+    different entity. The keeper's `ident` travels with it the same way
+    anchor_pos does -- both name the surviving entity's identity, opaque to
+    this module either way.
+
+    Only same-tag intervals merge -- the authoritative/provisional boundary
+    is the lineage frontier later phases read, and must survive the two
+    sides becoming adjacent.
+    """
+    same = sorted((iv for iv in intervals if iv.tag == tag), key=lambda iv: iv.lo_pos)
+    merged: List[Interval] = []
+    absorbed: List[Interval] = []
+    for iv in same:
+        if merged and iv.lo_pos <= merged[-1].hi_pos + 1:
+            prev = merged[-1]
+            keeper, loser = (prev, iv) if (prev.is_base or not iv.is_base) else (iv, prev)
+            absorbed.append(loser)
+            merged[-1] = Interval(
+                prev.lo_pos, max(prev.hi_pos, iv.hi_pos), tag,
+                keeper.anchor_pos, prev.is_base or iv.is_base, keeper.ident,
+            )
+        else:
+            merged.append(iv)
+    others = [iv for iv in intervals if iv.tag != tag]
+    return sorted(others + merged, key=lambda iv: iv.lo_pos), absorbed
+
+
 def build_linearization(repo_path: str, branch: str = "HEAD") -> List[str]:
     """Full C0..branch commit hash list in fixed topological order (oldest first).
 
@@ -210,40 +254,10 @@ class FrontierAllocator:
         return None
 
     def _coalesce(self, tag: str) -> List[Interval]:
-        """Merge same-tag intervals that overlap or touch, keeping intervals
-        disjoint and sorted. Returns the intervals that were merged AWAY, so
-        the persistence layer can retract their entities.
-
-        Survivor rule: the base wins if either participant is base;
-        otherwise the LOWER one wins and keeps its anchor_pos. The base is
-        what persists at the fixed :ingestion/frontier-high ident, so it must
-        survive every merge it takes part in or that ident would have to be
-        re-pointed at a different entity.
-
-        The keeper's `ident` (#325 review round 3, Finding 3) travels with it
-        the same way anchor_pos does -- both name the surviving entity's
-        identity, opaque to this allocator either way.
-
-        Only same-tag intervals merge -- the authoritative/provisional
-        boundary is the lineage frontier later phases read, and must survive
-        the two sides becoming adjacent.
-        """
-        same = sorted((iv for iv in self._intervals if iv.tag == tag), key=lambda iv: iv.lo_pos)
-        merged: List[Interval] = []
-        absorbed: List[Interval] = []
-        for iv in same:
-            if merged and iv.lo_pos <= merged[-1].hi_pos + 1:
-                prev = merged[-1]
-                keeper, loser = (prev, iv) if (prev.is_base or not iv.is_base) else (iv, prev)
-                absorbed.append(loser)
-                merged[-1] = Interval(
-                    prev.lo_pos, max(prev.hi_pos, iv.hi_pos), tag,
-                    keeper.anchor_pos, prev.is_base or iv.is_base, keeper.ident,
-                )
-            else:
-                merged.append(iv)
-        others = [iv for iv in self._intervals if iv.tag != tag]
-        self._intervals = sorted(others + merged, key=lambda iv: iv.lo_pos)
+        """Claim-time merge. The rule itself lives in the module-level
+        coalesce_intervals (#329), shared with mcp_server._frontier_load's
+        load-time merge so the two cannot drift."""
+        self._intervals, absorbed = coalesce_intervals(self._intervals, tag)
         return absorbed
 
     def _extend(self, pos: int, tag: str, from_low: bool) -> None:
