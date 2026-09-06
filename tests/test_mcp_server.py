@@ -28299,3 +28299,161 @@ class TestFrontierCheckLoadInvariants:
             self._prov(11, 25, is_base=True, ident=mcp_server._FRONTIER_HIGH_IDENT),
         ]
         mcp_server._frontier_check_load_invariants(intervals)  # must not raise
+
+
+class TestFrontierLoadCoalescesProvisionalIntervals:
+    """#329: two live provisional entities that are contiguous or
+    overlapping never merged, because frontier_registry._coalesce runs only
+    from _extend and _extend only from a claim -- and with the gap already
+    empty, no claim ever happens.
+
+    _intervals_read_extra was then permanently non-empty, so
+    _correction_sweep_select_position and _should_fold_lineage_watermark
+    both returned early on every subsequent run: Stage B never ran again,
+    :ingestion/lineage-confirmed-through never advanced, and provisional
+    :introduced-by stayed provisional for the life of the graph -- on runs
+    reporting status: complete, with a clean divergence and zero bytes on
+    stderr.
+
+    Seeded directly rather than driven through the issue's reachable path.
+    That path runs through _skip_claim, which #325 made vestigial (it needs
+    a loadable archived :type/completed-region, and after #325 that exists
+    only on the divergent-ref-regained path). The defect is in the LOAD
+    CONTRACT, which is where the fix lives and where every future producer
+    of this state arrives -- pinning the test to one narrow route through a
+    mechanism that may itself be removed would cover less, not more.
+    """
+
+    def _seed_interval(self, db, ident, lin, lo, hi, count, tag=":provisional"):
+        import mcp_server
+        facts = [
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f"[{ident} :tag {tag}]",
+            f'[{ident} :lo-hash "{lin[lo]}"]',
+            f'[{ident} :hi-hash "{lin[hi]}"]',
+        ]
+        if count is not None:
+            facts.append(f"[{ident} :pos-count {count}]")
+        if ident.startswith(mcp_server._INTERVAL_PROVISIONAL_IDENT_PREFIX):
+            facts.append(f'[{ident} :ident "{ident}"]')
+        mcp_server._transact(db, "[" + " ".join(facts) + "]", "2026-09-06T00:00:00Z")
+
+    def test_contiguous_loaded_intervals_merge_in_memory_and_on_disk(self, real_db):
+        # The linearization stops exactly at the extra's hi, so the gap is
+        # ALREADY EMPTY -- no claim will ever happen, which is what makes
+        # the unmerged state permanent rather than merely temporary.
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(26)]
+        self._seed_interval(real_db, mcp_server._FRONTIER_HIGH_IDENT, lin, 0, 10, 11)
+        extra = mcp_server._interval_ident(lin[25])
+        self._seed_interval(real_db, extra, lin, 11, 25, 15)
+
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-06T00:00:01Z")
+
+        assert alloc.is_gap_empty(), (
+            "fixture check: with a non-empty gap a later claim could merge "
+            "these by itself, and the test would not be about #329"
+        )
+        prov = [iv for iv in alloc.intervals()
+                if iv.tag == frontier_registry.TAG_PROVISIONAL]
+        assert [(iv.lo_pos, iv.hi_pos) for iv in prov] == [(0, 25)], (
+            "two contiguous loaded intervals must merge -- this is #329"
+        )
+        assert prov[0].is_base is True
+        assert prov[0].ident == mcp_server._FRONTIER_HIGH_IDENT
+
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) == ("h0", "h25")
+        assert mcp_server._frontier_read_pos_count(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) == 26
+        assert mcp_server._intervals_read_extra(real_db) == [], (
+            "the absorbed entity's facts must be gone -- a permanently "
+            "non-empty _intervals_read_extra is what declines Stage B forever"
+        )
+        assert mcp_server._frontier_read_bounds(real_db, extra) is None
+
+    def test_overlapping_loaded_intervals_merge_to_their_union(self, real_db):
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(26)]
+        self._seed_interval(real_db, mcp_server._FRONTIER_HIGH_IDENT, lin, 0, 10, 11)
+        extra = mcp_server._interval_ident(lin[25])
+        self._seed_interval(real_db, extra, lin, 5, 25, 21)
+
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-06T00:00:01Z")
+
+        assert alloc.is_gap_empty()
+        prov = [iv for iv in alloc.intervals()
+                if iv.tag == frontier_registry.TAG_PROVISIONAL]
+        assert [(iv.lo_pos, iv.hi_pos) for iv in prov] == [(0, 25)]
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) == ("h0", "h25")
+        assert mcp_server._frontier_read_pos_count(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) == 26
+        assert mcp_server._intervals_read_extra(real_db) == []
+
+    def test_the_merge_survives_a_reload(self, real_db):
+        """The merged interval must itself be RETAINED next time: its
+        :pos-count has to equal its span, or the whole union is discarded
+        and re-walked on every run."""
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(26)]
+        self._seed_interval(real_db, mcp_server._FRONTIER_HIGH_IDENT, lin, 0, 10, 11)
+        extra = mcp_server._interval_ident(lin[25])
+        self._seed_interval(real_db, extra, lin, 11, 25, 15)
+
+        mcp_server._frontier_load(real_db, lin, "2026-09-06T00:00:01Z")
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-06T00:00:02Z")
+
+        prov = [iv for iv in alloc.intervals()
+                if iv.tag == frontier_registry.TAG_PROVISIONAL]
+        assert [(iv.lo_pos, iv.hi_pos) for iv in prov] == [(0, 25)], (
+            "the merged interval must be RETAINED on reload, not discarded: "
+            "its :pos-count has to equal its span or the whole union is "
+            "re-walked on every run"
+        )
+        assert alloc.is_gap_empty()
+
+    def test_a_real_gap_between_loaded_intervals_is_preserved(self, real_db):
+        """The positive control. A fix that merged unconditionally would
+        pass every test above while silently asserting completion over a
+        span nothing ever walked."""
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(30)]
+        self._seed_interval(real_db, mcp_server._FRONTIER_HIGH_IDENT, lin, 0, 10, 11)
+        extra = mcp_server._interval_ident(lin[25])
+        self._seed_interval(real_db, extra, lin, 13, 25, 13)
+
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-06T00:00:01Z")
+
+        prov = [iv for iv in alloc.intervals()
+                if iv.tag == frontier_registry.TAG_PROVISIONAL]
+        assert [(iv.lo_pos, iv.hi_pos) for iv in prov] == [(0, 10), (13, 25)]
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) == ("h0", "h10")
+        assert [r[0] for r in mcp_server._intervals_read_extra(real_db)] == [extra]
+        assert (11, 12) in alloc._unclaimed()
+
+    def test_the_authoritative_side_is_untouched_when_it_abuts_the_base(self, real_db):
+        """frontier-low ending exactly where frontier-high begins is the
+        normal converged state. Merging across the tag boundary would
+        destroy the lineage-authority frontier later phases read."""
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(30)]
+        self._seed_interval(
+            real_db, mcp_server._FRONTIER_LOW_IDENT, lin, 0, 10, None,
+            tag=":authoritative",
+        )
+        self._seed_interval(real_db, mcp_server._FRONTIER_HIGH_IDENT, lin, 11, 20, 10)
+
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-06T00:00:01Z")
+
+        by_tag = sorted(
+            ((iv.lo_pos, iv.hi_pos, iv.tag) for iv in alloc.intervals()),
+            key=lambda t: t[0],
+        )
+        assert by_tag == [
+            (0, 10, frontier_registry.TAG_AUTHORITATIVE),
+            (11, 20, frontier_registry.TAG_PROVISIONAL),
+        ]
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_LOW_IDENT) == ("h0", "h10")

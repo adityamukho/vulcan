@@ -6258,6 +6258,11 @@ def _frontier_load(
             linearization, run_ts_iso, intervals, is_base=False, index_con=index_con,
         )
     _frontier_promote_base_if_missing(db, intervals, linearization, run_ts_iso, index_con=index_con)
+    # #329: LAST, and after the base promotion -- see _frontier_coalesce_loaded.
+    coalesced = _frontier_coalesce_loaded(
+        db, linearization, intervals, run_ts_iso, index_con=index_con
+    )
+    _frontier_check_load_invariants(intervals, strict=coalesced)
     return frontier_registry.FrontierAllocator(len(linearization), intervals)
 
 
@@ -6573,6 +6578,155 @@ def _frontier_check_load_invariants(
             f"at [{prov[0].lo_pos},{prov[0].hi_pos}] (#329)",
             file=sys.stderr,
         )
+
+
+def _frontier_persist_merge(
+    db: Any,
+    linearization: List[str],
+    merged: List["frontier_registry.Interval"],
+    absorbed: List["frontier_registry.Interval"],
+    run_ts_iso: str,
+    index_con: Optional[Any] = None,
+) -> None:
+    """#329: mirror a load-time coalesce onto the graph.
+
+    Idents come from _interval_persist_ident for BOTH sides, so this agrees
+    exactly with what the reverse walk's write dispatch
+    (_reverse_claim_persist_target) would resolve for the same Interval --
+    including #325 Finding 3's case, where a loaded extra's anchor_pos fell
+    back to hi_pos and re-deriving _interval_ident would mint a DIFFERENT
+    ident than the one actually on disk.
+
+    ORDER: absorbed entities are discarded FIRST, then survivors are
+    widened. Same order and same rationale as _frontier_persist_claim's
+    absorb-then-extend. A crash between the two leaves the absorbed span
+    described by NOBODY -- it reads unclaimed and is re-walked by the next
+    _frontier_load, losing nothing. Widening first would risk the DUPLICATE
+    outcome: the survivor already claiming the merged span while the
+    absorbed entity's now-redundant facts are still live, invisible right up
+    until the discard never runs, leaking a phantom into
+    _intervals_read_extra forever.
+
+    The survivor's new :pos-count is the merged span, and that is a
+    CLAIM-TIME denominator, not #326's computed-where-it-is-read trap. The
+    difference is which run does the comparing. Both components were
+    validated against THIS run's linearization moments earlier
+    (_load_one_interval retains only when the STORED claim-time count still
+    equals the current span), and their adjacency was established in that
+    same linearization -- so the merged count is a fresh assertion about
+    THIS run, compared in a LATER run against a linearization that may
+    differ. It discriminates. #326's archive case was different: archiving
+    and loading ran in the SAME run against the SAME linearization, so a
+    count computed at archive time always agreed.
+
+    ACCEPTED COST: merging is coarser than keeping the components apart. A
+    later commit landing inside what used to be the upper component now
+    discards the whole union rather than that component alone. Bigger
+    re-walk, never a loss. And :pos-count remains a CHECKSUM, not a proof of
+    set identity -- the #326 residual applies verbatim to every interval
+    this produces.
+    """
+    tag = ":provisional"
+    for iv in absorbed:
+        ident = _interval_persist_ident(iv, linearization)
+        bounds = _frontier_read_bounds(db, ident)
+        # Nothing on disk to retract: an interval minted and merged away
+        # within one run before its first claim ever persisted. Skipped
+        # rather than treated as an error, matching _frontier_persist_claim.
+        if bounds is None:
+            continue
+        _frontier_discard_interval(
+            db, ident, bounds, index_con=index_con,
+            pos_count=_frontier_read_pos_count(db, ident), tag=tag,
+        )
+
+    for iv in merged:
+        if iv.tag != frontier_registry.TAG_PROVISIONAL:
+            continue
+        ident = _interval_persist_ident(iv, linearization)
+        existing = _frontier_read_bounds(db, ident)
+        # The survivor's entity is not on disk. Fail safe: the absorbed
+        # facts are already gone, so the whole span reads unclaimed and is
+        # re-walked, rather than being described by a half-written entity.
+        if existing is None:
+            continue
+        new_lo_hash, new_hi_hash = linearization[iv.lo_pos], linearization[iv.hi_pos]
+        if existing == (new_lo_hash, new_hi_hash):
+            continue
+        to_retract: List[str] = []
+        to_transact: List[str] = []
+        if existing[0] != new_lo_hash:
+            to_retract.append(f'[{ident} :lo-hash "{_edn_escape(existing[0])}"]')
+            to_transact.append(f'[{ident} :lo-hash "{_edn_escape(new_lo_hash)}"]')
+        if existing[1] != new_hi_hash:
+            to_retract.append(f'[{ident} :hi-hash "{_edn_escape(existing[1])}"]')
+            to_transact.append(f'[{ident} :hi-hash "{_edn_escape(new_hi_hash)}"]')
+        _frontier_pos_count_delta(
+            db, ident, iv.hi_pos - iv.lo_pos + 1, to_retract, to_transact,
+        )
+        if to_retract:
+            _retract(db, "[" + " ".join(to_retract) + "]", index_con=index_con)
+        if to_transact:
+            _transact(db, "[" + " ".join(to_transact) + "]", run_ts_iso, index_con=index_con)
+
+
+def _frontier_coalesce_loaded(
+    db: Any,
+    linearization: List[str],
+    intervals: List["frontier_registry.Interval"],
+    run_ts_iso: str,
+    index_con: Optional[Any] = None,
+) -> bool:
+    """#329: merge contiguous or overlapping LOADED provisional intervals,
+    in memory and on disk. Returns whether the set is now guaranteed
+    disjoint and non-adjacent (the post-condition's `strict`).
+
+    frontier_registry._coalesce runs only from _extend, and _extend only
+    from a claim. FrontierAllocator.__init__ stores what it is handed
+    verbatim. So a load producing two adjacent entities WITH AN ALREADY-EMPTY
+    GAP never merged: no claim ever happens, and _intervals_read_extra stays
+    permanently non-empty -- which makes both
+    _correction_sweep_select_position and _should_fold_lineage_watermark
+    return early on every subsequent run. Stage B never runs again,
+    :ingestion/lineage-confirmed-through never advances, and provisional
+    :introduced-by stays provisional for the life of the graph, on runs
+    reporting status: complete.
+
+    MUST run after _frontier_promote_base_if_missing: coalesce_intervals'
+    survivor rule PRESERVES a base but never manufactures one, so merging
+    before the base is restored would leave the union at a minted ident
+    while :ingestion/frontier-high stays absent -- the very state that
+    function exists to repair.
+
+    Only TAG_PROVISIONAL: _frontier_load appends at most one authoritative
+    interval, so that side has no same-tag pair to merge, and the
+    authoritative/provisional boundary must survive the two sides becoming
+    adjacent.
+    """
+    provisional = [
+        iv for iv in intervals if iv.tag == frontier_registry.TAG_PROVISIONAL
+    ]
+    if any(iv.ident is None for iv in provisional):
+        # Unreachable: _load_one_interval and _frontier_promote_base_if_missing
+        # both always set an ident on a loaded interval. Defensive only, and
+        # the fail-safe direction is to leave the graph EXACTLY as found and
+        # re-walk -- never to retract an entity this function cannot name.
+        # The caller drops to strict=False so this does not become a raise.
+        print(
+            "[_frontier_load] a loaded provisional interval carries no ident; "
+            "skipping the load-time coalesce (#329)",
+            file=sys.stderr,
+        )
+        return False
+    merged, absorbed = frontier_registry.coalesce_intervals(
+        intervals, frontier_registry.TAG_PROVISIONAL
+    )
+    if absorbed:
+        _frontier_persist_merge(
+            db, linearization, merged, absorbed, run_ts_iso, index_con=index_con
+        )
+        intervals[:] = merged
+    return True
 
 
 def _frontier_discard_interval(
