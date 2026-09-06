@@ -13206,14 +13206,25 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # and `len(sources) > 1` alone already refuses it -- the
                 # same-numbered test asserts on frontier-high's persisted
                 # range, not on which half of the disjunction fired, so it
-                # does not distinguish the two. Case C is not constructible
-                # under today's allocator (every source of "lo_pos above the
-                # floor" this codebase produces is itself a fold -- the
-                # floor is set by a write failure on some ident, and only a
-                # merge moves a flush's span onto an ident other than the
-                # one that failed), so this half is belt-and-braces against
-                # a future non-monotonic allocator, not a demonstrated
-                # requirement. No test isolates it from `len(sources) > 1`.
+                # does not distinguish the two. Case C is NOT ruled out by
+                # needing a fold -- within ONE ident, a same-run skip at a
+                # HIGHER position followed by a write failure at a LOWER one
+                # produces exactly lo_pos > floor with sources == {that
+                # ident} and no merge anywhere (skipped_span/
+                # skipped_span_sources default to the singleton {ident}
+                # until a merge unions another one in, and
+                # _note_incomplete_rev floors whichever ident the failing
+                # claim already belongs to). What actually keeps this hard
+                # to reach today is narrower: _skip_claim (what populates
+                # skipped_span at all) requires a loadable archived
+                # :type/completed-region covering the position, and after
+                # #325 that only exists for the narrow divergent-ref-
+                # regained case -- see _load_one_interval's docstring. So
+                # constructing case C requires first constructing that
+                # already-narrow prerequisite. No test isolates
+                # `lo_pos > floor` from `len(sources) > 1`; that half is
+                # belt-and-braces against exercising this narrow same-ident
+                # shape, not a demonstrated requirement.
                 #
                 # `len(sources) > 1` guards a SEPARATE case that
                 # `lo_pos > floor` cannot see at all: a fold whose merged

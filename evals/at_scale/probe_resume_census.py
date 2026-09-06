@@ -88,17 +88,32 @@ have double-counted the overlap.
 just that field, read once, after the resume completes.
 
 WHY THE PROBE'S OWN `ok` IS `repo_vs_graph`, NOT collect_commit_census's --
-A CONTROLLER RULING, not this file's own design choice. `commit_census`'s `ok`
-gates on `ident_collisions`, `walk_vs_graph` (always) and `repo_vs_walk` (when
-complete). `repo_vs_walk` compares the repo against `walk_claimed`, and on a
-resume that skips already-completed positions (the exact #325 fast path)
-`walk_claimed` legitimately undercounts "commits this run attempted" relative
-to what `repo_vs_walk` was written to mean, for a perfectly healthy run --
-that field was designed and measured against a fresh-graph run, which never
-skips. `repo_vs_graph` asks the only question this probe exists to answer:
-after a resume, does the graph hold every commit the repo has? It is
-insensitive to how many positions were retired this run, by construction --
-see `resume_ok`.
+A CONTROLLER RULING, not this file's own design choice, and stated here for
+the THIRD time after two earlier wrong explanations (see CLAUDE.md's
+standing note on this exact mechanism, in the #325 section, for the full
+correction history -- both earlier drafts asserted `repo_vs_walk` goes
+POSITIVE on a healthy resume, which the math below shows cannot happen).
+`commit_census`'s `ok` gates on `ident_collisions`, `walk_vs_graph` (always)
+and `repo_vs_walk` (when complete). `_ingest_progress["processed"]` counts
+positions RETIRED this run (skip, extraction failure, or reaching write
+dispatch regardless of outcome -- mcp_server.py's three increment sites),
+never commits actually WRITTEN, and is SEEDED with `prior_ingested` at run
+start -- so a resume that retires a position already counted in that seed
+double-counts it, driving `walk_claimed`, and therefore
+`walk_vs_graph = walk_claimed - graph_commit_entities`, POSITIVE.
+`collect_commit_census` gates `walk_vs_graph` BEFORE `repo_vs_walk` (an
+`elif` chain in commit_census.py), so `walk_vs_graph` is the clause that
+actually fails a resume with this over-count -- never `repo_vs_walk`.
+`repo_vs_walk` cannot even supply a false positive of its own on an intact
+graph: every graph `:type/commit` entity corresponds to at least one
+retired position (Stage B's `lifecycle_only` forward-apply writes none), so
+`walk_claimed >= graph_commit_entities` always, which makes
+`repo_vs_walk = repo_commits - walk_claimed <= repo_commits -
+graph_commit_entities = repo_vs_graph` -- zero or negative whenever the
+graph is intact, never a positive shortfall. `repo_vs_graph` asks the only
+question this probe exists to answer: after a resume, does the graph hold
+every commit the repo has? It sidesteps BOTH failure directions above
+because it never routes through `walk_claimed` at all -- see `resume_ok`.
 
 THE REF IS THE RESOLVED BRANCH, NEVER "HEAD". `_run_ingestion`'s own
 `repo_total` was hardcoded to `HEAD` while ingestion took a `branch` argument,
@@ -299,10 +314,16 @@ async def run_resume_census(
     census["truncate_by"] = truncate_by
     # NOT what #325's retention shows up as -- a RETAINED interval's
     # positions are excluded from the walkable gap entirely (they are never
-    # claimed this run at all), so retention lowers `processed_this_run`
-    # below `repo_commits - prior_ingested` rather than raising this
-    # counter; see `retention_engaged`, the field that actually watches for
-    # it. This counter is #326's own same-run skip-fast-path (a position
+    # claimed this run at all), so a HEALTHY retention-using resume HOLDS
+    # `processed_this_run` AT `repo_commits - prior_ingested` (see
+    # retention_engaged's own docstring: "On a healthy resume this is
+    # processed_this_run == repo_commits - prior_ingested") -- it does not
+    # push it below that value. What pushes `processed_this_run` UP, toward
+    # `repo_commits`, is a WRONGLY-discarding `_frontier_load` re-walking
+    # territory retention should have held out of this run; that upward
+    # direction is what `retention_engaged`'s own `< repo_commits` check
+    # actually watches for. This counter (`positions_skipped_this_run`) is
+    # a DIFFERENT signal, #326's own same-run skip-fast-path (a position
     # retired via an archived `:type/completed-region` without parsing or
     # writing it) -- and after #325 that path is narrowed to the
     # unresolvable-bounds ("divergent-ref leak") case, mutually exclusive

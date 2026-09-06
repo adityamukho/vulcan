@@ -764,6 +764,19 @@ regression the fix closes — `:ingestion/frontier-high` ends up persisted as
 `[2,12]` with position 11 (the write that genuinely failed) inside that
 range and no `:commit/...` entity for it (commit `c47e7c4`).
 
+**The one genuine per-commit write-path cost this branch adds: a merging
+claim now pays two extra reads.** `_frontier_persist_claim`'s
+absorbed-interval loop (`mcp_server.py:7023` `_frontier_read_bounds`,
+`:7032` `_frontier_read_pos_count`) reads both per absorbed ident before
+discarding it, which master's single-interval version never did — there
+was nothing to absorb. This is O(intervals) — bounded by how many idents
+one claim's merge absorbs (0 in the common non-merging case, small in
+practice, since a merge happens once per interval's lifetime when it first
+touches a neighbour) — never O(commits), so it does not change the
+per-commit cost SHAPE the rest of this section describes. It is stated here
+rather than left to be found only in an ephemeral report, the way the
+handle-drop checkpoint cost above is documented in comparable detail.
+
 **The end-of-walk flush refuses a skipped-span persist on a DISJUNCTION,
 `lo_pos > floor or len(sources) > 1`, and both halves are load-bearing — do
 not describe either as covering the other.** `_frontier_persist_span`'s
@@ -784,14 +797,26 @@ Only the STRADDLING shape is reproduced end-to-end, by
 and both of that class's two tests are FOLDS (`len(sources) == 2` in both),
 so `len(sources) > 1` alone already refuses either one on its own. The
 shape that would isolate `lo_pos > floor`'s own contribution — call it case
-C: no fold (`len(sources) == 1`), span starts above the floor — is not
-constructible under today's allocator, for the same reason given at its
-code comment (`mcp_server.py`, the flush-trigger block): every source of
-"lo_pos above the floor" this codebase produces is itself a fold, since the
-floor is set by a write failure on some ident and only a merge moves a
-flush's span onto a different ident. No test isolates `lo_pos > floor` from
-`len(sources) > 1`; that half is belt-and-braces against a future
-non-monotonic allocator, not a demonstrated requirement. **An earlier
+C: no fold (`len(sources) == 1`), span starts above the floor — is NOT
+ruled out by needing a fold: within ONE ident, a same-run skip at a HIGHER
+position followed by a write failure at a LOWER one produces exactly
+`lo_pos > floor` with `sources == {that ident}` and no merge anywhere
+(`skipped_span`/`skipped_span_sources` default to the singleton `{ident}`
+until a merge unions another ident in, and `_note_incomplete_rev` floors
+whichever ident the failing claim already belongs to — nothing here
+requires two idents). **An earlier version of this section said case C
+"is not constructible under today's allocator" and gave the fold
+requirement as the reason — that reason is wrong, and so is the
+conclusion it was used to support.** What actually keeps case C hard to
+reach today is narrower and unrelated to folds: `_skip_claim` (the thing
+that populates `skipped_span` at all) requires a loadable archived
+`:type/completed-region` covering the position, and after #325 that only
+exists for the narrow divergent-ref-regained case (see "#326's skip fast
+path is now VESTIGIAL" above) — so constructing case C requires first
+constructing that already-narrow prerequisite. No test isolates
+`lo_pos > floor` from `len(sources) > 1`; that half is belt-and-braces
+against exercising this narrow same-ident shape, not a demonstrated
+requirement. **An earlier
 version of this same comment in `mcp_server.py` claimed testing
 `lo_pos > floor` alone "needs none of that side reasoning"
 `len(sources) > 1` rested on — that claim was the bug it now describes**:
@@ -871,20 +896,32 @@ is the only at-scale check that can observe a wrongly-retained interval at
 all.** It gates on `census_error is None and repo_vs_graph == 0`
 (`resume_ok`), never `collect_commit_census`'s own `ok`
 (`ident_collisions`, `walk_vs_graph` always, `repo_vs_walk` when complete).
-The `repo_vs_walk` half is the one that is actively WRONG on a resume, not
-merely uninformative: a HEALTHIER resume — one where retention correctly
-holds more already-ingested territory out of this run's walk — retires
-FEWER positions this run, so `processed_this_run` is lower and
-`walk_claimed = prior_ingested + processed_this_run` reads LOWER than
-`repo_commits`, even though `graph_commit_entities` still equals
-`repo_commits` and the graph is completely intact. `repo_vs_walk` (which
-compares the repo count against `walk_claimed`) reads that shortfall as a
-defect — the exact opposite of the truth — on the run this whole feature
-exists to make cheaper. `repo_vs_graph` sidesteps this because it never
-routes through `walk_claimed` at all. The nightly's own `commit_census`
-(#317) cannot exercise this failure mode regardless, for a simpler reason
-than any of that: it runs once on a fresh graph, which has no interval to
-retain in the first place. `retention_engaged`
+**This is the third stated explanation of why, and the first two were both
+wrong in the same direction — see the standing note below on which
+mechanism actually survives.** The correct rationale was already in this
+file, in the #326 section above: `_ingest_progress["processed"]` counts
+positions RETIRED this run (skip, extraction failure, or reaching write
+dispatch regardless of outcome — all three sites increment it), never
+commits actually WRITTEN, and it is SEEDED with
+`prior_ingested = _count_commit_entities(db)` at run start. A resume that
+retires a position already counted in that seed's snapshot double-counts
+it, driving `walk_claimed` — and therefore
+`walk_vs_graph = walk_claimed - graph_commit_entities` — POSITIVE.
+`collect_commit_census`'s own gate checks `walk_vs_graph` strictly BEFORE
+`repo_vs_walk` (an `elif` chain, `commit_census.py`), so `walk_vs_graph` is
+the clause that actually fails a resume exhibiting this over-count —
+never `repo_vs_walk`. `repo_vs_walk` cannot even supply a false positive of
+its own on an intact graph: every graph `:type/commit` entity corresponds
+to at least one retired position (Stage B's `lifecycle_only` forward-apply
+writes none), so `walk_claimed >= graph_commit_entities` always, which means
+`repo_vs_walk = repo_commits - walk_claimed <= repo_commits -
+graph_commit_entities = repo_vs_graph` — zero whenever the graph is
+complete, so `repo_vs_walk <= 0`, never a positive shortfall. `repo_vs_graph`
+sidesteps BOTH failure directions because it never routes through
+`walk_claimed` at all. The nightly's own `commit_census` (#317) cannot
+exercise this failure mode regardless, for a simpler reason than any of
+that: it runs once on a fresh graph, which has no interval to retain in the
+first place. `retention_engaged`
 (`prior_ingested > 0 and processed_this_run < repo_commits`) is the probe's
 positive control, RENDERED never gated: without it, a full regression back
 to pre-#325 discard-on-tip-growth would re-walk everything on the "resume"
@@ -900,6 +937,32 @@ catch a regression in the retention predicate itself but can NEVER observe
 a newly landed commit arriving INSIDE an already-retained interval's
 bounds — the exact scenario the `:pos-count` checksum above exists to
 catch — because the frozen slice never grows.
+
+**A standing note on the `repo_vs_walk`/`walk_vs_graph` explanation above,
+because it took three attempts to land and a future reader needs to know
+which one survived.** Draft 1 said `walk_claimed` is "nonzero on ANY
+resume that skips already-completed positions." Draft 2 (a documentation
+review round) replaced it with "a healthier resume retires FEWER positions,
+so `walk_claimed` reads LOWER than `repo_commits`, and `repo_vs_walk`
+misreads that shortfall as a defect." **Both were wrong, in the SAME
+direction, and the second was worse because it was asserted with a
+specific (backwards) mechanism rather than left vague.** `_ingest_progress
+["processed"]` never decreases and every one of its three increment sites
+(`mcp_server.py:12949, 13001, 13128`) fires on a position the run touches
+at all — skip, extraction failure, or reaching write dispatch regardless of
+whether the write itself then fails — so `walk_claimed >= graph_commit_
+entities` always, which makes `repo_vs_walk = repo_commits - walk_claimed
+<= repo_commits - graph_commit_entities = repo_vs_graph`: zero or NEGATIVE
+whenever the graph is intact, never the positive shortfall either draft
+described. The direction that IS reachable runs through `walk_vs_graph`
+going POSITIVE (an over-count, from double-counting an already-graphed
+position retired again this run), and `collect_commit_census` gates
+`walk_vs_graph` before `repo_vs_walk`, so `walk_vs_graph` — not
+`repo_vs_walk` — is the clause that actually fails a resume with this
+shape. The gate on `repo_vs_graph` itself was never in question through any
+of the three drafts; only the stated reason for preferring it kept
+changing, and this is the version checked against the actual increment
+sites and the actual gate order rather than reasoned about in the abstract.
 
 ## Claude Code Plugin Publishing
 

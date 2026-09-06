@@ -88,9 +88,18 @@ class TestResumeOk:
     def test_walk_vs_graph_alone_does_not_decide_it(self):
         """Counterfactual for using collect_commit_census's own `ok`: a
         nonzero walk_vs_graph with repo_vs_graph still 0 must NOT fail this
-        probe's gate -- that is exactly the shape a healthy skip-heavy resume
-        produces (walk_claimed undercounts what commit_census's repo_vs_walk
-        expects, but the graph is still complete)."""
+        probe's gate. The constructed numbers (walk_vs_graph=5,
+        repo_vs_walk=-5) encode an OVER-count, not an undercount:
+        `_ingest_progress["processed"]` counts positions retired this run,
+        not commits written, and is seeded with `prior_ingested` at run
+        start, so a resume that retires an already-graphed position again
+        this run drives `walk_claimed` -- and walk_vs_graph -- POSITIVE
+        (walk_claimed exceeds both graph_commit_entities and repo_commits,
+        hence repo_vs_walk's negative sign here), while the graph itself
+        stays complete. `collect_commit_census` gates walk_vs_graph BEFORE
+        repo_vs_walk, so walk_vs_graph is the clause that would actually
+        fail this run under commit_census's own `ok` -- this probe's
+        `resume_ok` must not inherit that false positive."""
         census = _census(walk_vs_graph=5, repo_vs_walk=-5, ok=False)
         assert resume_ok(census) is True
 
