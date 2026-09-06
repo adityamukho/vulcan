@@ -6514,6 +6514,67 @@ def _frontier_promote_base_if_missing(
     )
 
 
+def _frontier_check_load_invariants(
+    intervals: List["frontier_registry.Interval"], strict: bool = True
+) -> None:
+    """#329: what _frontier_load promises its callers about the provisional
+    interval set it returns.
+
+    ADJACENT OR OVERLAPPING -> raise (when `strict`). After
+    _frontier_coalesce_loaded this is unreachable unless
+    frontier_registry.coalesce_intervals or _frontier_persist_merge is
+    broken, so it should never fire. A raise here is caught by
+    _run_ingestion's run-level `except`: status goes to `error`, the
+    traceback reaches fd 2 (so stderr_capture's `error_signals` and
+    run_ingestion_benchmark._exit_code fail the at-scale gate), and no walk
+    has started, so nothing is half-written. `strict=False` is for the one
+    caller path that DELIBERATELY did not merge -- see
+    _frontier_coalesce_loaded's ident guard -- where leaving the graph as
+    found and re-walking is the fail-safe outcome and a raise would not be.
+
+    BASE NOT LOWEST -> stderr, never a raise. Coalescing does not enforce
+    this: two DISJOINT provisional intervals with a real gap between them
+    never merge, and _intervals_read_extra's query carries no positional
+    predicate, so a below-base extra would load. Nothing produces that state
+    today and it degrades conservatively (one more interval a caller
+    re-walks or folds defensively, never one silently dropped). Raising on
+    it would abort every future run on such a graph forever, with no repair
+    path -- turning conservative degradation into permanent denial of
+    service, which is worse than the state being guarded against.
+
+    Cross-tag overlap is deliberately NOT checked. It is unreachable
+    (claim_low/claim_high are served from _unclaimed, the complement of the
+    interval set, so no claim can land inside an interval of ANY tag), and
+    adjacency ACROSS tags is the normal converged state -- the
+    authoritative/provisional boundary is the lineage frontier, not a
+    defect. A third raise would only widen the blast radius of a guard whose
+    whole point is to stay quiet.
+    """
+    prov = sorted(
+        (iv for iv in intervals if iv.tag == frontier_registry.TAG_PROVISIONAL),
+        key=lambda iv: iv.lo_pos,
+    )
+    for prev, nxt in zip(prov, prov[1:]):
+        if nxt.lo_pos <= prev.hi_pos + 1:
+            message = (
+                "[_frontier_load] provisional intervals still adjacent or "
+                f"overlapping after coalescing: [{prev.lo_pos},{prev.hi_pos}] "
+                f"and [{nxt.lo_pos},{nxt.hi_pos}] (#329)"
+            )
+            if strict:
+                raise RuntimeError(message)
+            print(message, file=sys.stderr)
+            return
+    bases = [iv for iv in prov if iv.is_base]
+    if bases and bases[0].lo_pos != prov[0].lo_pos:
+        print(
+            "[_frontier_load] provisional base is not the lowest provisional "
+            f"interval: base at [{bases[0].lo_pos},{bases[0].hi_pos}], lowest "
+            f"at [{prov[0].lo_pos},{prov[0].hi_pos}] (#329)",
+            file=sys.stderr,
+        )
+
+
 def _frontier_discard_interval(
     db: Any,
     ident: str,

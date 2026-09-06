@@ -28222,3 +28222,80 @@ class TestShippedExamplesValidateAgainstSchema:
             f"expected at least one validated example per doc, found {checked} "
             f"across {self._EXAMPLE_DOCS} -- the extractor stopped matching"
         )
+
+
+class TestFrontierCheckLoadInvariants:
+    """#329: the load post-condition. Two violations, two deliberately
+    different consequences -- see the design spec's "Post-condition"."""
+
+    def _prov(self, lo, hi, is_base=False, ident=":ingestion/interval-provisional-x"):
+        import frontier_registry
+        return frontier_registry.Interval(
+            lo, hi, frontier_registry.TAG_PROVISIONAL,
+            anchor_pos=hi, is_base=is_base, ident=ident,
+        )
+
+    def test_adjacent_provisional_intervals_raise(self):
+        import mcp_server
+        intervals = [
+            self._prov(0, 10, is_base=True, ident=mcp_server._FRONTIER_HIGH_IDENT),
+            self._prov(11, 25),
+        ]
+        with pytest.raises(RuntimeError, match="adjacent or overlapping"):
+            mcp_server._frontier_check_load_invariants(intervals)
+
+    def test_overlapping_provisional_intervals_raise(self):
+        import mcp_server
+        intervals = [
+            self._prov(0, 10, is_base=True, ident=mcp_server._FRONTIER_HIGH_IDENT),
+            self._prov(5, 25),
+        ]
+        with pytest.raises(RuntimeError, match="adjacent or overlapping"):
+            mcp_server._frontier_check_load_invariants(intervals)
+
+    def test_disjoint_non_adjacent_provisional_intervals_pass(self):
+        import mcp_server
+        intervals = [
+            self._prov(0, 10, is_base=True, ident=mcp_server._FRONTIER_HIGH_IDENT),
+            self._prov(12, 25),
+        ]
+        mcp_server._frontier_check_load_invariants(intervals)  # must not raise
+
+    def test_non_strict_downgrades_the_adjacency_raise_to_a_warning(self, capsys):
+        """The defensive `ident is None` path in _frontier_coalesce_loaded
+        leaves the graph exactly as found and re-walks. Raising there would
+        make an unmergeable-but-harmless state fatal instead of fail-safe."""
+        import mcp_server
+        intervals = [
+            self._prov(0, 10, is_base=True, ident=mcp_server._FRONTIER_HIGH_IDENT),
+            self._prov(11, 25),
+        ]
+        mcp_server._frontier_check_load_invariants(intervals, strict=False)
+        assert "adjacent or overlapping" in capsys.readouterr().err
+
+    def test_a_base_that_is_not_lowest_warns_and_does_not_raise(self, capsys):
+        """Nothing produces this state today and it degrades conservatively.
+        Raising would abort EVERY future run on such a graph forever, with
+        no repair path -- a permanent denial of service, worse than the
+        state being guarded against."""
+        import mcp_server
+        intervals = [
+            self._prov(0, 10, ident=":ingestion/interval-provisional-below"),
+            self._prov(12, 25, is_base=True, ident=mcp_server._FRONTIER_HIGH_IDENT),
+        ]
+        mcp_server._frontier_check_load_invariants(intervals)  # must not raise
+        assert "base is not the lowest" in capsys.readouterr().err
+
+    def test_an_authoritative_interval_adjacent_to_a_provisional_one_is_fine(self):
+        """The authoritative/provisional boundary is the lineage frontier;
+        the two sides being adjacent is the NORMAL converged state, not a
+        violation. A check that fired here would go red on every healthy
+        graph."""
+        import mcp_server, frontier_registry
+        intervals = [
+            frontier_registry.Interval(
+                0, 10, frontier_registry.TAG_AUTHORITATIVE, anchor_pos=0,
+                is_base=True, ident=mcp_server._FRONTIER_LOW_IDENT),
+            self._prov(11, 25, is_base=True, ident=mcp_server._FRONTIER_HIGH_IDENT),
+        ]
+        mcp_server._frontier_check_load_invariants(intervals)  # must not raise
