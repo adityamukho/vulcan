@@ -939,6 +939,74 @@ a newly landed commit arriving INSIDE an already-retained interval's
 bounds — the exact scenario the `:pos-count` checksum above exists to
 catch — because the frozen slice never grows.
 
+**A LOADED provisional set is now coalesced too, and #329 is why that is
+not merely tidiness.** `frontier_registry._coalesce` runs only from
+`_extend`, `_extend` only from a claim, and `FrontierAllocator.__init__`
+stores what it is handed verbatim. So a load producing two contiguous or
+overlapping provisional entities **with an already-empty gap** never merged:
+no claim ever happens. `_intervals_read_extra` was then permanently
+non-empty, and Task 6's gate makes both
+`_correction_sweep_select_position` and `_should_fold_lineage_watermark`
+return early on that condition — so Stage B never ran again,
+`:ingestion/lineage-confirmed-through` never advanced, and provisional
+`:introduced-by` stayed provisional for the life of the graph, on runs
+reporting `status: complete` with a clean `divergence` and zero bytes on
+stderr. **No detector saw it and it did not self-heal**, which is the
+failure profile this arc exists to refuse: graph and index agree (nothing
+is missing from either, the lineage is simply never upgraded), both
+`:introduced-by` checks only examine entities that EXIST and are
+well-formed, `stderr_capture` has nothing to read, and `commit_census`
+compares commit counts that are correct.
+
+The merge rule is now the module-level `frontier_registry.coalesce_
+intervals`, called from BOTH `_coalesce` and `_frontier_load`'s
+`_frontier_coalesce_loaded` — shared, not mirrored, so the load-time merge
+cannot drift from the claim-time one. It runs AFTER
+`_frontier_promote_base_if_missing`, and that order is load-bearing: the
+survivor rule PRESERVES a base but never manufactures one, so merging first
+would leave the union at a minted ident while `:ingestion/frontier-high`
+stays absent — the very state that function exists to repair.
+
+**The survivor's new `:pos-count` is the merged span, and that is a
+CLAIM-TIME denominator, not #326's computed-where-it-is-read trap.** The
+difference is which run does the comparing. Both components were validated
+against THIS run's linearization moments earlier (`_load_one_interval`
+retains only when the STORED claim-time count still equals the current
+span), and their adjacency was established in that same linearization — so
+the merged count is a fresh assertion about THIS run, compared in a LATER
+run against a linearization that may differ. It discriminates. #326's
+archive case was different: archiving and loading ran in the SAME run
+against the SAME linearization, so the count always agreed. **Accepted
+cost:** merging is coarser, so a later commit landing inside what used to be
+the upper component now discards the whole union rather than that component
+alone — a bigger re-walk, never a loss. The `:pos-count` residual is
+unchanged: it stays a CHECKSUM, not a proof of set identity.
+
+**The post-condition's two violations have deliberately different
+consequences.** `_frontier_check_load_invariants` RAISES on an adjacent or
+overlapping provisional pair — unreachable once the coalesce lands, so it
+should never fire, and a raise reaches `_run_ingestion`'s run-level
+`except` before any walk starts (`status: error`, traceback on fd 2, so
+`stderr_capture`'s `error_signals` and `_exit_code` fail the at-scale
+gate). It only WARNS when the base is not the lowest provisional interval:
+coalescing does not enforce that — two DISJOINT intervals with a real gap
+never merge, and `_intervals_read_extra` carries no positional predicate,
+so a below-base extra would load. Nothing produces that state today and it
+degrades conservatively, and raising on it would abort every future run on
+such a graph forever with no repair path — permanent denial of service,
+worse than the state being guarded. Cross-tag overlap is deliberately NOT
+checked: it is unreachable (claims are served from `_unclaimed`, the
+complement of the interval set), and cross-tag ADJACENCY is the normal
+converged state, since the authoritative/provisional boundary is the
+lineage frontier itself.
+
+**No `GRAPH_FORMAT_VERSION` bump and no migration.** This changes no fact
+shape — it retracts facts that already exist and widens bounds that already
+exist, using the attributes `_frontier_persist_claim` already writes. This
+is the one case in this arc that DOES self-heal an affected graph, because
+the defective state is by definition present at load time and the fix runs
+at load time.
+
 ## Claude Code Plugin Publishing
 
 The plugin is published via a stub architecture — `install.py` handles all registration automatically.
