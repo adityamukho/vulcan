@@ -297,12 +297,23 @@ async def run_resume_census(
     census["prior_ingested"] = prior_ingested
     census["processed_this_run"] = processed_this_run
     census["truncate_by"] = truncate_by
-    # #326's skip fast path is what this whole probe exists to watch: a
-    # position counted here without a matching write is exactly a retained
-    # interval doing its job, and a resume that shows 0 despite a nonzero
-    # processed_this_run is evidence the fast path did NOT engage for this
-    # run (still `ok` if the graph is complete regardless, but worth seeing
-    # rather than inferring from processed_this_run alone).
+    # NOT what #325's retention shows up as -- a RETAINED interval's
+    # positions are excluded from the walkable gap entirely (they are never
+    # claimed this run at all), so retention lowers `processed_this_run`
+    # below `repo_commits - prior_ingested` rather than raising this
+    # counter; see `retention_engaged`, the field that actually watches for
+    # it. This counter is #326's own same-run skip-fast-path (a position
+    # retired via an archived `:type/completed-region` without parsing or
+    # writing it) -- and after #325 that path is narrowed to the
+    # unresolvable-bounds ("divergent-ref leak") case, mutually exclusive
+    # within one run with what this probe's own resume can ever produce
+    # (see CLAUDE.md's "#326's skip fast path is now VESTIGIAL" paragraph).
+    # The measured baseline (results/325-resume-census.json) is exactly
+    # this: `positions_skipped_this_run: 0` alongside `retention_engaged:
+    # true` on a perfectly healthy resume -- 0 here is the expected reading
+    # for this probe's own scenario, not evidence the mechanism failed to
+    # engage. Rendered for visibility regardless, in case a future scenario
+    # (a divergent ref) does exercise it.
     census["positions_skipped_this_run"] = mcp_server._ingest_progress.get(
         "positions_skipped", 0
     )
