@@ -7709,7 +7709,7 @@ class TestCompletedRegionRecord:
     position inside the interval provably completed" -- `:lo-hash` is a
     closed RANGE bound, so membership is implied by a NEIGHBOUR's claim, not
     necessarily by the position's own; what makes membership mean the
-    position's OWN completion is `_run_ingestion`'s `rev_claim_floor_pos` gate
+    position's OWN completion is `_run_ingestion`'s `rev_claim_floor` gate
     (see `_skip_claim`'s docstring).
 
     Deliberately NOT in MINIGRAF_SCHEMA: handle_minigraf_audit iterates exactly
@@ -8091,7 +8091,7 @@ class TestFrontierLoadArchivesDiscardedInterval:
     that is FALSE as a standalone claim: `:lo-hash` is a closed RANGE bound,
     so membership is implied by a NEIGHBOUR's claim, not necessarily by the
     position's own. What makes membership mean the position's OWN completion
-    is `_run_ingestion`'s `rev_claim_floor_pos` gate, which stops :lo-hash
+    is `_run_ingestion`'s `rev_claim_floor` gate, which stops :lo-hash
     descending past a position this run failed to complete (see
     `_skip_claim`'s docstring)."""
 
@@ -10146,7 +10146,7 @@ class TestNonTipWriteFailureIsReWalked:
     CONTINUES THE DESCENT. No claim is persisted for the failed position -- but
     :lo-hash is a closed RANGE bound, so the next LOWER position that succeeds
     would move it beneath the failed one and sweep it into the interval, were
-    it not for `rev_claim_floor_pos`.
+    it not for `rev_claim_floor`.
 
     So the witness statement -- "membership in a persisted interval proves the
     position completed" -- was only ever implied by a NEIGHBOUR's claim. #313's
@@ -10257,7 +10257,7 @@ class TestNonTipWriteFailureIsReWalked:
         assert not missing, (
             f"commits {[h[:12] for h in missing]} still have no :commit/... "
             "entity after a clean run 2. The reverse write that failed in "
-            "run 1 must remain a genuine hole (rev_claim_floor_pos keeps it "
+            "run 1 must remain a genuine hole (rev_claim_floor keeps it "
             "out of the persisted interval), for run 2's forward stream to "
             "pick up naturally"
         )
@@ -22767,7 +22767,7 @@ class TestCorrectionSweepDeclinesWhileFragmented:
     """#325: with a hole above frontier-high, Stream 2 can still descend past a
     position the sweep would confirm, so the sweep must decline."""
 
-    def _seed(self, db, lin, extra=None):
+    def _seed(self, db, lin, extra=None, hi_idx=11):
         import mcp_server
         hi = mcp_server._FRONTIER_HIGH_IDENT
         lo = mcp_server._FRONTIER_LOW_IDENT
@@ -22778,8 +22778,8 @@ class TestCorrectionSweepDeclinesWhileFragmented:
             f"[{lo} :pos-count 4]",
             f"[{hi} :entity-type :type/ingest-interval]",
             f"[{hi} :tag :provisional]",
-            f'[{hi} :lo-hash "{lin[4]}"]', f'[{hi} :hi-hash "{lin[11]}"]',
-            f"[{hi} :pos-count 8]",
+            f'[{hi} :lo-hash "{lin[4]}"]', f'[{hi} :hi-hash "{lin[hi_idx]}"]',
+            f"[{hi} :pos-count {hi_idx - 4 + 1}]",
         ]) + "]", "2026-09-04T00:00:00Z")
         if extra is not None:
             ident = mcp_server._interval_ident(lin[extra[1]])
@@ -22797,8 +22797,16 @@ class TestCorrectionSweepDeclinesWhileFragmented:
 
     def test_declines_while_a_hole_remains_above(self, real_db):
         import mcp_server
-        lin = [f"h{i}" for i in range(12)]
-        self._seed(real_db, lin, extra=(9, 11))
+        lin = [f"h{i}" for i in range(14)]
+        # frontier-high covers [4,7]; the extra covers [10,13] -- positions
+        # 8-9 sit between the two as a genuine hole ABOVE frontier-high,
+        # rather than the extra being nested INSIDE frontier-high's own
+        # span (the previous fixture had frontier-high at [4,11] and an
+        # extra at [9,11], entirely contained within it -- non-vacuous as a
+        # positive control for the shipped "any extra exists" predicate,
+        # but not the hole-above-frontier-high scenario this class is
+        # named for).
+        self._seed(real_db, lin, extra=(10, 13), hi_idx=7)
         assert mcp_server._correction_sweep_select_position(
             real_db, lin, self._meta(lin)) is None
 
@@ -22811,11 +22819,14 @@ class TestCorrectionSweepDeclinesWhileFragmented:
 
     def test_fold_gate_declines_while_fragmented(self, real_db):
         import mcp_server
-        lin = [f"h{i}" for i in range(12)]
-        self._seed(real_db, lin, extra=(9, 11))
+        lin = [f"h{i}" for i in range(14)]
+        # Same genuine hole-above-frontier-high shape as
+        # test_declines_while_a_hole_remains_above: frontier-high [4,7],
+        # extra [10,13], positions 8-9 an unclaimed gap between them.
+        self._seed(real_db, lin, extra=(10, 13), hi_idx=7)
         mcp_server._transact(
             real_db,
-            f'[[:ingestion/correction-sweep-through :hash "{lin[11]}"]]',
+            f'[[:ingestion/correction-sweep-through :hash "{lin[7]}"]]',
             "2026-09-04T00:00:00Z")
         assert mcp_server._should_fold_lineage_watermark(real_db, lin) is False
 

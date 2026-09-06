@@ -2120,10 +2120,18 @@ imported and reused verbatim — not reimplemented, so this probe and the
 nightly gate cannot drift into counting different things).
 
 **Repo and bound — a fixed 300-commit slice of this repo's own history, not
-the full branch tip.** `--repo-path .` per the at-scale tier's convention, but
+the full branch tip.** `--repo .` (the probe's flag is `--repo`, not the
+`--repo-path` several other at-scale scripts use), but
 `--branch` is the hash of the 300th commit from repo root
-(`git log --reverse --format=%H | sed -n '300p'`), not the branch's current
-tip. Ingestion cost here grows superlinearly with graph size (#241, #280), and
+(`git log --topo-order --reverse --format=%H | sed -n '300p'`), not the
+branch's current tip. `--topo-order` is required, not cosmetic: plain
+`--reverse` orders by commit DATE, and merging a long-lived branch whose
+commits carry OLDER timestamps than trunk would insert them below position
+300 and silently shift the slice, even though nothing about trunk's own
+history changed. `--topo-order --reverse` is the same order
+`build_linearization` (the code path this step measures) actually walks, so
+"the 300th commit" tracks the position ingestion would assign it. Ingestion
+cost here grows superlinearly with graph size (#241, #280), and
 that superlinearity was measured directly while choosing this bound, on this
 repo's own history, on the same machine:
 
@@ -2144,8 +2152,9 @@ since that flag only trims the tip — so pointing this probe at the branch's
 actual (900+ and growing) tip would roughly double the existing ingestion
 step's own already-substantial cost inside the nightly's shared 360-minute
 ceiling, and that cost grows every night the repo does. A commit at a FIXED
-POSITION FROM ROOT does not drift forward as history grows, so this bound
-needs no periodic recalibration the way a `HEAD`-relative offset would.
+POSITION FROM ROOT, walked in the same topological order ingestion uses,
+does not drift forward as history grows, so this bound needs no periodic
+recalibration the way a `HEAD`-relative offset would.
 
 **`--truncate-by 30` — large enough to show real, nontrivial resume work, not
 just an edge case.** The resulting split was `prior_ingested=262`,

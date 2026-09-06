@@ -6001,8 +6001,21 @@ def _interval_ident(anchor_hash: str) -> str:
 
 
 def _intervals_read_extra(db: Any) -> List[Tuple[str, str, str, Optional[int]]]:
-    """Every provisional interval entity ABOVE frontier-high, as
+    """Every minted provisional interval entity, as
     (ident, lo_hash, hi_hash, pos_count), sorted by ident.
+
+    Callers treat these as living ABOVE frontier-high -- that is a caller
+    CONTRACT, not something this query enforces: the where-clause below binds
+    only :entity-type plus the presence of :ident/:lo-hash/:hi-hash, with no
+    tag predicate, no positional predicate, and no check of the minted-ident
+    prefix a caller might otherwise key on. An entity satisfying those three
+    clauses is returned regardless of where its bounds actually sit. This is
+    deliberate, not an oversight: a below-base extra (which #325's own
+    machinery does not produce today, but nothing here rules out) degrades
+    conservatively -- it is one more interval a caller re-walks or folds
+    defensively, never one silently dropped -- so the query stays permissive
+    and callers are the ones who must not assume position from membership
+    alone.
 
     Binds ?ident rather than ?e: `[?e :entity-type :type/ingest-interval]`
     answers in UUID space. frontier-high and frontier-low carry no :ident fact
@@ -6459,9 +6472,13 @@ def _frontier_promote_base_if_missing(
     depends on (the same "count must come from the interval, never be
     recomputed where it is read" rule _load_one_interval follows).
     Retract-before-transact, the same order every other absorb-then-extend
-    write here uses: a crash in between leaves a DUPLICATE description (both
-    entities live, each still faithful to its own span) rather than a
-    window with neither -- re-walkable and safe, never silently lost.
+    write here uses: a crash in between leaves a WINDOW WITH NEITHER entity
+    describing the span (the old ident's facts are already gone, the fixed
+    ident's are not yet written) -- the span reads unclaimed and is
+    re-walked, fail-safe -- rather than a DUPLICATE description, which is
+    what transacting first would produce (both entities live at once, each
+    still faithful to its own span, and nothing left to notice the
+    redundancy once the second write lands).
     """
     provisional = [iv for iv in intervals if iv.tag == frontier_registry.TAG_PROVISIONAL]
     if not provisional or any(iv.is_base for iv in provisional):
@@ -6649,6 +6666,20 @@ def _completed_region_record(
 ) -> None:
     """Archive [lo_hash, hi_hash] as a completed region, coalescing it into the
     existing same-tag set.
+
+    #325 final review: this function currently has ZERO production call
+    sites (`grep -n '_completed_region_record(' mcp_server.py` matches only
+    this def). The one place that archives an unresolvable-bounds region
+    (`_load_one_interval`, the `not resolved and pos_count is not None`
+    branch) writes `_completed_region_facts` directly behind its own
+    query-before-write guard instead of calling here, precisely because that
+    case has no position space to coalesce into (see that branch's own
+    comment). So the coalescing/pruning machinery below is exercised only by
+    tests today, and unresolvable-bounds regions accumulate on disk without
+    bound -- one entity per divergence event, never merged, never retracted.
+    Not a bug to fix here: recorded so a future caller of this function (or a
+    decision to prune those regions another way) does not have to
+    rediscover the gap first.
 
     Query-before-write, the guard _watermark_update and _frontier_persist_claim
     established: a deterministic ident only guarantees repeated writes target
@@ -6980,15 +7011,15 @@ def _frontier_persist_claim(
     interval named by `ident` and one or more others have just become
     contiguous, and the others stop existing as their own entities. They are
     retracted BEFORE `ident`'s bound is extended: a crash between the two
-    then leaves a DUPLICATE description of the merged region (both the
-    survivor's old, narrower bounds and the absorbed entity's own facts are
-    still live and each still faithfully describes its own span, so the next
-    _frontier_load re-walks the overlap and nothing is lost), where extending
-    first would leave a WINDOW in which `ident` already claims the full
-    merged span but the absorbed entity's now-redundant facts are still live
-    -- and a crash there is invisible right up until _frontier_discard_interval
-    never runs, silently leaking a phantom entity into _intervals_read_extra
-    forever.
+    then leaves a WINDOW WITH NEITHER entity describing the absorbed span
+    (the absorbed entity's facts are already retracted, `ident`'s bound has
+    not yet been extended over that span) -- unclaimed and re-walked by the
+    next _frontier_load, nothing lost. Extending first would instead risk the
+    DUPLICATE outcome: a crash between the two would leave `ident` already
+    claiming the full merged span while the absorbed entity's now-redundant
+    facts are still live -- and a crash there is invisible right up until
+    _frontier_discard_interval never runs, silently leaking a phantom entity
+    into _intervals_read_extra forever.
 
     #325 review Finding 1: a merging claim's survivor takes the UNION of its
     own existing bounds, every absorbed interval's bounds, and the claimed
@@ -12751,11 +12782,31 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # #325 review Finding 4: which idents CONTRIBUTED to
                 # skipped_span[ident] -- always at least {ident} itself. A
                 # merge fold (below) moves the SPAN onto the survivor but
-                # cannot move the FLOOR with it: floors are set at DISPATCH,
-                # which runs strictly AFTER every claim (including the
-                # merging one) has already happened, so `rev_claim_floor`
-                # may not even hold the absorbed ident's entry yet at fold
-                # time. The flush (at true end-of-walk, after every floor
+                # cannot move the FLOOR with it: floors are set at DISPATCH
+                # (inside the `while pending:` loop's per-commit `except`
+                # blocks, via _note_incomplete_rev), while a merge folds at
+                # CLAIM time (inside submit_next(), when the claim is made
+                # and appended to `pending`) -- strictly earlier for that
+                # same position. So `rev_claim_floor` may not yet hold the
+                # absorbed ident's entry at fold time.
+                #
+                # (An earlier version of this comment claimed dispatch "runs
+                # strictly AFTER every claim [...] has already happened" --
+                # false as written: `pending` is bounded by pipeline_depth,
+                # so a position's dispatch only postdates the claims made
+                # while it sat in the queue, not every claim the run will
+                # ever make. The property this code actually needs is
+                # weaker and does hold: dispatch order equals claim order,
+                # since `pending` is FIFO and nothing reorders it, and the
+                # reverse stream's claims descend monotonically in position
+                # -- so for any two reverse positions, the higher one is
+                # both claimed AND dispatched before the lower one. A
+                # merging claim at some ident is therefore always dispatched
+                # -- and any floor it sets -- before a lower position under
+                # the same (post-merge) ident is dispatched, which is the
+                # ordering the flush actually relies on.)
+                #
+                # The flush (at true end-of-walk, after every floor
                 # exists) reads this to find every floor relevant to a
                 # (possibly folded) skipped span, not just the survivor's
                 # own -- see the flush loop below for why a floor found this
@@ -13272,6 +13323,43 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             (rev_claim_floor[s] for s in sources if s in rev_claim_floor),
                             default=None,
                         )
+                        # `floor is None` (no clamp, no refusal below) is safe
+                        # only because of a three-link chain, none of it
+                        # visible at this call site alone -- remove any one
+                        # link and this becomes a bridge across an
+                        # incomplete position:
+                        #
+                        # 1. next_claim() returns None only on
+                        #    self._allocator.is_gap_empty() -- never on a
+                        #    single stream having nothing to do this call
+                        #    (see its docstring's #325 review round 2 note).
+                        #    So the `while pending` loop draining normally
+                        #    (completed_all left True) means every position
+                        #    in the shared gap was actually claimed and
+                        #    popped, not skipped over by a stream that gave
+                        #    up early.
+                        # 2. Both paths that retire a claimed reverse
+                        #    position WITHOUT a persisted claim -- the
+                        #    extraction `except` and the write `except`,
+                        #    above -- call _note_incomplete_rev, which sets
+                        #    rev_claim_floor for that position's ident (and,
+                        #    via a merge's absorbed_idents, every ident it
+                        #    folded through). So an ident with no entry in
+                        #    rev_claim_floor had no incomplete retirement.
+                        # 3. The one other way a claimed reverse position
+                        #    retires without a persisted claim -- the
+                        #    _shutdown_requested break in the `while pending`
+                        #    loop above -- sets completed_all = False instead
+                        #    of a floor, and this whole block is gated on
+                        #    completed_all being True.
+                        #
+                        # Together: completed_all True means every claimed
+                        # position either persisted normally or is accounted
+                        # for by a floor. So `floor is None` for this ident's
+                        # sources means every position this run claimed under
+                        # them completed -- the unclamped flush below is
+                        # flushing a span this run actually proved, not one
+                        # it merely didn't happen to fail on.
                         if floor is not None:
                             if lo_pos > floor or len(sources) > 1:
                                 continue

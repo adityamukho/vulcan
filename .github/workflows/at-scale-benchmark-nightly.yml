@@ -181,9 +181,20 @@ jobs:
       # pointing at the full (900+ and growing) branch tip would roughly
       # double the existing ingestion step's own already-substantial cost
       # inside this job's shared 360-minute ceiling, and that cost grows every
-      # night. The 300th commit from repo root is a fixed position -- it does
-      # not drift forward as history grows, so this bound needs no periodic
-      # recalibration. See evals/at_scale/benchmark.md for the measured
+      # night. The 300th commit from repo root is meant to be a fixed
+      # position that does not drift forward as history grows, so this bound
+      # needs no periodic recalibration -- but that guarantee depends on
+      # ordering by the same rule ingestion itself uses.
+      # `git log --reverse` with NO `--topo-order` orders by commit DATE, not
+      # topology: merging a long-lived branch whose commits carry OLDER
+      # timestamps than trunk would insert them below position 300 and shift
+      # the slice out from under this step, silently, the next time it runs
+      # -- even though nothing about trunk's own history changed. `git log
+      # --topo-order --reverse` is what `build_linearization` (the code path
+      # this whole nightly measures) actually walks, per CLAUDE.md's #316/
+      # #317 notes, so `--topo-order` here makes "the 300th commit" track the
+      # same position ingestion would ever assign it, immune to a date-order
+      # merge doing this. See evals/at_scale/benchmark.md for the measured
       # baseline this produced.
       #
       # --fail-on-mismatch is passed HERE, unlike the initial measurement that
@@ -211,7 +222,7 @@ jobs:
         if: always()
         run: |
           resolved_branch=$(git rev-parse --abbrev-ref HEAD)
-          target_ref=$(git log --reverse --format=%H "$resolved_branch" | sed -n '300p')
+          target_ref=$(git log --topo-order --reverse --format=%H "$resolved_branch" | sed -n '300p')
           python evals/at_scale/probe_resume_census.py \
             --repo . --branch "$target_ref" \
             --graph "${{ runner.temp }}/325-resume-census.graph" \
