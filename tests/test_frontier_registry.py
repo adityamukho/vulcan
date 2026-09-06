@@ -134,13 +134,21 @@ class TestFrontierAllocatorClaiming:
         assert allocator.claim_low() == 0
         assert allocator.claim_low() == 1
         assert allocator.claim_low() == 2
-        assert allocator.intervals() == [Interval(0, 2, TAG_AUTHORITATIVE)]
+        # A brand-new interval is the base for its tag (#325: is_base marks
+        # the first same-tag interval, anchor_pos the position it was
+        # created at) -- so the grown interval carries real identity, not
+        # the dataclass defaults.
+        assert allocator.intervals() == [
+            Interval(0, 2, TAG_AUTHORITATIVE, anchor_pos=0, is_base=True)
+        ]
 
     def test_claim_high_grows_provisional_interval_downward(self):
         allocator = FrontierAllocator(10)
         assert allocator.claim_high() == 9
         assert allocator.claim_high() == 8
-        assert allocator.intervals() == [Interval(8, 9, TAG_PROVISIONAL)]
+        assert allocator.intervals() == [
+            Interval(8, 9, TAG_PROVISIONAL, anchor_pos=9, is_base=True)
+        ]
 
     def test_streams_converge_and_stay_separate_by_tag(self):
         allocator = FrontierAllocator(4)
@@ -150,8 +158,8 @@ class TestFrontierAllocatorClaiming:
         assert allocator.claim_high() == 2
         assert allocator.is_gap_empty()
         assert sorted(allocator.intervals(), key=lambda iv: iv.lo_pos) == [
-            Interval(0, 1, TAG_AUTHORITATIVE),
-            Interval(2, 3, TAG_PROVISIONAL),
+            Interval(0, 1, TAG_AUTHORITATIVE, anchor_pos=0, is_base=True),
+            Interval(2, 3, TAG_PROVISIONAL, anchor_pos=3, is_base=True),
         ]
 
     def test_seeded_authoritative_interval_extends_correctly(self):
@@ -184,7 +192,15 @@ class TestFrontierAllocatorGrownLinearization:
         assert allocator.is_gap_empty()
 
     def test_claim_low_strictly_increases_and_terminates(self):
-        allocator = FrontierAllocator(5, [Interval(2, 3, TAG_AUTHORITATIVE)])
+        # #325 review: seeded at [0, 2], not [2, 3] -- claim_low() now only
+        # ever serves the hole adjacent to the authoritative interval's own
+        # edge (see its docstring), and an authoritative interval that does
+        # not start at position 0 is unreachable in the real system anyway
+        # (frontier-low is always seeded from linearization[0]). A seed
+        # starting mid-linearization would make claim_low() correctly
+        # refuse forever, which is a different property than this test
+        # exists to check.
+        allocator = FrontierAllocator(5, [Interval(0, 2, TAG_AUTHORITATIVE)])
         seen = []
         for _ in range(20):
             pos = allocator.claim_low()
@@ -204,3 +220,149 @@ class TestFrontierAllocatorGrownLinearization:
             assert a.hi_pos < b.lo_pos or b.hi_pos < a.lo_pos, (
                 f"intervals must stay disjoint, got {ivs}"
             )
+
+
+class TestFragmentedProvisionalSet:
+    """#325: after tip growth the provisional side holds two disjoint
+    intervals with a hole above the lower one. The old gap_lo/gap_hi, defined
+    off 'the interval covering position 0 / the last position', hand out a
+    position an interval already owns."""
+
+    def _alloc(self):
+        # 20 positions. Authoritative [0,3]; provisional base [4,11].
+        # Positions 12..19 are the "new tip" hole.
+        return frontier_registry.FrontierAllocator(20, [
+            frontier_registry.Interval(0, 3, frontier_registry.TAG_AUTHORITATIVE,
+                                       anchor_pos=0, is_base=True),
+            frontier_registry.Interval(4, 11, frontier_registry.TAG_PROVISIONAL,
+                                       anchor_pos=11, is_base=True),
+        ])
+
+    def test_gap_lo_does_not_return_a_claimed_position(self):
+        a = self._alloc()
+        assert a.gap_lo == 12
+
+    def test_gap_hi_is_the_topmost_unclaimed_position(self):
+        a = self._alloc()
+        assert a.gap_hi == 19
+
+    def test_claim_high_serves_the_topmost_gap_first(self):
+        a = self._alloc()
+        assert [a.claim_high() for _ in range(3)] == [19, 18, 17]
+
+    def test_claim_high_falls_through_to_the_bulk_gap_when_the_tip_closes(self):
+        # A real bulk gap below the base: authoritative [0,1], base [8,11],
+        # so positions 2..7 are unclaimed underneath and 12..19 above.
+        b = frontier_registry.FrontierAllocator(20, [
+            frontier_registry.Interval(0, 1, frontier_registry.TAG_AUTHORITATIVE,
+                                       anchor_pos=0, is_base=True),
+            frontier_registry.Interval(8, 11, frontier_registry.TAG_PROVISIONAL,
+                                       anchor_pos=11, is_base=True),
+        ])
+        for _ in range(8):           # 19..12, closing the tip hole
+            b.claim_high()
+        assert b.claim_high() == 7, (
+            "once the tip hole merges into the base, the topmost unclaimed "
+            "position is the bulk gap's top"
+        )
+
+    def test_merge_keeps_the_base_and_reports_the_absorbed_interval(self):
+        a = self._alloc()
+        for _ in range(7):           # 19..13
+            a.claim_high()
+        result_before = a.last_claim
+        assert result_before.absorbed == []
+        assert a.claim_high() == 12  # this claim makes [12,19] touch [4,11]
+        merged = a.last_claim
+        assert merged.interval.lo_pos == 4 and merged.interval.hi_pos == 19
+        assert merged.interval.is_base is True
+        assert merged.interval.anchor_pos == 11
+        assert [iv.anchor_pos for iv in merged.absorbed] == [19]
+
+    def test_claim_low_returns_none_once_the_bulk_gap_closes(self):
+        """#325 review (post-Task-4 ruling): this replaces a test that
+        asserted [12, 13, 14] here, which encoded exactly the behaviour now
+        ruled wrong.
+
+        auth[0,3] + prov[4,11] means the bulk gap between the two sides has
+        ALREADY closed -- the only hole left is 12..19, above the
+        provisional region, not adjacent to the authoritative interval's
+        own edge (3+1=4). A claim_low() that served it anyway would jump
+        the forward stream over positions 4..11, which it has never
+        visited. `:ingestion/watermark`, `_preload_known_entities`'s
+        `watermark_pos` bound, and `:ingestion/lineage-confirmed-through`
+        all read the authoritative interval's reach as "the graph knows
+        everything up to here" -- a lie once the forward walk jumps over
+        unvisited territory. The costed failure mode is not abstract: a
+        later commit that merely re-touches an entity introduced inside the
+        skipped region reads as new to the forward walk's watermark-bounded
+        preload and mints a DUPLICATE `:introduced-by`, silently corrupting
+        lineage attribution. `TestMultiStreamParityWithForwardOnly` in
+        tests/test_mcp_server.py caught exactly this end-to-end; master
+        could never reach it because there was only ever one gap.
+
+        So claim_low() now returns None here: the forward stream has
+        nothing legitimate left to do until the provisional region folds
+        into the authoritative one.
+        """
+        a = self._alloc()
+        assert a.claim_low() is None
+
+    def test_is_gap_empty_requires_every_hole_closed(self):
+        a = self._alloc()
+        assert a.is_gap_empty() is False
+        for _ in range(8):
+            a.claim_high()
+        assert a.is_gap_empty() is True
+
+
+class TestCoalesceSurvivorRuleHigherBase:
+    """The merge-survivor rule (#325 code review, finding 1) has two live
+    branches: base wins because it is the LOWER participant (every other
+    test in this file only exercises that one, since claim_high() always
+    opens a fresh fragment ABOVE an existing base), and base wins because it
+    is the HIGHER participant. Nothing reaches the second branch through
+    claim_low()/claim_high() -- a same-tag interval seeded above an existing
+    base is not a state normal claiming produces -- so it is seeded directly
+    here, the same way TestFragmentedProvisionalSet seeds a reload state.
+
+    If `keeper, loser = (prev, iv) if (...) else (iv, prev)` in _coalesce
+    ever regressed to always keeping `prev` (the lower participant), this
+    test's assertions would flip silently: the merged interval would carry
+    the NON-base interval's anchor_pos, and `absorbed` would name the actual
+    base interval. A later task retracts every entity in `absorbed` -- so
+    that inversion means retracting the live :ingestion/frontier-high entity
+    while the merged interval keeps pointing persistence at an ident nothing
+    still holds. `is_base` on the merged interval would stay True either way
+    (it is an OR of both participants, independent of which is kept), so
+    that field alone would not catch the regression -- only anchor_pos and
+    the identity of the absorbed interval do.
+    """
+
+    def test_higher_base_survives_a_merge_with_a_lower_non_base_fragment(self):
+        # provisional: a lower non-base fragment [2,4] (anchor_pos=99, as if
+        # left over from some earlier state) and a higher base [6,11]
+        # (anchor_pos=11, the persisted :ingestion/frontier-high interval).
+        # Position 5 is the only gap; claiming it makes the two touch.
+        a = frontier_registry.FrontierAllocator(12, [
+            frontier_registry.Interval(0, 1, frontier_registry.TAG_AUTHORITATIVE,
+                                       anchor_pos=0, is_base=True),
+            frontier_registry.Interval(2, 4, frontier_registry.TAG_PROVISIONAL,
+                                       anchor_pos=99, is_base=False),
+            frontier_registry.Interval(6, 11, frontier_registry.TAG_PROVISIONAL,
+                                       anchor_pos=11, is_base=True),
+        ])
+        assert a.claim_high() == 5
+        merged = a.last_claim
+        assert merged.interval.lo_pos == 2 and merged.interval.hi_pos == 11
+        assert merged.interval.is_base is True
+        assert merged.interval.anchor_pos == 11, (
+            "the HIGHER interval is the base and must keep its anchor_pos "
+            "even though the LOWER interval merged first in sort order"
+        )
+        assert len(merged.absorbed) == 1
+        assert merged.absorbed[0].anchor_pos == 99, (
+            "the lower non-base fragment is what gets absorbed/retracted, "
+            "never the base"
+        )
+        assert merged.absorbed[0].is_base is False

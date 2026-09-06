@@ -2089,3 +2089,205 @@ at wall-clock valid-from. On this graph `count` and `count-distinct` both read
 the two is a signal rather than a surprise. `_STATUS_QUERY` deliberately keeps
 `count`: it is a latency instrument whose query is frozen for cross-run
 comparability, and its number is never read as a count.
+
+## Resume-Scenario Commit Census — 325-resume-census (2026-09-05)
+
+- Script: `evals/at_scale/probe_resume_census.py`
+- Raw: `evals/at_scale/results/325-resume-census.json`
+- Test: `tests/test_at_scale_resume_census.py`
+- Nightly step: "Census a resumed graph for a wrongly-retained frontier
+  interval" (`.github/workflows/at-scale-benchmark-nightly.yml`, beside the
+  ident-collision census)
+- Question: after #325 replaced discard-on-tip-growth with a persisted SET of
+  frontier intervals that `_frontier_load` may RETAIN, does a resumed graph
+  still hold every commit the repo has? `commit_census` (#317) cannot ask this
+  — it runs inside `run_ingestion_benchmark`, which ingests once into a fresh
+  graph, so no interval is ever RETAINED there and the failure mode #325
+  introduced (a wrongly-kept interval permanently skipping real commits) is
+  structurally unreachable from that step. `fact_audit`'s two witnesses agree
+  about a commit neither the graph nor the index ever received; both
+  `:introduced-by` checks (#287, #316) only examine entities that exist;
+  `stderr_capture` has nothing to read, because skipping a position that looks
+  complete prints nothing. This probe is the only one that ingests and then
+  RESUMES into the SAME graph, which is the only way to reach the branch #325
+  touched.
+
+**Method.** Ingest `<branch>~<truncate-by>` into a fresh graph, then ingest
+`<branch>` into the SAME graph (the resume), then hand the three resulting
+counts (`git rev-list --count`, the walk's own claim, and the graph's
+`:type/commit` recount) to `collect_commit_census` (#317's own module,
+imported and reused verbatim — not reimplemented, so this probe and the
+nightly gate cannot drift into counting different things).
+
+**Repo and bound — a fixed 300-commit slice of this repo's own history, not
+the full branch tip.** `--repo .` (the probe's flag is `--repo`, not the
+`--repo-path` several other at-scale scripts use), but
+`--branch` is the hash of the 300th commit from repo root
+(`git log --topo-order --reverse --format=%H | sed -n '300p'`), not the
+branch's current tip. `--topo-order` is required, not cosmetic: plain
+`--reverse` orders by commit DATE, and merging a long-lived branch whose
+commits carry OLDER timestamps than trunk would insert them below position
+300 and silently shift the slice, even though nothing about trunk's own
+history changed. `--topo-order --reverse` is the same order
+`build_linearization` (the code path this step measures) actually walks, so
+"the 300th commit" tracks the position ingestion would assign it. Ingestion
+cost here grows superlinearly with graph size (#241, #280), and
+that superlinearity was measured directly while choosing this bound, on this
+repo's own history, on the same machine:
+
+| Commits ingested (fresh graph) | Wall clock |
+|---|---|
+| 50 | 3.1s |
+| 200 | 26.4s |
+| 300 | 100.2s |
+
+200→300 is a 1.5x increase in commits for a 3.8x increase in time — consistent
+with the checkpoint-cost superlinearity #280 already measured
+(`evals/at_scale/benchmark.md`'s own Ingestion Run entries independently
+corroborate this at larger scale: 705–732 commits cost 1474–1600s, ~25–27
+commits/min, far below the ~1000 commits/min a 3.1s/50-commit rate would
+suggest at that size). The first (truncated) ingestion pays close to the FULL
+cost of walking history up to the target ref regardless of `--truncate-by`,
+since that flag only trims the tip — so pointing this probe at the branch's
+actual (900+ and growing) tip would roughly double the existing ingestion
+step's own already-substantial cost inside the nightly's shared 360-minute
+ceiling, and that cost grows every night the repo does. A commit at a FIXED
+POSITION FROM ROOT, walked in the same topological order ingestion uses,
+does not drift forward as history grows, so this bound needs no periodic
+recalibration the way a `HEAD`-relative offset would.
+
+**`--truncate-by 30` — large enough to show real, nontrivial resume work, not
+just an edge case.** The resulting split was `prior_ingested=262`,
+`processed_this_run=38` (not exactly 30: `<ref>~30` walks 30 FIRST-PARENT
+steps, and this range of history contains merge commits, so 30 mainline hops
+covers more than 30 positions in `build_linearization`'s full topological
+order — expected, not a bug in the probe or in git's `~N` syntax).
+
+**Result — clean, measured BEFORE `--fail-on-mismatch` was added to the
+nightly, per CLAUDE.md's rule against gating on a prediction:**
+
+| Metric | Value |
+|---|---|
+| `repo_commits` | 300 |
+| `walk_claimed` | 300 |
+| `graph_commit_entities` | 300 |
+| `repo_vs_graph` | **0** |
+| `repo_vs_walk` | 0 |
+| `walk_vs_graph` | 0 |
+| `prior_ingested` | 262 |
+| `processed_this_run` | 38 |
+| `positions_skipped_this_run` | 0 |
+| `retention_engaged` | **true** |
+| `proved_nothing` | false (nonzero denominator — the positive control) |
+| `ok` | true |
+| Wall clock (both ingestions + census) | 89–91s (two runs, both under 92s) |
+
+`retention_engaged` was added, and this baseline re-measured, after review
+flagged that `ok` alone has no positive control: a future regression to
+pre-#325 discard-on-tip-growth behaviour would re-walk all 300 positions on
+the "resume" and still report `repo_vs_graph == 0` (minigraf collapses a
+re-transacted commit triple at an identical `commit_ts_iso` rather than
+duplicating it), so `ok` would stay green while silently no longer exercising
+the mechanism this probe exists to guard. `retention_engaged` is `prior_ingested
+> 0 and processed_this_run < repo_commits` (`evals/at_scale/probe_resume_census.py`'s
+`retention_engaged`) — RENDERED, never gated, so every run re-proves its own
+positive control rather than it being a fact about the day this baseline was
+measured. `262 > 0` and `38 < 300` both hold, so this run's `true` is direct
+evidence the resume actually skipped the already-ingested region rather than
+re-walking everything and coincidentally landing on a clean total.
+
+**`positions_skipped_this_run == 0` is the EXPECTED reading for a clean
+append-only resume, not evidence retention failed to engage.** #326's skip
+counter increments only when the reverse walk ITERATES INTO a position already
+inside a retained completed region and backs off per-position; on this run the
+262 old positions were never even in the walkable gap the allocator handed the
+walk in the first place — `_frontier_load` retaining the persisted high
+interval excluded them from consideration before the loop began, which is a
+CHEAPER outcome than iterate-then-skip, not a different one. The evidence that
+retention actually fired is `processed_this_run == 38`, not ~300: had the
+interval been wrongly DISCARDED (#325's failure mode, pre-fix master
+behaviour), the reverse stream would have re-walked and re-counted the entire
+262-commit region as part of this run, and `processed_this_run` would read
+close to 300, not 38, while `graph_commit_entities` would still happen to read
+300 either way (minigraf transacts commit triples at `commit_ts_iso`, so a
+re-walk of an already-written position collapses rather than duplicating —
+`repo_vs_graph` alone cannot distinguish a correct skip from a wasteful
+re-walk that still lands on the right total). Both fields ship in the result
+together for exactly this reason.
+
+**Why the probe's own `ok` is `repo_vs_graph`, not `collect_commit_census`'s
+`ok` — a controller ruling, verified against the numbers above, not merely
+followed.** Two earlier stated reasons for this were wrong; the mechanism is
+the one already measured in CLAUDE.md's #326 section (`walk_vs_graph` "is
+nonzero on ANY resume that touches already-ingested territory, skip or no
+skip — measured 10 with the fast path against 9 without"). `commit_census`'s
+`ok` gates on `ident_collisions`, `walk_vs_graph` (always) and `repo_vs_walk`
+(when complete). `walk_claimed` here is 300 — matching, because
+`prior_ingested` (262) plus `processed_this_run` (38) already accounts for
+every commit, with no re-touched position in this particular clean run. A
+run that DOES re-touch already-ingested territory — the #326 same-run skip
+fast path, #313's torn-position repair re-walk, and this branch's own
+below-`rev_claim_floor` re-walk are all examples, and all three are CORRECT
+behaviour, not degraded resumes — double-counts that position:
+`_ingest_progress["processed"]` counts positions RETIRED this run (skip,
+extraction failure, or reaching write dispatch regardless of outcome),
+never commits actually WRITTEN, and is seeded with `prior_ingested` at run
+start, so a re-touched position already inside that seed drives
+`walk_claimed` — and `walk_vs_graph = walk_claimed - graph_commit_entities`
+— POSITIVE on a perfectly healthy run. Because `collect_commit_census` gates
+`walk_vs_graph` BEFORE `repo_vs_walk` (an `elif` chain), `walk_vs_graph` is
+the clause that would actually fail such a run — that is what makes it a
+false positive — the exact shape
+`tests/test_at_scale_resume_census.py::TestResumeOk::
+test_walk_vs_graph_alone_does_not_decide_it` pins with constructed numbers
+(`walk_vs_graph=5, repo_vs_walk=-5` — an OVER-count). `repo_vs_walk`'s own
+clause (`elif complete and deltas["repo_vs_walk"]:`) is only reached once
+`walk_vs_graph` reads falsy (zero), at which point
+`walk_claimed == graph_commit_entities` forces `repo_vs_walk ==
+repo_vs_graph` — zero here — so that clause is falsy too. `repo_vs_graph`
+answers the only question this probe exists to ask — does the graph hold
+every commit the repo has, after a resume — without routing through
+`walk_claimed` at all, sidestepping both gates above.
+
+**`resume_ok` checks `census_error is None` explicitly, not only
+`repo_vs_graph`.** An earlier draft checked `repo_vs_graph == 0` alone, which
+also reads 0 on a run whose OWN collection failed outright — `collect_commit_census`
+routes both `repo_commits` and `graph_commit_entities` to the same zero
+default on a `census_error`, so a persisted result would have read `"ok":
+true` beside a non-null `census_error`, the exact "unverified reads as
+verified-clean" shape `commit_census`'s own `ok` refuses. Fixed to
+`census_error is None and repo_vs_graph == 0`; pinned by
+`TestResumeOk::test_a_census_error_fails_even_with_repo_vs_graph_zero`, with
+its own counterfactual test proving `repo_vs_graph` alone WOULD have read
+clean on the same input.
+
+**Coverage residual of the frozen slice — read before treating a green run as
+full coverage.** `--branch`/`--truncate-by` are pinned to the same 300th-commit
+target and 30 every night, so this step replays an IDENTICAL scenario each
+run. That is enough to catch a REGRESSION in the retention predicate itself
+(pre-#325 discard-on-tip-growth reappearing) — which is what
+`retention_engaged` above additionally confirms this baseline actually
+exercises — but it can NEVER observe a newly landed commit arriving INSIDE an
+already-retained interval's bounds, the exact scenario the interval's
+`:pos-count` checksum was written to catch (see CLAUDE.md's "A region is
+stored as two HASHES but consumed as a closed POSITION RANGE" section). The
+ident-collision census immediately above this one in the nightly deliberately
+carries no `--since`
+bound for the matching reason — its own comment: the pair to worry about is
+new-vs-old, and a bounded collection would see only new-vs-new. This probe's
+fixed slice takes the opposite trade, accepted here for the ingestion-cost
+reasons measured above, and is named as a residual rather than left implicit.
+`probe_resume_census.py`'s own module docstring qualifies its "only at-scale
+check that can observe" claim against exactly this bound.
+
+**Where it runs, and what a red run means.** The at-scale nightly runs it with
+`--fail-on-mismatch` (`if: always()`, beside the ident-collision census, so a
+red ingestion or query step does not hide it). A `census_error` (the `git` or
+graph-query collection itself failing) fails the step UNCONDITIONALLY,
+regardless of the flag — the same two-axis split
+`probe_ident_collision_new_history.py`'s `measurement_invalid` uses, so a
+failed collection can never sit in a green log indistinguishable from a clean
+run. **A red resume-census step is not a harness failure in the sense the
+ident-collision census's own note describes** — it means #325's retention
+predicate is wrong on real history and needs reopening, with the full
+repo/walk/graph counts already in the run's log.

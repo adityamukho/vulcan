@@ -470,7 +470,9 @@ times per commit, measured at 48% of write time and growing 3.47x within a
 Attribution".
 
 **Re-walking an already-ingested position is now skipped, and the witness is
-the thing that decides whether that is safe (#326).** The obvious predicate is
+the thing that decides whether that is safe (#326 — narrowed by #325 below;
+see "Narrowed by #325" a few paragraphs down before treating this as the
+current answer to replay cost).** The obvious predicate is
 unsound: in `_reverse_apply` `[:commit/<hash> :entity-type :type/commit]` is the
 FIRST element of `all_triples`, written before any file result is looked at,
 while `_frontier_persist_claim` runs LAST. So the commit entity's presence is
@@ -484,6 +486,22 @@ claim never persisted, so it was never inside the interval that got archived: it
 is in no region and is never skipped, by construction rather than by care. Only
 a REPRESENTABLE interval is archived — the inverted case reaches the same branch
 and describes no completed region at all.
+
+**Narrowed by #325 below: retention, not this skip fast path, is what now
+removes the replay cost of ordinary tip growth.** This section describes the
+skip fast path #326 shipped — retiring an already-complete position without
+parsing or writing it, keyed on membership in an archived `:type/completed-
+region`. #325 replaces `_frontier_load`'s discard-on-tip-growth with
+RETENTION (see the #325 section below): a persisted provisional interval
+whose bounds and `:pos-count` still check out survives tip growth without
+ever being discarded, so the "branch tip grew" case this fast path exists to
+shortcut no longer produces an archived region for it to consume. After
+#325, `_load_one_interval` archives a region only on the UNRESOLVABLE-bounds
+path (a divergent ref whose hash no longer resolves), and
+`_completed_regions_load` only ever loads a region whose bounds DO resolve —
+mutually exclusive within one run, so nothing this run archives is ever
+skipped by this same run's own load. The mechanism below stays correct for
+that narrower case; it is not what makes an ordinary resume cheap anymore.
 
 **The obvious statement of why that interval is a witness — "`_frontier_persist_
 claim` is the LAST write of a position, so membership in a persisted interval
@@ -626,9 +644,20 @@ assert.
 There is no `GRAPH_FORMAT_VERSION` bump — this only adds facts going forward.
 Existing graphs are not repaired and need no migration: a region is only
 knowable from an interval that exists at discard time, so there is nothing to
-seed. They simply never skip until their first discard, and because archiving
-happens in `_frontier_load` at LOAD time, the run that discards is the run that
-skips.
+seed. They simply never skip until their first discard, and — as this was
+true under #326's own discard-on-tip-growth mechanism, where a discarded
+interval's bounds stayed resolvable in the very linearization that just
+discarded it — archiving in `_frontier_load` at LOAD time meant the run that
+discarded was the run that could skip via the archive. **This is no longer
+true in general after #325 (below): retention removes the tip-growth case
+that made it true, and the discard path that remains is either a count
+mismatch (`_load_one_interval` discards without archiving at all — see the
+retention paragraph below) or unresolvable bounds (archived, but by
+definition NOT resolvable in this same run's linearization, so
+`_completed_regions_load` cannot load it back until some later run's
+history happens to regain those exact hashes — which ordinary history
+rewrites never do in practice).** See the #325 section's "skip fast path is
+now VESTIGIAL" paragraph for the corrected, general statement.
 
 `handle_minigraf_ingest_status`'s report carries `positions_skipped_this_run`
 alongside a bare `positions_skipped` that is always the same number today — the
@@ -641,6 +670,274 @@ position exactly as it does on a new one, and nothing distinguished the two. A
 run whose `positions_skipped_this_run` climbs alongside `processed_this_run`
 while the graph's own commit count stays flat is re-walking territory it
 already holds, not making progress.
+
+**A provisional frontier is now a SET of intervals, not one scalar pair, and
+#325 is what makes that safe under a growing branch tip.**
+`:ingestion/frontier-high` is the LOWEST provisional interval — "the base" —
+read and written at its own fixed ident exactly as before. Any additional
+provisional interval a run opens above it (a fresh hole opened by new
+commits on the tip, or a reload of one from a prior run) persists as its own
+entity, ident-keyed via `_interval_ident(anchor_hash)` and carrying a
+string-valued `:ident` fact — `_intervals_read_extra` enumerates by binding
+`?ident`, since `[?e :entity-type :type/ingest-interval]` alone answers in
+UUID space. The two FIXED idents — `:ingestion/frontier-high` and
+`:ingestion/frontier-low` — carry NO `:ident` fact and are read by their
+fixed name instead; that is exactly what makes the change migration-free,
+since a pre-#325 graph's `:ingestion/frontier-high` fact set is untouched
+and `_intervals_read_extra`'s query simply returns nothing extra for it. An
+extra interval's ident is MINTED ONCE, at creation, from the anchor commit
+hash it first claimed, and NEVER re-derived from its current bounds: a
+provisional interval grows downward, so keying on `:lo-hash` would recreate
+the entity on every claim, and keying on the current `:hi-hash` would rename
+it on every merge — #326 already paid for the bounds-keyed version once
+(two regions collided onto one entity, `:pos-count` went nondeterministic
+through a last-write-wins join, and a retract destroyed the surviving
+witness).
+
+**The retain path's `:pos-count` check is mandatory, not defensive, and the
+old path was safe only by accident.** `_load_one_interval` retains a
+persisted interval iff both bounds resolve in the current linearization,
+`lo <= hi`, and the stored `:pos-count` still equals `hi - lo + 1`. Master's
+retain test was just `hi == last position` — no count check at all — and
+that was safe only because a genuinely new commit forces a new tip: a commit
+landing strictly INSIDE the old bounds makes `hi != last`, which pushed the
+case onto the DISCARD path, where the count check already lived. #325
+retains `hi < last` (that is the whole feature), which removes the
+accident: an insertion strictly inside a retained interval is now reachable,
+and without the count check it would be silent, permanent loss — the commit
+reaches neither the graph nor the index, so `fact_audit`'s two witnesses
+agree, both `:introduced-by` checks only examine entities that exist, and
+stderr carries nothing. An interval carrying no `:pos-count` at all is not
+retained either — "no denominator" and "a denominator that still checks
+out" must not be the same branch when the failure mode is silent.
+
+**`claim_low()` is contiguity-bound, not merely ascending, and that is a
+corrected mistake in this branch's own earlier design, not an original
+choice.** It serves ONLY the hole immediately adjacent to the authoritative
+interval's own edge (`gap_lo == authoritative.hi_pos + 1`, or `gap_lo == 0`
+with no authoritative interval yet) and returns `None` for every other
+hole, including the lowest unclaimed one. The forward stream's real
+contract is CONTIGUOUS FROM C0 — `:ingestion/watermark`,
+`_preload_known_entities`'s `watermark_pos` bound, and
+`:ingestion/lineage-confirmed-through` all read the authoritative
+interval's reach as "the graph knows everything up to here." A `claim_low()`
+that served the lowest unclaimed position in general — this branch's
+original rule, "still strictly ascending" — would let the forward stream
+jump over a retained provisional region it has never visited: a later
+commit that merely re-touches an entity introduced inside that skipped
+territory then reads as new to the forward walk's watermark-bounded preload
+and mints a DUPLICATE `:introduced-by`. `TestMultiStreamParityWithForwardOnly`
+(`tests/test_mcp_server.py`) caught exactly this end-to-end, ingesting the
+same repo once at the shipping ratio and once forward-only and requiring
+the two graphs to agree — master could never reach this bug because there
+was only ever one gap. `claim_high()` needed no equivalent fix: the reverse
+stream carries no contiguity contract, and serving the topmost hole before
+falling through to the bulk gap is the entire point of #325.
+
+**The reverse claim floor is now PER-INTERVAL (`rev_claim_floor`, keyed by
+target ident), and a merge must carry the absorbed interval's floor to the
+survivor.** #326 shipped a single run-global floor scalar, correct only
+while the reverse stream made one contiguous descent. #325's allocator can
+serve a tip gap and a disjoint bulk gap in the same run (`claim_high()` plus
+a merge into a retained interval), so a write failure in the tip gap must
+floor only the ident it belongs to — a run-global floor would sit above
+every position in the disjoint bulk gap and withhold that gap's bookkeeping
+entirely, for no reason, forcing a needless re-walk of work that actually
+completed. The harder failure runs the other way: a merging claim's target
+is always the SURVIVOR (`_coalesce`'s rule keeps the base, or else the lower
+interval), and the survivor need not carry the absorbed interval's own floor
+entry — floors are set at write-dispatch time, strictly after every claim in
+the pipeline window has already happened, so the absorbed ident's floor
+entry may not even exist yet when the merging claim is first allocated.
+Checking only `claim_ident` at dispatch reads a floored merge as
+unrestricted and persists a union spanning the very gap the failure sits
+in, permanently sweeping a genuinely failed write into the graph's own
+completion witness. The fix widens the dispatch-time check to
+`max(rev_claim_floor[i] for i in [claim_ident, *absorbed_idents] if i in
+rev_claim_floor)` — reproduced end-to-end by `TestPerIntervalReverseFloor::
+test_merge_does_not_launder_a_floored_positions_failure_through_the_survivor`:
+a minted tip interval floored by a failed write is later merged into a
+retained base, and without the fix the base's persisted range silently
+swallows the floored position. Ablation-proven, not merely asserted:
+reverting the dispatch check to `claim_ident` alone reproduces the exact
+regression the fix closes — `:ingestion/frontier-high` ends up persisted as
+`[2,12]` with position 11 (the write that genuinely failed) inside that
+range and no `:commit/...` entity for it (commit `c47e7c4`).
+
+**The one genuine per-commit write-path cost this branch adds: a merging
+claim now pays two extra reads.** `_frontier_persist_claim`'s
+absorbed-interval loop (`mcp_server.py:7023` `_frontier_read_bounds`,
+`:7032` `_frontier_read_pos_count`) reads both per absorbed ident before
+discarding it, which master's single-interval version never did — there
+was nothing to absorb. This is O(intervals) — bounded by how many idents
+one claim's merge absorbs (0 in the common non-merging case, small in
+practice, since a merge happens once per interval's lifetime when it first
+touches a neighbour) — never O(commits), so it does not change the
+per-commit cost SHAPE the rest of this section describes. It is stated here
+rather than left to be found only in an ephemeral report, the way the
+handle-drop checkpoint cost above is documented in comparable detail.
+
+**The end-of-walk flush refuses a skipped-span persist on a DISJUNCTION,
+`lo_pos > floor or len(sources) > 1`, and both halves are load-bearing — do
+not describe either as covering the other.** `_frontier_persist_span`'s
+union is advance-only and GAP-BLIND: it bridges from a flush target's
+EXISTING on-disk `:hi-hash` to the flushed span's hi in one shot, proving
+nothing about what lies in between. `lo_pos > floor` catches the shape
+where the flushed span's own lo already sits above the floor, so the
+ordinary clamp (`max(lo_pos, floor + 1)`) degenerates to a no-op and only
+outright refusal still does anything. `len(sources) > 1` catches a SEPARATE
+shape `lo_pos > floor` cannot see at all: a fold whose merged span
+STRADDLES the floor (`lo_pos <= floor < hi_pos`). There the clamp fires and
+looks fine in isolation — the clamped `lo_pos` still sits inside
+`[lo_pos, hi_pos]` — but the union is against the fold TARGET's existing
+hi, which a fold is exactly what can put far BELOW the floor, so the bridge
+crosses the floored position regardless of what `lo_pos` was clamped to.
+Only the STRADDLING shape is reproduced end-to-end, by
+`tests/test_mcp_server.py::TestFoldedSkipSpanFlushDoesNotLaunderAFloor` —
+and both of that class's two tests are FOLDS (`len(sources) == 2` in both),
+so `len(sources) > 1` alone already refuses either one on its own. The
+shape that would isolate `lo_pos > floor`'s own contribution — call it case
+C: no fold (`len(sources) == 1`), span starts above the floor — is NOT
+ruled out by needing a fold: within ONE ident, a same-run skip at a HIGHER
+position followed by a write failure at a LOWER one produces exactly
+`lo_pos > floor` with `sources == {that ident}` and no merge anywhere
+(`skipped_span`/`skipped_span_sources` default to the singleton `{ident}`
+until a merge unions another ident in, and `_note_incomplete_rev` floors
+whichever ident the failing claim already belongs to — nothing here
+requires two idents). **An earlier version of this section said case C
+"is not constructible under today's allocator" and gave the fold
+requirement as the reason — that reason is wrong, and so is the
+conclusion it was used to support.** What actually keeps case C hard to
+reach today is narrower and unrelated to folds: `_skip_claim` (the thing
+that populates `skipped_span` at all) requires a loadable archived
+`:type/completed-region` covering the position, and after #325 that only
+exists for the narrow divergent-ref-regained case (see "#326's skip fast
+path is now VESTIGIAL" above) — so constructing case C requires first
+constructing that already-narrow prerequisite. No test isolates
+`lo_pos > floor` from `len(sources) > 1`; that half is belt-and-braces
+against exercising this narrow same-ident shape, not a demonstrated
+requirement. **An earlier
+version of this same comment in `mcp_server.py` claimed testing
+`lo_pos > floor` alone "needs none of that side reasoning"
+`len(sources) > 1` rested on — that claim was the bug it now describes**:
+it swapped one case for the other instead of widening the refusal, and the
+straddling scenario is the reachable counter-example. Refusing on either
+condition costs nothing but a re-walk next run, the same accepted price
+#326 established throughout.
+
+**A base-less provisional side is reachable, and #325 repairs it ON DISK,
+not just in memory.** If `frontier-high` is discarded on a count break (a
+commit landed inside its own bounds) while an extra interval strictly above
+it is unaffected and stays retained, nothing in the loaded set carries
+`is_base` — `_load_one_interval` only ever passes `is_base=True` for
+`:ingestion/frontier-high` itself, and `frontier_registry._extend`'s
+`is_base = not any(iv.tag == tag for iv in self._intervals)` cannot
+self-heal this once any same-tag interval already exists. Left alone,
+`:ingestion/frontier-high` never comes back: `_correction_sweep_select_
+position` returns `None` unconditionally on `high_bounds is None`, so Stage
+B (the correction sweep) never runs again for the life of the graph,
+`:ingestion/lineage-confirmed-through` never advances, and provisional
+`:introduced-by` stays provisional forever — on a run that reports
+`status: complete`. `_frontier_promote_base_if_missing` (`mcp_server.py`)
+fixes this by picking the LOWEST retained extra (the one that would have
+become the base under ordinary claiming, had frontier-high not been
+discarded out from under it), retracting its facts at its own minted
+ident, and re-writing them at the fixed `:ingestion/frontier-high` ident —
+copying its stored `:pos-count` VERBATIM, never recomputed, since
+recomputing would discard the claim-time origin the retain check itself
+depends on. The write happens on disk, not only on the in-memory allocator,
+because the write dispatch re-mints a claim's persist target from
+`interval.is_base`/`.anchor_pos` every run, so an in-memory-only promotion
+would still persist through the OLD minted ident next time.
+
+**Stage B (the correction sweep) declines outright while the provisional
+side is fragmented, and that is exactly what lets `:ingestion/correction-
+sweep-through` keep its old meaning with no new semantics.**
+`_correction_sweep_select_position` returns `None` whenever
+`_intervals_read_extra(db)` is non-empty — a hole remains above
+`frontier-high`, so Stream 2 could still descend past a position the sweep
+would otherwise confirm, exactly the same "gap not yet closed" reasoning
+the pre-#325 design already used for the single-interval case. Once
+everything coalesces back into one provisional interval, the sweep's
+existing gap-closed test is exact again and needs no change.
+
+**#326's skip fast path is now VESTIGIAL for the case it was built for —
+corrected in place above, restated here for the reader who lands on this
+paragraph first.** After #325, `_load_one_interval` archives a
+`:type/completed-region` only on the UNRESOLVABLE-bounds path (a divergent
+ref whose hash no longer resolves in this linearization), and
+`_completed_regions_load` only ever loads a region whose bounds DO
+resolve — mutually exclusive within one run, so nothing this run archives
+can be skipped by this same run's own load. **What #326 actually did,
+measured rather than assumed: on MASTER, tip growth does NOT force a full
+re-walk.** Master discards the off-tip interval on `_frontier_load`, but
+archives it as a completed region whose hashes still resolve in the very
+same run, and `_skip_claim` intercepts same-run, so master applies only the
+newly appended positions. "#326 already removed #325's headline replay
+cost" is therefore CORRECT for plain tip growth — what #325 changes is that
+the interval is now RETAINED rather than discarded-and-immediately-
+re-skipped, which matters for the count-check safety property above, not
+for the ordinary-resume cost that #326 had already fixed.
+
+**The `:pos-count` residual is unchanged: it is a CHECKSUM, not a proof of
+set identity — do not upgrade that language to "sound."** Equal count does
+not imply the same member set; the undemonstrated (not measured) residual
+described in the #326 section above still applies verbatim to every
+interval #325 retains, extras included.
+
+**No `GRAPH_FORMAT_VERSION` bump, no migration.** #325 only adds facts
+(extra interval entities) and changes a retain/discard boundary condition;
+a pre-#325 graph has at most one provisional interval on disk
+(`:ingestion/frontier-high`) and is read correctly by the new code with no
+seeding step.
+
+**The resume census probe (`evals/at_scale/probe_resume_census.py`, #325)
+is the only at-scale check that can observe a wrongly-retained interval at
+all.** It gates on `census_error is None and repo_vs_graph == 0`
+(`resume_ok`), never `collect_commit_census`'s own `ok`
+(`ident_collisions`, `walk_vs_graph` always, `repo_vs_walk` when complete).
+Two earlier explanations of why were wrong; the mechanism is the one
+already measured in the #326 section above (`walk_vs_graph` "is nonzero on
+ANY resume that touches already-ingested territory, skip or no skip —
+measured 10 with the fast path against 9 without"). That RE-TOUCHED set
+includes the #326 same-run skip fast path, #313's torn-position repair
+re-walk, and this branch's own below-`rev_claim_floor` re-walk — **all
+three are CORRECT behaviour, not degraded resumes**, which is exactly what
+makes a nonzero `walk_vs_graph` on any of them a FALSE positive rather than
+a real one. `_ingest_progress["processed"]` counts positions RETIRED this
+run (skip, extraction failure, or reaching write dispatch — three increment
+sites, `mcp_server.py:12949, 13001, 13128`), never commits newly WRITTEN,
+and is SEEDED with `prior_ingested = _count_commit_entities(db)` at run
+start, so re-touching a position already inside that seed double-counts it
+and drives `walk_claimed` — and `walk_vs_graph = walk_claimed -
+graph_commit_entities` — positive on a perfectly healthy run.
+`collect_commit_census` gates `walk_vs_graph` strictly BEFORE `repo_vs_walk`
+(an `elif` chain, `commit_census.py`), so `walk_vs_graph` is the clause that
+actually fails such a run. `repo_vs_walk`'s own clause
+(`elif complete and deltas["repo_vs_walk"]:`) is a truthiness test that is
+only reached once `walk_vs_graph` reads falsy (zero) — at which point
+`walk_claimed == graph_commit_entities` forces `repo_vs_walk ==
+repo_vs_graph`, zero on an intact graph, so the clause is falsy there too.
+`repo_vs_graph` sidesteps both gates because it never routes through
+`walk_claimed` at all. The nightly's own `commit_census` (#317) cannot
+exercise this failure mode regardless, for a simpler reason than any of
+that: it runs once on a fresh graph, which has no interval to retain in the
+first place. `retention_engaged`
+(`prior_ingested > 0 and processed_this_run < repo_commits`) is the probe's
+positive control, RENDERED never gated: without it, a full regression back
+to pre-#325 discard-on-tip-growth would re-walk everything on the "resume"
+and still land on `repo_vs_graph == 0` (minigraf collapses a re-transacted
+commit triple at an identical `commit_ts_iso` rather than duplicating it),
+so `ok` alone cannot tell a correct skip apart from a wasteful total
+re-walk that happens to land on the same total. It has ZERO MARGIN at the
+boundary — a partial regression that re-walks all but one already-ingested
+position still reads `True`, so it discriminates a TOTAL regression in the
+retention predicate, not a partial one. The nightly step pins
+`--branch`/`--truncate-by` to a fixed slice for cost, which is enough to
+catch a regression in the retention predicate itself but can NEVER observe
+a newly landed commit arriving INSIDE an already-retained interval's
+bounds — the exact scenario the `:pos-count` checksum above exists to
+catch — because the frozen slice never grows.
 
 ## Claude Code Plugin Publishing
 

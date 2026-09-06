@@ -5984,6 +5984,77 @@ def _frontier_read_pos_count(db: Any, ident: str) -> Optional[int]:
         return None
 
 
+_INTERVAL_PROVISIONAL_IDENT_PREFIX = ":ingestion/interval-provisional-"
+
+
+def _interval_ident(anchor_hash: str) -> str:
+    """Deterministic ident for a provisional interval created at anchor_hash.
+
+    MINTED ONCE, at creation, and never re-derived from current bounds. A
+    provisional interval grows DOWNWARD, so keying on :lo-hash would recreate
+    the entity on every claim; keying on the CURRENT :hi-hash would rename it
+    on every merge. #326 paid for the bounds-keyed version once: two regions
+    collided onto one entity, :pos-count became nondeterministic through a
+    last-write-wins join, and a retract destroyed the surviving witness.
+    """
+    return f"{_INTERVAL_PROVISIONAL_IDENT_PREFIX}{anchor_hash[:12]}"
+
+
+def _intervals_read_extra(db: Any) -> List[Tuple[str, str, str, Optional[int]]]:
+    """Every minted provisional interval entity, as
+    (ident, lo_hash, hi_hash, pos_count), sorted by ident.
+
+    Callers treat these as living ABOVE frontier-high -- that is a caller
+    CONTRACT, not something this query enforces: the where-clause below binds
+    only :entity-type plus the presence of :ident/:lo-hash/:hi-hash, with no
+    tag predicate, no positional predicate, and no check of the minted-ident
+    prefix a caller might otherwise key on. An entity satisfying those three
+    clauses is returned regardless of where its bounds actually sit. This is
+    deliberate, not an oversight: a below-base extra (which #325's own
+    machinery does not produce today, but nothing here rules out) degrades
+    conservatively -- it is one more interval a caller re-walks or folds
+    defensively, never one silently dropped -- so the query stays permissive
+    and callers are the ones who must not assume position from membership
+    alone.
+
+    Binds ?ident rather than ?e: `[?e :entity-type :type/ingest-interval]`
+    answers in UUID space. frontier-high and frontier-low carry no :ident fact
+    and are therefore invisible here BY CONSTRUCTION -- they are read by their
+    fixed idents, which is what makes this change migration-free.
+
+    :pos-count is a SECOND query, not a join. An interval carrying no count is
+    untrustworthy but must still be enumerable -- it has to be retractable --
+    and a single wide join would make it invisible instead, leaking its facts
+    forever. Same rule as _completed_regions_read_full.
+    """
+    raw = _db_execute(
+        db,
+        "(query [:find ?ident ?lo ?hi :where"
+        " [?e :entity-type :type/ingest-interval]"
+        " [?e :ident ?ident] [?e :lo-hash ?lo] [?e :hi-hash ?hi]])",
+    )
+    raw_counts = _db_execute(
+        db,
+        "(query [:find ?ident ?c :where"
+        " [?e :entity-type :type/ingest-interval]"
+        " [?e :ident ?ident] [?e :pos-count ?c]])",
+    )
+    counts: Dict[str, Optional[int]] = {}
+    for ident, c in json.loads(raw_counts).get("results", []):
+        try:
+            counts[str(ident)] = int(c)
+        except (TypeError, ValueError):
+            counts[str(ident)] = None
+    seen = set()
+    out: List[Tuple[str, str, str, Optional[int]]] = []
+    for ident, lo, hi in json.loads(raw).get("results", []):
+        if str(ident) in seen:
+            continue
+        seen.add(str(ident))
+        out.append((str(ident), lo, hi, counts.get(str(ident))))
+    return sorted(out, key=lambda r: r[0])
+
+
 def _frontier_span_count(
     linearization: List[str], lo_hash: str, hi_hash: str
 ) -> Optional[int]:
@@ -6170,93 +6241,277 @@ def _frontier_load(
     low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
     if low_bounds is not None and low_bounds[0] in hash_to_pos and low_bounds[1] in hash_to_pos:
         intervals.append(frontier_registry.Interval(
-            hash_to_pos[low_bounds[0]], hash_to_pos[low_bounds[1]], frontier_registry.TAG_AUTHORITATIVE
+            hash_to_pos[low_bounds[0]], hash_to_pos[low_bounds[1]],
+            frontier_registry.TAG_AUTHORITATIVE, anchor_pos=0, is_base=True,
+            ident=_FRONTIER_LOW_IDENT,
         ))
     high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
-    if high_bounds is not None and high_bounds[0] in hash_to_pos and high_bounds[1] in hash_to_pos:
-        hi_lo_pos, hi_hi_pos = hash_to_pos[high_bounds[0]], hash_to_pos[high_bounds[1]]
-        if hi_lo_pos <= hi_hi_pos and hi_hi_pos == len(linearization) - 1:
-            intervals.append(frontier_registry.Interval(
-                hi_lo_pos, hi_hi_pos, frontier_registry.TAG_PROVISIONAL
-            ))
-        else:
-            # Unrepresentable (#222 phase 2b1). Either the pair is inverted
-            # (what the pre-2b1 persist path produced once the linearization
-            # grew), or it no longer reaches the last position -- meaning new
-            # commits have landed above it, so the real state is three spans
-            # (authoritative low, filled high, new unclaimed above) and the
-            # gap now sits ABOVE this interval. One lo/hi pair per side
-            # cannot express that, so drop it and let the region be
-            # re-walked: re-processing an already-processed position is
-            # idempotent, so the graph converges and only work is wasted.
-            #
-            # Retract the facts too, not just the in-memory interval. Leaving
-            # them behind means the next _frontier_persist_claim sees a
-            # non-None `existing` and extends a pair the allocator no longer
-            # believes in, re-creating the inverted state on the first claim
-            # of the new run.
-            #
-            # Folding a 2c-confirmed high region into frontier-low instead
-            # (no re-walk at all) needs :ingestion/correction-sweep-through
-            # and spans all three streams -- that is 2d's, see the 2b1 design
-            # spec's "Why re-ingest is made safe, not efficient".
-            # #326: the bounds are the completion witness -- archive before
-            # retracting. Dropping the facts is what made the proof
-            # unavailable in exactly the case (#325 tip growth) that most
-            # needs it. Only a REPRESENTABLE interval is archived: the
-            # inverted case below reaches the same branch and describes no
-            # completed region at all.
-            #
-            # "_frontier_persist_claim is the LAST write of a position, so
-            # membership in this interval proves that position completed" is
-            # FALSE as a standalone claim -- see _skip_claim's docstring.
-            # :lo-hash is a closed RANGE bound, so membership is implied by a
-            # NEIGHBOUR's claim, not necessarily by the position's own: a
-            # write that raises takes _run_ingestion's per-commit `except`,
-            # which continues the descent, and the next lower position that
-            # succeeds sweeps the failed one into the interval. What makes
-            # membership mean the position's OWN completion is
-            # _run_ingestion's `rev_claim_floor_pos` gate, which stops
-            # :lo-hash descending past a position this run failed to
-            # complete -- the interval archived here is only ever as precise
-            # as that floor made it.
-            #
-            # The archive is gated on the interval's OWN :pos-count, which was
-            # written at claim time against the linearization the positions
-            # were claimed under. A region is stored as two hashes but consumed
-            # as a closed POSITION RANGE, and that is sound only if the
-            # linearization grew by APPENDING above it.
-            # `git log --topo-order --reverse` gives no such guarantee: it
-            # places a new commit immediately after its branch point whenever
-            # the old tip's line stalls behind it -- "branch off an old commit,
-            # merge the mainline in, fast-forward the mainline" is enough. Such
-            # a commit lands INSIDE the archived bounds, is covered by a proof
-            # that was never about it, is skipped, and is lost permanently and
-            # silently: it reaches neither the graph nor the index, so
-            # fact_audit's two witnesses agree, both :introduced-by checks only
-            # look at entities that exist, and stderr carries nothing.
-            #
-            # The count must come from the interval, NOT be computed here. A
-            # count computed at archive time is computed from the very span it
-            # is then compared against, so it always agrees and discriminates
-            # nothing. An interval with no stored count (written before this
-            # attribute existed) is not archived either -- "no denominator" and
-            # "a denominator that still checks out" must not be the same
-            # branch when the failure mode is silent permanent loss. The cost
-            # of not archiving is one full re-walk, which is exactly what
-            # master does here.
-            high_count = _frontier_read_pos_count(db, _FRONTIER_HIGH_IDENT)
-            if hi_lo_pos <= hi_hi_pos and high_count == hi_hi_pos - hi_lo_pos + 1:
-                _completed_region_record(
-                    db, high_bounds[0], high_bounds[1], ":provisional",
-                    run_ts_iso, index_con=index_con,
-                    order={h: i for i, h in enumerate(linearization)},
-                )
-            _frontier_discard_interval(
-                db, _FRONTIER_HIGH_IDENT, high_bounds, index_con=index_con,
-                pos_count=high_count,
-            )
+    if high_bounds is not None:
+        high_count = _frontier_read_pos_count(db, _FRONTIER_HIGH_IDENT)
+        _load_one_interval(
+            db, _FRONTIER_HIGH_IDENT, high_bounds, high_count, hash_to_pos,
+            linearization, run_ts_iso, intervals, is_base=True, index_con=index_con,
+        )
+    for ident, lo_hash, hi_hash, count in _intervals_read_extra(db):
+        _load_one_interval(
+            db, ident, (lo_hash, hi_hash), count, hash_to_pos,
+            linearization, run_ts_iso, intervals, is_base=False, index_con=index_con,
+        )
+    _frontier_promote_base_if_missing(db, intervals, linearization, run_ts_iso, index_con=index_con)
     return frontier_registry.FrontierAllocator(len(linearization), intervals)
+
+
+def _load_one_interval(
+    db: Any,
+    ident: str,
+    bounds: Tuple[str, str],
+    pos_count: Optional[int],
+    hash_to_pos: Dict[str, int],
+    linearization: List[str],
+    run_ts_iso: str,
+    intervals: List["frontier_registry.Interval"],
+    is_base: bool,
+    index_con: Optional[Any] = None,
+) -> None:
+    """Retain, or archive-and-retract, one persisted provisional interval.
+
+    RETAINED iff both bounds resolve in this linearization, lo <= hi, and the
+    STORED :pos-count still equals the current span. Dropping the old
+    `hi == last position` test is #325's whole point -- new commits landing
+    on HEAD no longer force a re-walk of the whole region, only a fresh hole
+    above it. Adding the count check is mandatory, not defensive: the old
+    retain path performed no count check at all and was safe only by
+    accident -- a genuinely new commit implies a new tip, so a commit landing
+    strictly INSIDE the old bounds forced `hi != last` and pushed the case
+    onto the discard path, where the count check already lived. Retaining
+    `hi < last` removes that accident, and an insertion inside a retained
+    interval is silent permanent loss: the commit reaches neither the graph
+    nor the index, so fact_audit's two witnesses agree, both :introduced-by
+    checks only examine entities that exist, and stderr carries nothing.
+
+    An interval carrying NO count is not retained. "No denominator" and "a
+    denominator that still checks out" must not be the same branch when the
+    failure mode is silent permanent loss -- the fail-safe direction is to
+    re-walk.
+
+    "_frontier_persist_claim is the LAST write of a position, so membership in
+    this interval proves that position completed" is FALSE as a standalone
+    claim -- see _skip_claim's docstring. :lo-hash is a closed RANGE bound, so
+    membership is implied by a NEIGHBOUR's claim, not necessarily by the
+    position's own: a write that raises takes _run_ingestion's per-commit
+    `except`, which continues the descent, and the next lower position that
+    succeeds sweeps the failed one into the interval. What makes membership
+    mean the position's OWN completion is _run_ingestion's
+    `rev_claim_floor` gate (per target ident since #325), which stops
+    :lo-hash descending past a position this run failed to complete -- a
+    retained (or later archived) interval is only ever as precise as that
+    floor made it.
+
+    A region is stored as two hashes but consumed as a closed POSITION RANGE,
+    which holds only if the linearization grew by APPENDING above it.
+    `git log --topo-order --reverse` gives no such guarantee: it places a new
+    commit immediately after its branch point whenever the old tip's line
+    stalls behind it -- "branch off an old commit, merge the mainline in,
+    fast-forward the mainline" is enough. Such a commit lands INSIDE the
+    bounds, is covered by a proof that was never about it, and is skipped.
+    That is exactly what the stored :pos-count checksum is for: the count
+    MUST come from the interval, never be recomputed here, because a count
+    computed from the very span it is then compared against always agrees and
+    discriminates nothing (equal count does not by itself prove the same
+    member set -- see the design spec's "checksum, not proof of set
+    identity" residual -- but it is what stands between this path and the
+    #325 tip-growth loss it exists to close).
+
+    Anything not retained is discarded (its facts retracted). Only the
+    UNRESOLVABLE-bounds case (the "divergent-ref leak", #325) is also
+    ARCHIVED as a :type/completed-region first: a REPRESENTABLE pair that
+    fails the retain check failed it on the count, so archiving it here too
+    would record a region whose freshly-computed count always matches its own
+    (now-wrong) bounds -- the same discriminates-nothing failure the retain
+    check exists to avoid. An unresolvable pair carries no position space to
+    recompute a count from at all -- routing it through
+    _completed_region_record's `order`-driven count would silently produce
+    None -- so the archive writes the interval's OWN stored pos_count
+    directly instead (#325 review round 2), preserving the CLAIM-time
+    denominator as the witness's checksum rather than discarding it.
+
+    That checksum only becomes USABLE again in a run whose linearization
+    regains these exact commit hashes -- ordinary history rewrites (rebase,
+    amend) never reproduce a prior hash, they only replace it, so in
+    practice an archived divergent-ref region is discovered once, discarded,
+    and never consulted by _skip_claim again in any two-run scenario. That is
+    a real, measured consequence of #325 (not a defect introduced by this
+    docstring's fix): the fast path _skip_claim provides stays CORRECT for
+    the case it still covers, but that case is narrower after #325 than
+    #326 assumed -- see TestDivergentRefEndToEnd's docstring in
+    tests/test_mcp_server.py for the full accounting.
+
+    Leaving a non-retained interval's facts in the graph -- what happened to
+    an unresolvable pair before this fix -- was NEITHER a discard NOR an
+    archive: the facts stayed while no interval loaded, so the next
+    _frontier_persist_claim read a non-None `existing` and extended bounds the
+    allocator no longer believed in.
+    """
+    lo_hash, hi_hash = bounds
+    lo_pos = hash_to_pos.get(lo_hash)
+    hi_pos = hash_to_pos.get(hi_hash)
+    tag = ":provisional"
+    resolved = lo_pos is not None and hi_pos is not None
+    if resolved and lo_pos <= hi_pos and pos_count == hi_pos - lo_pos + 1:
+        if is_base:
+            anchor_pos = hi_pos
+        else:
+            # #325: the ident's identity is the anchor hash it was minted
+            # from (_interval_ident), never the current bounds -- a
+            # provisional interval grows downward, so :hi-hash stays fixed at
+            # the anchor under normal claims, but recover it from the ident
+            # rather than assuming that, in case a merge ever changes it.
+            # Falls back to hi_pos only if the anchor hash itself has dropped
+            # out of this linearization -- and #325 review round 3 (Finding
+            # 3) is why the ORIGINAL `ident` string is still carried onto the
+            # Interval below in that case: anchor_pos=hi_pos is a stand-in
+            # for GAP MATH only, and re-deriving _interval_ident from it
+            # would mint a DIFFERENT ident than the one actually on disk,
+            # creating a second live entity for the same region the moment a
+            # later claim persists through the re-derived one instead.
+            suffix = ident[len(_INTERVAL_PROVISIONAL_IDENT_PREFIX):]
+            anchor_pos = next(
+                (pos for h, pos in hash_to_pos.items() if h.startswith(suffix)), hi_pos
+            )
+        intervals.append(frontier_registry.Interval(
+            lo_pos, hi_pos, frontier_registry.TAG_PROVISIONAL,
+            anchor_pos=anchor_pos, is_base=is_base, ident=ident,
+        ))
+        return
+    if not resolved and pos_count is not None:
+        # #325 review round 2: carry the interval's OWN stored :pos-count
+        # through to the archive, rather than routing through
+        # _completed_region_record (whose count would be None here -- no
+        # order map exists, since at least one bound is absent from this
+        # linearization and there is no position space to compute a fresh
+        # count from). A None count is exactly what _completed_regions_load
+        # refuses to trust: "no denominator" and "a denominator that still
+        # checks out" must not be the same branch. This interval's
+        # pos_count was written at CLAIM time under whatever linearization
+        # these positions were claimed against, and stays a legitimate
+        # checksum even though it can no longer be recomputed here -- if
+        # the branch ever un-diverges back to these exact hashes, a later
+        # run's _completed_regions_load can then trust it (though bounds
+        # this specific are only ever resolvable again if the exact same
+        # commit hashes reappear, which no ordinary rebase produces).
+        #
+        # Bypasses _completed_region_record's coalescing machinery
+        # entirely, rather than calling it with an explicit count it has
+        # no parameter to accept: an unresolvable region has no position
+        # space to merge into by definition (verified against order=None
+        # per the original Task 4 ruling -- it records fine, just with a
+        # count of None). Query-before-write directly, matching the
+        # pattern every other write site here uses (#156): this ident is
+        # archived at most once in practice, since the discard below
+        # retracts the source facts and _load_one_interval is never
+        # called again for this ident once they are gone -- but a stray
+        # second call must still not duplicate a live datom.
+        region_ident = _completed_region_ident(lo_hash, tag)
+        existing_region = _db_execute(
+            db, f"(query [:find ?lo :where [{region_ident} :lo-hash ?lo]])"
+        )
+        if not json.loads(existing_region).get("results", []):
+            _transact(
+                db,
+                _completed_region_facts(lo_hash, hi_hash, tag, pos_count=pos_count),
+                run_ts_iso,
+                index_con=index_con,
+            )
+    _frontier_discard_interval(
+        db, ident, bounds, index_con=index_con, pos_count=pos_count, tag=tag,
+    )
+
+
+def _frontier_promote_base_if_missing(
+    db: Any,
+    intervals: List["frontier_registry.Interval"],
+    linearization: List[str],
+    run_ts_iso: str,
+    index_con: Optional[Any] = None,
+) -> None:
+    """#325 review round 3, Finding 1: restore the base invariant ON DISK
+    when a run ends with a fragmented provisional side that has no base at
+    all.
+
+    Reachable, reproduced against a real graph: a commit landing inside
+    frontier-high's span breaks its stored :pos-count, so it is discarded
+    (_load_one_interval), while an extra interval ABOVE it is unaffected and
+    stays retained. _load_one_interval only ever passes is_base=True for
+    :ingestion/frontier-high, so the provisional side then loads with every
+    interval is_base=False. frontier_registry._extend cannot self-heal this:
+    `is_base = not any(iv.tag == tag for iv in self._intervals)` is False
+    while ANY same-tag interval already exists, and _coalesce's survivor
+    rule only PRESERVES an existing base, it never MANUFACTURES one. Left
+    alone, :ingestion/frontier-high never comes back -- and
+    _correction_sweep_select_position returns None on `high_bounds is
+    None`, so Stage B never runs again, :ingestion/lineage-confirmed-through
+    never advances, and the forward stream is deliberately starved above a
+    retained provisional region (#325 review round 2, Ruling 1) -- so
+    nothing else ever upgrades that lineage. Provisional :introduced-by
+    stays provisional for the life of the graph, silently, on a run that
+    reports status: complete.
+
+    The fix lands ON DISK, not just on the returned allocator's in-memory
+    intervals: the write dispatch re-mints a claim's persist target from
+    interval.is_base/.anchor_pos (_reverse_claim_persist_target) every run,
+    so an in-memory-only promotion would still persist through the OLD
+    minted ident next time and :ingestion/frontier-high would still never
+    reappear on disk.
+
+    Picks the LOWEST retained extra (by lo_pos) -- the one that would have
+    become the base under ordinary claiming, had frontier-high not been
+    discarded out from under it. Retracts its facts at its OWN (minted)
+    ident and rewrites them at the fixed :ingestion/frontier-high ident,
+    copying its stored :pos-count VERBATIM -- never recomputed, since
+    recomputing would discard the claim-time origin the retain check itself
+    depends on (the same "count must come from the interval, never be
+    recomputed where it is read" rule _load_one_interval follows).
+    Retract-before-transact, the same order every other absorb-then-extend
+    write here uses: a crash in between leaves a WINDOW WITH NEITHER entity
+    describing the span (the old ident's facts are already gone, the fixed
+    ident's are not yet written) -- the span reads unclaimed and is
+    re-walked, fail-safe -- rather than a DUPLICATE description, which is
+    what transacting first would produce (both entities live at once, each
+    still faithful to its own span, and nothing left to notice the
+    redundancy once the second write lands).
+    """
+    provisional = [iv for iv in intervals if iv.tag == frontier_registry.TAG_PROVISIONAL]
+    if not provisional or any(iv.is_base for iv in provisional):
+        return
+    chosen = min(provisional, key=lambda iv: iv.lo_pos)
+    old_ident = chosen.ident
+    if old_ident is None:
+        # Never happens for a loaded extra -- _load_one_interval always sets
+        # ident. Defensive only: fail safe (no promotion, re-walked next
+        # time via the same missing-base path) rather than promote an
+        # interval this function cannot correctly retract.
+        return
+    lo_hash, hi_hash = linearization[chosen.lo_pos], linearization[chosen.hi_pos]
+    pos_count = _frontier_read_pos_count(db, old_ident)
+    _frontier_discard_interval(
+        db, old_ident, (lo_hash, hi_hash), index_con=index_con,
+        pos_count=pos_count, tag=":provisional",
+    )
+    facts = [
+        f"[{_FRONTIER_HIGH_IDENT} :entity-type :type/ingest-interval]",
+        f"[{_FRONTIER_HIGH_IDENT} :tag :provisional]",
+        f'[{_FRONTIER_HIGH_IDENT} :lo-hash "{_edn_escape(lo_hash)}"]',
+        f'[{_FRONTIER_HIGH_IDENT} :hi-hash "{_edn_escape(hi_hash)}"]',
+    ]
+    if pos_count is not None:
+        facts.append(f"[{_FRONTIER_HIGH_IDENT} :pos-count {int(pos_count)}]")
+    _transact(db, "[" + " ".join(facts) + "]", run_ts_iso, index_con=index_con)
+
+    idx = next(i for i, iv in enumerate(intervals) if iv is chosen)
+    intervals[idx] = frontier_registry.Interval(
+        chosen.lo_pos, chosen.hi_pos, frontier_registry.TAG_PROVISIONAL,
+        anchor_pos=chosen.hi_pos, is_base=True, ident=_FRONTIER_HIGH_IDENT,
+    )
 
 
 def _frontier_discard_interval(
@@ -6265,6 +6520,7 @@ def _frontier_discard_interval(
     bounds: Tuple[str, str],
     index_con: Optional[Any] = None,
     pos_count: Optional[int] = None,
+    tag: Optional[str] = None,
 ) -> None:
     """Retract an interval's persisted facts, mirroring the set
     _frontier_persist_claim creates. Used by _frontier_load when a persisted
@@ -6274,8 +6530,21 @@ def _frontier_discard_interval(
     read one. Left behind it would attach to whatever interval the next
     _frontier_persist_claim creates at this ident and license a comparison
     against a span it was never measured from.
+
+    `tag` defaults to None, meaning "derive it the way the two fixed idents
+    always have" -- frontier-low is :authoritative, everything else (including
+    frontier-high) is :provisional. #325's minted per-anchor idents need the
+    caller to say which tag was actually written, since neither fixed ident
+    equality holds for them.
+
+    A minted ident (the #325 _INTERVAL_PROVISIONAL_IDENT_PREFIX form) also
+    carries a string-valued :ident fact -- unlike frontier-high/-low, which are
+    read by fixed ident and never had one -- so its retract set includes it.
+    Leaving it live would leak the fact and keep the entity answering
+    _intervals_read_extra's enumeration after every other fact is gone.
     """
-    tag = ":authoritative" if ident == _FRONTIER_LOW_IDENT else ":provisional"
+    if tag is None:
+        tag = ":authoritative" if ident == _FRONTIER_LOW_IDENT else ":provisional"
     facts = [
         f"[{ident} :entity-type :type/ingest-interval]",
         f"[{ident} :tag {tag}]",
@@ -6284,6 +6553,8 @@ def _frontier_discard_interval(
     ]
     if pos_count is not None:
         facts.append(f"[{ident} :pos-count {int(pos_count)}]")
+    if ident.startswith(_INTERVAL_PROVISIONAL_IDENT_PREFIX):
+        facts.append(f'[{ident} :ident "{_edn_escape(ident)}"]')
     _retract(db, "[" + " ".join(facts) + "]", index_con=index_con)
 
 
@@ -6395,6 +6666,20 @@ def _completed_region_record(
 ) -> None:
     """Archive [lo_hash, hi_hash] as a completed region, coalescing it into the
     existing same-tag set.
+
+    #325 final review: this function currently has ZERO production call
+    sites (`grep -n '_completed_region_record(' mcp_server.py` matches only
+    this def). The one place that archives an unresolvable-bounds region
+    (`_load_one_interval`, the `not resolved and pos_count is not None`
+    branch) writes `_completed_region_facts` directly behind its own
+    query-before-write guard instead of calling here, precisely because that
+    case has no position space to coalesce into (see that branch's own
+    comment). So the coalescing/pruning machinery below is exercised only by
+    tests today, and unresolvable-bounds regions accumulate on disk without
+    bound -- one entity per divergence event, never merged, never retracted.
+    Not a bug to fix here: recorded so a future caller of this function (or a
+    decision to prune those regions another way) does not have to
+    rediscover the gap first.
 
     Query-before-write, the guard _watermark_update and _frontier_persist_claim
     established: a deterministic ident only guarantees repeated writes target
@@ -6680,8 +6965,10 @@ def _skip_claim(
     descent, and the next lower position that succeeds sweeps the failed one
     into the interval. #313 is safe only because a SIGKILL stops the process.
     What makes membership mean the position's own completion is the floor gate
-    in _run_ingestion (`rev_claim_floor_pos`), which stops :lo-hash descending
-    past a position this run failed to complete.
+    in _run_ingestion (`rev_claim_floor`, keyed per target ident since #325 --
+    a single run-global scalar stopped discriminating once one run could serve
+    more than one gap), which stops :lo-hash descending past a position this
+    run failed to complete.
 
     The other guard is a CHECKSUM, not a proof of set identity: the stored
     :pos-count catches a linearization whose span changed, but equal count does
@@ -6706,25 +6993,140 @@ def _frontier_persist_claim(
     from_low: bool,
     commit_ts_iso: str,
     index_con: Optional[Any] = None,
+    ident: Optional[str] = None,
+    absorbed_idents: Optional[List[str]] = None,
 ) -> None:
-    """Persist a single claimed position by extending the correct fixed-ident
-    interval fact -- retracts+reasserts only the moved bound, mirroring
+    """Persist a single claimed position by extending the correct interval
+    fact -- retracts+reasserts only the moved bound, mirroring
     _watermark_update's per-commit cost profile (see the design spec's
     "Persistence timing" and "Graph persistence schema" sections).
+
+    `ident` defaults to today's fixed low/high choice (_FRONTIER_LOW_IDENT /
+    _FRONTIER_HIGH_IDENT), so every pre-#325 call site and test keeps writing
+    exactly what it always has. #325's reverse walk instead names a specific
+    provisional interval entity (_interval_ident) when the claim belongs to
+    one already tracked separately from frontier-high.
+
+    `absorbed_idents` names entities this claim's merge swallows -- the
+    interval named by `ident` and one or more others have just become
+    contiguous, and the others stop existing as their own entities. They are
+    retracted BEFORE `ident`'s bound is extended: a crash between the two
+    then leaves a WINDOW WITH NEITHER entity describing the absorbed span
+    (the absorbed entity's facts are already retracted, `ident`'s bound has
+    not yet been extended over that span) -- unclaimed and re-walked by the
+    next _frontier_load, nothing lost. Extending first would instead risk the
+    DUPLICATE outcome: a crash between the two would leave `ident` already
+    claiming the full merged span while the absorbed entity's now-redundant
+    facts are still live -- and a crash there is invisible right up until
+    _frontier_discard_interval never runs, silently leaking a phantom entity
+    into _intervals_read_extra forever.
+
+    #325 review Finding 1: a merging claim's survivor takes the UNION of its
+    own existing bounds, every absorbed interval's bounds, and the claimed
+    position -- never just the one bound the non-merging branch below moves.
+    An earlier version of this function moved only that one bound on a merge
+    too, which retracted the absorbed entity's facts while its span ended up
+    described by NOBODY: measured producing an inverted survivor with a
+    NEGATIVE :pos-count (`('h7','h5')`, count -1) from claims that had built
+    `('h4','h5')` and `('h8','h9')` before the merge. `_frontier_load`'s
+    `lo <= hi` guard happens to catch that specific shape today by discarding
+    frontier-high outright -- but that throws away the completion witness for
+    the WHOLE interval, which is exactly the loss #326's archiving exists to
+    prevent, and an absorbed interval BELOW the survivor is not caught at all
+    ([100,120] absorbing [50,98] via a claim at 99 would silently produce
+    [99,120], losing the proven [50,98] region with no inversion to trip the
+    guard).
+
+    `_coalesce`'s same-tag filter (frontier_registry.py) is what makes
+    passing the survivor's own `tag` to every absorbed entity's discard
+    correct -- a merge can only ever absorb an interval carrying the SAME tag
+    as the survivor. If that invariant is ever relaxed, a mismatched `:tag`
+    literal here matches nothing on retract, leaving a live `:tag` fact on an
+    entity whose `:entity-type` and `:ident` are already gone -- silently,
+    since `_intervals_read_extra` can never surface it again to notice.
     """
-    ident = _FRONTIER_LOW_IDENT if from_low else _FRONTIER_HIGH_IDENT
+    if ident is None:
+        ident = _FRONTIER_LOW_IDENT if from_low else _FRONTIER_HIGH_IDENT
     tag = ":authoritative" if from_low else ":provisional"
+
+    absorbed_bounds_list: List[Tuple[str, str]] = []
+    for absorbed in absorbed_idents or []:
+        absorbed_bounds = _frontier_read_bounds(db, absorbed)
+        # An absorbed ident can name an interval that was minted and merged
+        # away again within the same run before its first claim ever
+        # persisted -- there is nothing on disk to retract or fold into the
+        # union below, so it is skipped rather than treated as an error.
+        if absorbed_bounds is not None:
+            absorbed_bounds_list.append(absorbed_bounds)
+            _frontier_discard_interval(
+                db, absorbed, absorbed_bounds, index_con=index_con,
+                pos_count=_frontier_read_pos_count(db, absorbed), tag=tag,
+            )
+
     moved_hash = linearization[pos]
     existing = _frontier_read_bounds(db, ident)
 
     to_retract: List[str] = []
     to_transact: List[str] = []
-    if existing is None:
+    # #325 review round 2: branch on `absorbed_idents` (what the CALLER says
+    # merged), never on `absorbed_bounds_list` (what survived the phantom
+    # filter above). A merge whose absorbed interval was minted and coalesced
+    # away again within the SAME _extend() call -- degenerate from birth, so
+    # it never got an independent claim to persist -- leaves
+    # absorbed_bounds_list empty while absorbed_idents is not, and the two
+    # used to be treated as the same signal. They are not: falling through to
+    # the plain single-bound-move branch below then MOVES the wrong bound
+    # (assuming the claim is adjacent to the survivor's own lo, which is false
+    # whenever the claim actually landed on the far side of a gap and merged
+    # through a same-call phantom) and silently INVERTS the pair -- measured
+    # producing exactly `(hash-at-9, hash-at-8)` for a claim at position 9
+    # against a base spanning [6,8], from TestMultiStreamParityWithForwardOnly.
+    # A phantom absorbed interval's span is always exactly the claimed
+    # position itself (it was created AND absorbed by that one claim, with no
+    # independent history), so `moved_hash` already covers it in the union
+    # below -- no special contribution needed, only the branch choice matters.
+    if absorbed_idents:
+        # #325: the merged span is the union of the claimed position, the
+        # survivor's own current bounds (if it already existed), and every
+        # absorbed interval's bounds -- see the docstring's Finding 1 note
+        # for what moving only one bound produced instead.
+        candidate_hashes = [moved_hash]
+        if existing is not None:
+            candidate_hashes.extend(existing)
+        for absorbed_lo, absorbed_hi in absorbed_bounds_list:
+            candidate_hashes.extend((absorbed_lo, absorbed_hi))
+        positions = [linearization.index(h) for h in candidate_hashes]
+        new_lo_hash = linearization[min(positions)]
+        new_hi_hash = linearization[max(positions)]
+
+        if existing is None:
+            to_transact.append(f"[{ident} :entity-type :type/ingest-interval]")
+            to_transact.append(f"[{ident} :tag {tag}]")
+        else:
+            lo_hash, hi_hash = existing
+            if lo_hash != new_lo_hash:
+                to_retract.append(f'[{ident} :lo-hash "{_edn_escape(lo_hash)}"]')
+            if hi_hash != new_hi_hash:
+                to_retract.append(f'[{ident} :hi-hash "{_edn_escape(hi_hash)}"]')
+        to_transact.append(f'[{ident} :lo-hash "{_edn_escape(new_lo_hash)}"]')
+        to_transact.append(f'[{ident} :hi-hash "{_edn_escape(new_hi_hash)}"]')
+        if existing is None and ident.startswith(_INTERVAL_PROVISIONAL_IDENT_PREFIX):
+            to_transact.append(f'[{ident} :ident "{_edn_escape(ident)}"]')
+        new_count: Optional[int] = _frontier_span_count(linearization, new_lo_hash, new_hi_hash)
+    elif existing is None:
         to_transact.append(f"[{ident} :entity-type :type/ingest-interval]")
         to_transact.append(f"[{ident} :tag {tag}]")
         to_transact.append(f'[{ident} :lo-hash "{_edn_escape(moved_hash)}"]')
         to_transact.append(f'[{ident} :hi-hash "{_edn_escape(moved_hash)}"]')
-        new_count: Optional[int] = 1
+        # #325: a minted ident (_INTERVAL_PROVISIONAL_IDENT_PREFIX's form)
+        # needs its own string-valued :ident fact so _intervals_read_extra
+        # can enumerate it -- frontier-low/-high are read by fixed ident and
+        # never carry one, and adding one to them would make them show up in
+        # that enumeration too, breaking its "frontier-high is not extra"
+        # contract.
+        if ident.startswith(_INTERVAL_PROVISIONAL_IDENT_PREFIX):
+            to_transact.append(f'[{ident} :ident "{_edn_escape(ident)}"]')
+        new_count = 1
     else:
         lo_hash, hi_hash = existing
         if from_low:
@@ -6788,6 +7190,7 @@ def _frontier_persist_span(
     from_low: bool,
     commit_ts_iso: str,
     index_con: Optional[Any] = None,
+    ident: Optional[str] = None,
 ) -> None:
     """Persist a whole claimed SPAN in one write, for #326's end-of-walk flush.
 
@@ -6795,26 +7198,38 @@ def _frontier_persist_span(
     facts are gone, so its `existing is None` branch writes lo == hi ==
     moved_hash: the interval collapses to a point and the top bound is lost.
 
+    `ident` defaults to today's fixed low/high choice, same rationale as
+    _frontier_persist_claim's: every pre-#325 call site keeps flushing
+    frontier-low/-high unchanged, and #325's walk names a specific
+    provisional interval entity when the flush belongs to one.
+
     Advance-only in both directions -- the flush is bookkeeping catching up with
     the allocator, and must never retreat a bound a real per-commit claim
     already moved. A span that changes nothing writes nothing (#156: a
     re-transact at a new valid-from is not a graph-level no-op).
     """
-    ident = _FRONTIER_LOW_IDENT if from_low else _FRONTIER_HIGH_IDENT
+    if ident is None:
+        ident = _FRONTIER_LOW_IDENT if from_low else _FRONTIER_HIGH_IDENT
     tag = ":authoritative" if from_low else ":provisional"
     lo_hash, hi_hash = linearization[lo_pos], linearization[hi_pos]
     existing = _frontier_read_bounds(db, ident)
 
     if existing is None:
+        facts = [
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f"[{ident} :tag {tag}]",
+            f'[{ident} :lo-hash "{_edn_escape(lo_hash)}"]',
+            f'[{ident} :hi-hash "{_edn_escape(hi_hash)}"]',
+            f"[{ident} :pos-count {hi_pos - lo_pos + 1}]",
+        ]
+        # #325: same rule _frontier_persist_claim follows -- a minted ident
+        # needs its own :ident fact to be enumerable via _intervals_read_extra;
+        # frontier-low/-high never get one.
+        if ident.startswith(_INTERVAL_PROVISIONAL_IDENT_PREFIX):
+            facts.append(f'[{ident} :ident "{_edn_escape(ident)}"]')
         _transact(
             db,
-            "[" + " ".join([
-                f"[{ident} :entity-type :type/ingest-interval]",
-                f"[{ident} :tag {tag}]",
-                f'[{ident} :lo-hash "{_edn_escape(lo_hash)}"]',
-                f'[{ident} :hi-hash "{_edn_escape(hi_hash)}"]',
-                f"[{ident} :pos-count {hi_pos - lo_pos + 1}]",
-            ]) + "]",
+            "[" + " ".join(facts) + "]",
             commit_ts_iso,
             index_con=index_con,
         )
@@ -10283,12 +10698,36 @@ def _reverse_apply(
     file_results: List[tuple],
     index_con: Optional[Any] = None,
     persist_claim: bool = True,
+    claim_ident: Optional[str] = None,
+    absorbed_idents: Optional[List[str]] = None,
 ) -> str:
     """#222 phase 2b: apply one already-claimed, already-extracted commit --
     structural facts, :modified-in edges, and provisional :introduced-by for
     every entity the commit's "A"/"M" files touch. "D"/"R" files are skipped
     entirely (deletions and renames are out of scope for this sub-phase --
     see the design spec).
+
+    `claim_ident`/`absorbed_idents` (#325 review round 2, the ident-wiring
+    slice of Task 5's scope): passed straight through to
+    _frontier_persist_claim's own `ident`/`absorbed_idents`. Both default to
+    None, which _frontier_persist_claim reads as "the fixed
+    :ingestion/frontier-high ident, nothing absorbed" -- correct for every
+    caller before #325's provisional side could hold more than one
+    interval. Once it can, the caller MUST supply the claim's own target:
+    _run_ingestion captures `allocator.last_claim` right after the claim
+    that produced this position (before any LATER claim overwrites it) and
+    resolves its ident via `_interval_persist_ident`, which prefers the
+    interval's own carried `.ident` over re-deriving one from
+    `.is_base`/`.anchor_pos` -- `_load_one_interval` no longer resolves an
+    ident on the read side either, it carries the one it was handed (#325
+    review round 3, Finding 3). Get this wrong and every reverse claim
+    persists to :ingestion/frontier-high regardless of which in-memory
+    interval it actually belongs to --
+    measured producing an INVERTED pair (`lo` from the new claim's hash,
+    `hi` still the old interval's) the moment a reverse claim lands above a
+    RETAINED interval it does not touch, which is silent since
+    `_frontier_read_bounds` returns the pair as-is and nothing checks
+    lo <= hi until the next _frontier_load.
 
     Split out of _reverse_fill_claim_and_process's single body (#222 phase
     2d): `pos` (from allocator.claim_high()) and `file_results` (from
@@ -10591,14 +11030,18 @@ def _reverse_apply(
 
     # #326 (Finding A): `persist_claim=False` withholds the BOOKKEEPING for this
     # position, never the work -- every triple above has already been written.
-    # See _run_ingestion's `rev_claim_floor_pos` for why: :lo-hash is a RANGE
-    # bound, so claiming a position below one whose write FAILED silently
-    # swallows the failed position into the interval, and the archive then turns
-    # that into a permanent skip. Do NOT "optimize" this into skipping the
+    # See _run_ingestion's `rev_claim_floor` (per target ident since #325) for
+    # why: :lo-hash is a RANGE bound, so claiming a position below one whose
+    # write FAILED silently swallows the failed position into the interval,
+    # and the archive then turns that into a permanent skip. Do NOT
+    # "optimize" this into skipping the
     # writes as well: the run below the floor is still doing real, necessary
     # ingestion, it is simply not entitled to assert that it completed.
     if persist_claim:
-        _frontier_persist_claim(db, linearization, pos, from_low=False, commit_ts_iso=commit_ts_iso, index_con=index_con)
+        _frontier_persist_claim(
+            db, linearization, pos, from_low=False, commit_ts_iso=commit_ts_iso,
+            index_con=index_con, ident=claim_ident, absorbed_idents=absorbed_idents,
+        )
     _db_checkpoint_gated(db)
     return commit_hash
 
@@ -11360,6 +11803,7 @@ def _correction_sweep_select_position(
     linearization: List[str],
     commit_metadata: List[Tuple[str, str, str, str]],
     hash_to_pos: Optional[Dict[str, int]] = None,
+    fragmented: Optional[bool] = None,
 ) -> Optional[Tuple[str, str]]:
     """Returns (commit_hash, commit_ts_iso) for the next commit this sweep
     should process, upward through frontier-high's own claimed territory,
@@ -11367,8 +11811,10 @@ def _correction_sweep_select_position(
     (Stream 2 could still descend past a position this call would confirm
     -- see the design spec's "Why confirming requires the gap to already
     be closed"), frontier-high hasn't claimed anything yet, a required
-    boundary hash is stale, commit_metadata doesn't match linearization, or
-    the sweep has already reached frontier-high's own :hi-hash.
+    boundary hash is stale, the provisional side is still fragmented (a
+    hole above frontier-high, #325), commit_metadata doesn't match
+    linearization, or the sweep has already reached frontier-high's own
+    :hi-hash.
 
     DB-bound, parse-free -- must run off the event-loop thread (per the
     design spec's Execution context) but never on the same executor as
@@ -11377,6 +11823,19 @@ def _correction_sweep_select_position(
     hash_to_pos, if omitted, is built fresh from linearization -- callers
     doing a full sweep should build it once and pass it in instead to
     avoid rebuilding an N-entry map on every one of a full sweep's N calls.
+
+    fragmented, if omitted, is computed fresh via _intervals_read_extra(db)
+    -- two datalog queries. #325 review Finding 3: the Stage B driving loop
+    in _run_ingestion calls this function once per swept position, and
+    fragmentation cannot change within that loop (Stage B only starts once
+    completed_all is True, meaning the whole gap is claimed and the walk
+    that mints/merges interval entities has already finished for this run;
+    nothing in the Stage B loop body writes an interval fact), so that
+    driver computes it ONCE before the loop and passes it in on every call,
+    the same hash_to_pos idiom -- turning O(N) extra queries per sweep into
+    O(1). A caller that omits it (every direct test call, and any future
+    caller that cannot prove the no-mid-loop-mutation invariant for its own
+    situation) gets the always-correct, always-fresh read.
     """
     low_bounds = _frontier_read_bounds(db, _FRONTIER_LOW_IDENT)
     high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
@@ -11408,6 +11867,12 @@ def _correction_sweep_select_position(
     if low_hi_pos + 1 != hash_to_pos[high_bounds[0]]:
         return None  # gap still open -- Stream 2 may still descend past a position
                      # this sweep would otherwise confirm
+
+    if fragmented if fragmented is not None else _intervals_read_extra(db):
+        return None  # #325: a hole remains above frontier-high, so Stream 2 can
+                     # still descend past a position this sweep would confirm.
+                     # Once everything coalesces there is exactly one provisional
+                     # interval and the gap-closed test above is exact again.
 
     if high_bounds[1] not in hash_to_pos:
         return None  # frontier-high's :hi-hash is stale; nothing safe to do
@@ -11777,16 +12242,24 @@ def _should_fold_lineage_watermark(db: Any, linearization: List[str]) -> bool:
     to it.
 
     Stage B's loop exit alone must NOT trigger the fold.
-    _correction_sweep_select_position returns None for six different
+    _correction_sweep_select_position returns None for seven different
     reasons, only one of which is "reached the ceiling": it also returns
     None when frontier-high is absent, when either boundary hash is stale
-    (rewritten history), when the gap is still open, and when
-    commit_metadata violates its contract. Folding on any None would report
-    lineage as confirmed through HEAD in exactly the situations where the
-    sweep did no work at all.
+    (rewritten history), when the gap is still open, when the provisional
+    side is still fragmented -- a hole above frontier-high (#325) -- and
+    when commit_metadata violates its contract. Folding on any None would
+    report lineage as confirmed through HEAD in exactly the situations
+    where the sweep did no work at all.
     """
     high_bounds = _frontier_read_bounds(db, _FRONTIER_HIGH_IDENT)
     if high_bounds is None:
+        return False
+    if _intervals_read_extra(db):
+        # #325: a hole remains above frontier-high, so the sweep itself
+        # would have declined (see _correction_sweep_select_position) even
+        # if through_hash already equals high_bounds[1] from before the
+        # hole opened up -- folding here would still misreport lineage as
+        # confirmed through a ceiling Stream 2 can still descend past.
         return False
     through_hash = _correction_sweep_through_query(db)
     if through_hash is None:
@@ -11852,29 +12325,135 @@ class _RoundRobinClaimer:
     def next_claim(self) -> Optional[Tuple[str, int]]:
         """('fwd', pos) or ('rev', pos), or None once the gap is empty.
 
-        There is deliberately no "the other side might still have work"
-        fallback: claim_low() and claim_high() both return None on exactly
-        the same condition, is_gap_empty(), so they can only ever return
-        None together. A fallthrough would be dead code reading as if the
-        two frontiers could exhaust independently -- they cannot; they share
-        one gap.
+        #325 review round 2: claim_low() and claim_high() no longer return
+        None on exactly the same condition -- that invariant held only
+        because claim_low() used to serve the lowest unclaimed position
+        unconditionally. It now refuses a hole that is not adjacent to the
+        authoritative interval's own edge (the forward stream's contiguous-
+        from-C0 contract; see claim_low()'s own docstring), which can be
+        true while claim_high() can still serve the topmost hole -- e.g. the
+        bulk gap between the two sides has already closed and only a fresh
+        tip gap remains, not touching the authoritative interval at all.
+
+        So a None from the CURRENT phase's own stream is no longer proof the
+        shared gap is empty; only is_gap_empty() is. When it is forward's
+        turn and claim_low() has nothing legitimate to do, this hands the
+        turn to reverse instead of reporting no claim at all -- the forward
+        stream stays starved (by design) until the provisional region folds
+        into the authoritative one, but the reverse stream must keep making
+        progress on whatever remains.
+
+        claim_high() itself is unchanged and still returns None on exactly
+        is_gap_empty(), so no symmetric fallback is needed on that side.
+
+        #325 review round 3 (Finding 5): the fallback used to keep
+        `_taken_in_phase` as accumulated under FORWARD's budget but then
+        compare it against REVERSE's limit for the very same call -- a
+        forward phase already `forward_per_round - 1` claims in would
+        immediately trip `_taken_in_phase >= reverse_per_round` on the
+        fallback claim (since `_taken_in_phase` was never reset), flip back
+        to "forward" one call later on a fresh reverse-phase entry, refuse
+        again, and repeat -- serving roughly `2 x reverse_per_round`
+        reverse claims per nominal cycle instead of `reverse_per_round`,
+        silently detaching `MINIGRAF_INGEST_STREAM_RATIO` from what it
+        configures the moment forward starves. Falling through now ENDS the
+        forward phase outright (resets `_taken_in_phase` to 0 and flips
+        `_forward_phase` to False) before charging the fallback claim
+        against reverse's own, fresh budget -- so a starved forward phase
+        costs nothing but the one free peek, and reverse gets exactly
+        `reverse_per_round` claims per cycle, same as an ordinary rotation.
         """
+        if self._allocator.is_gap_empty():
+            return None
         if self._forward_phase:
             pos = self._allocator.claim_low()
-            tag = "fwd"
-            limit = self._forward_per_round
-        else:
-            pos = self._allocator.claim_high()
-            tag = "rev"
-            limit = self._reverse_per_round
+            if pos is not None:
+                self._taken_in_phase += 1
+                if self._taken_in_phase >= self._forward_per_round:
+                    self._taken_in_phase = 0
+                    self._forward_phase = False
+                return "fwd", pos
+            # Forward has nothing legitimate to do this turn. The phase
+            # ends HERE, not after forward_per_round more attempts that
+            # would all refuse identically -- so the reverse phase that
+            # follows starts its own count from zero, never inheriting
+            # whatever forward had already accumulated.
+            self._taken_in_phase = 0
+            self._forward_phase = False
+
+        pos = self._allocator.claim_high()
         if pos is None:
             return None
-
         self._taken_in_phase += 1
-        if self._taken_in_phase >= limit:
+        if self._taken_in_phase >= self._reverse_per_round:
             self._taken_in_phase = 0
-            self._forward_phase = not self._forward_phase
-        return tag, pos
+            self._forward_phase = True
+        return "rev", pos
+
+
+def _interval_persist_ident(
+    interval: "frontier_registry.Interval", linearization: List[str]
+) -> str:
+    """The graph ident `interval` actually persists to (or would, if newly
+    minted this run).
+
+    #325 review round 3 (Finding 3): prefers `interval.ident` -- the REAL
+    on-disk identity _load_one_interval carried onto a LOADED interval --
+    over re-deriving one from `anchor_pos`. Re-derivation is only safe for
+    an interval created FRESH during this run, whose anchor_pos is its own
+    creation position in THIS linearization and therefore always resolves;
+    for a loaded extra whose original anchor hash has since dropped out of
+    the linearization, anchor_pos falls back to hi_pos for gap math only
+    (_load_one_interval), and re-deriving _interval_ident from THAT
+    fallback would mint a DIFFERENT ident than the one on disk -- creating a
+    second live entity for the same region the moment a claim persists
+    through it instead of the original.
+
+    `interval.ident` is None for every interval this run creates itself
+    (frontier_registry never sets it, only carries a caller-set one through
+    _extend/_coalesce), so the fallback below is exactly the pre-existing
+    behaviour for that case: the fixed :ingestion/frontier-high ident for a
+    base, or a freshly minted ident from the interval's own (always
+    resolvable) anchor_pos otherwise.
+    """
+    if interval.ident is not None:
+        return interval.ident
+    if interval.is_base:
+        return _FRONTIER_HIGH_IDENT
+    return _interval_ident(linearization[interval.anchor_pos])
+
+
+def _reverse_claim_persist_target(
+    allocator: "frontier_registry.FrontierAllocator", linearization: List[str]
+) -> Tuple[Optional[str], List[str]]:
+    """The (ident, absorbed_idents) a reverse claim's _frontier_persist_claim
+    call needs, read from `allocator.last_claim` -- the ClaimResult the
+    claim that produced this position just left behind.
+
+    #325 review round 2 (Task 5's ident-wiring, applied narrowly here: this
+    function and its one call site are the minimum needed to stop a reverse
+    claim above a RETAINED interval from corrupting :ingestion/frontier-high;
+    the per-interval reverse floor and end-of-walk flush generalization
+    Task 5's brief also describes are untouched).
+
+    Every absorbed interval gets the same ident resolution
+    (_interval_persist_ident) so _frontier_persist_claim can retract its
+    entity: the coalesce survivor rule (frontier_registry._coalesce) never
+    lets the base be absorbed, so an absorbed interval here is always
+    itself a non-base ident.
+
+    MUST be called immediately after the claim that produced `pos` -- a
+    later claim overwrites `allocator.last_claim`, and reading it after the
+    fact would attribute the wrong interval's ident to this position.
+    """
+    claim = allocator.last_claim
+    if claim is None:
+        return None, []
+    ident = _interval_persist_ident(claim.interval, linearization)
+    absorbed_idents = [
+        _interval_persist_ident(iv, linearization) for iv in claim.absorbed
+    ]
+    return ident, absorbed_idents
 
 
 @dataclass
@@ -12188,8 +12767,51 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # The skipped span is the only thing this flush is entitled to
                 # assert; positions above it either persisted their own claim
                 # or legitimately did not.
-                lowest_skipped_pos: Optional[int] = None
-                highest_skipped_pos: Optional[int] = None
+                #
+                # #325: keyed by target ident, not a run-global pair. A skipped
+                # claim still came out of the allocator, so it still extended
+                # (and possibly merged) an in-memory interval, and the flush
+                # has to persist that skipped span to the SAME entity the
+                # claim belonged to -- a run that skips into more than one
+                # provisional interval (a retained one below a fresh tip gap,
+                # say) would otherwise fold an unrelated interval's skip span
+                # into whichever ident happened to be current when the two
+                # scalars were last written.
+                skipped_span: Dict[str, Tuple[int, int]] = {}
+
+                # #325 review Finding 4: which idents CONTRIBUTED to
+                # skipped_span[ident] -- always at least {ident} itself. A
+                # merge fold (below) moves the SPAN onto the survivor but
+                # cannot move the FLOOR with it: floors are set at DISPATCH
+                # (inside the `while pending:` loop's per-commit `except`
+                # blocks, via _note_incomplete_rev), while a merge folds at
+                # CLAIM time (inside submit_next(), when the claim is made
+                # and appended to `pending`) -- strictly earlier for that
+                # same position. So `rev_claim_floor` may not yet hold the
+                # absorbed ident's entry at fold time.
+                #
+                # (An earlier version of this comment claimed dispatch "runs
+                # strictly AFTER every claim [...] has already happened" --
+                # false as written: `pending` is bounded by pipeline_depth,
+                # so a position's dispatch only postdates the claims made
+                # while it sat in the queue, not every claim the run will
+                # ever make. The property this code actually needs is
+                # weaker and does hold: dispatch order equals claim order,
+                # since `pending` is FIFO and nothing reorders it, and the
+                # reverse stream's claims descend monotonically in position
+                # -- so for any two reverse positions, the higher one is
+                # both claimed AND dispatched before the lower one. A
+                # merging claim at some ident is therefore always dispatched
+                # -- and any floor it sets -- before a lower position under
+                # the same (post-merge) ident is dispatched, which is the
+                # ordering the flush actually relies on.)
+                #
+                # The flush (at true end-of-walk, after every floor
+                # exists) reads this to find every floor relevant to a
+                # (possibly folded) skipped span, not just the survivor's
+                # own -- see the flush loop below for why a floor found this
+                # way still is not enough on its own.
+                skipped_span_sources: Dict[str, Set[str]] = {}
 
                 # #326 Finding A: the floor :lo-hash may not cross this run.
                 #
@@ -12245,15 +12867,48 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # `completed_all = False` already gates the end-of-walk flush
                 # off for this run -- so do not go looking for a third
                 # _note_incomplete_rev call to match it.
-                rev_claim_floor_pos: Optional[int] = None
+                #
+                # #325: ONE FLOOR PER INTERVAL, not per run. #326 shipped this
+                # as a single scalar because a run's reverse stream made one
+                # contiguous descent -- correct then. #325's allocator now
+                # serves the topmost gap first and falls through to a bulk gap
+                # entirely below it (claim_high() + a merge into a retained
+                # interval), so a failure in the tip gap's ident must not sit
+                # above every position in a disjoint bulk gap's ident: that
+                # would withhold the bookkeeping for work the bulk gap's claims
+                # actually completed, silently, and the next run would re-walk
+                # all of it for no reason. Same guarantee as #326 Finding A,
+                # stated over the unit it was always really about -- the
+                # interval a claim targets, not the run.
+                #
+                # #325 review Finding 1 (CRITICAL): a floor keyed on an ident
+                # an absorbed interval no longer HAS is no floor at all -- a
+                # merge reassigns the floored interval's own claims to the
+                # SURVIVOR's ident, so the write-dispatch floor check below
+                # must consult every ident a merging claim's `absorbed_idents`
+                # names, not only `claim_ident`, or the survivor reads as
+                # unrestricted and a mid-gap write failure gets swept into the
+                # persisted interval permanently.
+                rev_claim_floor: Dict[str, int] = {}
 
-                def _note_incomplete_rev(claim_tag: str, claim_pos: int) -> None:
-                    nonlocal rev_claim_floor_pos
+                def _note_incomplete_rev(claim_tag: str, claim_pos: int, ident: str) -> None:
+                    # #325 review Finding 3 (Minor): `ident` is typed `str`,
+                    # never `Optional[str]` -- this is only ever called with
+                    # `claim_tag == "rev"` carrying a real claim_ident, since
+                    # 'fwd' claims resolve (None, []) in submit_next and this
+                    # function returns before touching `ident` for them, and
+                    # a 'rev' claim's ident is always set immediately after
+                    # claim_high() by _reverse_claim_persist_target. A None
+                    # key here would silently poison rev_claim_floor with a
+                    # non-str key, which sorted(skipped_span.items()) below
+                    # raises TypeError on the moment a real str key also
+                    # exists.
                     if claim_tag != "rev":
                         return
-                    rev_claim_floor_pos = (
-                        claim_pos if rev_claim_floor_pos is None
-                        else max(rev_claim_floor_pos, claim_pos)
+                    assert ident is not None, "a 'rev' claim must always resolve a real ident"
+                    prev = rev_claim_floor.get(ident)
+                    rev_claim_floor[ident] = (
+                        claim_pos if prev is None else max(prev, claim_pos)
                     )
 
                 # #222 phase 2d: positions come from the shared-gap claimer,
@@ -12276,21 +12931,65 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # interval scan, so a long run of skips costs microseconds per
                 # position and never stalls the event loop.
                 def submit_next() -> bool:
-                    nonlocal lowest_skipped_pos, highest_skipped_pos
                     while True:
                         claim = claimer.next_claim()
                         if claim is None:
                             return False
                         tag, pos = claim
+                        # #325 review round 2's placement rule applies to a
+                        # SKIPPED claim too, not only the one that breaks out
+                        # of this loop below: allocator.last_claim is
+                        # overwritten by the very next claim, so the ident a
+                        # skipped position belongs to must be resolved here,
+                        # immediately, or it is lost. A skipped position still
+                        # came out of the allocator and still extended (and
+                        # possibly merged) an in-memory interval -- the
+                        # end-of-walk flush has to persist that skipped span
+                        # to the SAME entity the claim belonged to. Only
+                        # 'rev' claims need it -- 'fwd' never skips
+                        # (_skip_claim), and the authoritative side never
+                        # fragments, so _frontier_persist_claim's own default
+                        # (:ingestion/frontier-low, nothing absorbed) is
+                        # already correct for 'fwd'.
+                        target_ident, absorbed = (
+                            _reverse_claim_persist_target(allocator, linearization)
+                            if tag == "rev" else (None, [])
+                        )
+                        # #325 review Finding 2: a merge can absorb an
+                        # interval that already holds its OWN skipped_span
+                        # entry from an earlier claim. This claim's merge (if
+                        # it persists) makes _frontier_persist_claim retract
+                        # the absorbed entity outright -- a flush that still
+                        # named it afterwards would resurrect it, because
+                        # _frontier_persist_span's `existing is None` branch
+                        # mints a fresh entity unconditionally. Fold at CLAIM
+                        # time, here, not at dispatch: the merge itself
+                        # happens here (allocator.last_claim), and dispatch
+                        # never sees which idents a skipped claim's own merge
+                        # touched.
+                        for a in absorbed:
+                            if a in skipped_span:
+                                lo_a, hi_a = skipped_span.pop(a)
+                                lo_t, hi_t = skipped_span.get(target_ident, (lo_a, hi_a))
+                                skipped_span[target_ident] = (
+                                    min(lo_t, lo_a), max(hi_t, hi_a)
+                                )
+                                # #325 review Finding 4: carry provenance
+                                # along with the span, so the flush can find
+                                # a floor that was never the survivor's own.
+                                # Union rather than overwrite -- transitive
+                                # folds (T1 into T2, T2 later into T3) must
+                                # accumulate every original source, not just
+                                # the most recent one.
+                                sources_a = skipped_span_sources.pop(a, {a})
+                                sources_t = skipped_span_sources.get(
+                                    target_ident, {target_ident}
+                                )
+                                skipped_span_sources[target_ident] = sources_t | sources_a
                         if not _skip_claim(tag, pos, completed_regions):
                             break
-                        lowest_skipped_pos = (
-                            pos if lowest_skipped_pos is None else min(lowest_skipped_pos, pos)
-                        )
-                        highest_skipped_pos = (
-                            pos if highest_skipped_pos is None
-                            else max(highest_skipped_pos, pos)
-                        )
+                        lo, hi = skipped_span.get(target_ident, (pos, pos))
+                        skipped_span[target_ident] = (min(lo, pos), max(hi, pos))
                         _ingest_progress["positions_skipped"] += 1
                         # `processed` keeps its meaning -- positions retired by
                         # the walk -- which is what #317's commit_census reads
@@ -12299,10 +12998,11 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         # git rev-list, turning a clean skip-heavy resume into
                         # a reported lost commit.
                         _ingest_progress["processed"] += 1
+                    claim_ident, absorbed_idents = target_ident, absorbed
                     fut = loop.run_in_executor(
                         executor, _extract_commit, repo_path, linearization[pos], ignore_patterns
                     )
-                    pending.append((tag, pos, fut))
+                    pending.append((tag, pos, fut, claim_ident, absorbed_idents))
                     return True
 
                 for _ in range(pipeline_depth):
@@ -12314,7 +13014,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                         completed_all = False
                         break
 
-                    tag, pos, fut = pending.popleft()
+                    tag, pos, fut, claim_ident, absorbed_idents = pending.popleft()
                     commit_hash, commit_ts_iso, author, subject = commit_metadata[pos]
                     # renamed_pairs (Task 9's 4th _extract_commit return element) is
                     # unpacked here but not yet consumed — Task 10 wires it into
@@ -12346,7 +13046,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                             f"({subject!r}): {e}",
                             file=sys.stderr,
                         )
-                        _note_incomplete_rev(tag, pos)
+                        _note_incomplete_rev(tag, pos, claim_ident)
                         submit_next()
                         _ingest_progress["current_commit"] = commit_hash
                         _ingest_progress["processed"] += 1
@@ -12396,9 +13096,51 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 await loop.run_in_executor(
                                     write_executor, _reverse_apply, db, repo_path, linearization,
                                     commit_metadata, pos, extracted_files, index_con,
-                                    # #326 Finding A: below the floor we do the
-                                    # work but withhold the claim.
-                                    rev_claim_floor_pos is None or pos > rev_claim_floor_pos,
+                                    # #326 Finding A / #325: below THIS
+                                    # ident's floor we do the work but
+                                    # withhold the claim. Keyed by
+                                    # claim_ident, not a run-global scalar --
+                                    # a floor set by a failure in one
+                                    # interval must not block a claim
+                                    # targeting a different, disjoint one.
+                                    #
+                                    # #325 review (Finding 1, CRITICAL): a
+                                    # merging claim's target is the SURVIVOR,
+                                    # never the interval that was actually
+                                    # floored. A minted tip interval T
+                                    # floored at position X by a failed write
+                                    # descends and eventually touches a
+                                    # retained base -- _coalesce makes the
+                                    # base the survivor and T absorbed, so
+                                    # claim_ident becomes :ingestion/frontier-
+                                    # high, which carries no floor entry of
+                                    # its own. Checking claim_ident alone
+                                    # reads that as unrestricted and persists
+                                    # a union spanning the gap X sits in --
+                                    # sweeping the failed position into the
+                                    # graph permanently, the exact
+                                    # closed-range defect #326 exists to
+                                    # prevent, reintroduced across a merge.
+                                    # This MUST be evaluated at dispatch
+                                    # time, not claim time (as it already is,
+                                    # here): claims run ahead of writes by
+                                    # pipeline_depth, so the ident that fails
+                                    # may not have a floor entry yet when the
+                                    # merging claim is first ALLOCATED in
+                                    # submit_next, only by the time its write
+                                    # is actually dispatched.
+                                    pos > max(
+                                        [rev_claim_floor[i] for i in
+                                         [claim_ident, *(absorbed_idents or [])]
+                                         if i in rev_claim_floor] or [-1]
+                                    ),
+                                    # #325 review round 2: the ident this
+                                    # claim's interval resolved to when it
+                                    # was MADE (captured in submit_next),
+                                    # never re-derived here -- see
+                                    # _reverse_claim_persist_target's
+                                    # docstring.
+                                    claim_ident, absorbed_idents,
                                 )
 
                         except Exception as e:
@@ -12418,7 +13160,7 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                                 file=sys.stderr,
                             )
                             _trace_write_ok = False
-                            _note_incomplete_rev(tag, pos)
+                            _note_incomplete_rev(tag, pos, claim_ident)
 
                     # #260: no record for a commit whose write failed -- same
                     # contamination class the brief excluded extraction
@@ -12448,13 +13190,13 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # is still non-empty, and those entries are positions claimed
                 # and queued for extraction but never applied -- nothing
                 # persisted a claim for them. :lo-hash is a RANGE bound, so an
-                # ungated flush down to lowest_skipped_pos would swallow them
+                # ungated flush down to a skipped span's lo would swallow them
                 # and declare them complete: the next run's _frontier_load
                 # would read the gap as closed and never re-walk commits that
                 # have no entity in the graph at all. #326's own shape makes
                 # that the LIKELY case rather than an exotic one -- skips are
                 # retired inline in submit_next and never occupy `pending`, so
-                # the genuine tip claims sit there while lowest_skipped_pos is
+                # the genuine tip claims sit there while the skipped span is
                 # driven far below them. And _shutdown_requested is set by
                 # plain stdin EOF at session end, not just by a signal.
                 #
@@ -12464,35 +13206,172 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                 # covers it), so the next run re-skips the same region at
                 # microsecond cost -- exactly what this feature makes cheap.
                 #
-                # `highest_skipped_pos is not None` is belt-and-braces, not a
-                # reachable case: the two are set in the same branch, so
-                # either both are None or neither is. It is kept so the
-                # commit_metadata[highest_skipped_pos] subscript below is
-                # guarded at the point of use rather than by an argument made
-                # thirty lines away.
+                # #325: one flush per ident, not one flush for the whole run.
+                # A run that skips into more than one provisional interval
+                # (a retained one below a fresh tip gap, say) has to persist
+                # each interval's own skipped span to ITS OWN entity -- a
+                # single flush written unconditionally to
+                # :ingestion/frontier-high would either miss a minted
+                # interval's span entirely or, worse, misattribute it.
                 #
-                # #326 Finding A: the flush obeys the same floor the per-commit
-                # claims do. _frontier_persist_span moves :lo-hash DOWN, so an
-                # unclamped flush would re-open the exact hole the floor closes
-                # -- a skipped position below a failed one would drag the
-                # persisted bound past it in one write. Clamping the lo bound
-                # (rather than dropping the flush) keeps the flush doing its
-                # job for the skipped span that IS above the floor.
-                flush_lo_pos = lowest_skipped_pos
-                if flush_lo_pos is not None and rev_claim_floor_pos is not None:
-                    flush_lo_pos = max(flush_lo_pos, rev_claim_floor_pos + 1)
-                if (
-                    completed_all
-                    and flush_lo_pos is not None
-                    and highest_skipped_pos is not None
-                    and flush_lo_pos <= highest_skipped_pos
-                ):
-                    async with db_lease_async() as db:
-                        await loop.run_in_executor(
-                            write_executor, _frontier_persist_span, db, linearization,
-                            flush_lo_pos, highest_skipped_pos, False,
-                            commit_metadata[highest_skipped_pos][1], index_con,
+                # #326 Finding A: each entry obeys the SAME ident's floor the
+                # per-commit claims do. _frontier_persist_span moves :lo-hash
+                # DOWN, so an unclamped flush would re-open the exact hole the
+                # floor closes -- a skipped position below a failed one would
+                # drag the persisted bound past it in one write. Clamping the
+                # lo bound (rather than dropping the flush) keeps it doing its
+                # job for the skipped span that IS above that ident's floor.
+                #
+                # #325 review Finding 4 (CRITICAL): clamping `lo_pos` against
+                # the widened (provenance-aware) floor is NECESSARY but not
+                # SUFFICIENT once a fold has moved another interval's span
+                # onto this ident. Demonstrated case: T is floored at
+                # position 10 by a failed write; T's own skipped span (from
+                # an archived region at position 11) folds onto a retained
+                # base whose own on-disk range is [1,6] -- far below either
+                # number. The span being flushed, (11,11), is already ABOVE
+                # the floor (10), so clamping `lo_pos` by `floor + 1 = 11`
+                # is a no-op -- lo_pos was already 11. The danger is not in
+                # the flushed span's OWN bounds; it is that
+                # _frontier_persist_span's advance-only union takes base's
+                # existing hi (6) and the flushed hi (11) and silently
+                # bridges the entire gap between them, INCLUDING position 10
+                # -- which no witness anywhere ever proved complete for
+                # `base`. Reproduced empirically pre-fix: frontier-high ends
+                # [1,11], with zero :commit/... entities at position 10.
+                #
+                # So the flush additionally REFUSES this ident outright on
+                # the DISJUNCTION `lo_pos > floor or len(sources) > 1`,
+                # rather than clamping -- and BOTH halves are required,
+                # because they guard two DIFFERENT ways the clamp can fail,
+                # not one restated twice.
+                #
+                # `lo_pos > floor` guards case C: a flush whose own lo_pos
+                # already sits above the floor, with NO fold involved
+                # (len(sources) == 1) -- there the clamp `max(lo_pos,
+                # floor + 1)` degenerates to a no-op and refusing is the
+                # only thing that still does anything. Stated precisely,
+                # because the case demonstrated just above (Finding 4) is
+                # NOT case C: T's own skipped span there folds onto the
+                # retained base to produce the flush, so len(sources) == 2
+                # and `len(sources) > 1` alone already refuses it -- the
+                # same-numbered test asserts on frontier-high's persisted
+                # range, not on which half of the disjunction fired, so it
+                # does not distinguish the two. Case C is NOT ruled out by
+                # needing a fold -- within ONE ident, a same-run skip at a
+                # HIGHER position followed by a write failure at a LOWER one
+                # produces exactly lo_pos > floor with sources == {that
+                # ident} and no merge anywhere (skipped_span/
+                # skipped_span_sources default to the singleton {ident}
+                # until a merge unions another one in, and
+                # _note_incomplete_rev floors whichever ident the failing
+                # claim already belongs to). What actually keeps this hard
+                # to reach today is narrower: _skip_claim (what populates
+                # skipped_span at all) requires a loadable archived
+                # :type/completed-region covering the position, and after
+                # #325 that only exists for the narrow divergent-ref-
+                # regained case -- see _load_one_interval's docstring. So
+                # constructing case C requires first constructing that
+                # already-narrow prerequisite. No test isolates
+                # `lo_pos > floor` from `len(sources) > 1`; that half is
+                # belt-and-braces against exercising this narrow same-ident
+                # shape, not a demonstrated requirement.
+                #
+                # `len(sources) > 1` guards a SEPARATE case that
+                # `lo_pos > floor` cannot see at all: a fold whose merged
+                # span STRADDLES the floor, i.e. `lo_pos <= floor < hi_pos`.
+                # There `lo_pos > floor` is False, so the clamp fires and
+                # looks fine in isolation -- lo_pos becomes floor + 1, still
+                # inside [lo_pos, hi_pos]. But _frontier_persist_span's own
+                # union (see its docstring) is against the FOLD TARGET's
+                # EXISTING on-disk hi, not against lo_pos, and a fold is
+                # exactly what can put that existing hi far BELOW the floor
+                # (the absorbed interval's span reaches down to lo_pos while
+                # the target's own claimed territory stops well short of
+                # it). The union then bridges existing_hi -> hi_pos in one
+                # shot, crossing the floored position regardless of what
+                # lo_pos was clamped to. #325 review round 3 reproduced this
+                # exact shape by seeding an extra completed region BELOW the
+                # injected write failure so the fold's merged span straddled
+                # rather than sat entirely above it: `lo_pos > floor` alone
+                # let the clamp+flush through and left frontier-high at
+                # [1,11] with zero :commit/... entities at position 10 --
+                # the identical corruption the fold-only trigger existed to
+                # prevent, just reached through the other half of the
+                # disjunction. `len(sources) > 1` is exactly "a merge folded
+                # something else into this span this run", the one
+                # condition under which the flush target's on-disk bounds
+                # and the flushed span's own claim history can have
+                # diverged this far -- so it is the correct, and only,
+                # guard for that shape.
+                #
+                # An earlier version of this comment claimed testing
+                # `lo_pos > floor` alone "needs none of th[e] side
+                # reasoning" `len(sources) > 1` rested on. That claim was
+                # the bug: it swapped one case for the other instead of
+                # widening the refusal, and the straddling scenario above is
+                # the reachable counter-example. Refusing on either
+                # condition costs nothing but a re-walk next run (the
+                # completed-region fact that produced the skip is untouched,
+                # independent of skipped_span entirely), which is the
+                # accepted price #326 established throughout for "unproven
+                # -> don't assert, re-walk instead".
+                if completed_all:
+                    for ident, (lo_pos, hi_pos) in sorted(skipped_span.items()):
+                        sources = skipped_span_sources.get(ident, {ident})
+                        floor = max(
+                            (rev_claim_floor[s] for s in sources if s in rev_claim_floor),
+                            default=None,
                         )
+                        # `floor is None` (no clamp, no refusal below) is safe
+                        # only because of a three-link chain, none of it
+                        # visible at this call site alone -- remove any one
+                        # link and this becomes a bridge across an
+                        # incomplete position:
+                        #
+                        # 1. next_claim() returns None only on
+                        #    self._allocator.is_gap_empty() -- never on a
+                        #    single stream having nothing to do this call
+                        #    (see its docstring's #325 review round 2 note).
+                        #    So the `while pending` loop draining normally
+                        #    (completed_all left True) means every position
+                        #    in the shared gap was actually claimed and
+                        #    popped, not skipped over by a stream that gave
+                        #    up early.
+                        # 2. Both paths that retire a claimed reverse
+                        #    position WITHOUT a persisted claim -- the
+                        #    extraction `except` and the write `except`,
+                        #    above -- call _note_incomplete_rev, which sets
+                        #    rev_claim_floor for that position's ident (and,
+                        #    via a merge's absorbed_idents, every ident it
+                        #    folded through). So an ident with no entry in
+                        #    rev_claim_floor had no incomplete retirement.
+                        # 3. The one other way a claimed reverse position
+                        #    retires without a persisted claim -- the
+                        #    _shutdown_requested break in the `while pending`
+                        #    loop above -- sets completed_all = False instead
+                        #    of a floor, and this whole block is gated on
+                        #    completed_all being True.
+                        #
+                        # Together: completed_all True means every claimed
+                        # position either persisted normally or is accounted
+                        # for by a floor. So `floor is None` for this ident's
+                        # sources means every position this run claimed under
+                        # them completed -- the unclamped flush below is
+                        # flushing a span this run actually proved, not one
+                        # it merely didn't happen to fail on.
+                        if floor is not None:
+                            if lo_pos > floor or len(sources) > 1:
+                                continue
+                            lo_pos = max(lo_pos, floor + 1)
+                        if lo_pos > hi_pos:
+                            continue
+                        async with db_lease_async() as db:
+                            await loop.run_in_executor(
+                                write_executor, _frontier_persist_span, db, linearization,
+                                lo_pos, hi_pos, False,
+                                commit_metadata[hi_pos][1], index_con, ident,
+                            )
 
                 # Stage B: the correction sweep. A third, strictly
                 # SEQUENTIAL pass, not a third concurrent task -- claim_low()
@@ -12518,10 +13397,26 @@ async def _run_ingestion(repo_path: str, branch: str) -> None:
                     }
                     skipped = 0
                     async with db_lease_async() as db:
+                        # #325 review Finding 3: computed ONCE, not inside
+                        # the loop below. Stage B only starts once
+                        # completed_all is True -- the whole gap is
+                        # claimed and the walk that mints/merges interval
+                        # entities has already finished for this run -- and
+                        # nothing in this loop's body (select/extract/apply/
+                        # lifecycle-apply/watermark-update/checkpoint)
+                        # writes an interval fact, so fragmentation cannot
+                        # change between iterations. Passing it in turns
+                        # 2 extra datalog queries per swept commit into 2
+                        # for the whole sweep, mirroring the hash_to_pos
+                        # idiom just above.
+                        sweep_fragmented = bool(await loop.run_in_executor(
+                            write_executor, _intervals_read_extra, db,
+                        ))
                         while not _shutdown_requested.is_set():
                             selected = await loop.run_in_executor(
                                 write_executor, _correction_sweep_select_position,
                                 db, linearization, commit_metadata, hash_to_pos,
+                                sweep_fragmented,
                             )
                             if selected is None:
                                 break

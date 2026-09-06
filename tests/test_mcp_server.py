@@ -7568,8 +7568,13 @@ class TestFrontierLoad:
         allocator = mcp_server._frontier_load(db, linearization, "2026-01-02T00:00:00Z")
 
         assert allocator.total_positions == 4
+        # #325: the authoritative interval always carries anchor_pos=0,
+        # is_base=True -- it is the fixed base the low side is keyed on.
         assert allocator.intervals() == [
-            frontier_registry.Interval(0, 1, frontier_registry.TAG_AUTHORITATIVE)
+            frontier_registry.Interval(
+                0, 1, frontier_registry.TAG_AUTHORITATIVE, anchor_pos=0, is_base=True,
+                ident=mcp_server._FRONTIER_LOW_IDENT,
+            )
         ]
         assert mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_LOW_IDENT) == ("h0", "h1")
 
@@ -7583,7 +7588,10 @@ class TestFrontierLoad:
         second = mcp_server._frontier_load(db, linearization, "2026-01-03T00:00:00Z")
 
         assert second.intervals() == [
-            frontier_registry.Interval(0, 1, frontier_registry.TAG_AUTHORITATIVE)
+            frontier_registry.Interval(
+                0, 1, frontier_registry.TAG_AUTHORITATIVE, anchor_pos=0, is_base=True,
+                ident=mcp_server._FRONTIER_LOW_IDENT,
+            )
         ]
         # Directly count raw facts -- _frontier_read_bounds's results[0]
         # shortcut would silently collapse a duplicate live datom and hide a
@@ -7644,15 +7652,22 @@ class TestFrontierLoadNormalisesUnrepresentableIntervals:
             facts.append(f"[{mcp_server._FRONTIER_HIGH_IDENT} :pos-count {pos_count}]")
         mcp_server._transact(db, "[" + " ".join(facts) + "]", "2026-01-01T00:00:00Z")
 
-    def test_discards_and_retracts_high_interval_that_no_longer_tops_out(self, real_db):
+    def test_discards_and_retracts_a_high_interval_whose_stored_count_no_longer_matches(
+        self, real_db
+    ):
+        """#325 superseded this class's original trigger ("doesn't reach the
+        tip") -- a span-matching interval is now RETAINED regardless of the
+        tip, see TestFrontierLoadRetainsAcrossTipGrowth. What still forces a
+        discard is the stored :pos-count no longer matching the span: here a
+        commit ("x") landed BETWEEN h1 and h2, growing the span from 2 to 3
+        while the interval's stored count still says 2."""
         import mcp_server
-        # Run 1 claimed h1..h2 of a 3-commit repo; h3 and h4 have since landed.
-        self._seed_high(real_db, "h1", "h2")
-        grown = ["h0", "h1", "h2", "h3", "h4"]
+        self._seed_high(real_db, "h1", "h2")  # pos-count 2, from the original 3-commit repo
+        interleaved = ["h0", "h1", "x", "h2", "h3", "h4"]
 
-        allocator = mcp_server._frontier_load(real_db, grown, "2026-01-02T00:00:00Z")
+        allocator = mcp_server._frontier_load(real_db, interleaved, "2026-01-02T00:00:00Z")
 
-        assert allocator.intervals() == [], "stale high interval must not be reconstructed"
+        assert allocator.intervals() == [], "stale-count high interval must not be reconstructed"
         assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) is None, (
             "discarding only in memory leaves the next persist call extending a pair "
             "the allocator no longer believes in, which re-creates the inverted state"
@@ -7675,8 +7690,14 @@ class TestFrontierLoadNormalisesUnrepresentableIntervals:
 
         allocator = mcp_server._frontier_load(real_db, linearization, "2026-01-02T00:00:00Z")
 
+        # #325: a retained interval now carries anchor_pos/is_base -- for
+        # frontier-high, anchor_pos is its own hi_pos and it is always the
+        # base of the provisional side.
         assert allocator.intervals() == [
-            frontier_registry.Interval(2, 3, frontier_registry.TAG_PROVISIONAL)
+            frontier_registry.Interval(
+                2, 3, frontier_registry.TAG_PROVISIONAL, anchor_pos=3, is_base=True,
+                ident=mcp_server._FRONTIER_HIGH_IDENT,
+            )
         ]
         assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) == ("h2", "h3")
 
@@ -7688,7 +7709,7 @@ class TestCompletedRegionRecord:
     position inside the interval provably completed" -- `:lo-hash` is a
     closed RANGE bound, so membership is implied by a NEIGHBOUR's claim, not
     necessarily by the position's own; what makes membership mean the
-    position's OWN completion is `_run_ingestion`'s `rev_claim_floor_pos` gate
+    position's OWN completion is `_run_ingestion`'s `rev_claim_floor` gate
     (see `_skip_claim`'s docstring).
 
     Deliberately NOT in MINIGRAF_SCHEMA: handle_minigraf_audit iterates exactly
@@ -8070,7 +8091,7 @@ class TestFrontierLoadArchivesDiscardedInterval:
     that is FALSE as a standalone claim: `:lo-hash` is a closed RANGE bound,
     so membership is implied by a NEIGHBOUR's claim, not necessarily by the
     position's own. What makes membership mean the position's OWN completion
-    is `_run_ingestion`'s `rev_claim_floor_pos` gate, which stops :lo-hash
+    is `_run_ingestion`'s `rev_claim_floor` gate, which stops :lo-hash
     descending past a position this run failed to complete (see
     `_skip_claim`'s docstring)."""
 
@@ -8094,16 +8115,6 @@ class TestFrontierLoadArchivesDiscardedInterval:
         if pos_count is not None:
             facts.append(f"[{mcp_server._FRONTIER_HIGH_IDENT} :pos-count {pos_count}]")
         mcp_server._transact(db, "[" + " ".join(facts) + "]", "2026-01-01T00:00:00Z")
-
-    def test_discarded_interval_is_archived_as_a_provisional_region(self, real_db):
-        import mcp_server
-        self._seed_high(real_db, "h1", "h2")
-        grown = ["h0", "h1", "h2", "h3", "h4"]
-
-        mcp_server._frontier_load(real_db, grown, "2026-01-02T00:00:00Z")
-
-        assert mcp_server._completed_regions_read(real_db) == [("h1", "h2", ":provisional")]
-        assert mcp_server._frontier_read_bounds(real_db, mcp_server._FRONTIER_HIGH_IDENT) is None
 
     def test_a_kept_interval_archives_nothing(self, real_db):
         """A live interval is already its own witness. Archiving one that was
@@ -8176,9 +8187,15 @@ class TestFrontierLoadArchivesDiscardedInterval:
     def test_the_discard_takes_the_pos_count_fact_with_it(self, real_db):
         """A count left behind attaches to whatever interval the next
         _frontier_persist_claim creates at this ident, licensing a comparison
-        against a span it was never measured from."""
+        against a span it was never measured from.
+
+        #325: h1..h3 is seeded with a count of 2 while its actual span under
+        the loaded linearization is 3 -- a deliberate mismatch, since a
+        matching count is now RETAINED rather than discarded (see
+        TestFrontierLoadRetainsAcrossTipGrowth), and this test needs a
+        genuine discard to exercise the pos-count cleanup."""
         import mcp_server
-        self._seed_high(real_db, "h1", "h2")
+        self._seed_high(real_db, "h1", "h3", pos_count=2)
 
         mcp_server._frontier_load(
             real_db, ["h0", "h1", "h2", "h3", "h4"], "2026-01-02T00:00:00Z"
@@ -8188,14 +8205,359 @@ class TestFrontierLoadArchivesDiscardedInterval:
             real_db, mcp_server._FRONTIER_HIGH_IDENT
         ) is None
 
-    def test_two_discards_across_runs_coalesce_into_one_region(self, real_db):
+    def test_two_unresolvable_discards_stay_separate_regions(self, real_db):
+        """#325 review round 2: an unresolvable-bounds archive now writes the
+        interval's OWN stored :pos-count directly (bypassing
+        _completed_region_record's `order`-driven coalescing, which would
+        have discarded that count to None -- see _load_one_interval's
+        docstring). Two separately-archived divergent-ref regions therefore
+        do NOT merge, even when their bounds would be adjacent under some
+        hypothetical order: there is no position space to compare them in,
+        so each stands alone as its own witness, carrying its own claim-time
+        denominator rather than a recomputed (and therefore untrustworthy)
+        one."""
         import mcp_server
-        self._seed_high(real_db, "h3", "h4")
-        mcp_server._frontier_load(real_db, ["h0", "h1", "h2", "h3", "h4", "h5"], "2026-01-02T00:00:00Z")
-        self._seed_high(real_db, "h1", "h4")
-        mcp_server._frontier_load(real_db, ["h0", "h1", "h2", "h3", "h4", "h5", "h6"], "2026-01-03T00:00:00Z")
+        self._seed_high(real_db, "gone-b", "gone-c", pos_count=2)
+        mcp_server._frontier_load(real_db, ["h0", "h1", "h2"], "2026-01-02T00:00:00Z")
+        self._seed_high(real_db, "gone-a", "gone-b", pos_count=5)
+        mcp_server._frontier_load(real_db, ["h0", "h1", "h2"], "2026-01-03T00:00:00Z")
 
-        assert mcp_server._completed_regions_read(real_db) == [("h1", "h4", ":provisional")]
+        assert sorted(mcp_server._completed_regions_read(real_db)) == [
+            ("gone-a", "gone-b", ":provisional"),
+            ("gone-b", "gone-c", ":provisional"),
+        ]
+        assert sorted(mcp_server._completed_regions_read_full(real_db)) == [
+            ("gone-a", "gone-b", ":provisional", 5),
+            ("gone-b", "gone-c", ":provisional", 2),
+        ], "each region keeps its OWN claim-time pos-count, not a recomputed one"
+
+
+class TestFrontierLoadRetainsAcrossTipGrowth:
+    """#325: a high interval that no longer reaches the last position is
+    RETAINED, not discarded, provided its stored :pos-count still matches its
+    span in this linearization."""
+
+    def _seed_high(self, db, lin, lo, hi, count):
+        import mcp_server
+        ident = mcp_server._FRONTIER_HIGH_IDENT
+        facts = [
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f"[{ident} :tag :provisional]",
+            f'[{ident} :lo-hash "{lin[lo]}"]',
+            f'[{ident} :hi-hash "{lin[hi]}"]',
+        ]
+        if count is not None:
+            facts.append(f"[{ident} :pos-count {count}]")
+        mcp_server._transact(db, "[" + " ".join(facts) + "]", "2026-09-04T00:00:00Z")
+
+    def test_a_span_matching_interval_off_tip_is_retained_not_archived(self, real_db):
+        """#325 review round 3, Finding 6: moved here from
+        TestFrontierLoadArchivesDiscardedInterval, which its OWN assertions
+        (retained, not archived) contradicted. Pre-#325, "reaches the tip"
+        was the retain test, and a span-matching interval that no longer
+        topped out was discarded and archived; the retain test is now
+        "stored :pos-count still matches the span", which this fixture
+        satisfies regardless of the tip -- the smallest possible instance of
+        this class's own subject."""
+        import mcp_server, frontier_registry
+        lin = ["h0", "h1", "h2", "h3", "h4"]
+        self._seed_high(real_db, lin, 1, 2, 2)
+
+        allocator = mcp_server._frontier_load(real_db, lin, "2026-01-02T00:00:00Z")
+
+        assert [iv.tag for iv in allocator.intervals()] == [frontier_registry.TAG_PROVISIONAL]
+        assert mcp_server._completed_regions_read(real_db) == []
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) == ("h1", "h2")
+
+    def test_grown_tip_retains_the_interval_and_leaves_a_hole_above(self, real_db):
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(20)]
+        self._seed_high(real_db, lin, 4, 11, 8)
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-04T00:00:01Z")
+        prov = [iv for iv in alloc.intervals()
+                if iv.tag == frontier_registry.TAG_PROVISIONAL]
+        assert [(iv.lo_pos, iv.hi_pos) for iv in prov] == [(4, 11)]
+        assert prov[0].is_base is True
+        assert alloc.gap_hi == 19, "the new tip must be unclaimed"
+        assert mcp_server._completed_regions_read(real_db) == [], (
+            "a retained interval must not also be archived -- two descriptions "
+            "of one region is how #326's bounds-keyed dedup went wrong"
+        )
+
+    def test_a_countless_interval_is_still_discarded(self, real_db):
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(20)]
+        self._seed_high(real_db, lin, 4, 11, None)
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-04T00:00:01Z")
+        assert [iv for iv in alloc.intervals()
+                if iv.tag == frontier_registry.TAG_PROVISIONAL] == []
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) is None
+
+    def test_a_stale_count_is_discarded_not_retained(self, real_db):
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(20)]
+        self._seed_high(real_db, lin, 4, 11, 7)   # span is 8, count says 7
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-04T00:00:01Z")
+        assert [iv for iv in alloc.intervals()
+                if iv.tag == frontier_registry.TAG_PROVISIONAL] == []
+
+    def test_extra_intervals_load_alongside_the_base(self, real_db):
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(20)]
+        self._seed_high(real_db, lin, 4, 11, 8)
+        ident = mcp_server._interval_ident(lin[19])
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f'[{ident} :ident "{ident}"]',
+            f"[{ident} :tag :provisional]",
+            f'[{ident} :lo-hash "{lin[16]}"]',
+            f'[{ident} :hi-hash "{lin[19]}"]',
+            f"[{ident} :pos-count 4]",
+        ]) + "]", "2026-09-04T00:00:00Z")
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-04T00:00:01Z")
+        prov = sorted(
+            (iv for iv in alloc.intervals()
+             if iv.tag == frontier_registry.TAG_PROVISIONAL),
+            key=lambda iv: iv.lo_pos)
+        assert [(iv.lo_pos, iv.hi_pos, iv.is_base) for iv in prov] == \
+            [(4, 11, True), (16, 19, False)]
+        assert alloc.gap_hi == 15, "the hole between the two is what's unclaimed"
+
+    def test_extra_intervals_anchor_pos_is_the_mint_position_not_hi(self, real_db):
+        """#325 review round 3, Finding 4: the reviewer showed this needs no
+        real walk to exercise -- a fixture where the extra interval's anchor
+        hash and its current :hi-hash DIFFER is enough. Minted from lin[17]
+        (an anchor somewhere in the MIDDLE of the interval, not its top) with
+        bounds lin[16]..lin[19]; anchor_pos must read back as 17, not 19. A
+        regression to "always use hi_pos" passes
+        test_extra_intervals_load_alongside_the_base (its fixture mints from
+        lin[19], the same hash as :hi-hash, so anchor and hi coincide there
+        and the bug is invisible) but fails this one."""
+        import mcp_server, frontier_registry
+        lin = [f"h{i}" for i in range(20)]
+        self._seed_high(real_db, lin, 4, 11, 8)
+        ident = mcp_server._interval_ident(lin[17])
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f'[{ident} :ident "{ident}"]',
+            f"[{ident} :tag :provisional]",
+            f'[{ident} :lo-hash "{lin[16]}"]',
+            f'[{ident} :hi-hash "{lin[19]}"]',
+            f"[{ident} :pos-count 4]",
+        ]) + "]", "2026-09-04T00:00:00Z")
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-04T00:00:01Z")
+        extra = next(
+            iv for iv in alloc.intervals()
+            if iv.tag == frontier_registry.TAG_PROVISIONAL and not iv.is_base
+        )
+        assert extra.anchor_pos == 17
+
+
+class TestFrontierLoadRetractsUnresolvableBounds:
+    """#325: a bound hash absent from the linearization used to leave the facts
+    in the graph while loading no interval -- so the next _frontier_persist_claim
+    read a non-None `existing` and extended bounds the allocator did not
+    believe in."""
+
+    def test_unresolvable_bounds_are_retracted(self, real_db):
+        import mcp_server
+        ident = mcp_server._FRONTIER_HIGH_IDENT
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f"[{ident} :tag :provisional]",
+            f'[{ident} :lo-hash "gone-a"]',
+            f'[{ident} :hi-hash "gone-b"]',
+            f"[{ident} :pos-count 2]",
+        ]) + "]", "2026-09-04T00:00:00Z")
+        lin = [f"h{i}" for i in range(20)]
+        mcp_server._frontier_load(real_db, lin, "2026-09-04T00:00:01Z")
+        assert mcp_server._frontier_read_bounds(real_db, ident) is None, (
+            "left behind, these bounds are extended by the next claim"
+        )
+        assert mcp_server._completed_regions_read(real_db) == \
+            [("gone-a", "gone-b", ":provisional")], (
+            "archive before retracting -- the branch may straighten out"
+        )
+
+    def test_unresolvable_bounds_archive_the_claim_time_pos_count(self, real_db):
+        """#325 review round 2: the archived region carries the interval's
+        OWN stored :pos-count (2 here), not None. Routing an unresolvable
+        pair through _completed_region_record's `order`-driven count would
+        silently produce None -- exactly the "no denominator" case
+        _completed_regions_load refuses to trust -- so _load_one_interval
+        writes the claim-time count directly instead."""
+        import mcp_server
+        ident = mcp_server._FRONTIER_HIGH_IDENT
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f"[{ident} :tag :provisional]",
+            f'[{ident} :lo-hash "gone-a"]',
+            f'[{ident} :hi-hash "gone-b"]',
+            f"[{ident} :pos-count 2]",
+        ]) + "]", "2026-09-04T00:00:00Z")
+        lin = [f"h{i}" for i in range(20)]
+        mcp_server._frontier_load(real_db, lin, "2026-09-04T00:00:01Z")
+        assert mcp_server._completed_regions_read_full(real_db) == \
+            [("gone-a", "gone-b", ":provisional", 2)]
+
+
+class TestFrontierPromoteBaseIfMissing:
+    """#325 review round 3, Finding 1: a run can end with a provisional side
+    that has NO BASE at all, and the state is self-perpetuating.
+
+    Reachable: a commit landing inside frontier-high's span breaks its
+    stored :pos-count, so frontier-high is discarded, while an extra
+    interval ABOVE it is unaffected and stays retained.
+    `_load_one_interval` only ever passes is_base=True for
+    :ingestion/frontier-high, so the provisional side then loads with no
+    base at all -- and frontier_registry cannot self-heal it:
+    `_extend`'s `is_base = not any(iv.tag == tag ...)` is False while the
+    extra already exists, and `_coalesce`'s survivor rule only PRESERVES an
+    existing base, never manufactures one.
+
+    Simulated here the same way the rest of this file simulates a discard:
+    a stored :pos-count that does not match its span under the loaded
+    linearization, not a literal interleaved-commit linearization -- the
+    mechanism under test (_frontier_promote_base_if_missing) does not care
+    which of _load_one_interval's discard branches fired, only that
+    frontier-high ended up gone while an extra stayed retained.
+    """
+
+    def _seed_interval(self, db, ident, lin, lo, hi, count, tag=":provisional"):
+        import mcp_server
+        facts = [
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f"[{ident} :tag {tag}]",
+            f'[{ident} :lo-hash "{lin[lo]}"]',
+            f'[{ident} :hi-hash "{lin[hi]}"]',
+        ]
+        if count is not None:
+            facts.append(f"[{ident} :pos-count {count}]")
+        if ident.startswith(mcp_server._INTERVAL_PROVISIONAL_IDENT_PREFIX):
+            facts.append(f'[{ident} :ident "{ident}"]')
+        mcp_server._transact(db, "[" + " ".join(facts) + "]", "2026-09-04T00:00:00Z")
+
+    def test_promotes_the_lowest_retained_extra_to_the_base_ident(self, real_db):
+        import mcp_server
+        import frontier_registry
+        lin = [f"h{i}" for i in range(30)]
+
+        # frontier-high: bounds resolve and are representable, but the
+        # stored count (5) does not match the real span (8) -- discarded,
+        # not archived (a representable-but-mismatched interval is never
+        # archived; see _load_one_interval's own docstring).
+        self._seed_interval(real_db, mcp_server._FRONTIER_HIGH_IDENT, lin, 4, 11, 5)
+
+        # Two retained extras above it. extra1 is the LOWEST and must be
+        # the one promoted; extra2 must be left alone as an ordinary extra.
+        extra1 = mcp_server._interval_ident(lin[19])
+        self._seed_interval(real_db, extra1, lin, 13, 19, 7)
+        extra2 = mcp_server._interval_ident(lin[27])
+        self._seed_interval(real_db, extra2, lin, 21, 27, 7)
+
+        alloc = mcp_server._frontier_load(real_db, lin, "2026-09-04T00:00:01Z")
+
+        prov = [iv for iv in alloc.intervals() if iv.tag == frontier_registry.TAG_PROVISIONAL]
+        bases = [iv for iv in prov if iv.is_base]
+        assert len(bases) == 1, (
+            f"exactly one provisional interval must carry is_base=True, got {bases}"
+        )
+        assert (bases[0].lo_pos, bases[0].hi_pos) == (13, 19), (
+            "the LOWEST retained extra (13..19) must be the one promoted, "
+            "not extra2 (21..27)"
+        )
+        assert bases[0].ident == mcp_server._FRONTIER_HIGH_IDENT
+
+        # The invariant restored ON DISK, not just in the returned allocator.
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT
+        ) == (lin[13], lin[19])
+        assert mcp_server._frontier_read_pos_count(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT
+        ) == 7, "the promoted count must be COPIED from the extra, never recomputed"
+
+        # The old extra1 entity must be gone (retracted), not left as a
+        # duplicate description of the same region.
+        assert mcp_server._frontier_read_bounds(real_db, extra1) is None
+        # extra2 is untouched -- still enumerable as an ordinary extra, not
+        # promoted, not retracted.
+        remaining_extra = mcp_server._intervals_read_extra(real_db)
+        assert [(ident, lo, hi) for ident, lo, hi, _c in remaining_extra] == [
+            (extra2, lin[21], lin[27])
+        ]
+
+    def test_promotion_unblocks_the_correction_sweep(self, real_db):
+        """The reachable COST of a missing base, demonstrated rather than
+        asserted from the code alone:
+        _correction_sweep_select_position's very first gate is
+        `if high_bounds is None: return None`. Before the fix, a run that
+        ends with no base makes that gate permanent -- Stage B never runs
+        again and :ingestion/lineage-confirmed-through never advances, on a
+        run that reports status: complete. This closes the authoritative
+        side up to the promoted base's own lo-hash so the sweep's OTHER
+        gate (the gap must already be closed) is satisfied too, letting the
+        call return an actual position rather than merely "not None for a
+        different reason".
+        """
+        import mcp_server
+        lin = [f"h{i}" for i in range(30)]
+
+        self._seed_interval(
+            real_db, mcp_server._FRONTIER_LOW_IDENT, lin, 0, 12, 13, tag=":authoritative"
+        )
+        self._seed_interval(real_db, mcp_server._FRONTIER_HIGH_IDENT, lin, 4, 11, 5)
+        extra = mcp_server._interval_ident(lin[19])
+        self._seed_interval(real_db, extra, lin, 13, 19, 7)
+
+        mcp_server._frontier_load(real_db, lin, "2026-09-04T00:00:01Z")
+
+        assert mcp_server._correction_sweep_select_position(
+            real_db, lin, [(h, "2026-09-04T00:00:00Z", "a", f"s{i}") for i, h in enumerate(lin)],
+        ) == (lin[13], "2026-09-04T00:00:00Z"), (
+            "with frontier-high restored at [13, 19] and frontier-low at "
+            "[0, 12], the gap reads closed and the sweep must select the "
+            "first position past frontier-low -- proving it is no longer "
+            "the missing-base branch returning None"
+        )
+
+    def test_ablation_without_the_fix_frontier_high_never_reappears(self, real_db):
+        """Ablation: reproduces the exact pre-fix behaviour by calling
+        _load_one_interval directly (bypassing _frontier_promote_base_if_
+        missing entirely) to confirm the state this test class guards
+        against is real and self-perpetuating, not a strawman. Without the
+        promotion call _frontier_load makes, frontier-high simply never
+        reappears and _correction_sweep_select_position stays permanently
+        gated on `high_bounds is None`.
+        """
+        import mcp_server
+        lin = [f"h{i}" for i in range(30)]
+        hash_to_pos = {h: i for i, h in enumerate(lin)}
+        intervals = []
+        # Mirrors _frontier_load's own high-bounds block, without the
+        # promotion call that follows it on the real path.
+        mcp_server._load_one_interval(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT, (lin[4], lin[11]), 5,
+            hash_to_pos, lin, "2026-09-04T00:00:00Z", intervals, is_base=True,
+        )
+        extra = mcp_server._interval_ident(lin[19])
+        self._seed_interval(real_db, extra, lin, 13, 19, 7)
+        mcp_server._load_one_interval(
+            real_db, extra, (lin[13], lin[19]), 7,
+            hash_to_pos, lin, "2026-09-04T00:00:00Z", intervals, is_base=False,
+        )
+
+        assert not any(iv.is_base for iv in intervals if iv.tag == "provisional"), (
+            "precondition: the provisional side must genuinely have no base "
+            "here, or this ablation proves nothing"
+        )
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT
+        ) is None, "frontier-high never comes back without the promotion step"
+        assert mcp_server._correction_sweep_select_position(
+            real_db, lin, [(h, "2026-09-04T00:00:00Z", "a", f"s{i}") for i, h in enumerate(lin)],
+        ) is None, "Stage B stays permanently gated on the missing base"
 
 
 class TestCompletedRegionsLoad:
@@ -8537,8 +8899,13 @@ class TestFrontierPersistClaim:
         reopened_db = mcp_server.get_db()
         allocator = mcp_server._frontier_load(reopened_db, linearization, "2026-01-02T00:00:00Z")
 
+        # #325: the authoritative interval always carries anchor_pos=0,
+        # is_base=True on load.
         assert allocator.intervals() == [
-            frontier_registry.Interval(0, 0, frontier_registry.TAG_AUTHORITATIVE)
+            frontier_registry.Interval(
+                0, 0, frontier_registry.TAG_AUTHORITATIVE, anchor_pos=0, is_base=True,
+                ident=mcp_server._FRONTIER_LOW_IDENT,
+            )
         ]
 
 
@@ -8642,16 +9009,363 @@ class TestFrontierPersistSpan:
         assert json.loads(raw)["results"] == [[1]]
 
 
-class TestSkipFastPathEndToEnd:
-    """#326 acceptance test 1: a real re-walk of an ingested region, driven by
-    #325's actual trigger (the branch tip growing past the persisted :hi-hash)
-    rather than a simulation of it.
+class TestIntervalEntityPersistence:
+    """#325: provisional intervals above frontier-high persist as their own
+    ident-keyed entities. frontier-high and frontier-low keep their fixed
+    idents and carry no :ident fact, so an existing graph needs no migration."""
 
-    Two independent witnesses that the work did not happen:
-      * the per-commit trace (MINIGRAF_INGEST_TRACE_PATH) emits one record per
-        APPLIED commit, so a skipped position appears in no record -- an
-        existing mechanism, not one built for this test;
-      * positions_skipped_this_run, incremented in the one branch that skips.
+    def test_ident_is_minted_from_the_anchor_hash(self):
+        import mcp_server
+        assert mcp_server._interval_ident("abcdef0123456789") == \
+            ":ingestion/interval-provisional-abcdef012345"
+
+    def test_extra_intervals_are_enumerable_and_frontier_high_is_not(self, real_db):
+        import mcp_server
+        ts = "2026-09-04T00:00:00Z"
+        mcp_server._frontier_persist_claim(real_db, ["h0", "h1", "h2"], 2, False, ts)
+        ident = mcp_server._interval_ident("h9")
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f'[{ident} :ident "{ident}"]',
+            f"[{ident} :tag :provisional]",
+            f'[{ident} :lo-hash "h8"]',
+            f'[{ident} :hi-hash "h9"]',
+            f"[{ident} :pos-count 2]",
+        ]) + "]", ts)
+        # A second minted interval, deliberately given a LEXICALLY SMALLER
+        # ident than the first (h2 < h9 as strings after the shared prefix),
+        # so this also exercises _intervals_read_extra's sorted(...) rather
+        # than happening to match insertion order.
+        ident2 = mcp_server._interval_ident("h2")
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident2} :entity-type :type/ingest-interval]",
+            f'[{ident2} :ident "{ident2}"]',
+            f"[{ident2} :tag :provisional]",
+            f'[{ident2} :lo-hash "h0"]',
+            f'[{ident2} :hi-hash "h2"]',
+            f"[{ident2} :pos-count 3]",
+        ]) + "]", ts)
+
+        extras = mcp_server._intervals_read_extra(real_db)
+        assert extras == sorted([(ident, "h8", "h9", 2), (ident2, "h0", "h2", 3)]), (
+            "enumeration must return both minted-ident intervals, sorted by "
+            "ident, and must NOT return frontier-high, which is read by "
+            "fixed ident"
+        )
+
+    def test_an_extra_interval_with_no_pos_count_is_still_enumerable(self, real_db):
+        import mcp_server
+        ts = "2026-09-04T00:00:00Z"
+        ident = mcp_server._interval_ident("h9")
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f'[{ident} :ident "{ident}"]',
+            f"[{ident} :tag :provisional]",
+            f'[{ident} :lo-hash "h8"]',
+            f'[{ident} :hi-hash "h9"]',
+        ]) + "]", ts)
+        assert mcp_server._intervals_read_extra(real_db) == [(ident, "h8", "h9", None)], (
+            "a countless interval is untrustworthy but must stay enumerable, "
+            "or its facts leak forever -- the same rule "
+            "_completed_regions_read_full follows"
+        )
+
+    def test_discard_removes_every_fact_including_the_ident(self, real_db):
+        import mcp_server
+        ts = "2026-09-04T00:00:00Z"
+        ident = mcp_server._interval_ident("h9")
+        mcp_server._transact(real_db, "[" + " ".join([
+            f"[{ident} :entity-type :type/ingest-interval]",
+            f'[{ident} :ident "{ident}"]',
+            f"[{ident} :tag :provisional]",
+            f'[{ident} :lo-hash "h8"]',
+            f'[{ident} :hi-hash "h9"]',
+            f"[{ident} :pos-count 2]",
+        ]) + "]", ts)
+        mcp_server._frontier_discard_interval(
+            real_db, ident, ("h8", "h9"), pos_count=2, tag=":provisional",
+        )
+        assert mcp_server._intervals_read_extra(real_db) == []
+        assert mcp_server._frontier_read_bounds(real_db, ident) is None
+        # A residual :pos-count would attach to whatever interval the next
+        # _frontier_persist_claim mints at this same deterministic ident, and
+        # neither assertion above would catch it: _intervals_read_extra scans
+        # via :entity-type/:ident, which are gone, and _frontier_read_bounds
+        # only reads :lo-hash/:hi-hash.
+        assert mcp_server._frontier_read_pos_count(real_db, ident) is None
+
+
+class TestFrontierPersistClaimTargetsAnInterval:
+    """#325: a claim extends the interval entity it belongs to, and a merge
+    retracts the absorbed entity in the same call."""
+
+    def test_claim_extends_a_minted_ident_when_given_one(self, real_db):
+        import mcp_server
+        lin = [f"h{i}" for i in range(10)]
+        ident = mcp_server._interval_ident("h9")
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 9, False, "2026-09-04T00:00:00Z", ident=ident,
+        )
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 8, False, "2026-09-04T00:00:01Z", ident=ident,
+        )
+        assert mcp_server._frontier_read_bounds(real_db, ident) == ("h8", "h9")
+        assert mcp_server._frontier_read_pos_count(real_db, ident) == 2
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) is None, (
+            "the fixed high ident must be untouched when a claim names another"
+        )
+        # #325 review Finding 2: the bounds/count assertions above pass even
+        # if the minted ident never got its own :ident fact -- they read by
+        # fixed ident, not through the enumeration join. Without the write,
+        # _intervals_read_extra's `[?e :ident ?ident]` clause can never bind
+        # this entity at all, so it stays permanently invisible to
+        # enumeration and to _frontier_discard_interval's retract set.
+        assert mcp_server._intervals_read_extra(real_db) == [(ident, "h8", "h9", 2)]
+
+    def test_absorbed_idents_are_retracted_by_the_merging_claim(self, real_db):
+        import mcp_server
+        lin = [f"h{i}" for i in range(10)]
+        upper = mcp_server._interval_ident("h9")
+        for p, t in ((9, "00"), (8, "01")):
+            mcp_server._frontier_persist_claim(
+                real_db, lin, p, False, f"2026-09-04T00:00:{t}Z", ident=upper)
+        for p, t in ((5, "02"), (4, "03")):
+            mcp_server._frontier_persist_claim(
+                real_db, lin, p, False, f"2026-09-04T00:00:{t}Z")
+        # Positive control (#325 review Finding 2): confirm "upper" is
+        # genuinely enumerable BEFORE the merge. Without this, an entity that
+        # was NEVER made enumerable (a missing :ident write) would also leave
+        # the post-merge `== []` assertion below vacuously true.
+        assert mcp_server._intervals_read_extra(real_db) == [(upper, "h8", "h9", 2)]
+
+        # The claim at 7 merges the default-ident interval [h4,h5] with
+        # "upper" [h8,h9]; nothing claims position 6 explicitly.
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 7, False, "2026-09-04T00:00:04Z",
+            ident=mcp_server._FRONTIER_HIGH_IDENT, absorbed_idents=[upper],
+        )
+        assert mcp_server._intervals_read_extra(real_db) == [], (
+            "the absorbed entity's facts must be gone, not merely unreferenced"
+        )
+        # #325 review Finding 1: the survivor must describe the UNION of its
+        # own span [h4,h5], the absorbed span [h8,h9], and the claimed
+        # position h7 -- [h4,h9], count 6 -- not just the one bound a
+        # non-merging claim would have moved.
+        assert mcp_server._frontier_read_bounds(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) == ("h4", "h9")
+        assert mcp_server._frontier_read_pos_count(
+            real_db, mcp_server._FRONTIER_HIGH_IDENT) == 6
+
+    def test_absorbed_interval_below_the_survivor_is_not_lost(self, real_db):
+        """#325 review Finding 1's own docstring names this exact geometry as
+        untested: every other merge test here has the absorbed interval
+        ABOVE the survivor. The union code is direction-agnostic by
+        construction (min/max over candidate positions, no `from_low`
+        branch), so this is a missing guard, not a bug -- but the FAILURE
+        mode it guards is real and was named at the time: '[100,120]
+        absorbing [50,98] via a claim at 99 would silently produce [99,120],
+        losing the proven [50,98] region with no inversion to trip the
+        _frontier_load lo<=hi guard'.
+        """
+        import mcp_server
+        lin = [f"h{i}" for i in range(130)]
+        survivor = mcp_server._interval_ident("h120")
+        below = mcp_server._interval_ident("h98")
+
+        for p, t in ((120, "00"), (100, "01")):
+            mcp_server._frontier_persist_claim(
+                real_db, lin, p, False, f"2026-09-04T00:00:{t}Z", ident=survivor)
+        for p, t in ((98, "02"), (50, "03")):
+            mcp_server._frontier_persist_claim(
+                real_db, lin, p, False, f"2026-09-04T00:00:{t}Z", ident=below)
+
+        assert mcp_server._frontier_read_bounds(real_db, survivor) == ("h100", "h120")
+        assert mcp_server._frontier_read_bounds(real_db, below) == ("h50", "h98")
+
+        # The claim at 99 merges `below` [h50,h98] UP into `survivor`
+        # [h100,h120] -- the mirror image of every other merge test's
+        # geometry, where the absorbed interval sits above the survivor.
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 99, False, "2026-09-04T00:00:04Z",
+            ident=survivor, absorbed_idents=[below],
+        )
+
+        assert mcp_server._frontier_read_bounds(real_db, below) is None, (
+            "the absorbed entity's facts must be gone, not merely unreferenced"
+        )
+        assert mcp_server._frontier_read_bounds(real_db, survivor) == ("h50", "h120"), (
+            "the survivor must describe the UNION of its own span [h100,h120], "
+            "the absorbed span [h50,h98], and the claimed position h99 -- "
+            "[h50,h120] -- never just the one bound a non-merging claim would "
+            "have moved (which would silently produce [h99,h120] and lose the "
+            "proven [h50,h98] region with no inversion to trip any guard)"
+        )
+        assert mcp_server._frontier_read_pos_count(real_db, survivor) == 71
+
+    def test_absorb_retracts_before_the_survivor_transacts(self, real_db):
+        """#325 review Finding 3: the crash-safety property this API exists
+        for is about EMITTED ORDER, not end state -- retract-then-extend
+        leaves a re-walkable duplicate if a crash lands between them;
+        extend-then-retract would leave a silent hole. Assert the order
+        directly with execute_spy rather than only checking end state."""
+        import mcp_server
+        lin = [f"h{i}" for i in range(10)]
+        upper = mcp_server._interval_ident("h9")
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 9, False, "2026-09-04T00:00:00Z", ident=upper)
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 8, False, "2026-09-04T00:00:01Z", ident=upper)
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 5, False, "2026-09-04T00:00:02Z")
+        mcp_server._frontier_persist_claim(
+            real_db, lin, 4, False, "2026-09-04T00:00:03Z")
+
+        with execute_spy() as calls:
+            mcp_server._frontier_persist_claim(
+                real_db, lin, 7, False, "2026-09-04T00:00:04Z",
+                ident=mcp_server._FRONTIER_HIGH_IDENT, absorbed_idents=[upper],
+            )
+
+        retract_of_absorbed = [
+            i for i, c in enumerate(calls)
+            if c.startswith("(retract") and upper in c
+        ]
+        transact_of_survivor = [
+            i for i, c in enumerate(calls)
+            if c.startswith("(transact") and mcp_server._FRONTIER_HIGH_IDENT in c
+        ]
+        assert retract_of_absorbed, "expected a (retract ...) call naming the absorbed ident"
+        assert transact_of_survivor, "expected a (transact ...) call naming the survivor ident"
+        assert max(retract_of_absorbed) < min(transact_of_survivor), (
+            "the absorbed entity's retract must be emitted before the "
+            "survivor's extending transact"
+        )
+
+    def test_span_flush_targets_a_named_ident(self, real_db):
+        import mcp_server
+        lin = [f"h{i}" for i in range(10)]
+        ident = mcp_server._interval_ident("h9")
+        mcp_server._frontier_persist_span(
+            real_db, lin, 6, 9, False, "2026-09-04T00:00:00Z", ident=ident)
+        assert mcp_server._frontier_read_bounds(real_db, ident) == ("h6", "h9")
+        assert mcp_server._frontier_read_pos_count(real_db, ident) == 4
+        # #325 review Finding 2: same rationale as the claim-path test above
+        # -- prove the minted interval is actually enumerable, not just
+        # readable by its own fixed ident.
+        assert mcp_server._intervals_read_extra(real_db) == [(ident, "h6", "h9", 4)]
+
+
+class TestSkipClaimFastPathStillFiresForAResolvableRegion:
+    """#325 review round 3, Finding 2 (partial acceptance): #325 makes
+    _skip_claim's fast path unreachable via any NATURALLY-arising archived
+    region in a two-run scenario -- see
+    TestDivergentRefEndToEnd.test_divergent_ref_forces_a_full_correct_rewalk_not_a_skip's
+    docstring for the proof (an archived region's bounds only fail to
+    resolve in the SAME run that archives them, by construction, so
+    _completed_regions_load's resolvability requirement and
+    _load_one_interval's archive-only-when-unresolvable condition can never
+    both hold in one run).
+
+    That does not mean the MECHANISM is dead code to stop guarding: a
+    region that DOES resolve -- as one could if a divergent branch ever
+    un-diverged back to its exact prior hashes, or via any future producer
+    of a trustworthy resolvable region -- must still be skipped. This seeds
+    the :type/completed-region facts directly, bypassing the archive
+    trigger entirely, so the guard stays live regardless of whether
+    anything can naturally produce that input today.
+    """
+
+    def _repo(self, tmp_path, n):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(n):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_a_resolvable_archived_region_is_skipped(self, tmp_path, monkeypatch):
+        import mcp_server
+        import frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = self._repo(tmp_path, 10)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+
+        lin = frontier_registry.build_linearization(str(repo))
+        # Positions 3..9 (7 of the 10) seeded as an already-"proven" region
+        # -- resolvable in THIS run's own linearization by construction,
+        # unlike anything _load_one_interval could ever archive naturally.
+        region_lo, region_hi = 3, 9
+        mcp_server._transact(
+            mcp_server.get_db(),
+            mcp_server._completed_region_facts(
+                lin[region_lo], lin[region_hi], ":provisional",
+                pos_count=region_hi - region_lo + 1,
+            ),
+            "2026-09-04T00:00:00Z",
+        )
+
+        trace = tmp_path / "trace.jsonl"
+        monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(trace))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        status = mcp_server.handle_minigraf_ingest_status()
+        assert status["positions_skipped_this_run"] > 0, (
+            "a resolvable, count-matching archived region must still drive "
+            "submit_next's skip branch"
+        )
+        records = [
+            json.loads(line) for line in trace.read_text().splitlines() if line.strip()
+        ]
+        applied_rev = {r["pos"] for r in records if r.get("tag") == "rev"}
+        assert not (applied_rev & set(range(region_lo, region_hi + 1))), (
+            "the archived region must cost the reverse stream no write at all"
+        )
+        missing = [
+            h for h in lin
+            if json.loads(mcp_server._db_execute(
+                mcp_server.get_db(),
+                f"(query [:find (count-distinct ?t) :where "
+                f"[:commit/{h[:12]} :entity-type ?t]])",
+            ))["results"][0][0] == 0
+        ]
+        assert [lin.index(h) for h in missing] == list(range(region_lo, region_hi + 1)), (
+            "exactly the skipped region -- and nothing else -- must be "
+            "missing a commit entity: the skip must be sound (no genuine "
+            "loss elsewhere), not merely present"
+        )
+
+
+class TestDivergentRefEndToEnd:
+    """#326 acceptance tests, real end-to-end ingestion runs against a real
+    file-backed graph. Renamed from TestSkipFastPathEndToEnd in #325 review
+    round 3 (Finding 6): once rewritten (see below), nothing here still
+    exercises the skip fast path -- the old name was actively misleading.
+
+    #325 review round 2 REWRITES this class. Its original trigger -- plain
+    tip growth past a span-matching interval -- is now a RETAIN, not a
+    discard (TestFrontierLoadRetainsAcrossTipGrowth): those positions are
+    simply excluded from the gap from the start, so _skip_claim never even
+    sees them. The remaining "still discards and archives" trigger,
+    unresolvable bounds (a history rewrite), STILL cannot make _skip_claim's
+    fast path fire in a two-run scenario -- proven, not assumed, in
+    test_divergent_ref_forces_a_full_correct_rewalk_not_a_skip's docstring
+    below, with an empirical reproduction to back it. So `positions_skipped_
+    this_run > 0` is not achievable end-to-end any more under a correct
+    #325 implementation; every test below asserts it stays 0 instead, as a
+    documented, load-bearing fact rather than a silently dropped check.
+
+    What still IS end-to-end testable, and is what these tests now check:
+    a divergent ref forces a full, CORRECT re-walk (no data loss, no
+    corruption) rather than a skip -- a real behaviour change from #326
+    alone, but a safe one.
     """
 
     def _repo(self, tmp_path, n, start=0):
@@ -8667,17 +9381,67 @@ class TestSkipFastPathEndToEnd:
             _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
         return repo
 
+    def _rewrite_from(self, repo, commit_hash):
+        """Rewrite `commit_hash` and every descendant with a NEW hash: amend
+        that commit's tree, then rebase everything after it onto the amended
+        commit. Simulates a force-push/rebase -- a bound that referenced
+        `commit_hash` (or anything at or after it) is no longer present in
+        the new linearization, #325's "divergent-ref leak" / unresolvable-
+        bounds path. Everything BELOW commit_hash keeps its original hash,
+        so frontier-low's bounds (and any positions below commit_hash) are
+        untouched."""
+        branch = _subprocess.run(
+            ["git", "symbolic-ref", "--short", "HEAD"], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        _subprocess.run(["git", "checkout", commit_hash], cwd=repo, check=True, capture_output=True)
+        (repo / "REWRITTEN").write_text("poison\n")
+        _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(["git", "commit", "--amend", "--no-edit"], cwd=repo, check=True, capture_output=True)
+        new_hash = _subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        _subprocess.run(["git", "checkout", branch], cwd=repo, check=True, capture_output=True)
+        _subprocess.run(
+            ["git", "rebase", "--onto", new_hash, commit_hash, branch], cwd=repo,
+            check=True, capture_output=True,
+        )
+
     @pytest.mark.asyncio
-    async def test_archived_region_is_skipped_on_the_next_run(self, tmp_path, monkeypatch):
+    async def test_divergent_ref_forces_a_full_correct_rewalk_not_a_skip(
+        self, tmp_path, monkeypatch
+    ):
+        """#325 review round 2 replacement for this class's original
+        acceptance test ("test_archived_region_is_skipped_on_the_next_run").
+
+        WHY _skip_claim's fast path is unreachable, proven rather than
+        assumed: _completed_regions_load only ever offers a region to
+        _skip_claim when its bounds RESOLVE in the CURRENT run's
+        linearization (mcp_server.py: `if lo_hash not in hash_to_pos or
+        hi_hash not in hash_to_pos: continue`), but _load_one_interval only
+        ever archives a region whose bounds do NOT resolve in that exact
+        linearization (`if not resolved and pos_count is not None: ...
+        archive`). Those two conditions are mutually exclusive within one
+        run -- an archived region can only become visible to _skip_claim in
+        a LATER run whose linearization regains the exact same commit
+        hashes, which no ordinary git operation produces (a rebase or
+        amend always replaces a hash, never reproduces an old one). This was
+        verified empirically with a real rebase (not merely reasoned): after
+        one, positions_skipped_this_run reliably stayed 0 and the trace
+        showed every diverged position genuinely re-applied.
+
+        So what #326's machinery still guarantees, and what this test
+        checks, is narrower than the original acceptance test: a divergent
+        ref is discovered, archived (with its claim-time :pos-count
+        preserved, not silently dropped to None -- see
+        _load_one_interval's docstring), and discarded; the whole region is
+        then safely and completely re-walked, with no data loss. A full
+        re-walk, not a skip -- that trade is #325's, not a regression.
+        """
         import mcp_server
         import frontier_registry
 
-        # 1:20 forward:reverse, not the (1,1) default. The two streams
-        # partition ONE gap, so at 1:1 the forward stream claims the archived
-        # positions before the reverse stream walks down to them and the
-        # reverse stream skips NOTHING -- the test would then pass its "no rev
-        # writes" assertion vacuously, which is precisely the failure this
-        # acceptance test exists to rule out.
         monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
         repo = self._repo(tmp_path, 12)
         mcp_server._reset_db_state()
@@ -8688,54 +9452,66 @@ class TestSkipFastPathEndToEnd:
             mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT
         )
         assert first_high is not None, (
-            "run 1 must leave a persisted frontier-high, or there is nothing to "
-            "discard and this test proves nothing"
+            "run 1 must leave a persisted frontier-high, or there is nothing "
+            "to diverge and this test proves nothing"
         )
 
-        # #325's trigger, reproduced: the tip moves past the persisted :hi-hash,
-        # so _frontier_load's discard branch fires on its own.
+        self._rewrite_from(repo, first_high[0])
         self._repo(tmp_path, 2, start=12)
-        grown = frontier_registry.build_linearization(str(repo))
-        archived_lo, archived_hi = first_high
-        archived_positions = set(
-            range(grown.index(archived_lo), grown.index(archived_hi) + 1)
-        )
-        assert len(archived_positions) >= 3, (
-            f"only {len(archived_positions)} positions archived; raise the commit "
-            "count or the reverse ratio, or this test measures almost nothing"
-        )
 
         trace = tmp_path / "trace.jsonl"
         monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(trace))
         await mcp_server._run_ingestion(str(repo), "HEAD")
 
+        status = mcp_server.handle_minigraf_ingest_status()
+        assert status["positions_skipped_this_run"] == 0, (
+            "an unresolvable-bounds archive can never be skip-fast-pathed in "
+            "the same run that discovers it -- see this test's own docstring"
+        )
+
+        grown = frontier_registry.build_linearization(str(repo))
         records = [
             json.loads(line)
             for line in trace.read_text().splitlines() if line.strip()
         ]
-        rev_applied = {r["pos"] for r in records if r["tag"] == "rev"}
-        assert not (rev_applied & archived_positions), (
-            f"reverse re-applied positions {sorted(rev_applied & archived_positions)}; "
-            "the archived region must cost the reverse stream no write at all"
+        applied = {r["pos"] for r in records}
+        assert applied, "run 2 must have applied something -- the whole region diverged"
+
+        missing = [
+            h for h in grown
+            if json.loads(mcp_server._db_execute(
+                mcp_server.get_db(),
+                f"(query [:find (count-distinct ?t) :where "
+                f"[:commit/{h[:12]} :entity-type ?t]])",
+            ))["results"][0][0] == 0
+        ]
+        assert not missing, (
+            f"commits {[h[:12] for h in missing]} have no :commit/... entity "
+            "after the rewalk -- a divergent ref must lose nothing"
         )
-        assert rev_applied, "run 2 must still apply the genuinely-new tip commits"
-
-        # Forward records are deliberately NOT asserted on. A forward claim
-        # landing inside a provisional archived region is the authority
-        # upgrade that must still happen -- _skip_claim never skips 'fwd', and
-        # TestSkipClaim covers that direction at the unit level with its own
-        # ablation.
-
-        status = mcp_server.handle_minigraf_ingest_status()
-        assert status["positions_skipped_this_run"] > 0, (
-            "the reverse stream reached the archived region but skipped nothing"
+        assert mcp_server._completed_regions_read(mcp_server.get_db()) != [], (
+            "the diverged region's witness must still be archived, even "
+            "though nothing consults it for skipping in this run"
         )
 
     @pytest.mark.asyncio
-    async def test_skipped_positions_still_advance_the_persisted_frontier(self, tmp_path, monkeypatch):
-        """#326 requirement 3. Skipping the work is not skipping the
-        bookkeeping: a position skipped without the interval growing leaves the
-        same region unclaimed for the next run to replay again."""
+    async def test_a_full_rewalk_after_divergence_leaves_no_coverage_gap(
+        self, tmp_path, monkeypatch
+    ):
+        """#325 review round 2 replacement for "#326 requirement 3" (the
+        end-of-walk flush closing the gap a skip run left open). That
+        mechanism is only reachable when skips occur, and #326's fast path
+        is unreachable in any two-run scenario under #325 (see
+        test_divergent_ref_forces_a_full_correct_rewalk_not_a_skip's
+        docstring for the proof).
+
+        This checks the SURVIVING form of the same invariant: after a
+        divergent-ref-triggered full rewalk, frontier-low and frontier-high
+        must still MEET with no unclaimed hole between them. It holds here
+        because ordinary per-commit persistence covers every position for
+        real (a full rewalk, not a skip run), not because a flush
+        recomputed a boundary skips left open.
+        """
         import mcp_server
         import frontier_registry
 
@@ -8749,63 +9525,33 @@ class TestSkipFastPathEndToEnd:
             mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT
         )
         assert first_high is not None, (
-            "run 1 must leave a persisted frontier-high, or there is no region to "
-            "archive and this test proves nothing"
+            "run 1 must leave a persisted frontier-high, or there is nothing "
+            "to diverge and this test proves nothing"
         )
 
+        self._rewrite_from(repo, first_high[0])
         self._repo(tmp_path, 2, start=12)
         await mcp_server._run_ingestion(str(repo), "HEAD")
 
-        # Everything below reasons from "the reverse stream skips 2..11", and
-        # nothing below can SEE whether it did: the coverage assertion is
-        # satisfiable by a run that skipped nothing and walked every position
-        # for real, so it would stay green under a _skip_claim that silently
-        # stopped matching. This one line is what keeps the rest of this test
-        # about the flush rather than about ingestion in general.
         assert mcp_server.handle_minigraf_ingest_status()[
             "positions_skipped_this_run"
-        ] > 0, (
-            "run 2 skipped no positions at all, so the end-of-walk flush this "
-            "test exists to check was never exercised"
+        ] == 0, (
+            "if this ever becomes nonzero, _skip_claim has become reachable "
+            "again and the reasoning in this class's docstring needs "
+            "re-examining, not just this number"
         )
 
         grown = frontier_registry.build_linearization(str(repo))
         high = mcp_server._frontier_read_bounds(
             mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT
         )
-        assert high is not None, (
-            "the reverse stream claimed positions, so it must leave a persisted "
-            "interval -- skipping the work is not skipping the bookkeeping"
-        )
+        assert high is not None, "the reverse stream claimed positions too"
         lo_pos, hi_pos = grown.index(high[0]), grown.index(high[1])
         assert lo_pos <= hi_pos, f"persisted frontier-high is inverted: {high}"
         assert hi_pos == len(grown) - 1, (
-            "a completed run's high interval must reach the tip, or the next run "
-            "discards it again and the skip bought nothing"
+            "a completed run's high interval must reach the tip"
         )
 
-        # The LOW bound of frontier-high is what the end-of-walk flush owns,
-        # and neither assertion above can see it. Run 2's reverse stream makes
-        # two genuine claims at the tip (13, then 12) BEFORE it descends into
-        # the archived region, and those two alone create a frontier-high whose
-        # hi is the tip -- so `hi_pos == len(grown) - 1` stays green with the
-        # flush removed, over an interval of merely [12, 13].
-        #
-        # The invariant that does discriminate it is COVERAGE: the two streams
-        # partition one gap, so on a completed run their two intervals must
-        # meet, leaving no position unclaimed. Measured on this scenario the
-        # archived region is [1, 11]; run 2's forward stream claims position 1
-        # (the authority upgrade -- _skip_claim never skips "fwd"), the reverse
-        # stream skips 2..11 and the flush persists frontier-high = [2, 13],
-        # against frontier-low = [0, 1]. They meet. Delete the flush and the
-        # reverse stream persists only its two real claims, [12, 13], while
-        # frontier-low still ends at 1 -- positions 2..11 are then claimed by
-        # NOBODY and the next run replays the very region this one skipped.
-        #
-        # Note this is deliberately NOT `lo_pos <= <archived region's low>`.
-        # That is unsatisfiable by correct behaviour: the bottom of the
-        # archived region goes to the forward stream, so frontier-high's low
-        # bound legitimately never reaches it.
         low = mcp_server._frontier_read_bounds(
             mcp_server.get_db(), mcp_server._FRONTIER_LOW_IDENT
         )
@@ -8816,15 +9562,14 @@ class TestSkipFastPathEndToEnd:
         )
         low_lo_pos, low_hi_pos = grown.index(low[0]), grown.index(low[1])
         assert low_lo_pos == 0, (
-            f"frontier-low starts at position {low_lo_pos}, not 0; the coverage "
-            "check below assumes the forward stream covers everything beneath it"
+            f"frontier-low starts at position {low_lo_pos}, not 0; the "
+            "coverage check below assumes the forward stream covers "
+            "everything beneath it"
         )
         assert low_hi_pos + 1 >= lo_pos, (
-            f"frontier-low ends at position {low_hi_pos} and frontier-high starts "
-            f"at {lo_pos}, so positions {low_hi_pos + 1}..{lo_pos - 1} are claimed "
-            "by neither stream -- the walk ended inside a run of skips and nothing "
-            "persisted them, so the next run replays the very region this one "
-            "skipped and the skip bought nothing"
+            f"frontier-low ends at position {low_hi_pos} and frontier-high "
+            f"starts at {lo_pos}, so positions {low_hi_pos + 1}..{lo_pos - 1} "
+            "are claimed by neither stream"
         )
 
     @pytest.mark.asyncio
@@ -8850,6 +9595,36 @@ class TestSkipFastPathEndToEnd:
         The assertion is the INVARIANT -- no position inside the persisted
         interval lacks a commit entity -- not a particular interval value, so it
         keeps stating the property when the numbers move.
+
+        #325 review round 2: TWO independent problems rule out reusing the
+        original #326 mechanism (grow the tip, let real skips into an
+        archived region drive the interrupt). First, _skip_claim can no
+        longer discover a real skip in any two-run scenario (see
+        test_divergent_ref_forces_a_full_correct_rewalk_not_a_skip's
+        docstring for why). Second -- discovered while trying to force the
+        predicate via monkeypatch instead -- submit_next's inner skip loop
+        never checks _shutdown_requested; it keeps calling
+        claimer.next_claim() and retiring skips INLINE until the shared gap
+        is empty or a non-skippable ('fwd') claim breaks it out, so a forced
+        predicate that skips every 'rev' claim burns through the whole
+        region as skips in one call, setting the shutdown flag too late to
+        interrupt anything -- the run completes normally with a graph full
+        of falsely-"complete" but unwritten positions, which is a different
+        (and separately concerning, see this test's report) failure mode
+        than the one under test here.
+
+        So this interrupts a REAL in-flight reverse APPLY instead -- the
+        same technique TestSkipFlushNeverCoversFailedWrites and
+        TestNonTipWriteFailureIsReWalked already use for write
+        failures -- against a divergent-ref-triggered full rewalk (a single
+        unified interval, avoiding the retained-base-plus-new-interval
+        scenario that mcp_server.py's current write dispatch cannot persist
+        correctly: _reverse_apply has no ident/claim_ident parameter yet, so
+        every reverse claim's persistence targets the fixed
+        :ingestion/frontier-high ident regardless of which in-memory
+        interval it belongs to -- fine for a single interval, corrupting for
+        two). A real apply gives `pending` genuine, still-unapplied entries
+        for the interrupt to catch.
         """
         import mcp_server
         import frontier_registry
@@ -8860,35 +9635,39 @@ class TestSkipFastPathEndToEnd:
         mcp_server.open_db(str(repo / "memory.graph"))
 
         await mcp_server._run_ingestion(str(repo), "HEAD")
+        first_high = mcp_server._frontier_read_bounds(
+            mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT
+        )
+        assert first_high is not None, (
+            "run 1 must leave a persisted frontier-high, or there is nothing "
+            "to diverge and this test proves nothing"
+        )
+        self._rewrite_from(repo, first_high[0])
         self._repo(tmp_path, 2, start=12)
 
-        # Interrupt from inside the walk, on the third skip -- late enough that
-        # lowest_skipped_pos has been driven well below the tip claims still
-        # sitting unapplied in `pending`, which is the configuration that makes
-        # an ungated flush swallow them.
-        real_skip_claim = mcp_server._skip_claim
-        skips_seen = [0]
+        real_reverse_apply = mcp_server._reverse_apply
+        applies_seen = [0]
 
-        def interrupting_skip_claim(tag, pos, regions):
-            result = real_skip_claim(tag, pos, regions)
-            if result:
-                skips_seen[0] += 1
-                if skips_seen[0] >= 3:
-                    mcp_server._shutdown_requested.set()
-            return result
+        def interrupting_reverse_apply(*args, **kwargs):
+            applies_seen[0] += 1
+            if applies_seen[0] >= 3:
+                mcp_server._shutdown_requested.set()
+            return real_reverse_apply(*args, **kwargs)
 
-        monkeypatch.setattr(mcp_server, "_skip_claim", interrupting_skip_claim)
+        monkeypatch.setattr(mcp_server, "_reverse_apply", interrupting_reverse_apply)
         try:
             await mcp_server._run_ingestion(str(repo), "HEAD")
         finally:
+            monkeypatch.setattr(mcp_server, "_reverse_apply", real_reverse_apply)
             # Never leak the flag into another test in this session: it is a
             # module-level asyncio.Event, and every later _run_ingestion would
             # break out of its walk immediately.
             mcp_server._shutdown_requested.clear()
 
-        assert skips_seen[0] >= 3, (
-            f"only {skips_seen[0]} skips occurred, so the interrupt never fired "
-            "mid-walk and this test proves nothing about the shutdown path"
+        assert applies_seen[0] >= 3, (
+            f"only {applies_seen[0]} reverse applies occurred, so the "
+            "interrupt never fired mid-walk and this test proves nothing "
+            "about the shutdown path"
         )
 
         grown = frontier_registry.build_linearization(str(repo))
@@ -9083,8 +9862,14 @@ class TestSkipFlushNeverCoversFailedWrites:
             mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT
         ) is not None, "run 1 must persist a frontier-high to be discarded"
 
-        # Two new tip commits, so run 2 discards + archives the old interval
-        # (skipping into it) AND has genuinely-new positions above it.
+        # Two new tip commits. #325 review round 2: this used to say run 2
+        # "discards + archives the old interval (skipping into it)" -- that
+        # was #326's original trigger, and #325 supersedes it: a
+        # span-matching interval that no longer reaches the tip is now
+        # RETAINED, not discarded (TestFrontierLoadRetainsAcrossTipGrowth),
+        # so run 2 never touches the old region at all. That is fine for
+        # THIS test: its subject is the two NEW tip positions' write
+        # failures, entirely independent of what happens to the old region.
         self._repo(tmp_path, 2, start=10)
         grown = frontier_registry.build_linearization(str(repo))
         failing = set(grown[-2:])
@@ -9092,24 +9877,33 @@ class TestSkipFlushNeverCoversFailedWrites:
         real_reverse_apply = mcp_server._reverse_apply
 
         def failing_reverse_apply(db, repo_path, linearization, commit_metadata,
-                                  pos, file_results, index_con=None,
-                                  persist_claim=True):
+                                  pos, file_results, *args, **kwargs):
+            # *args/**kwargs, not a fixed persist_claim/claim_ident/
+            # absorbed_idents signature (#325 review round 2): forwards
+            # whatever _run_ingestion's write dispatch passes positionally,
+            # so this wrapper does not need updating again the next time
+            # _reverse_apply's signature grows.
             if linearization[pos] in failing:
                 raise RuntimeError("simulated per-commit write failure")
             return real_reverse_apply(
                 db, repo_path, linearization, commit_metadata, pos, file_results,
-                index_con, persist_claim,
+                *args, **kwargs,
             )
 
         monkeypatch.setattr(mcp_server, "_reverse_apply", failing_reverse_apply)
         await mcp_server._run_ingestion(str(repo), "HEAD")
         monkeypatch.setattr(mcp_server, "_reverse_apply", real_reverse_apply)
 
-        status = mcp_server.handle_minigraf_ingest_status()
-        assert status["positions_skipped_this_run"] > 0, (
-            "run 2 skipped nothing, so the end-of-walk flush this test is about "
-            "never ran and the assertion below would prove nothing"
-        )
+        # #325 review round 2: no longer asserting positions_skipped_this_run
+        # > 0 here. _skip_claim's fast path is structurally unreachable in a
+        # two-run scenario under #325's corrected retain/archive gating --
+        # see TestDivergentRefEndToEnd's
+        # test_divergent_ref_forces_a_full_correct_rewalk_not_a_skip
+        # docstring for the full reasoning and the empirical verification.
+        # This test's own non-vacuity guard is the very next assertion
+        # (missing_after_run2 == 2): it does not need a skip to have
+        # happened, only that the two injected write failures genuinely
+        # failed.
         missing_after_run2 = [
             h for h in failing
             if json.loads(mcp_server._db_execute(
@@ -9144,29 +9938,241 @@ class TestSkipFlushNeverCoversFailedWrites:
             "rather than discarded -- nothing will ever re-walk them"
         )
 
-class TestSkipFastPathFailedWriteIsNotClaimed:
-    """#326 Finding A: an isolated per-commit WRITE FAILURE at a non-tip
+
+class TestTipGrowthRetainsTheReverseFrontier:
+    """#325 acceptance 1: after the tip grows, the reverse stream walks only
+    the new commits, and frontier-high is retained -- keeping its original
+    lo -- and extended to the new tip, rather than being discarded and
+    re-derived. This is the issue's headline property (#325: ~18h re-walk
+    measured on a real 53k-commit repo) and the most important test on this
+    branch.
+
+    Corrected after review: an earlier version of this docstring, and this
+    class's introducing commit (42167df), claimed master re-walks "every
+    position -- not just the new ones" for plain tip growth, and that the
+    trace assertion below "cannot be satisfied vacuously by a fast skip
+    path either". Both are false, reproduced by ablation both ways -- see
+    the correcting commit that follows 42167df, and
+    .superpowers/sdd/2026-09-04-frontier-interval-set/task-7-report.md's
+    Finding 2 addendum, for the full account. The true picture:
+
+    - Against MASTER, only the retained-lo assertion below discriminates.
+      Master's _frontier_load discards an off-tip interval but ARCHIVES it
+      first (#326), and a plain tip-growth run never rewrites history, so
+      the archived region's hashes still resolve in that SAME run's
+      linearization -- #326's _skip_claim fast path intercepts it there,
+      same run, reassigning the old span to a freshly-derived interval
+      instead of re-walking it. Master's trace therefore also shows only
+      the 3 new positions applied; what it gets wrong is frontier-high's
+      lo, which moves to a later position than the one this run started
+      with, rather than being retained.
+    - On THIS BRANCH the trace assertion has real teeth: #325 removed the
+      "reaches the tip" requirement from _load_one_interval's retain check
+      (mcp_server.py, the `if resolved and lo_pos <= hi_pos and pos_count
+      == hi_pos - lo_pos + 1:` line), which is exactly what makes
+      off-tip retention possible at all. Re-adding master's `and hi_pos ==
+      len(linearization) - 1` to that line, on this branch, made positions
+      2-11 re-apply via the reverse stream (verified by ablation, not
+      merely reasoned) -- so on this branch, unlike on master, the fast
+      path is genuinely gone and a regression here would show up as a full
+      re-walk, which the trace assertion catches directly.
+
+    MINIGRAF_INGEST_TRACE_PATH is the independent witness of which commits
+    were actually APPLIED by the reverse stream: it emits one JSONL record
+    per applied commit (fields confirmed against _IngestTrace.emit).
+    """
+
+    @pytest.mark.asyncio
+    async def test_second_run_applies_only_the_new_commits(self, tmp_path, monkeypatch):
+        import mcp_server, frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = TestDivergentRefEndToEnd()._repo(tmp_path, 12)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        first_high = mcp_server._frontier_read_bounds(
+            mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT)
+        assert first_high is not None, (
+            "run 1 must leave a persisted frontier-high, or there is nothing "
+            "to retain and this test proves nothing"
+        )
+
+        TestDivergentRefEndToEnd()._repo(tmp_path, 3, start=12)
+        trace = tmp_path / "trace.jsonl"
+        monkeypatch.setenv("MINIGRAF_INGEST_TRACE_PATH", str(trace))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        lin = frontier_registry.build_linearization(str(repo))
+        records = [
+            json.loads(line) for line in trace.read_text().splitlines()
+            if line.strip()
+        ]
+        applied_rev = {r["pos"] for r in records if r.get("tag") == "rev"}
+        assert applied_rev, (
+            "run 2 must have applied at least one reverse position -- the "
+            "new tip -- or this test proves nothing"
+        )
+        new_positions = set(range(len(lin) - 3, len(lin)))
+        assert applied_rev <= new_positions, (
+            "reverse stream re-applied already-ingested positions: "
+            f"{sorted(applied_rev - new_positions)}"
+        )
+        assert mcp_server._intervals_read_extra(mcp_server.get_db()) == [], (
+            "the tip interval must have merged into frontier-high, not "
+            "persisted as a separate extra interval"
+        )
+        merged = mcp_server._frontier_read_bounds(
+            mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT)
+        assert merged is not None
+        assert merged[0] == first_high[0] and merged[1] == lin[-1], (
+            f"frontier-high must retain its original lo ({first_high[0][:12]}) "
+            f"and extend its hi to the new tip ({lin[-1][:12]}); got {merged}"
+        )
+
+
+class TestSecondTipGrowthBeforeMerge:
+    """#325: two disjoint provisional intervals must persist and reload.
+    This is the case a single extra fixed ident cannot express -- prior to
+    #325's ident-keyed provisional interval entities (70dd757), there was
+    nowhere to persist a SECOND, independent provisional region while the
+    first one was still unmerged with frontier-high.
+
+    Observed directly in this scenario (via a debug run against this
+    branch, not merely reasoned): a 10-commit run 1 closes fully,
+    frontier-high = [1,9]. Growing the tip by 4 (positions 10-13) and
+    interrupting the reverse stream after two applies leaves a genuinely
+    disjoint extra interval [11,13] -- one position (10) short of merging
+    with frontier-high's hi (9). Growing the tip again by 3 more (positions
+    14-16) and reloading shows both survive as separate provisional
+    intervals: prov == [(1,9,is_base=True), (11,13,is_base=False)], with the
+    hole at position 10 still open between them.
+
+    Review round 4 removed this class's original third assertion, "the
+    correction sweep declines while fragmented while a hole remains
+    between them" -- it was VACUOUS in this exact scenario: run 1's
+    correction sweep already parks :ingestion/correction-sweep-through at
+    frontier-high's own ceiling (position 9) when it closes cleanly, so
+    _correction_sweep_select_position's `pos > ceiling_pos` guard returns
+    None on its own, before the fragmentation clause is ever reached --
+    reproduced by calling it with fragmented=False forced and observing it
+    still return None. That property IS covered, and non-vacuously (with a
+    real positive control that DOES select when unfragmented), by
+    TestCorrectionSweepDeclinesWhileFragmented
+    (test_declines_while_a_hole_remains_above /
+    test_selects_once_the_provisional_side_is_one_interval, both unit-level
+    against a seeded fixture) -- not duplicated here.
+    """
+
+    @pytest.mark.asyncio
+    async def test_two_intervals_persist_and_reload(self, tmp_path, monkeypatch):
+        import mcp_server, frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = TestDivergentRefEndToEnd()._repo(tmp_path, 10)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        base_after_run1 = mcp_server._frontier_read_bounds(
+            mcp_server.get_db(), mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run1 is not None, (
+            "run 1 must leave a persisted frontier-high, or there is nothing "
+            "for the extra interval to stay disjoint from"
+        )
+
+        # Grow, then interrupt inside the tip gap so it never merges into
+        # frontier-high.
+        TestDivergentRefEndToEnd()._repo(tmp_path, 4, start=10)
+        original = mcp_server._reverse_apply
+        seen = {"n": 0}
+
+        def stop_after_two(*a, **kw):
+            seen["n"] += 1
+            if seen["n"] > 2:
+                mcp_server._shutdown_requested.set()
+            return original(*a, **kw)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", stop_after_two)
+        try:
+            await mcp_server._run_ingestion(str(repo), "HEAD")
+        finally:
+            # monkeypatch itself restores _reverse_apply at teardown; no
+            # need to set it back here too (#325 review round 4, Finding 4
+            # -- a second undo entry was redundant).
+            mcp_server._shutdown_requested.clear()
+
+        db = mcp_server.get_db()
+        extras_after_run2 = mcp_server._intervals_read_extra(db)
+        assert extras_after_run2 != [], (
+            "the interrupted run must leave a genuinely disjoint extra "
+            "provisional interval, separate from frontier-high, or this "
+            "test is not exercising the two-interval case at all"
+        )
+
+        # Grow the tip again, before the two provisional pieces ever merge.
+        TestDivergentRefEndToEnd()._repo(tmp_path, 3, start=14)
+        lin = frontier_registry.build_linearization(str(repo))
+        alloc = mcp_server._frontier_load(db, lin, "2026-09-04T00:00:00Z")
+        prov = [iv for iv in alloc.intervals()
+                if iv.tag == frontier_registry.TAG_PROVISIONAL]
+        assert len(prov) >= 2, (
+            f"expected frontier-high plus at least one disjoint extra "
+            f"interval to reload after the second growth, got {len(prov)}: "
+            f"{[(iv.lo_pos, iv.hi_pos, iv.is_base) for iv in prov]}"
+        )
+        assert mcp_server._intervals_read_extra(db) != [], (
+            "the extra interval must still be persisted and reloadable "
+            "after the second tip growth, not merged or dropped"
+        )
+        # No assertion on _correction_sweep_select_position here: in this
+        # scenario the sweep's own :ingestion/correction-sweep-through
+        # watermark is already parked at frontier-high's ceiling from run
+        # 1's clean close, so it declines via the ceiling check regardless
+        # of fragmentation -- asserting None here would not discriminate
+        # the fragmentation-declines property (see class docstring).
+
+
+class TestNonTipWriteFailureIsReWalked:
+    """Renamed from TestSkipFastPathFailedWriteIsNotClaimed in #325 review
+    round 3 (Finding 6): the recovery this class tests no longer goes
+    through the skip fast path at all (see the round-2 note below), so the
+    old name misled a "who tests the skip path" grep.
+
+    #326 Finding A: an isolated per-commit WRITE FAILURE at a non-tip
     reverse position must not become a permanent silent skip.
 
     _frontier_persist_claim is _reverse_apply's LAST write, but a write that
     RAISES takes _run_ingestion's per-commit `except`, which logs, counts, and
     CONTINUES THE DESCENT. No claim is persisted for the failed position -- but
     :lo-hash is a closed RANGE bound, so the next LOWER position that succeeds
-    moves it beneath the failed one and sweeps it into the interval. That
-    interval is archived on the next tip growth (pure tip growth preserves its
-    :pos-count exactly), and _skip_claim then skips that position forever.
+    would move it beneath the failed one and sweep it into the interval, were
+    it not for `rev_claim_floor`.
 
     So the witness statement -- "membership in a persisted interval proves the
     position completed" -- was only ever implied by a NEIGHBOUR's claim. #313's
     SIGKILL is safe because the process STOPS; the `except` path does not. On
     master this was self-healing by accident (the discard forced a full
-    re-walk); the archive converts it into permanent loss that every at-scale
-    detector reads clean.
+    re-walk); on #326 alone (before #325), archiving would have converted it
+    into permanent loss that every at-scale detector reads clean.
 
     The fix makes the interval PRECISE: once a reverse write fails, :lo-hash
     stops descending for the rest of the run. Positions below are still walked
-    and still written -- they simply do not claim -- so the next run re-walks
-    them.
+    and still written -- they simply do not claim -- so the victim position
+    stays a genuine hole, never inside the persisted (and, after #325,
+    RETAINABLE) interval at all.
+
+    #325 review round 2: this class's own name still says "FailedWriteIsNot
+    Claimed", but its ORIGINAL docstring claimed the failed write's recovery
+    depended on #326's skip fast path ("the interval was archived... and
+    _skip_claim now skips that position forever"). That is no longer true and
+    was never the actual mechanism this test needs: what matters is that the
+    victim position remains OUTSIDE the persisted interval (the floor's job),
+    so it stays a genuine, ordinary hole that the forward stream's claim_low()
+    picks up naturally on the very next run -- no archive, no skip, involved
+    at all. See TestDivergentRefEndToEnd's
+    test_divergent_ref_forces_a_full_correct_rewalk_not_a_skip docstring for
+    why _skip_claim's fast path is structurally unreachable in any two-run
+    scenario under #325.
     """
 
     def _repo(self, tmp_path, n, start=0):
@@ -9209,13 +10215,14 @@ class TestSkipFastPathFailedWriteIsNotClaimed:
         real_reverse_apply = mcp_server._reverse_apply
 
         def failing_reverse_apply(db, repo_path, linearization, commit_metadata,
-                                  pos, file_results, index_con=None,
-                                  persist_claim=True):
+                                  pos, file_results, *args, **kwargs):
+            # *args/**kwargs -- see the sibling wrapper in
+            # TestSkipFlushNeverCoversFailedWrites for why.
             if linearization[pos] == victim:
                 raise RuntimeError("simulated per-commit write failure")
             return real_reverse_apply(
                 db, repo_path, linearization, commit_metadata, pos, file_results,
-                index_con, persist_claim,
+                *args, **kwargs,
             )
 
         monkeypatch.setattr(mcp_server, "_reverse_apply", failing_reverse_apply)
@@ -9227,30 +10234,537 @@ class TestSkipFastPathFailedWriteIsNotClaimed:
             "have failed, or the rest of this test proves nothing"
         )
 
-        # Grow the tip, which is what drives _frontier_load down its
-        # discard-and-archive branch -- #325's real trigger, reproduced.
+        # Grow the tip. #325 review round 2: this used to say tip growth
+        # "drives _frontier_load down its discard-and-archive branch" --
+        # that was #326's original trigger, and #325 supersedes it: a
+        # span-matching interval (the [victim+1, 9] frontier-high the floor
+        # left behind) is now RETAINED, not discarded
+        # (TestFrontierLoadRetainsAcrossTipGrowth). The victim position was
+        # never INSIDE that retained interval in the first place -- the
+        # floor kept :lo-hash from descending past it -- so it stays a
+        # genuine hole adjacent to frontier-low's own edge, and claim_low()
+        # (Ruling 1: the forward stream's contiguous-from-C0 contract) picks
+        # it up naturally in run 2. No skip is needed or possible any more;
+        # see TestDivergentRefEndToEnd's
+        # test_divergent_ref_forces_a_full_correct_rewalk_not_a_skip
+        # docstring for why _skip_claim's fast path is unreachable here.
         self._repo(tmp_path, 2, start=10)
         grown = frontier_registry.build_linearization(str(repo))
-
-        await mcp_server._run_ingestion(str(repo), "HEAD")
-        skipped_run2 = mcp_server.handle_minigraf_ingest_status()[
-            "positions_skipped_this_run"
-        ]
-        assert skipped_run2 > 0, (
-            "run 2 skipped nothing, so the fast path was not exercised at all "
-            "and the assertion below could pass under a _skip_claim that "
-            "silently stopped matching"
-        )
 
         await mcp_server._run_ingestion(str(repo), "HEAD")
 
         missing = [h for h in grown if not self._has_commit_entity(h)]
         assert not missing, (
             f"commits {[h[:12] for h in missing]} still have no :commit/... "
-            "entity after two clean runs. The reverse write that failed in run "
-            "1 was swallowed by frontier-high's closed range when a LOWER "
-            "position claimed beneath it, the interval was archived as a "
-            "completed region, and _skip_claim now skips that position forever"
+            "entity after a clean run 2. The reverse write that failed in "
+            "run 1 must remain a genuine hole (rev_claim_floor keeps it "
+            "out of the persisted interval), for run 2's forward stream to "
+            "pick up naturally"
+        )
+
+
+class TestPerIntervalReverseFloor:
+    """#325: a write failure in the tip gap must not withhold bookkeeping for
+    a DISJOINT bulk gap below it. #326's `rev_claim_floor_pos` is a single
+    run-global scalar, correct only while the reverse stream makes one
+    contiguous descent. #325 lets it serve the topmost gap first and fall
+    through to a bulk gap entirely below (via claim_high() + a merge into a
+    retained interval), so a failure in the tip gap must floor only the
+    entity ident IT belongs to, never every ident the run touches.
+
+    The two gaps are constructed, not asserted-for: run 1 injects a failure
+    at position 5 of a 10-commit repo, leaving frontier-high's persisted lo
+    stuck at position 6 -- positions 4..1 still get their entity WRITE (the
+    floor only withholds the CLAIM, per #326), so the interval never
+    descends into {1..5} on disk. Growing the tip then opens a SECOND,
+    disjoint gap: {1..5} below the retained [6,9] interval, and the new tip
+    positions above it. A failure at the very top of the tip gap (so the
+    failed interval never has any on-disk bounds of its own to leak into the
+    merge -- see _frontier_persist_claim's "nothing on disk to retract or
+    fold into the union" case) isolates the two idents cleanly: T (the
+    minted tip ident) and :ingestion/frontier-high (the retained base,
+    survivor of the merge once a lower tip claim touches it).
+    """
+
+    def _repo(self, tmp_path, n, start=0):
+        repo = tmp_path / "repo"
+        if not repo.exists():
+            repo.mkdir()
+            _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(start, start + n):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_tip_gap_failure_does_not_floor_the_bulk_gap(self, tmp_path, monkeypatch):
+        import mcp_server, frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = self._repo(tmp_path, 10)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+
+        lin1 = frontier_registry.build_linearization(str(repo))
+        real_apply = mcp_server._reverse_apply
+
+        def fail_at_5(db, repo_path, linearization, commit_metadata, pos,
+                      files, *args, **kwargs):
+            # *args/**kwargs so this wrapper forwards whatever _run_ingestion's
+            # write dispatch passes positionally, unaffected by _reverse_apply
+            # growing more parameters later (matches the sibling wrappers in
+            # TestSkipFlushNeverCoversFailedWrites / TestNonTipWriteFailureIsReWalked).
+            if linearization[pos] == lin1[5]:
+                raise RuntimeError("injected run-1 bulk-gap write failure")
+            return real_apply(db, repo_path, linearization, commit_metadata,
+                               pos, files, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", fail_at_5)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_apply)
+
+        db = mcp_server.get_db()
+        base_after_run1 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run1 is not None
+        assert lin1.index(base_after_run1[0]) == 6, (
+            "precondition: run 1 must leave frontier-high's persisted lo at "
+            "position 6, i.e. never descend past the injected position-5 "
+            "write failure -- otherwise run 2 has no real bulk gap to test"
+        )
+
+        # Grow the tip: a second gap, disjoint from the bulk gap {1..5} left
+        # by run 1, and not touching it until a reverse claim descends all
+        # the way down to position 6's neighbour.
+        self._repo(tmp_path, 3, start=10)
+        lin2 = frontier_registry.build_linearization(str(repo))
+        tip_top = lin2[-1]
+
+        def fail_at_tip_top(db, repo_path, linearization, commit_metadata, pos,
+                             files, *args, **kwargs):
+            if linearization[pos] == tip_top:
+                raise RuntimeError("injected tip-gap write failure")
+            return real_apply(db, repo_path, linearization, commit_metadata,
+                               pos, files, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", fail_at_tip_top)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_apply)
+
+        base_after_run2 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run2 is not None
+        base_lo_pos = lin2.index(base_after_run2[0])
+        assert base_lo_pos <= 5, (
+            "bulk-gap claims below a tip-gap failure must still persist their "
+            "bookkeeping; a run-global floor withholds all of them, leaving "
+            f"frontier-high's lo stuck at position {base_lo_pos} instead of "
+            "descending into the bulk gap left by run 1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_merge_does_not_launder_a_floored_positions_failure_through_the_survivor(
+        self, tmp_path, monkeypatch
+    ):
+        """#325 review Finding 1 (CRITICAL): a merging claim's target is the
+        SURVIVOR, never the interval the floor actually belongs to. A minted
+        tip interval T floored by a failed write descends until it touches a
+        retained base -- _coalesce makes the base the survivor and T
+        absorbed, so the claim that performs the merge resolves its ident to
+        the base, which carries no floor entry of its own. Checking only
+        that ident (the pre-fix behaviour) reads the merge as unrestricted
+        and persists a union spanning the gap the failure sits in --
+        permanently sweeping a position whose write genuinely failed into
+        the graph's own completion witness.
+
+        Same fixture as test_tip_gap_failure_does_not_floor_the_bulk_gap, one
+        position down: the injected tip-gap failure lands at lin2[-2]
+        (position 11, not the topmost) rather than lin2[-1] (position 12).
+        Position 12 succeeds and persists to a minted ident T = [h12,h12]
+        BEFORE position 11 fails and floors T at 11. The claim at position
+        10 then merges T into the retained base -- exactly the shape the
+        fix must catch.
+        """
+        import mcp_server, frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = self._repo(tmp_path, 10)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+
+        lin1 = frontier_registry.build_linearization(str(repo))
+        real_apply = mcp_server._reverse_apply
+
+        def fail_at_5(db, repo_path, linearization, commit_metadata, pos,
+                      files, *args, **kwargs):
+            if linearization[pos] == lin1[5]:
+                raise RuntimeError("injected run-1 bulk-gap write failure")
+            return real_apply(db, repo_path, linearization, commit_metadata,
+                               pos, files, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", fail_at_5)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_apply)
+
+        db = mcp_server.get_db()
+        base_after_run1 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run1 is not None
+        assert lin1.index(base_after_run1[0]) == 6, (
+            "precondition: run 1 must leave frontier-high's persisted lo at "
+            "position 6"
+        )
+
+        self._repo(tmp_path, 3, start=10)
+        lin2 = frontier_registry.build_linearization(str(repo))
+        victim = lin2[-2]  # position 11 -- one below the topmost tip claim
+        victim_pos = lin2.index(victim)
+
+        def fail_at_victim(db, repo_path, linearization, commit_metadata, pos,
+                            files, *args, **kwargs):
+            if linearization[pos] == victim:
+                raise RuntimeError("injected mid-gap write failure")
+            return real_apply(db, repo_path, linearization, commit_metadata,
+                               pos, files, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", fail_at_victim)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_apply)
+
+        raw = mcp_server._db_execute(
+            db,
+            f"(query [:find (count-distinct ?t) :where "
+            f"[:commit/{victim[:12]} :entity-type ?t]])",
+        )
+        assert json.loads(raw)["results"][0][0] == 0, (
+            "precondition: the injected mid-gap write must actually have "
+            "failed, or this test proves nothing"
+        )
+
+        base_after_run2 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run2 is not None
+        lo_pos = lin2.index(base_after_run2[0])
+        hi_pos = lin2.index(base_after_run2[1])
+        assert not (lo_pos <= victim_pos <= hi_pos), (
+            f"frontier-high's persisted range [{lo_pos},{hi_pos}] must "
+            f"EXCLUDE position {victim_pos}, whose write genuinely failed -- "
+            "a merge into the survivor swept the floored interval's failure "
+            "into the persisted interval as if it had completed, and the "
+            "next run will never re-walk it"
+        )
+
+
+class TestSkippedSpanTransferredOnMerge:
+    """#325 review Finding 2 (Important): skipped_span is keyed by target
+    ident, exactly like rev_claim_floor, and suffers the same hazard a merge
+    creates -- an interval's OWN skipped_span entry does not automatically
+    follow it when a later claim absorbs it into a survivor.
+
+    Unlike Finding 1, this one is wrong in the OPPOSITE direction: it is not
+    that the merge silently claims too much, it is that the end-of-walk
+    flush, still keyed to the absorbed (now-retracted) ident, RESURRECTS a
+    phantom entity. _frontier_persist_claim's merge retracts the absorbed
+    interval's facts outright; _frontier_persist_span's `existing is None`
+    branch then mints a brand new entity, :ident fact and all, the moment
+    anything later flushes to that same ident -- so a stale skipped_span
+    entry left behind by the merge brings the absorbed interval back from
+    the dead, overlapping the survivor it was just folded into.
+    """
+
+    def _repo(self, tmp_path, n, start=0):
+        repo = tmp_path / "repo"
+        if not repo.exists():
+            repo.mkdir()
+            _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(start, start + n):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_absorbed_intervals_skip_span_does_not_resurrect_it(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server, frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        # Run 1: a clean 7-commit repo closes fully -- authoritative=[0,0],
+        # frontier-high (base, is_base=True) = [1,6].
+        repo = self._repo(tmp_path, 7)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        db = mcp_server.get_db()
+        base_after_run1 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        lin1 = frontier_registry.build_linearization(str(repo))
+        assert base_after_run1 is not None
+        assert lin1.index(base_after_run1[0]) == 1 and lin1.index(base_after_run1[1]) == 6, (
+            "precondition: run 1 must close the whole 7-commit repo with "
+            "frontier-high spanning [1,6]"
+        )
+
+        # Grow the tip by 6 (positions 7..12) and seed a completed region at
+        # [8,10] -- resolvable in the grown linearization, mirroring
+        # TestSkipClaimFastPathStillFiresForAResolvableRegion's seeding.
+        # claim_high() descends 12, 11 (genuine claims, persisted to a
+        # freshly minted ident T), then 10, 9, 8 (all inside the seeded
+        # region -- skipped, recorded under T's skipped_span), then 7
+        # (adjacent to both T's lo and frontier-high's hi -- MERGES T into
+        # frontier-high).
+        self._repo(tmp_path, 6, start=7)
+        lin2 = frontier_registry.build_linearization(str(repo))
+        region_lo, region_hi = 8, 10
+        mcp_server._transact(
+            db,
+            mcp_server._completed_region_facts(
+                lin2[region_lo], lin2[region_hi], ":provisional",
+                pos_count=region_hi - region_lo + 1,
+            ),
+            "2026-09-05T00:00:00Z",
+        )
+
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        status = mcp_server.handle_minigraf_ingest_status()
+        assert status["positions_skipped_this_run"] > 0, (
+            "precondition: the seeded region must actually have driven the "
+            "skip branch, or this test proves nothing about the transfer"
+        )
+
+        extras = mcp_server._intervals_read_extra(db)
+        assert extras == [], (
+            f"a minted interval entity survived or was resurrected after "
+            f"being absorbed into frontier-high: {extras}. The end-of-walk "
+            "flush must have written to the ABSORBED ident's stale "
+            "skipped_span entry instead of folding it into the survivor "
+            "frontier-high absorbed it into"
+        )
+
+        base_after_run2 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run2 is not None
+        assert lin2.index(base_after_run2[0]) == 1 and lin2.index(base_after_run2[1]) == 12, (
+            "frontier-high must end up spanning the whole run, [1,12] -- "
+            f"got {[lin2.index(h) for h in base_after_run2]}"
+        )
+
+
+class TestFoldedSkipSpanFlushDoesNotLaunderAFloor:
+    """#325 review Finding 4 (CRITICAL): the Finding-2 fold moves an
+    absorbed interval's skipped span onto the survivor, but the survivor's
+    OWN on-disk bounds can sit far below where that span begins, with the
+    floored position in between. _frontier_persist_span is advance-only and
+    gap-blind -- its union with the survivor's existing bounds bridges the
+    ENTIRE distance in one shot, including a position that this run failed
+    to complete and that no witness anywhere else ever proved complete for
+    the survivor.
+
+    Combines both ingredients Finding 1 and Finding 2's own tests each
+    lacked alone: an archived completed region (drives the fold) AND an
+    injected write failure strictly BELOW that region but ABOVE the
+    survivor's own existing hi bound (creates a floor the flushed span's own
+    lo does not need clamping against, since it sits entirely above it --
+    the bug is in the union with the survivor's existing bounds, not in the
+    flushed span's own extent).
+    """
+
+    def _repo(self, tmp_path, n, start=0):
+        repo = tmp_path / "repo"
+        if not repo.exists():
+            repo.mkdir()
+            _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.email", "t@t.com"], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, capture_output=True)
+        for i in range(start, start + n):
+            (repo / "auth.py").write_text(f"def login():\n    return {i}\n")
+            _subprocess.run(["git", "add", "."], cwd=repo, check=True, capture_output=True)
+            _subprocess.run(["git", "commit", "-m", f"c{i}"], cwd=repo, check=True, capture_output=True)
+        return repo
+
+    @pytest.mark.asyncio
+    async def test_flush_does_not_bridge_a_floored_position_via_a_folded_span(
+        self, tmp_path, monkeypatch
+    ):
+        import mcp_server, frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        # Run 1: a clean 7-commit repo closes fully -- authoritative=[0,0],
+        # frontier-high (base, is_base=True) = [1,6].
+        repo = self._repo(tmp_path, 7)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        db = mcp_server.get_db()
+        lin1 = frontier_registry.build_linearization(str(repo))
+        base_after_run1 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run1 is not None
+        assert lin1.index(base_after_run1[0]) == 1 and lin1.index(base_after_run1[1]) == 6, (
+            "precondition: run 1 must close the whole 7-commit repo with "
+            "frontier-high spanning [1,6]"
+        )
+
+        # Grow the tip by 6 (positions 7..12) and seed a completed region at
+        # the single position 11 -- resolvable in the grown linearization.
+        # claim_high() descends 12 (genuine claim, persists to a freshly
+        # minted ident T), 11 (in the region -- skipped, recorded under T's
+        # skipped_span), then 10 (genuine claim -- injected write failure,
+        # floors T at position 10), 9, 8 (genuine claims below T's own
+        # floor, work done but claim withheld), then 7 (adjacent to both
+        # T's lo and frontier-high's hi -- MERGES T into frontier-high;
+        # T's floor(10) also blocks THIS claim from persisting, per Finding
+        # 1's fix, so frontier-high's on-disk state never moves from [1,6]
+        # via the per-claim path at all -- only the end-of-walk flush can
+        # still touch it).
+        self._repo(tmp_path, 6, start=7)
+        lin2 = frontier_registry.build_linearization(str(repo))
+        victim = lin2[10]
+        victim_pos = lin2.index(victim)
+        region_lo = region_hi = 11
+        mcp_server._transact(
+            db,
+            mcp_server._completed_region_facts(
+                lin2[region_lo], lin2[region_hi], ":provisional",
+                pos_count=region_hi - region_lo + 1,
+            ),
+            "2026-09-05T00:00:00Z",
+        )
+
+        real_apply = mcp_server._reverse_apply
+
+        def fail_at_victim(db, repo_path, linearization, commit_metadata, pos,
+                            files, *args, **kwargs):
+            if linearization[pos] == victim:
+                raise RuntimeError("injected failure below the archived region")
+            return real_apply(db, repo_path, linearization, commit_metadata,
+                               pos, files, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", fail_at_victim)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_apply)
+
+        raw = mcp_server._db_execute(
+            db,
+            f"(query [:find (count-distinct ?t) :where "
+            f"[:commit/{victim[:12]} :entity-type ?t]])",
+        )
+        assert json.loads(raw)["results"][0][0] == 0, (
+            "precondition: the injected write must actually have failed, or "
+            "this test proves nothing"
+        )
+
+        base_after_run2 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run2 is not None
+        lo_pos = lin2.index(base_after_run2[0])
+        hi_pos = lin2.index(base_after_run2[1])
+        assert not (lo_pos <= victim_pos <= hi_pos), (
+            f"frontier-high's persisted range [{lo_pos},{hi_pos}] must "
+            f"EXCLUDE position {victim_pos}, whose write genuinely failed -- "
+            "the end-of-walk flush bridged the gap between frontier-high's "
+            "own existing bounds and a skipped span folded onto it from a "
+            "merge, silently declaring the floored position complete"
+        )
+
+    @pytest.mark.asyncio
+    async def test_flush_refuses_when_folded_span_straddles_the_floor(
+        self, tmp_path, monkeypatch
+    ):
+        """#325 review round 3 (CRITICAL, Finding 1): the sibling test above
+        seeds its completed region entirely ABOVE the injected failure, so
+        the folded span's own `lo_pos` already exceeds the floor and the
+        `lo_pos > floor` half of the disjunction alone refuses it. Seeding a
+        SECOND completed region BELOW the failure instead makes the folded
+        span STRADDLE the floor (`lo_pos <= floor < hi_pos`) -- the shape
+        `lo_pos > floor` cannot see at all, because clamping `lo_pos` up to
+        `floor + 1` looks like it worked (the result is still inside
+        [lo_pos, hi_pos]). Only `len(sources) > 1` catches this: it is a
+        fold, and the fold is what let the flush target's existing on-disk
+        hi sit below the floor in the first place. Without that half of the
+        disjunction, `_frontier_persist_span`'s advance-only union bridges
+        straight across the floored position.
+
+        Descent (claim_high, 1:20 stream ratio): 12 (mint T), 11 (in the
+        first region -- skip, attributed to T), 10 (injected failure --
+        floors T at 10), 9 (genuine claim, withheld by the floor), 8 (in the
+        NEW region -- skip, attributed to T), 7 (adjacent to both T's lo and
+        frontier-high's hi -- merges T into frontier-high; T's floor also
+        blocks this claim's own persist, per Finding 1). The merge yields
+        skipped_span[frontier-high] = (8, 11), sources = {frontier-high, T},
+        floor = 10 -- `lo_pos` (8) does not exceed `floor` (10), so only the
+        fold half of the disjunction refuses the flush.
+        """
+        import mcp_server, frontier_registry
+
+        monkeypatch.setenv("MINIGRAF_INGEST_STREAM_RATIO", "1:20")
+        repo = self._repo(tmp_path, 7)
+        mcp_server._reset_db_state()
+        mcp_server.open_db(str(repo / "memory.graph"))
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+
+        db = mcp_server.get_db()
+        lin1 = frontier_registry.build_linearization(str(repo))
+        base_after_run1 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run1 is not None
+        assert lin1.index(base_after_run1[0]) == 1 and lin1.index(base_after_run1[1]) == 6, (
+            "precondition: run 1 must close the whole 7-commit repo with "
+            "frontier-high spanning [1,6]"
+        )
+
+        self._repo(tmp_path, 6, start=7)
+        lin2 = frontier_registry.build_linearization(str(repo))
+        victim = lin2[10]
+        victim_pos = lin2.index(victim)
+        # Region 1, above the failure (as the sibling test) -- keeps 11
+        # skipped and attributed to T. Region 2, BELOW the failure, is the
+        # one added ingredient: it puts a second skip at position 8 onto
+        # the same ident T, so the folded span's lo (8) sits under the
+        # floor (10) instead of over it.
+        for region_lo, region_hi in ((11, 11), (8, 8)):
+            mcp_server._transact(
+                db,
+                mcp_server._completed_region_facts(
+                    lin2[region_lo], lin2[region_hi], ":provisional",
+                    pos_count=region_hi - region_lo + 1,
+                ),
+                "2026-09-05T00:00:00Z",
+            )
+
+        real_apply = mcp_server._reverse_apply
+
+        def fail_at_victim(db, repo_path, linearization, commit_metadata, pos,
+                            files, *args, **kwargs):
+            if linearization[pos] == victim:
+                raise RuntimeError("injected failure below the archived regions")
+            return real_apply(db, repo_path, linearization, commit_metadata,
+                               pos, files, *args, **kwargs)
+
+        monkeypatch.setattr(mcp_server, "_reverse_apply", fail_at_victim)
+        await mcp_server._run_ingestion(str(repo), "HEAD")
+        monkeypatch.setattr(mcp_server, "_reverse_apply", real_apply)
+
+        raw = mcp_server._db_execute(
+            db,
+            f"(query [:find (count-distinct ?t) :where "
+            f"[:commit/{victim[:12]} :entity-type ?t]])",
+        )
+        assert json.loads(raw)["results"][0][0] == 0, (
+            "precondition: the injected write must actually have failed, or "
+            "this test proves nothing"
+        )
+
+        base_after_run2 = mcp_server._frontier_read_bounds(db, mcp_server._FRONTIER_HIGH_IDENT)
+        assert base_after_run2 is not None
+        lo_pos = lin2.index(base_after_run2[0])
+        hi_pos = lin2.index(base_after_run2[1])
+        assert not (lo_pos <= victim_pos <= hi_pos), (
+            f"frontier-high's persisted range [{lo_pos},{hi_pos}] must "
+            f"EXCLUDE position {victim_pos}, whose write genuinely failed -- "
+            "a folded span straddling the floor (lo_pos <= floor < hi_pos) "
+            "must refuse via len(sources) > 1, since lo_pos > floor alone "
+            "cannot see this shape and lets the clamp through"
         )
 
 
@@ -21249,6 +22763,74 @@ class TestCorrectionSweepSelectPosition:
         assert result is not None
 
 
+class TestCorrectionSweepDeclinesWhileFragmented:
+    """#325: with a hole above frontier-high, Stream 2 can still descend past a
+    position the sweep would confirm, so the sweep must decline."""
+
+    def _seed(self, db, lin, extra=None, hi_idx=11):
+        import mcp_server
+        hi = mcp_server._FRONTIER_HIGH_IDENT
+        lo = mcp_server._FRONTIER_LOW_IDENT
+        mcp_server._transact(db, "[" + " ".join([
+            f"[{lo} :entity-type :type/ingest-interval]",
+            f"[{lo} :tag :authoritative]",
+            f'[{lo} :lo-hash "{lin[0]}"]', f'[{lo} :hi-hash "{lin[3]}"]',
+            f"[{lo} :pos-count 4]",
+            f"[{hi} :entity-type :type/ingest-interval]",
+            f"[{hi} :tag :provisional]",
+            f'[{hi} :lo-hash "{lin[4]}"]', f'[{hi} :hi-hash "{lin[hi_idx]}"]',
+            f"[{hi} :pos-count {hi_idx - 4 + 1}]",
+        ]) + "]", "2026-09-04T00:00:00Z")
+        if extra is not None:
+            ident = mcp_server._interval_ident(lin[extra[1]])
+            mcp_server._transact(db, "[" + " ".join([
+                f"[{ident} :entity-type :type/ingest-interval]",
+                f'[{ident} :ident "{ident}"]',
+                f"[{ident} :tag :provisional]",
+                f'[{ident} :lo-hash "{lin[extra[0]]}"]',
+                f'[{ident} :hi-hash "{lin[extra[1]]}"]',
+                f"[{ident} :pos-count {extra[1] - extra[0] + 1}]",
+            ]) + "]", "2026-09-04T00:00:00Z")
+
+    def _meta(self, lin):
+        return [(h, "2026-09-04T00:00:00Z", "a", f"s{i}") for i, h in enumerate(lin)]
+
+    def test_declines_while_a_hole_remains_above(self, real_db):
+        import mcp_server
+        lin = [f"h{i}" for i in range(14)]
+        # frontier-high covers [4,7]; the extra covers [10,13] -- positions
+        # 8-9 sit between the two as a genuine hole ABOVE frontier-high,
+        # rather than the extra being nested INSIDE frontier-high's own
+        # span (the previous fixture had frontier-high at [4,11] and an
+        # extra at [9,11], entirely contained within it -- non-vacuous as a
+        # positive control for the shipped "any extra exists" predicate,
+        # but not the hole-above-frontier-high scenario this class is
+        # named for).
+        self._seed(real_db, lin, extra=(10, 13), hi_idx=7)
+        assert mcp_server._correction_sweep_select_position(
+            real_db, lin, self._meta(lin)) is None
+
+    def test_selects_once_the_provisional_side_is_one_interval(self, real_db):
+        import mcp_server
+        lin = [f"h{i}" for i in range(12)]
+        self._seed(real_db, lin)
+        assert mcp_server._correction_sweep_select_position(
+            real_db, lin, self._meta(lin)) == (lin[4], "2026-09-04T00:00:00Z")
+
+    def test_fold_gate_declines_while_fragmented(self, real_db):
+        import mcp_server
+        lin = [f"h{i}" for i in range(14)]
+        # Same genuine hole-above-frontier-high shape as
+        # test_declines_while_a_hole_remains_above: frontier-high [4,7],
+        # extra [10,13], positions 8-9 an unclaimed gap between them.
+        self._seed(real_db, lin, extra=(10, 13), hi_idx=7)
+        mcp_server._transact(
+            real_db,
+            f'[[:ingestion/correction-sweep-through :hash "{lin[7]}"]]',
+            "2026-09-04T00:00:00Z")
+        assert mcp_server._should_fold_lineage_watermark(real_db, lin) is False
+
+
 class TestCorrectionSweepApply:
     def _init_repo(self, repo):
         _subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -22712,6 +24294,59 @@ class TestRoundRobinClaimer:
         while allocator.claim_low() is not None:
             pass
         assert claimer.next_claim() is None
+
+    def test_starved_forward_resets_the_phase_counter_before_reverse_claims(self):
+        """#325 review round 3, Finding 5: a starved forward turn used to
+        leave `_taken_in_phase` accumulated under forward's own budget while
+        immediately checking it against reverse's limit for the SAME call --
+        detaching the phase counter from either budget's actual meaning the
+        moment forward could not contribute, and silently unmooring
+        MINIGRAF_INGEST_STREAM_RATIO from what it configures.
+
+        Not independently observable via next_claim()'s own return sequence
+        here: claim_high() always returns whatever position the allocator's
+        own gap state dictates, regardless of which budget the internal
+        counter mis-tracks against, so a permanently-starved forward stream
+        (the only reachable case today -- Ruling 1 of round 2 starves it
+        for the rest of the run once triggered) still hands out the same
+        positions in the same order either way. This asserts the INTERNAL
+        bookkeeping directly instead, which is where the bug actually lives
+        and where a future caller (e.g. one that inspects the phase state,
+        or a fold mechanism that could someday un-starve forward mid-run)
+        would be misled.
+
+        Ablation-proven: reverted to the pre-fix code, forward accumulates
+        2 real claims (`_taken_in_phase == 2`) before starving; the third
+        call (the first real reverse claim) left `_taken_in_phase == 3`
+        (2 inherited + 1) and `_forward_phase` still True -- confirmed
+        empirically before writing this assertion, not assumed.
+        """
+        import mcp_server, frontier_registry
+        allocator = frontier_registry.FrontierAllocator(20, [
+            frontier_registry.Interval(0, 0, frontier_registry.TAG_AUTHORITATIVE,
+                                       anchor_pos=0, is_base=True),
+            frontier_registry.Interval(3, 10, frontier_registry.TAG_PROVISIONAL,
+                                       anchor_pos=10, is_base=True),
+        ])
+        claimer = mcp_server._RoundRobinClaimer(
+            allocator, forward_per_round=5, reverse_per_round=5
+        )
+        assert claimer.next_claim() == ("fwd", 1)
+        assert claimer.next_claim() == ("fwd", 2)
+        # Position 3 is retained (part of the provisional interval), so the
+        # next low position is 11 -- not adjacent to authoritative's edge
+        # (0+1=1... now 2+1=3, and 11 != 3) -- claim_low() refuses, and this
+        # falls through to the first real reverse claim.
+        assert claimer.next_claim() == ("rev", 19)
+        assert claimer._taken_in_phase == 1, (
+            "the fallback reverse claim must start reverse's own budget "
+            "count at 1 (itself), not inherit forward's accumulated count"
+        )
+        assert claimer._forward_phase is False, (
+            "the phase flag must already read reverse -- it must not stay "
+            "mislabeled forward until a stale inherited counter happens to "
+            "trip reverse's limit on some later call"
+        )
 
 
 class TestStageAInterleave:
