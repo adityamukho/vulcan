@@ -896,28 +896,29 @@ is the only at-scale check that can observe a wrongly-retained interval at
 all.** It gates on `census_error is None and repo_vs_graph == 0`
 (`resume_ok`), never `collect_commit_census`'s own `ok`
 (`ident_collisions`, `walk_vs_graph` always, `repo_vs_walk` when complete).
-**This is the third stated explanation of why, and the first two were both
-wrong in the same direction — see the standing note below on which
-mechanism actually survives.** The correct rationale was already in this
-file, in the #326 section above: `_ingest_progress["processed"]` counts
-positions RETIRED this run (skip, extraction failure, or reaching write
-dispatch regardless of outcome — all three sites increment it), never
-commits actually WRITTEN, and it is SEEDED with
-`prior_ingested = _count_commit_entities(db)` at run start. A resume that
-retires a position already counted in that seed's snapshot double-counts
-it, driving `walk_claimed` — and therefore
-`walk_vs_graph = walk_claimed - graph_commit_entities` — POSITIVE.
-`collect_commit_census`'s own gate checks `walk_vs_graph` strictly BEFORE
-`repo_vs_walk` (an `elif` chain, `commit_census.py`), so `walk_vs_graph` is
-the clause that actually fails a resume exhibiting this over-count —
-never `repo_vs_walk`. `repo_vs_walk` cannot even supply a false positive of
-its own on an intact graph: every graph `:type/commit` entity corresponds
-to at least one retired position (Stage B's `lifecycle_only` forward-apply
-writes none), so `walk_claimed >= graph_commit_entities` always, which means
-`repo_vs_walk = repo_commits - walk_claimed <= repo_commits -
-graph_commit_entities = repo_vs_graph` — zero whenever the graph is
-complete, so `repo_vs_walk <= 0`, never a positive shortfall. `repo_vs_graph`
-sidesteps BOTH failure directions because it never routes through
+Two earlier explanations of why were wrong; the mechanism is the one
+already measured in the #326 section above (`walk_vs_graph` "is nonzero on
+ANY resume that touches already-ingested territory, skip or no skip —
+measured 10 with the fast path against 9 without"). That RE-TOUCHED set
+includes the #326 same-run skip fast path, #313's torn-position repair
+re-walk, and this branch's own below-`rev_claim_floor` re-walk — **all
+three are CORRECT behaviour, not degraded resumes**, which is exactly what
+makes a nonzero `walk_vs_graph` on any of them a FALSE positive rather than
+a real one. `_ingest_progress["processed"]` counts positions RETIRED this
+run (skip, extraction failure, or reaching write dispatch — three increment
+sites, `mcp_server.py:12949, 13001, 13128`), never commits newly WRITTEN,
+and is SEEDED with `prior_ingested = _count_commit_entities(db)` at run
+start, so re-touching a position already inside that seed double-counts it
+and drives `walk_claimed` — and `walk_vs_graph = walk_claimed -
+graph_commit_entities` — positive on a perfectly healthy run.
+`collect_commit_census` gates `walk_vs_graph` strictly BEFORE `repo_vs_walk`
+(an `elif` chain, `commit_census.py`), so `walk_vs_graph` is the clause that
+actually fails such a run. `repo_vs_walk`'s own clause
+(`elif complete and deltas["repo_vs_walk"]:`) is a truthiness test that is
+only reached once `walk_vs_graph` reads falsy (zero) — at which point
+`walk_claimed == graph_commit_entities` forces `repo_vs_walk ==
+repo_vs_graph`, zero on an intact graph, so the clause is falsy there too.
+`repo_vs_graph` sidesteps both gates because it never routes through
 `walk_claimed` at all. The nightly's own `commit_census` (#317) cannot
 exercise this failure mode regardless, for a simpler reason than any of
 that: it runs once on a fresh graph, which has no interval to retain in the
@@ -937,32 +938,6 @@ catch a regression in the retention predicate itself but can NEVER observe
 a newly landed commit arriving INSIDE an already-retained interval's
 bounds — the exact scenario the `:pos-count` checksum above exists to
 catch — because the frozen slice never grows.
-
-**A standing note on the `repo_vs_walk`/`walk_vs_graph` explanation above,
-because it took three attempts to land and a future reader needs to know
-which one survived.** Draft 1 said `walk_claimed` is "nonzero on ANY
-resume that skips already-completed positions." Draft 2 (a documentation
-review round) replaced it with "a healthier resume retires FEWER positions,
-so `walk_claimed` reads LOWER than `repo_commits`, and `repo_vs_walk`
-misreads that shortfall as a defect." **Both were wrong, in the SAME
-direction, and the second was worse because it was asserted with a
-specific (backwards) mechanism rather than left vague.** `_ingest_progress
-["processed"]` never decreases and every one of its three increment sites
-(`mcp_server.py:12949, 13001, 13128`) fires on a position the run touches
-at all — skip, extraction failure, or reaching write dispatch regardless of
-whether the write itself then fails — so `walk_claimed >= graph_commit_
-entities` always, which makes `repo_vs_walk = repo_commits - walk_claimed
-<= repo_commits - graph_commit_entities = repo_vs_graph`: zero or NEGATIVE
-whenever the graph is intact, never the positive shortfall either draft
-described. The direction that IS reachable runs through `walk_vs_graph`
-going POSITIVE (an over-count, from double-counting an already-graphed
-position retired again this run), and `collect_commit_census` gates
-`walk_vs_graph` before `repo_vs_walk`, so `walk_vs_graph` — not
-`repo_vs_walk` — is the clause that actually fails a resume with this
-shape. The gate on `repo_vs_graph` itself was never in question through any
-of the three drafts; only the stated reason for preferring it kept
-changing, and this is the version checked against the actual increment
-sites and the actual gate order rather than reasoned about in the abstract.
 
 ## Claude Code Plugin Publishing
 

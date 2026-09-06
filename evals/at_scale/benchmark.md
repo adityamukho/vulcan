@@ -2208,34 +2208,37 @@ together for exactly this reason.
 
 **Why the probe's own `ok` is `repo_vs_graph`, not `collect_commit_census`'s
 `ok` — a controller ruling, verified against the numbers above, not merely
-followed. This is the third stated reason after two wrong ones; see
-CLAUDE.md's standing note on this mechanism for the full correction
-history.** `commit_census`'s `ok` gates on `ident_collisions`, `walk_vs_graph`
-(always) and `repo_vs_walk` (when complete). `walk_claimed` here is 300 —
-matching, because `prior_ingested` (262) plus `processed_this_run` (38)
-already accounts for every commit, with no double-counted position and no
-skip or failure in this clean run. `_ingest_progress["processed"]` counts
-positions RETIRED this run (skip, extraction failure, or reaching write
-dispatch regardless of outcome), never commits actually WRITTEN, and is
-seeded with `prior_ingested` at run start — so a LESS healthy resume than
-this one, one that retires a position ALREADY counted in that seed (a
-same-run skip against an already-graphed position is the concrete case),
-would drive `walk_claimed` — and `walk_vs_graph = walk_claimed -
-graph_commit_entities` — POSITIVE, not `walk_claimed` lower. Because
-`collect_commit_census` gates `walk_vs_graph` BEFORE `repo_vs_walk` (an
-`elif` chain), `walk_vs_graph` is the clause that would actually fail such a
-run — the exact false positive
+followed.** Two earlier stated reasons for this were wrong; the mechanism is
+the one already measured in CLAUDE.md's #326 section (`walk_vs_graph` "is
+nonzero on ANY resume that touches already-ingested territory, skip or no
+skip — measured 10 with the fast path against 9 without"). `commit_census`'s
+`ok` gates on `ident_collisions`, `walk_vs_graph` (always) and `repo_vs_walk`
+(when complete). `walk_claimed` here is 300 — matching, because
+`prior_ingested` (262) plus `processed_this_run` (38) already accounts for
+every commit, with no re-touched position in this particular clean run. A
+run that DOES re-touch already-ingested territory — the #326 same-run skip
+fast path, #313's torn-position repair re-walk, and this branch's own
+below-`rev_claim_floor` re-walk are all examples, and all three are CORRECT
+behaviour, not degraded resumes — double-counts that position:
+`_ingest_progress["processed"]` counts positions RETIRED this run (skip,
+extraction failure, or reaching write dispatch regardless of outcome),
+never commits actually WRITTEN, and is seeded with `prior_ingested` at run
+start, so a re-touched position already inside that seed drives
+`walk_claimed` — and `walk_vs_graph = walk_claimed - graph_commit_entities`
+— POSITIVE on a perfectly healthy run. Because `collect_commit_census` gates
+`walk_vs_graph` BEFORE `repo_vs_walk` (an `elif` chain), `walk_vs_graph` is
+the clause that would actually fail such a run — that is what makes it a
+false positive — the exact shape
 `tests/test_at_scale_resume_census.py::TestResumeOk::
 test_walk_vs_graph_alone_does_not_decide_it` pins with constructed numbers
-(`walk_vs_graph=5, repo_vs_walk=-5` — an OVER-count, not a shortfall).
-`repo_vs_walk` cannot supply a false positive of its own on an intact graph
-either way: `walk_claimed >= graph_commit_entities` always (every graph
-entity corresponds to at least one retired position), so
-`repo_vs_walk <= repo_vs_graph`, which is 0 here — `repo_vs_walk` is never
-positive on a complete graph. `repo_vs_graph` answers the only question this
-probe exists to ask — does the graph hold every commit the repo has, after a
-resume — without routing through `walk_claimed` at all, sidestepping both
-failure directions above.
+(`walk_vs_graph=5, repo_vs_walk=-5` — an OVER-count). `repo_vs_walk`'s own
+clause (`elif complete and deltas["repo_vs_walk"]:`) is only reached once
+`walk_vs_graph` reads falsy (zero), at which point
+`walk_claimed == graph_commit_entities` forces `repo_vs_walk ==
+repo_vs_graph` — zero here — so that clause is falsy too. `repo_vs_graph`
+answers the only question this probe exists to ask — does the graph hold
+every commit the repo has, after a resume — without routing through
+`walk_claimed` at all, sidestepping both gates above.
 
 **`resume_ok` checks `census_error is None` explicitly, not only
 `repo_vs_graph`.** An earlier draft checked `repo_vs_graph == 0` alone, which

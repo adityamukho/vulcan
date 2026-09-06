@@ -88,32 +88,34 @@ have double-counted the overlap.
 just that field, read once, after the resume completes.
 
 WHY THE PROBE'S OWN `ok` IS `repo_vs_graph`, NOT collect_commit_census's --
-A CONTROLLER RULING, not this file's own design choice, and stated here for
-the THIRD time after two earlier wrong explanations (see CLAUDE.md's
-standing note on this exact mechanism, in the #325 section, for the full
-correction history -- both earlier drafts asserted `repo_vs_walk` goes
-POSITIVE on a healthy resume, which the math below shows cannot happen).
-`commit_census`'s `ok` gates on `ident_collisions`, `walk_vs_graph` (always)
-and `repo_vs_walk` (when complete). `_ingest_progress["processed"]` counts
-positions RETIRED this run (skip, extraction failure, or reaching write
-dispatch regardless of outcome -- mcp_server.py's three increment sites),
-never commits actually WRITTEN, and is SEEDED with `prior_ingested` at run
-start -- so a resume that retires a position already counted in that seed
-double-counts it, driving `walk_claimed`, and therefore
-`walk_vs_graph = walk_claimed - graph_commit_entities`, POSITIVE.
-`collect_commit_census` gates `walk_vs_graph` BEFORE `repo_vs_walk` (an
-`elif` chain in commit_census.py), so `walk_vs_graph` is the clause that
-actually fails a resume with this over-count -- never `repo_vs_walk`.
-`repo_vs_walk` cannot even supply a false positive of its own on an intact
-graph: every graph `:type/commit` entity corresponds to at least one
-retired position (Stage B's `lifecycle_only` forward-apply writes none), so
-`walk_claimed >= graph_commit_entities` always, which makes
-`repo_vs_walk = repo_commits - walk_claimed <= repo_commits -
-graph_commit_entities = repo_vs_graph` -- zero or negative whenever the
-graph is intact, never a positive shortfall. `repo_vs_graph` asks the only
-question this probe exists to answer: after a resume, does the graph hold
-every commit the repo has? It sidesteps BOTH failure directions above
-because it never routes through `walk_claimed` at all -- see `resume_ok`.
+A CONTROLLER RULING, not this file's own design choice. Two earlier stated
+reasons for this were wrong; the mechanism is the one already measured in
+CLAUDE.md's #326 section (`walk_vs_graph` is nonzero on ANY resume that
+touches already-ingested territory, skip or no skip -- measured 10 with the
+fast path against 9 without). `commit_census`'s `ok` gates on
+`ident_collisions`, `walk_vs_graph` (always) and `repo_vs_walk` (when
+complete). A resume that RE-TOUCHES already-ingested territory -- the #326
+same-run skip fast path, #313's torn-position repair re-walk, and this
+branch's own below-`rev_claim_floor` re-walk are all examples, and all
+three are CORRECT behaviour, not degraded resumes -- double-counts that
+territory: `_ingest_progress["processed"]` counts positions RETIRED this
+run (skip, extraction failure, or reaching write dispatch regardless of
+outcome -- mcp_server.py's three increment sites), never commits actually
+WRITTEN, and is SEEDED with `prior_ingested` at run start, so a re-touched
+position already inside that seed drives `walk_claimed`, and therefore
+`walk_vs_graph = walk_claimed - graph_commit_entities`, POSITIVE on a
+perfectly healthy run. `collect_commit_census` gates `walk_vs_graph` BEFORE
+`repo_vs_walk` (an `elif` chain in commit_census.py), so `walk_vs_graph` is
+the clause that actually fails such a run -- that is what makes it a false
+positive. `repo_vs_walk`'s own clause
+(`elif complete and deltas["repo_vs_walk"]:`) is only reached once
+`walk_vs_graph` reads falsy (zero), at which point
+`walk_claimed == graph_commit_entities` forces
+`repo_vs_walk == repo_vs_graph`, zero on an intact graph, so that clause is
+falsy too. `repo_vs_graph` asks the only question this probe exists to
+answer: after a resume, does the graph hold every commit the repo has? It
+sidesteps both gates above because it never routes through `walk_claimed`
+at all -- see `resume_ok`.
 
 THE REF IS THE RESOLVED BRANCH, NEVER "HEAD". `_run_ingestion`'s own
 `repo_total` was hardcoded to `HEAD` while ingestion took a `branch` argument,
