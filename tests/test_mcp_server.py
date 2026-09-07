@@ -17488,6 +17488,63 @@ class TestRunStartupBackfillDbLockRelease:
         assert mcp_server._lease_manager.lease_count == baseline
 
 
+class TestAmbientMinigrafEnvIsScrubbed:
+    """tests/conftest.py must neutralise a MINIGRAF_* variable inherited from the shell.
+
+    Deliberately a SUBPROCESS test. The in-process form -- asserting that no
+    MINIGRAF_* key is visible in os.environ -- is vacuous on CI, where none is
+    ambient in the first place: it would pass identically with the fixture
+    deleted, which is the failure mode this repo keeps refusing. Running pytest
+    in a child whose environment genuinely carries the variable is the only form
+    that discriminates, and it discriminates the same way everywhere.
+
+    The real conftest.py is COPIED next to the generated test rather than
+    imported, because a conftest only applies to its own directory tree; copying
+    is what puts the shipped fixture on the child's collection path (#331).
+    """
+
+    def _run_child(self, tmp_path, conftest_text):
+        (tmp_path / "conftest.py").write_text(conftest_text, encoding="utf-8")
+        (tmp_path / "test_ambient.py").write_text(
+            "import os\n"
+            "def test_no_ambient_minigraf_vars():\n"
+            "    leaked = sorted(k for k in os.environ if k.startswith('MINIGRAF_'))\n"
+            "    assert leaked == [], leaked\n",
+            encoding="utf-8",
+        )
+        env = dict(os.environ)
+        env["MINIGRAF_NO_AUTO_INGEST"] = "1"
+        env["MINIGRAF_EXTRACTION_STRATEGY"] = "llm"
+        return _subprocess.run(
+            [sys.executable, "-m", "pytest", str(tmp_path / "test_ambient.py"),
+             "-q", "-p", "no:cacheprovider", "--no-header"],
+            env=env, capture_output=True, text=True, cwd=str(tmp_path), timeout=300,
+        )
+
+    def test_shipped_conftest_scrubs_ambient_vars(self, tmp_path):
+        conftest_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conftest.py")
+        with open(conftest_path, encoding="utf-8") as handle:
+            conftest_text = handle.read()
+        result = self._run_child(tmp_path, conftest_text)
+        assert result.returncode == 0, (
+            "the shipped tests/conftest.py failed to scrub an ambient "
+            f"MINIGRAF_* variable\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+
+    def test_positive_control_without_the_fixture(self, tmp_path):
+        """Ablation: the same child must FAIL when the fixture is absent.
+
+        Without this the test above proves nothing -- a child that would pass
+        with an empty conftest tells you the variable never reached it, not that
+        the fixture removed it.
+        """
+        result = self._run_child(tmp_path, '"""No scrub fixture."""\n')
+        assert result.returncode != 0, (
+            "ablation did not fail: the ambient MINIGRAF_* variables never "
+            f"reached the child, so the sibling test is vacuous\nstdout:\n{result.stdout}"
+        )
+
+
 class TestMainStartupBackfill:
     @pytest.mark.asyncio
     async def test_kicks_off_backfill_when_needed(self, monkeypatch, tmp_path):

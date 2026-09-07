@@ -8,15 +8,16 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.8", "3.9", "3.10"]
     steps:
     - uses: actions/checkout@v4
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
-      with:
-        python-version: ${{ matrix.python-version }}
+    # ruff is a standalone binary: it parses with its own Rust front end and
+    # never imports the code under the host interpreter. So this job said
+    # nothing about Python compatibility -- it used to run the identical check
+    # under a 3.8/3.9/3.10 matrix, two rows of which `requires-python` already
+    # excludes, and all three of which end in `|| echo` and cannot fail (#331).
+    # One row, and the interpreter version is whatever setup-python defaults to.
+    - name: Set up Python
+      uses: actions/setup-python@v5
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
