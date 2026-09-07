@@ -38,6 +38,109 @@ shows there never was. To read a graph outside the server, open a
 - `hooks/claude-code.json` - Claude Code MCP + auto-memory hook config
 - `evals/at_scale/` - at-scale ingestion + query-correctness benchmark tier (real repo history, observational, see its own `benchmark.md`). It also holds one-off read-only probes (e.g. `probe_dep_preload_exposure.py`, #245) and their recorded measurements under `results/`, which are analysis artifacts rather than part of the recurring benchmark run.
 
+## Python Version Support
+
+**Supported: 3.10 through 3.14, and `requires-python` is deliberately left
+unbounded above.** `.github/workflows/pytest.yml` runs the full suite on every
+one of those five interpreters and `pyproject.toml`'s classifiers list exactly
+that set — so the three declarations agree by construction, and a new
+interpreter is added by editing all three together.
+
+An unbounded ceiling is the honest choice here rather than the lazy one. A cap
+does not make an untested interpreter work; it only refuses to install on it.
+Since nothing in this repo is version-fragile in a way anyone has been able to
+demonstrate, refusing to install would cost real users a working install to buy
+a guarantee CI already provides for every version that exists. **When a new
+interpreter ships, add a matrix row and a classifier rather than a cap** — and
+if it genuinely fails, cap it then, with the failure recorded.
+
+**Measured before the matrix rows were added, not predicted.** Full suite,
+this repo, #331: **3.14.7 — 1993 passed, 1 xfailed**; **3.13.14 — 1993 passed,
+1 xfailed**. The `<3.13` cap the issue offered as a fallback was therefore never
+needed. 3.10/3.11/3.12 were already green in CI. Dependency resolution was
+checked separately on 3.13 before trusting the run: minigraf 2.0.0 ships a
+`py3-none-manylinux` wheel and every `tree-sitter-*` grammar resolves, so no
+dependency pins the ceiling either.
+
+**One flake surfaced during that measurement and is NOT a version problem —
+worth knowing before it is blamed on 3.13.**
+`TestMcpToolWiring::test_call_tool_lock_retry_does_not_block_event_loop` failed
+once in a full 3.13 run and passed in isolation, on the rerun, and on master
+under the same interpreter, so it is pre-existing and unrelated to any change
+here. Cause: the test does `monkeypatch.setattr(mcp_server.time, "sleep", ...)`,
+and `mcp_server.time` IS the `time` module, so the patch replaces `time.sleep`
+**process-wide**. `_open_index_writer_safe` (`mcp_server.py`) and
+`fact_index.py`'s SQLite retry both call `time.sleep` from WORKER THREADS by
+design — both are documented as safe precisely because they never run on the
+event loop. A worker thread from an earlier test hitting lock contention inside
+this test's window therefore trips an assertion written only for the event-loop
+path. The guard is too broad, not the code under it. Tracked as #334; do not
+"fix" it by widening the version policy.
+
+**The six "Python 3.14 failures" that prompted this policy were not Python 3.14
+failures, and the misdiagnosis is the part worth remembering (#331).**
+`.claude/settings.local.json` exports `MINIGRAF_NO_AUTO_INGEST=1` into every
+Claude Code session in this repo, and every `pytest` run started inside one
+inherits it. `main()` gates its whole auto-ingest and backfill startup block on
+that variable (`mcp_server.py`, `if not os.environ.get("MINIGRAF_NO_AUTO_INGEST")`),
+so with it set `_ingest_progress["status"]` stays `idle` and `_ingest_task` /
+`_backfill_task` stay `None` — which is precisely what
+`TestMainAutoIngestLockCheck` and `TestMainStartupBackfill` assert against. CI
+carries no such variable and was green throughout.
+
+The failure was environmental, as the issue said, but the environment was the
+SESSION, not the interpreter. Every reproduction ran from inside a Claude Code
+session carrying the same `settings.local.json`, which is exactly what kept the
+variable invisible and left 3.14 holding the blame. Two details are worth
+keeping because both misled: only ONE of the six actually raised the
+`TimeoutError` the issue reported — the other five failed on ordinary
+assertions — so "all six share one mechanism" was true while the named mechanism
+was wrong; and the cost landed on PR #328, where nine tasks and ~15 review
+rounds each had to be told a six-failure baseline and trusted not to wave a
+seventh through.
+
+**`tests/conftest.py` now scrubs every `MINIGRAF_*` variable before each test,
+and scrubbing beats pinning.** A test that wants a value sets it with
+`monkeypatch.setenv`, which runs in the test body and therefore still wins over
+the autouse fixture. The tests that need `MINIGRAF_NO_AUTO_INGEST` PRESENT
+always set it explicitly; it was the tests needing it ABSENT that depended on an
+unstated precondition, which is the asymmetry the fixture removes.
+
+`MINIGRAF_EXTRACTION_STRATEGY` was ambient in the same session and is the more
+expensive instance of the same class: `handle_memory_finalize_turn` defaults to
+`heuristic`, so a test exercising it without setting the variable would have
+taken the **LLM path and a real network call** under a session exporting
+`llm`. The scrub closes that too.
+
+**What the scrub CANNOT reach: module-level reads, which happen at import,
+before any fixture runs.** `_OWNER_HINT_TTL`, `_MAX_MATCH_POOL_SIZE` and
+`_MAX_FACT_VALUE_LENGTH` (`mcp_server.py`) all bake an ambient value into a
+module constant at import time, and no autouse fixture can undo that. A session
+exporting one of those still perturbs the suite silently. This is stated rather
+than fixed — no test depends on those defaults today, so there is nothing to
+guard yet, but a new test that does must set the constant, not the variable.
+
+**The regression test runs pytest in a SUBPROCESS with the variable genuinely
+set in `os.environ`**, against a copy of `tests/conftest.py`, because the
+in-process form is vacuous: on CI, where no `MINIGRAF_*` variable is ambient, a
+test asserting "no such variable is visible" passes whether or not the fixture
+exists. Ablation-proven — deleting the fixture reddens it.
+
+**`install.py` mirrors the floor and had drifted below it.**
+`check_python_version` accepted 3.9 while `requires-python` said `>=3.10`, so on
+3.9 the installer printed a tick for the version check and then handed the run
+to a `pip install -e .` that refused the very interpreter it had just approved.
+`pyproject.toml` stays canonical; raise the floor there first and mirror it
+here. It carries no ceiling for the same reason the spec does not.
+
+`.github/workflows/pylint.yml` no longer carries a version matrix. It installs
+**ruff**, a standalone binary that parses with its own front end and never
+imports the code under the host interpreter, and its one step ends in
+`|| echo "Lint warnings (non-blocking)"`. The old 3.8/3.9/3.10 matrix therefore
+ran the identical check three times, could not fail, and said nothing about
+Python compatibility — while two of its three rows named interpreters
+`requires-python` already excludes.
+
 ## Graph Storage
 
 Default: `memory.graph` in the current working directory.

@@ -8,6 +8,11 @@ version = "0.0.0"  # stamped from .claude-plugin/plugin.json by CI
 description = "Perfect memory. Exact reasoning. Complete history. Bi-temporal graph memory for AI coding agents."
 readme = "README.md"
 license = {text = "MIT"}
+# Deliberately unbounded above, and the bound below is the real claim: every
+# released interpreter from 3.10 up is exercised by .github/workflows/pytest.yml
+# and the classifiers below list exactly that set. See "Python Version Support"
+# in CLAUDE.md for why an unbounded ceiling is the honest choice here and what
+# to do when a new interpreter ships (#331).
 requires-python = ">=3.10"
 authors = [
     {name = "Aditya Mukhopadhyay", email = "webmaster@adityamukho.com"}
@@ -21,6 +26,8 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 
 dependencies = [

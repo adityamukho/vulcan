@@ -135,9 +135,20 @@ def ensure_venv() -> bool:
 
 
 def check_python_version():
-    """Check Python version is 3.9+."""
-    if sys.version_info < (3, 9):
-        print(f"ERROR: Python 3.9+ required, "
+    """Check Python version against pyproject.toml's requires-python floor.
+
+    Mirrors `requires-python = ">=3.10"`, and mirroring is the whole point: this
+    used to accept 3.9, so the installer printed a tick and then handed the run
+    to a `pip install -e .` that refused the interpreter it had just approved
+    (#331). pyproject.toml stays canonical -- raise the floor there first.
+
+    No ceiling, deliberately. CI covers every released interpreter from the floor
+    up (.github/workflows/pytest.yml), so refusing to install on a newer one
+    would cost a working install to buy nothing. See "Python Version Support" in
+    CLAUDE.md.
+    """
+    if sys.version_info < (3, 10):
+        print(f"ERROR: Python 3.10+ required, "
               f"found {sys.version_info.major}.{sys.version_info.minor}")
         return False
     print(f"✓ Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
