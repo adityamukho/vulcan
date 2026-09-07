@@ -366,3 +366,88 @@ class TestCoalesceSurvivorRuleHigherBase:
             "never the base"
         )
         assert merged.absorbed[0].is_base is False
+
+
+class TestCoalesceIntervalsModuleLevel:
+    """#329: the merge rule has to be callable WITHOUT a claim, because
+    _frontier_load needs it on a set it has just built from graph facts.
+    _coalesce runs only from _extend, and _extend only from a claim, so a
+    loaded-but-never-claimed set never merges."""
+
+    def test_contiguous_provisional_intervals_merge_and_report_the_absorbed(self):
+        loaded = [
+            Interval(0, 10, TAG_PROVISIONAL, anchor_pos=10, is_base=True,
+                     ident=":ingestion/frontier-high"),
+            Interval(11, 25, TAG_PROVISIONAL, anchor_pos=25, is_base=False,
+                     ident=":ingestion/interval-provisional-abc"),
+        ]
+        merged, absorbed = frontier_registry.coalesce_intervals(loaded, TAG_PROVISIONAL)
+        assert [(iv.lo_pos, iv.hi_pos) for iv in merged] == [(0, 25)]
+        assert merged[0].is_base is True
+        assert merged[0].ident == ":ingestion/frontier-high", (
+            "the base must survive every merge it takes part in -- it is what "
+            "persists at the fixed frontier-high ident"
+        )
+        assert [iv.ident for iv in absorbed] == [":ingestion/interval-provisional-abc"]
+
+    def test_overlapping_provisional_intervals_merge_to_their_union(self):
+        loaded = [
+            Interval(0, 10, TAG_PROVISIONAL, anchor_pos=10, is_base=True,
+                     ident=":ingestion/frontier-high"),
+            Interval(5, 25, TAG_PROVISIONAL, anchor_pos=25, is_base=False,
+                     ident=":ingestion/interval-provisional-abc"),
+        ]
+        merged, absorbed = frontier_registry.coalesce_intervals(loaded, TAG_PROVISIONAL)
+        assert [(iv.lo_pos, iv.hi_pos) for iv in merged] == [(0, 25)]
+        assert len(absorbed) == 1
+
+    def test_disjoint_intervals_with_a_real_gap_do_not_merge(self):
+        loaded = [
+            Interval(0, 10, TAG_PROVISIONAL, anchor_pos=10, is_base=True,
+                     ident=":ingestion/frontier-high"),
+            Interval(12, 25, TAG_PROVISIONAL, anchor_pos=25, is_base=False,
+                     ident=":ingestion/interval-provisional-abc"),
+        ]
+        merged, absorbed = frontier_registry.coalesce_intervals(loaded, TAG_PROVISIONAL)
+        assert [(iv.lo_pos, iv.hi_pos) for iv in merged] == [(0, 10), (12, 25)]
+        assert absorbed == []
+
+    def test_an_authoritative_interval_is_returned_untouched_and_never_merged(self):
+        """The authoritative/provisional boundary is the lineage frontier
+        later phases read, and must survive the two sides being adjacent."""
+        loaded = [
+            Interval(0, 10, TAG_AUTHORITATIVE, anchor_pos=0, is_base=True,
+                     ident=":ingestion/frontier-low"),
+            Interval(11, 25, TAG_PROVISIONAL, anchor_pos=25, is_base=True,
+                     ident=":ingestion/frontier-high"),
+        ]
+        merged, absorbed = frontier_registry.coalesce_intervals(loaded, TAG_PROVISIONAL)
+        assert [(iv.lo_pos, iv.hi_pos, iv.tag) for iv in merged] == [
+            (0, 10, TAG_AUTHORITATIVE), (11, 25, TAG_PROVISIONAL),
+        ]
+        assert absorbed == []
+
+    def test_the_allocator_method_still_merges_on_a_claim(self):
+        """_coalesce is now a wrapper -- claim-time behaviour must be
+        byte-for-byte what it was, or every #325 guarantee moves."""
+        alloc = FrontierAllocator(30, [
+            Interval(0, 10, TAG_PROVISIONAL, anchor_pos=10, is_base=True,
+                     ident=":ingestion/frontier-high"),
+            Interval(12, 25, TAG_PROVISIONAL, anchor_pos=25, is_base=False,
+                     ident=":ingestion/interval-provisional-abc"),
+        ])
+        assert alloc.claim_high() == 29
+        assert alloc.claim_high() == 28
+        prov = [iv for iv in alloc.intervals() if iv.tag == TAG_PROVISIONAL]
+        assert [(iv.lo_pos, iv.hi_pos) for iv in prov] == [(0, 10), (12, 25), (28, 29)]
+        assert alloc.claim_high() == 27
+        assert alloc.claim_high() == 26
+        prov = [iv for iv in alloc.intervals() if iv.tag == TAG_PROVISIONAL]
+        assert [(iv.lo_pos, iv.hi_pos) for iv in prov] == [(0, 10), (12, 29)], (
+            "the claim at 26 must merge the new top interval into the "
+            "extra at [12,25], and the LOWER one wins as survivor"
+        )
+        assert alloc.last_claim.absorbed != [], (
+            "the merging claim must still report what it swallowed, or "
+            "_reverse_claim_persist_target has nothing to retract"
+        )
